@@ -112,6 +112,10 @@ ValidateCapabilityOutputCallback = Callable[
     Awaitable[ValidatedCapabilityOutput[_CompletionValue]],
 ]
 LockedTaskAuthorizationCallback = Callable[[AsyncSession, Task], Awaitable[None]]
+LockedTaskEffectCallback = Callable[
+    [AsyncSession, Task, bool],
+    Awaitable[Task],
+]
 
 
 def capability_task_lock(task_id: int) -> asyncio.Lock:
@@ -334,6 +338,7 @@ async def _create_invocation(
     requested_by_user_id: int | None,
     request_source_log_id: int | None = None,
     authorize_locked_task: LockedTaskAuthorizationCallback | None = None,
+    lock_effect_task: LockedTaskEffectCallback | None = None,
 ) -> tuple[CapabilityInvocation, bool]:
     capability_key = capability_key.strip()
     idempotency_key = idempotency_key.strip()
@@ -362,7 +367,7 @@ async def _create_invocation(
             raise CapabilityConflictError(
                 "Idempotency key was already used for a different request"
             )
-        if authorize_locked_task is None:
+        if authorize_locked_task is None and lock_effect_task is None:
             return existing, False
 
     if (
@@ -378,17 +383,51 @@ async def _create_invocation(
             f"Capability {capability_key!r} is not registered"
         )
 
+    observed_task = await db.get(Task, task_id)
+    if observed_task is None:
+        raise CapabilityNotFoundError("Task not found")
+
     # The idempotency probe above opened a read transaction.  End it before
     # the Task write fence so a receipt committed by another SQLite WAL
     # connection wins cleanly instead of producing BUSY_SNAPSHOT.
     await _end_routing_read(db)
+    worker_node_fence_held = existing is None
     async with capability_task_lock(task_id):
         try:
-            task = await _lock_task(
-                db,
-                task_id,
-                require_termination_clear=True,
-            )
+            if worker_node_fence_held:
+                from backend.services.worker_node_control import (
+                    fence_worker_node_mutation,
+                )
+
+                await fence_worker_node_mutation(db)
+            if lock_effect_task is None:
+                task = await _lock_task(
+                    db,
+                    task_id,
+                    require_termination_clear=True,
+                )
+            else:
+                task = await lock_effect_task(
+                    db,
+                    observed_task,
+                    worker_node_fence_held,
+                )
+                if task.id != task_id:
+                    raise CapabilityConflictError(
+                        "Capability effect fence returned a different Task"
+                    )
+                termination_clear = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task.id,
+                        no_active_worker_task_termination_predicate(),
+                    )
+                    .values(status=Task.status)
+                )
+                if termination_clear.rowcount != 1:
+                    raise CapabilityConflictError(
+                        "Task has an active Worker termination receipt"
+                    )
             _ensure_local_task(task)
             if authorize_locked_task is not None:
                 await authorize_locked_task(db, task)
@@ -536,6 +575,7 @@ async def create_human_invocation(
     idempotency_key: str,
     requested_by_user_id: int | None,
     authorize_locked_task: LockedTaskAuthorizationCallback | None = None,
+    lock_effect_task: LockedTaskEffectCallback | None = None,
 ) -> tuple[CapabilityInvocation, bool]:
     """Create the only public contract: advisory + attach-only."""
 
@@ -550,6 +590,7 @@ async def create_human_invocation(
         resume_policy="attach_only",
         requested_by_user_id=requested_by_user_id,
         authorize_locked_task=authorize_locked_task,
+        lock_effect_task=lock_effect_task,
     )
 
 
@@ -679,6 +720,14 @@ async def _lock_aggregate(
         task_id,
         require_termination_clear=require_termination_clear,
     )
+    return await _lock_aggregate_after_task(db, invocation_id, task)
+
+
+async def _lock_aggregate_after_task(
+    db: AsyncSession,
+    invocation_id: int,
+    task: Task,
+) -> tuple[Task, CapabilityInvocation, list[CapabilityExecution]]:
     invocation = (
         await db.execute(
             select(CapabilityInvocation)
@@ -890,6 +939,11 @@ async def stage_and_claim_execution(
     invocation: CapabilityInvocation | None = None
     async with capability_task_lock(task_id):
         try:
+            from backend.services.worker_node_control import (
+                fence_worker_node_mutation,
+            )
+
+            await fence_worker_node_mutation(db)
             task, invocation, executions = await _lock_aggregate(
                 db,
                 invocation_id,
@@ -1043,6 +1097,11 @@ async def claim_execution(
     await _end_routing_read(db)
     async with capability_task_lock(task_id):
         try:
+            from backend.services.worker_node_control import (
+                fence_worker_node_mutation,
+            )
+
+            await fence_worker_node_mutation(db)
             _, invocation, executions = await _lock_aggregate(
                 db,
                 invocation_id,
@@ -1081,6 +1140,9 @@ async def claim_execution(
             return invocation, execution
         except CapabilityError:
             await db.rollback()
+            raise
+        except BaseException:
+            await _rollback_safely(db)
             raise
 
 
@@ -1129,6 +1191,11 @@ async def resume_waiting_execution(
     await _end_routing_read(db)
     async with capability_task_lock(task_id):
         try:
+            from backend.services.worker_node_control import (
+                fence_worker_node_mutation,
+            )
+
+            await fence_worker_node_mutation(db)
             _, invocation, executions = await _lock_aggregate(
                 db,
                 invocation_id,
@@ -1165,6 +1232,9 @@ async def resume_waiting_execution(
             return invocation, execution
         except CapabilityError:
             await db.rollback()
+            raise
+        except BaseException:
+            await _rollback_safely(db)
             raise
 
 
@@ -1414,12 +1484,31 @@ async def consume_ready_invocation(
     expected_state_version: int,
     allow_workflow_owned: bool = False,
     authorize_locked_task: LockedTaskAuthorizationCallback | None = None,
+    lock_effect_task: LockedTaskEffectCallback | None = None,
 ) -> CapabilityInvocation:
     task_id = await _invocation_task_id(db, invocation_id)
+    observed_task = await db.get(Task, task_id)
+    if observed_task is None:
+        raise CapabilityNotFoundError("Task not found")
     await _end_routing_read(db)
     async with capability_task_lock(task_id):
         try:
-            task, invocation, executions = await _lock_aggregate(db, invocation_id)
+            if lock_effect_task is None:
+                task, invocation, executions = await _lock_aggregate(
+                    db,
+                    invocation_id,
+                )
+            else:
+                task = await lock_effect_task(db, observed_task, False)
+                if task.id != task_id:
+                    raise CapabilityConflictError(
+                        "Capability effect fence returned a different Task"
+                    )
+                task, invocation, executions = await _lock_aggregate_after_task(
+                    db,
+                    invocation_id,
+                    task,
+                )
             if authorize_locked_task is not None:
                 await authorize_locked_task(db, task)
             if not allow_workflow_owned:
@@ -1461,14 +1550,33 @@ async def cancel_invocation(
     expected_state_version: int,
     allow_workflow_owned: bool = False,
     authorize_locked_task: LockedTaskAuthorizationCallback | None = None,
+    lock_effect_task: LockedTaskEffectCallback | None = None,
 ) -> CapabilityInvocation:
     """Request cancellation; queued/ready work terminates synchronously."""
 
     task_id = await _invocation_task_id(db, invocation_id)
+    observed_task = await db.get(Task, task_id)
+    if observed_task is None:
+        raise CapabilityNotFoundError("Task not found")
     await _end_routing_read(db)
     async with capability_task_lock(task_id):
         try:
-            task, invocation, executions = await _lock_aggregate(db, invocation_id)
+            if lock_effect_task is None:
+                task, invocation, executions = await _lock_aggregate(
+                    db,
+                    invocation_id,
+                )
+            else:
+                task = await lock_effect_task(db, observed_task, False)
+                if task.id != task_id:
+                    raise CapabilityConflictError(
+                        "Capability effect fence returned a different Task"
+                    )
+                task, invocation, executions = await _lock_aggregate_after_task(
+                    db,
+                    invocation_id,
+                    task,
+                )
             if authorize_locked_task is not None:
                 await authorize_locked_task(db, task)
             if not allow_workflow_owned:

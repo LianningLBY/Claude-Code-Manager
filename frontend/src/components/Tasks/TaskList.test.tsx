@@ -40,7 +40,9 @@ vi.mock('../../api/client', () => ({
 
 import { api } from '../../api/client';
 
-function makeTask(overrides: Partial<Task> = {}): Task {
+type LegacyTaskFixture = Task & { session_id?: string | null };
+
+function makeTask(overrides: Partial<LegacyTaskFixture> = {}): LegacyTaskFixture {
   return {
     id: 1,
     title: '',
@@ -67,6 +69,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     archived: false,
     has_unread: false,
     session_id: null,
+    has_session: false,
+    access_scope: 'control',
+    is_worker_managed: false,
     error_message: null,
     provider: 'claude',
     model: null,
@@ -87,6 +92,7 @@ describe('TaskList', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    localStorage.clear();
   });
 
   it('renders task description when no title', () => {
@@ -108,6 +114,7 @@ describe('TaskList', () => {
       status: 'failed',
       title: 'Controlled delivery',
       session_id: 'delivery-session',
+      has_session: true,
       delivery_run_id: 17,
       delivery_phase: 'monitoring',
       delivery_activity: 'waiting',
@@ -573,7 +580,7 @@ describe('TaskList', () => {
 
   describe('Chat button', () => {
     it('shows Chat button when session_id exists', () => {
-      const tasks = [makeTask({ session_id: 'abc-123' })];
+      const tasks = [makeTask({ session_id: 'abc-123', has_session: true })];
       render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
       expect(screen.getByTitle('Chat')).toBeInTheDocument();
     });
@@ -582,6 +589,159 @@ describe('TaskList', () => {
       const tasks = [makeTask({ session_id: null })];
       render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
       expect(screen.queryByTitle('Chat')).not.toBeInTheDocument();
+    });
+
+    it('uses has_session without requiring the native provider session id', () => {
+      const tasks = [makeTask({ session_id: undefined, has_session: true })];
+      render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
+      expect(screen.getByTitle('Chat')).toBeInTheDocument();
+    });
+  });
+
+  describe('chat-only access projection', () => {
+    it('keeps Chat and read-only data but hides every Task mutation control', () => {
+      const tasks = [makeTask({
+        access_scope: 'chat',
+        session_id: undefined,
+        has_session: true,
+        title: 'Shared conversation',
+        attention_tag: 'owner note',
+        starred: true,
+        has_unread: true,
+      })];
+
+      render(
+        <TaskList
+          tasks={tasks}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      expect(screen.getByTitle('Chat')).toBeInTheDocument();
+      expect(screen.getByText('Shared · Chat')).toBeInTheDocument();
+      expect(screen.getByText('owner note')).toBeInTheDocument();
+      expect(screen.queryByTitle('More actions')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('Unstar')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('Mark as read')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('按住拖动排序')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('Plugins')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('Task Config')).not.toBeInTheDocument();
+      expect(screen.queryByTitle('Edit attention tag')).not.toBeInTheDocument();
+    });
+
+    it('does not let a chat-only row initiate a sort update', () => {
+      vi.useFakeTimers();
+      try {
+        const tasks = [
+          makeTask({ id: 11, access_scope: 'chat', sort_order: 200 }),
+          makeTask({ id: 12, access_scope: 'control', sort_order: 100 }),
+        ];
+        const { container } = render(
+          <TaskList
+            tasks={tasks}
+            projects={projects}
+            onRefresh={onRefresh}
+            onOpenChat={onOpenChat}
+          />,
+        );
+        const rows = container.querySelectorAll('[data-reorder-idx]');
+        expect(rows).toHaveLength(2);
+
+        fireEvent.touchStart(rows[0]);
+        act(() => { vi.advanceTimersByTime(500); });
+        const dataTransfer = { effectAllowed: '', setData: vi.fn(), getData: vi.fn() };
+        fireEvent.dragOver(rows[1], { dataTransfer });
+        fireEvent.drop(rows[1], { dataTransfer });
+
+        expect(api.updateTask).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not mount Delivery controls for a chat-only Delivery row', () => {
+      render(
+        <TaskList
+          tasks={[makeTask({
+            access_scope: 'chat',
+            mode: 'delivery_loop',
+            delivery_run_id: 17,
+          })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      expect(screen.queryByRole('button', { name: 'DLV-17' })).not.toBeInTheDocument();
+      expect(api.getDeliveryRun).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('Team Share visibility', () => {
+    it('shows Team Share to the Task creator', async () => {
+      localStorage.setItem('cc_user', JSON.stringify({ id: 42, role: 'member' }));
+      render(
+        <TaskList
+          tasks={[makeTask({ created_by: 42 })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      await userEvent.click(screen.getByTitle('More actions'));
+
+      expect(screen.getByText('Team Share')).toBeInTheDocument();
+    });
+
+    it('hides Team Share from a member who does not own the Task', async () => {
+      localStorage.setItem('cc_user', JSON.stringify({ id: 42, role: 'member' }));
+      render(
+        <TaskList
+          tasks={[makeTask({ created_by: 7 })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      await userEvent.click(screen.getByTitle('More actions'));
+
+      expect(screen.queryByText('Team Share')).not.toBeInTheDocument();
+    });
+
+    it('hides Team Share when no authoritative user identity is cached', async () => {
+      render(
+        <TaskList
+          tasks={[makeTask({ created_by: 7 })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      await userEvent.click(screen.getByTitle('More actions'));
+
+      expect(screen.queryByText('Team Share')).not.toBeInTheDocument();
+    });
+
+    it.each(['admin', 'super_admin'])('shows Team Share to a %s', async (role) => {
+      localStorage.setItem('cc_user', JSON.stringify({ id: 42, role }));
+      render(
+        <TaskList
+          tasks={[makeTask({ created_by: 7 })]}
+          projects={projects}
+          onRefresh={onRefresh}
+          onOpenChat={onOpenChat}
+        />,
+      );
+
+      await userEvent.click(screen.getByTitle('More actions'));
+
+      expect(screen.getByText('Team Share')).toBeInTheDocument();
     });
   });
 });

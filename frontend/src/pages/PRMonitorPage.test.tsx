@@ -4,6 +4,10 @@ import userEvent from '@testing-library/user-event';
 import { PRMonitorPage } from './PRMonitorPage';
 import type { MonitoredRepo, PRMonitorRun, PRReview } from '../api/client';
 
+vi.mock('../hooks/useWebSocket', () => ({
+  useWebSocket: vi.fn(),
+}));
+
 vi.mock('../api/client', () => ({
   api: {
     config: vi.fn(),
@@ -29,6 +33,7 @@ vi.mock('../api/client', () => ({
 }));
 
 import { api } from '../api/client';
+import { useWebSocket } from '../hooks/useWebSocket';
 
 const baseRepo: MonitoredRepo = {
   id: 1,
@@ -129,11 +134,12 @@ async function openReview(
   user: ReturnType<typeof userEvent.setup>,
   review: PRReview,
   run: PRMonitorRun,
+  repo: MonitoredRepo = baseRepo,
 ) {
   vi.mocked(api.getRepoReviews).mockResolvedValue([review]);
   vi.mocked(api.getReviewDetail).mockResolvedValue(review);
   vi.mocked(api.getPRMonitorRun).mockResolvedValue(run);
-  await openRepo(user);
+  await openRepo(user, repo);
   await user.click(await screen.findByText(review.pr_title));
   await screen.findByText(`Review Detail · PR #${review.pr_number}`);
 }
@@ -210,11 +216,58 @@ describe('PRMonitorPage safety controls', () => {
     expect(screen.queryByRole('dialog', { name: 'Add Repository' })).not.toBeInTheDocument();
   });
 
+  it('hides projectless PR Monitor creation from members', async () => {
+    localStorage.setItem('cc_user', JSON.stringify({ id: 9, role: 'member' }));
+
+    render(<PRMonitorPage />);
+
+    await waitFor(() => expect(api.getMonitoredRepos).toHaveBeenCalled());
+    expect(screen.queryByRole('button', { name: /Add Repository/i })).not.toBeInTheDocument();
+  });
+
+  it('fails closed if administrator identity changes while the add dialog is open', async () => {
+    const user = userEvent.setup();
+    render(<PRMonitorPage />);
+
+    await user.click(await screen.findByRole('button', { name: /Add Repository/i }));
+    localStorage.setItem('cc_user', JSON.stringify({ id: 9, role: 'member' }));
+    await user.type(screen.getByPlaceholderText('owner/repo'), 'acme/new-repo');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+
+    expect(await screen.findByText('Only administrators can add a PR Monitor repository.')).toBeInTheDocument();
+    expect(api.createMonitoredRepo).not.toHaveBeenCalled();
+  });
+
+  it('defaults new repositories to one bounded reviewer Task', async () => {
+    const user = userEvent.setup();
+    render(<PRMonitorPage />);
+    await user.click(await screen.findByRole('button', { name: 'Add Repository' }));
+
+    expect(selectFollowingLabel('Review Harness')).toHaveValue('single');
+    expect(screen.getByText('One review Task with a bounded PR context.')).toBeInTheDocument();
+    expect(screen.queryByText(/roughly 3× the model work/)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Wait for exact-head CI')).toBeDisabled();
+
+    await user.type(screen.getByPlaceholderText('owner/repo'), 'acme/default-single');
+    await user.click(screen.getByRole('button', { name: 'Add' }));
+
+    await waitFor(() => expect(api.createMonitoredRepo).toHaveBeenCalledWith(
+      expect.objectContaining({
+        repo_full_name: 'acme/default-single',
+        review_mode: 'single',
+        wait_for_ci: false,
+        required_checks: [],
+      }),
+    ));
+  });
+
   it('allows panel auto-merge and keeps it mutually exclusive with Merge Queue', async () => {
     const user = userEvent.setup();
     render(<PRMonitorPage />);
     await user.click(await screen.findByRole('button', { name: 'Add Repository' }));
 
+    await user.selectOptions(selectFollowingLabel('Review Harness'), 'panel');
+    expect(screen.getByText(/three independent review Tasks/)).toHaveTextContent('roughly 3×');
     const autoMerge = screen.getByLabelText('Direct auto-merge after review and exact-head gates pass');
     const mergeQueue = selectFollowingLabel('Merge Queue');
     expect(autoMerge).toBeEnabled();
@@ -360,6 +413,135 @@ describe('PRMonitorPage safety controls', () => {
     expect(screen.getByText('QUEUE AUTO')).toBeInTheDocument();
   });
 
+  it('renders the backend human projection and reviewer summaries without canned advice', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({
+      task_ids: [301, 302, 303],
+      task_id: null,
+      display_status: 'Review system failed',
+      display_summary: 'The Senior reviewer could not start, so this panel has no complete code verdict.',
+      outcome_kind: 'infrastructure_error',
+      aggregate_verdict: null,
+      reviewer_count: 3,
+      reviewer_status_counts: { completed: 2, error: 1 },
+      reviewer_verdict_counts: { pass: 1, changes_required: 1 },
+      reviewer_runs: [{
+        id: 31,
+        role: 'principal',
+        task_id: 301,
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+        effort: 'high',
+        status: 'completed',
+        verdict: 'changes_required',
+        result_body: 'Principal found one correctness issue in the changed request path.',
+        outcome_kind: 'review_result',
+        error_message: null,
+        created_at: '2026-08-02T00:00:00Z',
+        completed_at: '2026-08-02T00:05:00Z',
+        findings: [],
+      }],
+    });
+    await openReview(user, review, runFixture());
+
+    expect(screen.getAllByText('Review system failed').length).toBeGreaterThan(0);
+    expect(screen.getByRole('alert')).toHaveTextContent('Senior reviewer could not start');
+    expect(screen.getByRole('alert')).toHaveTextContent('No code verdict was produced');
+    expect(screen.getByText('Principal found one correctness issue in the changed request path.')).toBeInTheDocument();
+    expect(screen.getByText('Task #301')).toBeInTheDocument();
+    expect(screen.getByText(/3 reviewers/)).toBeInTheDocument();
+    expect(screen.getByText(/Progress: 2 completed · 1 review failed/)).toBeInTheDocument();
+    expect(screen.queryByText(/优先处理高风险和中风险问题/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/应用修复前下载并检查 Diff/)).not.toBeInTheDocument();
+  });
+
+  it('does not infer a historical review mode from the current repository setting', async () => {
+    const user = userEvent.setup();
+    const currentPanelRepo: MonitoredRepo = {
+      ...baseRepo,
+      review_mode: 'panel',
+      wait_for_ci: true,
+      required_checks: [],
+      auto_repair: false,
+      merge_queue_mode: 'manual',
+    };
+    const review = reviewFixture({
+      task_id: 701,
+      task_ids: undefined,
+      reviewer_runs: [],
+      reviewer_count: 0,
+      display_status: 'Changes required',
+      display_summary: 'The single reviewer found one blocking issue.',
+      outcome_kind: 'review_result',
+      aggregate_verdict: 'changes_required',
+    });
+
+    await openReview(user, review, runFixture(), currentPanelRepo);
+
+    expect(screen.getByText('The single reviewer found one blocking issue.')).toBeInTheDocument();
+    expect(screen.getAllByText('#701').length).toBeGreaterThan(0);
+    expect(screen.queryByText('Reviewer panel has not started yet.')).not.toBeInTheDocument();
+  });
+
+  it('loads the complete review body when a bounded history row is opened', async () => {
+    const user = userEvent.setup();
+    const listReview = reviewFixture({
+      display_summary: 'Authorization finding preview…',
+      review_summary: 'Authorization finding preview…',
+    });
+    const detailReview = {
+      ...listReview,
+      display_summary: 'Authorization can be bypassed.\n\nCheck the project ACL before dispatch.',
+      review_summary: 'Authorization can be bypassed.\n\nCheck the project ACL before dispatch.',
+    };
+    vi.mocked(api.getRepoReviews).mockResolvedValue([listReview]);
+    vi.mocked(api.getReviewDetail).mockResolvedValue(detailReview);
+
+    await openRepo(user);
+    await user.click(await screen.findByText(listReview.pr_title));
+
+    expect(await screen.findByText(/Authorization can be bypassed/)).toHaveTextContent(
+      'Authorization can be bypassed. Check the project ACL before dispatch.',
+    );
+    expect(screen.queryByText('Authorization finding preview…')).not.toBeInTheDocument();
+    expect(api.getReviewDetail).toHaveBeenCalledWith(listReview.id);
+  });
+
+  it('labels current and historical review heads in history', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getRepoReviews).mockResolvedValue([
+      reviewFixture({ id: 12, head_sha: '2222222222222222222222222222222222222222', is_current_snapshot: true }),
+      reviewFixture({ id: 11, head_sha: '1111111111111111111111111111111111111111', is_current_snapshot: false }),
+    ]);
+
+    await openRepo(user);
+
+    expect(await screen.findByText('22222222')).toBeInTheDocument();
+    expect(screen.getByText('11111111')).toBeInTheDocument();
+    expect(screen.getByText('Current head')).toBeInTheDocument();
+    expect(screen.getByText('Historical head')).toBeInTheDocument();
+  });
+
+  it('subscribes to PR Monitor updates and refreshes an active review list', async () => {
+    const user = userEvent.setup();
+    const activeReview = reviewFixture({ status: 'reviewing', outcome_kind: 'in_progress' });
+    vi.mocked(api.getRepoReviews).mockResolvedValue([activeReview]);
+    await openRepo(user);
+
+    const subscription = vi.mocked(useWebSocket).mock.calls.find(([channels]) => (
+      channels.length === 1 && channels[0] === 'pr-monitor'
+    ));
+    expect(subscription).toBeDefined();
+
+    vi.mocked(api.getRepoReviews).mockResolvedValue([{ ...activeReview, pr_title: 'Refreshed review title' }]);
+    await act(async () => {
+      subscription?.[1]?.({ type: 'review_updated', review_id: activeReview.id });
+      await Promise.resolve();
+    });
+
+    expect(await screen.findByText('Refreshed review title')).toBeInTheDocument();
+  });
+
   it('shows CI and monitor details before reviewer runs exist', async () => {
     const user = userEvent.setup();
     const review = reviewFixture({ status: 'waiting_ci', reviewer_runs: [] });
@@ -378,8 +560,11 @@ describe('PRMonitorPage safety controls', () => {
 
     expect(screen.getByText('CI: Failed: tests')).toBeInTheDocument();
     expect(screen.getByText('failure · tests · github-actions')).toBeInTheDocument();
-    expect(screen.getByText(/Loop: waiting_for_fix/)).toBeInTheDocument();
-    expect(screen.getByText(/Wake #7: shadow/)).toBeInTheDocument();
+    const diagnostics = screen.getByText('Advanced diagnostics').closest('details');
+    expect(diagnostics).not.toHaveAttribute('open');
+    await user.click(screen.getByText('Advanced diagnostics'));
+    expect(screen.getByText(/Loop: Waiting For Fix/)).toBeInTheDocument();
+    expect(screen.getByText(/Wake #7: Shadow/)).toBeInTheDocument();
     expect(screen.getByText('Reviewer panel has not started yet.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Bind' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Pause loop' })).not.toBeInTheDocument();
@@ -449,7 +634,8 @@ describe('PRMonitorPage safety controls', () => {
     });
     await openReview(user, reviewFixture(), run);
 
-    expect(screen.getByText(/Wake #8: delivering/)).toBeInTheDocument();
+    await user.click(screen.getByText('Advanced diagnostics'));
+    expect(screen.getByText(/Wake #8: Delivering/)).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Unbind Developer' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Pause loop' })).not.toBeInTheDocument();
   });

@@ -63,6 +63,110 @@ async def _task(db_factory) -> int:
 
 
 @pytest.mark.asyncio
+async def test_public_harness_projection_redacts_managed_workspace_routes(
+    db_factory,
+):
+    run_id = "7" * 32
+    workspace_id = "8" * 32
+    job_id = "9" * 32
+    private_workspace = "/srv/ccm/private/project"
+    private_url = "http://127.0.0.1:43123/"
+    async with db_factory() as db:
+        owner = Task(
+            title="Private Harness projection owner",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        db.add(owner)
+        await db.flush()
+        db.add(
+            RunModel(
+                id=run_id,
+                task_id=owner.id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
+                workspace_review_run_id=workspace_id,
+                browser_review_job_id=job_id,
+                target_kind="current_workspace",
+                target_spec={"kind": "current_workspace"},
+                test_plan={"version": 1, "objective": "Inspect the UI"},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="a" * 64,
+                root_run_id=run_id,
+                status="completed",
+                stage="completed",
+                report=f"Preview checked at {private_url}settings",
+                cleanup_status="completed",
+            )
+        )
+        db.add(
+            WorkspaceReviewRun(
+                id=workspace_id,
+                task_id=owner.id,
+                owner_task_incarnation_id=owner.incarnation_id,
+                owner_task_retry_count=owner.retry_count,
+                owner_task_turn_generation=owner.turn_generation,
+                owner_task_status=owner.status,
+                harness_run_id=run_id,
+                browser_review_job_id=job_id,
+                mode="review_only",
+                profile="standard",
+                goal="Inspect the UI",
+                status="completed",
+                stage="completed",
+                workspace_path=private_workspace,
+                git_head="b" * 40,
+                workspace_fingerprint="c" * 64,
+                preview_config={"version": 1, "processes": []},
+                preview_url=private_url,
+                report=f"Loaded {private_url}settings",
+                cleanup_status="completed",
+            )
+        )
+        db.add(
+            AttemptModel(
+                id="d" * 32,
+                run_id=run_id,
+                ordinal=1,
+                status="completed",
+                stage="completed",
+                provider="codex",
+                model="gpt-5.6-sol",
+                reasoning_effort="high",
+                codex_service_tier="default",
+                browser_review_job_id=job_id,
+                archive_state="complete",
+                archive_manifest={},
+                result_data={
+                    "id": job_id,
+                    "url": private_url,
+                    "network_policy": "managed_preview",
+                    "report": f"Opened {private_url}settings",
+                    "telemetry": {
+                        "request_failures": [{"url": f"{private_url}api"}]
+                    },
+                    "trace": [{"detail": f"Navigate to {private_url}settings"}],
+                },
+            )
+        )
+        await db.commit()
+
+    service = HarnessService(db_factory=db_factory, poll_interval=0.01)
+    payload = await service.get_run(run_id)
+
+    assert payload is not None
+    assert payload["workspace_review"]["workspace_path"] is None
+    assert payload["workspace_review"]["preview_url"] is None
+    assert payload["browser_review"]["url"] is None
+    assert private_workspace not in str(payload)
+    assert "127.0.0.1:43123" not in str(payload)
+    assert "[managed-preview]" in str(payload)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("graph_kind", ["harness", "workspace"])
 async def test_terminal_run_with_unproven_cleanup_remains_active_owner_graph(
     db_factory,
@@ -1172,6 +1276,144 @@ async def test_sync_terminal_workspace_run_records_cleanup_event(db_factory):
     assert payload["cleanup_status"] == "completed"
     assert payload["events"][-1]["event_type"] == "cleanup"
     assert payload["events"][-1]["title"] == "隔离预览已清理"
+
+
+@pytest.mark.asyncio
+async def test_cross_service_late_harness_cleanup_failure_cannot_replace_success(
+    db_factory,
+):
+    run_id = "91" * 16
+    async with db_factory() as db:
+        db.add(
+            RunModel(
+                id=run_id,
+                task_id=None,
+                target_kind="fixed_url",
+                target_spec={"kind": "fixed_url", "url": "https://example.com"},
+                test_plan={"version": 1},
+                runtime_config={"provider": "codex"},
+                request_fingerprint="9" * 64,
+                root_run_id=run_id,
+                status="cancelled",
+                stage="cancelled",
+                cleanup_status="pending",
+            )
+        )
+        await db.commit()
+
+    winner = HarnessService(db_factory=db_factory)
+    late_failure = HarnessService(db_factory=db_factory)
+    await winner._update_run(
+        run_id,
+        values={"cleanup_status": "completed", "cleanup_error": None},
+        event_type="cleanup",
+        title="cleanup completed",
+        source_key="cleanup:completed",
+    )
+    await late_failure._update_run(
+        run_id,
+        values={"cleanup_status": "failed", "cleanup_error": "late failure"},
+        event_type="cleanup",
+        title="cleanup failed",
+        detail="late failure",
+        source_key="cleanup:late-failure",
+    )
+
+    async with db_factory() as db:
+        durable = await db.get(RunModel, run_id)
+        assert durable is not None
+        assert durable.cleanup_status == "completed"
+        assert durable.cleanup_error is None
+        assert durable.event_sequence == 1
+
+
+@pytest.mark.asyncio
+async def test_exact_owner_stop_never_sweeps_future_generation_runs(db_factory):
+    from backend.services.test_harness_owner_fence import (
+        TEST_HARNESS_TERMINAL_GATE_KEY,
+        test_harness_owner_identity,
+    )
+
+    old_run_id = "92" * 16
+    future_run_id = "93" * 16
+    async with db_factory() as db:
+        owner = Task(
+            title="Exact-generation cleanup owner",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+        )
+        db.add(owner)
+        await db.flush()
+        identity = test_harness_owner_identity(owner)
+        for run_id, retry_count, turn_generation in (
+            (old_run_id, identity.retry_count, identity.turn_generation),
+            (future_run_id, identity.retry_count + 1, identity.turn_generation + 1),
+        ):
+            db.add(
+                RunModel(
+                    id=run_id,
+                    task_id=owner.id,
+                    owner_task_incarnation_id=identity.incarnation_id,
+                    owner_task_retry_count=retry_count,
+                    owner_task_turn_generation=turn_generation,
+                    owner_task_status=identity.status,
+                    target_kind="fixed_url",
+                    target_spec={"kind": "fixed_url", "url": "https://example.com"},
+                    test_plan={"version": 1},
+                    runtime_config={"provider": "codex"},
+                    request_fingerprint=run_id[0] * 64,
+                    root_run_id=run_id,
+                    status="running",
+                    stage="running",
+                    cleanup_status="pending",
+                )
+            )
+        await db.commit()
+        owner_id = owner.id
+
+    class RecordingChildService:
+        def __init__(self):
+            self.owner_sweeps: list[int] = []
+            self.binding_stops: list[str] = []
+
+        async def stop_for_harness_run(self, _run_id, *, reason):
+            assert reason
+            return False
+
+        async def stop_for_owner(self, task_id, *, reason):
+            assert reason
+            self.owner_sweeps.append(task_id)
+            return 0
+
+        async def stop_binding(self, binding_id, *, reason):
+            assert reason
+            self.binding_stops.append(binding_id)
+
+    child_service = RecordingChildService()
+    service = HarnessService(
+        db_factory=db_factory,
+        child_service=child_service,
+    )
+    async with service.owner_stop_fence(
+        owner_id,
+        reason="stop only the frozen generation",
+        expected_identity=identity,
+    ):
+        pass
+
+    async with db_factory() as db:
+        old_run = await db.get(RunModel, old_run_id)
+        future_run = await db.get(RunModel, future_run_id)
+        owner = await db.get(Task, owner_id)
+        assert old_run is not None and old_run.status == "cancelled"
+        assert old_run.cleanup_status == "completed"
+        assert future_run is not None and future_run.status == "running"
+        assert future_run.cleanup_status == "pending"
+        gate = (owner.metadata_ or {})[TEST_HARNESS_TERMINAL_GATE_KEY]
+        assert gate["cleanup_harness_run_ids"] == [old_run_id]
+    assert child_service.owner_sweeps == []
+    assert child_service.binding_stops == []
 
 
 @pytest.mark.asyncio

@@ -235,8 +235,9 @@ async def test_answer_and_cancel_converge_without_cross_lock_deadlock(tmp_path):
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         factory = async_sessionmaker(
             engine,
             class_=AsyncSession,
@@ -391,7 +392,7 @@ async def test_ordinary_cancel_fences_claim_committed_after_stale_read(db_factor
             assert claiming_owner is not None
             claimed = await dispatcher._claim_plan_run(
                 claiming_db,
-                instance=claiming_owner,
+                instance_id=claiming_owner.id,
             )
         assert claimed == (run_id, 1)
         assert run.status == "queued"

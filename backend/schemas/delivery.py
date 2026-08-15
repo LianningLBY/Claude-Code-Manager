@@ -5,10 +5,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from backend.schemas.plan_resource import (
-    PlanInputRequestResponse,
-    PlanRunResource,
-)
+from backend.schemas.plan_resource import PlanQuestion
 
 
 class DeliveryRunCreate(BaseModel):
@@ -83,25 +80,17 @@ class DeliveryQuickStartCreate(BaseModel):
 
 class DeliveryRunResponse(BaseModel):
     id: int
-    created_by: int | None
     project_id: int
     monitored_repo_id: int | None
     source_todo_id: int | None
     developer_task_id: int | None
     pr_monitor_run_id: int | None
-    worktree_id: int | None
     title: str
     requirements: str
-    requirements_hash: str
-    policy_hash: str
     base_branch: str
     delivery_branch: str
-    workspace_path: str | None
     base_sha: str | None
     head_sha: str | None
-    head_tree_sha: str | None
-    patch_sha256: str | None
-    head_generation: int
     pr_number: int | None
     pr_url: str | None
     phase: str
@@ -120,7 +109,6 @@ class DeliveryRunResponse(BaseModel):
     max_cycles: int
     no_progress_count: int
     max_no_progress: int
-    next_reconcile_at: datetime | None
     created_at: datetime
     updated_at: datetime
     completed_at: datetime | None
@@ -140,12 +128,7 @@ class DeliveryCycleResponse(BaseModel):
     base_sha: str | None
     start_head_sha: str | None
     result_head_sha: str | None
-    result_head_tree_sha: str | None
-    result_patch_sha256: str | None
-    plan_invocation_id: int | None
     plan_version_id: int | None
-    review_invocation_id: int | None
-    review_result_id: int | None
     review_verdict: str | None
     review_summary: str | None
     frontend_review_run_id: str | None
@@ -169,18 +152,11 @@ class DeliveryTurnResponse(BaseModel):
     run_id: int
     cycle_id: int
     generation: int
-    correlation_id: str
     purpose: str
     trigger_kind: str
-    trigger_payload: dict
     status: str
     task_id: int | None
-    task_retry_count: int | None
-    task_instance_id: int | None
     task_started_at: datetime | None
-    task_session_id: str | None
-    checkpoint: dict | None
-    checkpoint_status: str | None
     attempts: int
     last_error: str | None
     created_at: datetime
@@ -196,17 +172,12 @@ class DeliveryTransitionResponse(BaseModel):
     state_version: int
     cause: str
     actor_kind: str
-    actor_id: str | None
-    before_state: dict
-    after_state: dict
-    metadata: dict | None = Field(default=None, validation_alias="metadata_")
     created_at: datetime
 
-    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+    model_config = ConfigDict(from_attributes=True)
 
 
 class DeliveryRunDetail(DeliveryRunResponse):
-    policy_snapshot: dict
     cycles: list[DeliveryCycleResponse]
     turns: list[DeliveryTurnResponse]
     transitions: list[DeliveryTransitionResponse]
@@ -261,9 +232,6 @@ class DeliveryAgentActivity(BaseModel):
     activity_kind: str
     headline: str
     detail: str | None = None
-    task_id: int | None = None
-    source_kind: str
-    source_id: str | None = None
     started_at: datetime | None = None
     first_output_at: datetime | None = None
     last_activity_at: datetime | None = None
@@ -307,10 +275,33 @@ class DeliveryTimelineEvent(BaseModel):
     created_at: datetime
 
 
+class DeliveryPlanRunProjection(BaseModel):
+    """Minimum Plan run identity required to submit one open answer."""
+
+    id: int
+    generation: int
+    status: str
+    current_stage: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DeliveryPlanInputRequestProjection(BaseModel):
+    """Open questions without Plan execution principal or receipt fields."""
+
+    id: int
+    requested_by: str
+    reason: str | None
+    questions: list[PlanQuestion]
+    status: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class DeliveryPlanInputProjection(BaseModel):
     plan_id: int
-    run: PlanRunResource
-    request: PlanInputRequestResponse
+    run: DeliveryPlanRunProjection
+    request: DeliveryPlanInputRequestProjection
 
 
 class DeliveryFrontendReviewProgress(BaseModel):

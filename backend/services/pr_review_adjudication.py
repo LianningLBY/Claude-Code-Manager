@@ -24,6 +24,7 @@ from backend.models.pr_monitor import (
     PRReview,
 )
 from backend.models.task import Task
+from backend.services.task_creation import system_task_execution_principal_values
 from backend.services.worker_task_termination import (
     no_active_worker_task_termination_predicate,
 )
@@ -262,6 +263,7 @@ async def create_rebuttal_task(
         effort_level=repo.review_effort,
         project_id=await _get_or_create_pr_monitor_project(db),
         worker_id=repo.worker_id,
+        **system_task_execution_principal_values(),
     )
     rebuttal.task_id = task.id
     run.status = "adjudicating"
@@ -278,6 +280,7 @@ async def create_rebuttal_task(
 async def complete_adjudication(
     db: AsyncSession, *, adjudication_id: int, task_id: int,
     retry_count: int,
+    expected_background_generation: str | None = None,
 ) -> None:
     rebuttal = await db.get(PRFindingRebuttal, adjudication_id, populate_existing=True)
     if rebuttal is None or rebuttal.task_id != task_id or rebuttal.status != "adjudicating":
@@ -289,7 +292,9 @@ async def complete_adjudication(
     if (
         finding is None or review is None or run is None or task is None
         or task.status != "completed" or task.retry_count != retry_count
-        or task.started_at is None or task.pty_background_generation is not None
+        or task.started_at is None
+        or task.pty_background_generation
+        != expected_background_generation
         or run.current_review_id != review.id or run.current_head_sha != finding.head_sha
     ):
         return
@@ -325,6 +330,11 @@ async def complete_adjudication(
     # synchronize cleanup order.  In particular, a new-head webhook may have
     # marked the review/rebuttal superseded while the log scan above ran.
     await db.rollback()
+    from backend.services.worker_node_control import (
+        fence_worker_node_mutation,
+    )
+
+    await fence_worker_node_mutation(db)
     task = (await db.execute(
         select(Task)
         .where(Task.id == task_id)
@@ -381,7 +391,8 @@ async def complete_adjudication(
         or task.status != "completed" or task.retry_count != retry_count
         or task.started_at != expected_started_at
         or task.completed_at != expected_completed_at
-        or task.pty_background_generation is not None
+        or task.pty_background_generation
+        != expected_background_generation
         or rebuttal.task_id != task.id
         or rebuttal.status != "adjudicating"
         or rebuttal.base_sha != review.base_sha
@@ -411,7 +422,12 @@ async def complete_adjudication(
                 if expected_completed_at is None
                 else Task.completed_at == expected_completed_at
             ),
-            Task.pty_background_generation.is_(None),
+            (
+                Task.pty_background_generation.is_(None)
+                if expected_background_generation is None
+                else Task.pty_background_generation
+                == expected_background_generation
+            ),
             no_active_worker_task_termination_predicate(),
         )
         .values(status=Task.status)

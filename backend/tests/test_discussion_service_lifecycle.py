@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 
 from backend.models.discussion import Discussion, DiscussionAgent, DiscussionEvent
 from backend.models.project import Project
-from backend.models.team_share import TeamProjectShare
+from backend.models.task_share import ProjectShare
 from backend.models.user import User
 from backend.services import discussion_service
 from backend.services.discussion_service import (
@@ -640,7 +640,7 @@ async def test_auth_disabled_discussion_rejected_before_provider_effect(
 
 
 @pytest.mark.asyncio
-async def test_preclaimed_agent_becomes_visible_error_when_final_share_gate_vetoes(
+async def test_preclaimed_agent_becomes_visible_error_when_outbound_share_gate_vetoes(
     db_factory,
     monkeypatch,
 ):
@@ -664,11 +664,12 @@ async def test_preclaimed_agent_becomes_visible_error_when_final_share_gate_veto
             pid=None,
         )
         db.add(agent)
-        db.add(TeamProjectShare(
+        db.add(ProjectShare(
             project_id=project.id,
-            target_type="user",
-            target_id=993,
-            shared_by=0,
+            shared_to_open_id="remote-discussion-reviewer",
+            shared_to_name="Remote reviewer",
+            shared_to_ccm_url="https://remote.example.test",
+            status="active",
         ))
         await db.commit()
         project_id = project.id

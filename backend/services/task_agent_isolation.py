@@ -1189,10 +1189,38 @@ def _canonical_protected_paths(values: Iterable[str]) -> tuple[str, ...]:
             paths.add(os.path.realpath(path))
         except OSError:
             pass
-    paths.add(str(runtime_secret_root()))
+    runtime_root = str(runtime_secret_root())
+    paths.add(runtime_root)
+    # These are validated as exact fail-closed boundaries below. The runtime
+    # root is materialized before Claude starts, so retaining it beneath a
+    # broader deny cannot reproduce the stale missing-leaf mount failure.
+    required_exact_paths = {runtime_root}
     if os.name == "posix" and Path("/proc").is_dir():
         paths.add("/proc")
-    return tuple(sorted(paths))
+        required_exact_paths.add("/proc")
+
+    # Claude's Linux sandbox materializes each deny entry as a bubblewrap
+    # mount target. A redundant missing leaf below an already-denied directory
+    # cannot be created once that parent is read-only, which makes every Bash
+    # command fail before it starts. Keep the minimal ancestor set instead:
+    # denying the parent already protects all existing and future descendants,
+    # including stale/missing managed SSH key paths.
+    def covered_by(candidate: str, root: str) -> bool:
+        try:
+            return os.path.commonpath((candidate, root)) == root
+        except ValueError:
+            # Different Windows drives have no common path.
+            return False
+
+    roots: list[str] = []
+    for path in sorted(paths, key=lambda value: (len(Path(value).parts), value)):
+        if (
+            path not in required_exact_paths
+            and any(covered_by(path, root) for root in roots)
+        ):
+            continue
+        roots.append(path)
+    return tuple(sorted(roots))
 
 
 def _canonical_exact_filesystem_paths(

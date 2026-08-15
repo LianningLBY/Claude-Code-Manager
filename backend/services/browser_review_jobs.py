@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import copy
 import json
 import logging
 import re
@@ -14,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import urlsplit
 
 from sqlalchemy import select
 
@@ -52,6 +54,61 @@ BrowserReviewAdmissionReclaimer = Callable[[int], Awaitable[int | None]]
 
 class BrowserReviewBusyError(RuntimeError):
     """Raised when the single demo browser slot is already occupied."""
+
+
+def _managed_preview_tokens(url: str) -> tuple[str, ...]:
+    """Return exact private URL forms that may occur in public evidence."""
+
+    candidates = {url, url.rstrip("/")}
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme and parsed.netloc:
+            candidates.add(f"{parsed.scheme}://{parsed.netloc}")
+    except ValueError:
+        pass
+    return tuple(sorted((item for item in candidates if item), key=len, reverse=True))
+
+
+def redact_managed_preview_urls(value: Any, urls: list[str] | tuple[str, ...]) -> Any:
+    """Clone one public payload while removing exact managed Preview routes."""
+
+    tokens = tuple(
+        dict.fromkeys(
+            token
+            for url in urls
+            if isinstance(url, str) and url
+            for token in _managed_preview_tokens(url)
+        )
+    )
+
+    def redact(item: Any) -> Any:
+        if isinstance(item, str):
+            for token in tokens:
+                item = item.replace(token, "[managed-preview]")
+            return item
+        if isinstance(item, dict):
+            return {key: redact(child) for key, child in item.items()}
+        if isinstance(item, list):
+            return [redact(child) for child in item]
+        if isinstance(item, tuple):
+            return tuple(redact(child) for child in item)
+        return copy.deepcopy(item)
+
+    return redact(value)
+
+
+def public_browser_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Hide an ephemeral managed-preview origin from a browser result."""
+
+    if payload.get("network_policy") != "managed_preview":
+        return copy.deepcopy(payload)
+    private_url = payload.get("url")
+    projected = redact_managed_preview_urls(
+        payload,
+        [private_url] if isinstance(private_url, str) else [],
+    )
+    projected["url"] = None
+    return projected
 
 
 @dataclass
@@ -126,6 +183,11 @@ class BrowserReviewJob:
             "artifacts": self.artifact_names(),
             "report": self._read_report(),
         }
+
+    def public_dict(self) -> dict[str, Any]:
+        """Return the user-facing form without a managed loopback origin."""
+
+        return public_browser_review_payload(self.as_dict())
 
     def artifact_names(self) -> list[str]:
         output_dir = self.options.output_dir

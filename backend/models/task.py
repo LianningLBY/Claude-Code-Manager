@@ -27,6 +27,42 @@ class Task(Base):
             name="ck_tasks_codex_service_tier",
         ),
         CheckConstraint(
+            "execution_user_role IN ('member', 'admin', 'super_admin')",
+            name="ck_tasks_execution_user_role",
+        ),
+        CheckConstraint(
+            "execution_mode IN ('sandbox', 'unrestricted')",
+            name="ck_tasks_execution_mode",
+        ),
+        CheckConstraint(
+            "execution_principal_kind IN "
+            "('user', 'deployment_token', 'system', 'delegated_user', "
+            "'delegated_deployment_token')",
+            name="ck_tasks_execution_principal_kind",
+        ),
+        CheckConstraint(
+            "(execution_principal_kind IN ('user', 'delegated_user') "
+            "AND execution_user_id IS NOT NULL) OR "
+            "(execution_principal_kind NOT IN ('user', 'delegated_user') "
+            "AND execution_user_id IS NULL)",
+            name="ck_tasks_execution_user_shape",
+        ),
+        CheckConstraint(
+            "(execution_principal_kind = 'system' "
+            "AND execution_user_role = 'member' "
+            "AND execution_mode = 'sandbox') OR "
+            "(execution_principal_kind IN "
+            "('deployment_token', 'delegated_deployment_token') "
+            "AND execution_user_role = 'super_admin' "
+            "AND execution_mode = 'unrestricted') OR "
+            "(execution_principal_kind IN ('user', 'delegated_user') AND "
+            "((execution_user_role IN ('admin', 'super_admin') "
+            "AND execution_mode = 'unrestricted') OR "
+            "(execution_user_role = 'member' "
+            "AND execution_mode = 'sandbox')))",
+            name="ck_tasks_execution_principal_policy",
+        ),
+        CheckConstraint(
             "(mode = 'delivery_loop' AND delivery_run_id IS NOT NULL "
             "AND delivery_role = 'developer') OR "
             "(mode <> 'delivery_loop' AND delivery_run_id IS NULL "
@@ -86,6 +122,20 @@ class Task(Base):
     worker_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     # Team CCM: 谁创建的（users.id）
     created_by: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Durable authority for the next/active logical turn. These fields are
+    # internal execution state, not caller-controlled Task configuration.
+    # Ordinary local user turns freeze their authenticated principal here;
+    # system-derived and cross-boundary Tasks remain sandboxed.
+    execution_user_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    execution_user_role: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="member", server_default="member"
+    )
+    execution_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="sandbox", server_default="sandbox"
+    )
+    execution_principal_kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="system", server_default="system"
+    )
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     max_retries: Mapped[int] = mapped_column(Integer, default=2)
     mode: Mapped[str] = mapped_column(String(20), default="auto")  # auto/plan/loop/goal/delivery_loop

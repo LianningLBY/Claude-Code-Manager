@@ -58,7 +58,14 @@ async def _seed_resume(
     *,
     invocation_status: str = "failed",
     generation: int = 7,
+    execution_principal: dict[str, object] | None = None,
 ) -> _Seed:
+    principal = execution_principal or {
+        "execution_user_id": None,
+        "execution_user_role": "member",
+        "execution_mode": "sandbox",
+        "execution_principal_kind": "system",
+    }
     task = Task(
         title="Capability resume",
         description="continue after capability",
@@ -70,6 +77,7 @@ async def _seed_resume(
         retry_count=2,
         turn_generation=generation,
         session_id="session-resume",
+        **principal,
     )
     db.add(task)
     await db.flush()
@@ -199,6 +207,10 @@ async def _seed_resume(
         request_source_log_id=source.id,
         request_output_log_id=output.id,
         request_terminal_log_id=output.id,
+        request_execution_user_id=task.execution_user_id,
+        request_execution_user_role=task.execution_user_role,
+        request_execution_mode=task.execution_mode,
+        request_execution_principal_kind=task.execution_principal_kind,
     )
     db.add(outbox)
     await db.commit()
@@ -280,6 +292,65 @@ async def test_success_materializes_one_frozen_resume_envelope(
             "id": 101,
             "content": "plan",
         }
+
+
+@pytest.mark.asyncio
+async def test_resume_preserves_original_admin_principal_through_claim(
+    db_factory,
+):
+    principal = {
+        "execution_user_id": 73,
+        "execution_user_role": "admin",
+        "execution_mode": "unrestricted",
+        "execution_principal_kind": "user",
+    }
+    async with db_factory() as db:
+        seed = await _seed_resume(
+            db,
+            invocation_status="failed",
+            execution_principal=principal,
+        )
+    async with db_factory() as db:
+        materialized = await materialize_resume_outbox(db, seed.outbox_id)
+
+    assert materialized is not None
+    assert {
+        "execution_user_id": materialized.execution_user_id,
+        "execution_user_role": materialized.execution_user_role,
+        "execution_mode": materialized.execution_mode,
+        "execution_principal_kind": materialized.execution_principal_kind,
+    } == principal
+
+    async with db_factory() as db:
+        published = await claim_resume_publication(db, seed.outbox_id)
+    assert published is not None and published.lease_token is not None
+    assert {
+        "execution_user_id": published.execution_user_id,
+        "execution_user_role": published.execution_user_role,
+        "execution_mode": published.execution_mode,
+        "execution_principal_kind": published.execution_principal_kind,
+    } == principal
+
+    claimed = await _claim_turn(
+        db_factory,
+        seed,
+        lease_token=published.lease_token,
+        instance_id=17,
+    )
+    assert {
+        "execution_user_id": claimed.envelope.execution_user_id,
+        "execution_user_role": claimed.envelope.execution_user_role,
+        "execution_mode": claimed.envelope.execution_mode,
+        "execution_principal_kind": claimed.envelope.execution_principal_kind,
+    } == principal
+    async with db_factory() as db:
+        task = await db.get(Task, seed.task_id)
+    assert (
+        task.execution_user_id,
+        task.execution_user_role,
+        task.execution_mode,
+        task.execution_principal_kind,
+    ) == (73, "admin", "unrestricted", "user")
 
 
 @pytest.mark.asyncio

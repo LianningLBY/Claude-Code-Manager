@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.api.deps import require_task_access
+from backend.api.deps import lock_task_effect_access, require_task_access
 from backend.database import async_session, get_db
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
@@ -26,6 +26,7 @@ from backend.services.ask_user import (
     ask_user_registry,
     format_answer_reason,
 )
+from backend.services.cancellation import settle_awaitable
 
 router = APIRouter(prefix="/api", tags=["ask-user"])
 
@@ -50,17 +51,7 @@ class AskUserAnswer(BaseModel):
 async def _settle_despite_cancellation(awaitable):
     """Finish an answer-audit commit before delivering request cancellation."""
 
-    operation = asyncio.ensure_future(awaitable)
-    cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            if cancellation is None:
-                cancellation = exc
-        except BaseException:
-            break
-    return operation, cancellation
+    return await settle_awaitable(awaitable)
 
 
 @router.post("/ask-user/wait")
@@ -394,37 +385,31 @@ async def ask_user_submit(
     if claim_id is None:
         raise HTTPException(410, "提问正在回答、已过期或不存在")
 
-    # End the authorization read transaction, then acquire a portable exact
-    # generation writer fence before attaching an answer log. On SQLite this
-    # no-op UPDATE serializes delete/import; on row-locking databases it closes
-    # the same Task-id reuse window. The audit commit deliberately precedes a
-    # second exact fence: a turn transition in that commit-to-wake window must
-    # revoke the old hook instead of receiving a stale answer.
+    # End the authorization read transaction, then acquire Project -> Task ->
+    # group membership -> User writer fences before attaching an answer log.
+    # This serializes Task-share/Project-share revocation and role changes with
+    # the exact generation check. The audit commit deliberately precedes a
+    # second identical fence: a turn/ACL transition in that commit-to-wake
+    # window must revoke the old hook instead of receiving a stale answer.
     delayed_cancellation: asyncio.CancelledError | None = None
     try:
-        await db.rollback()
-        fenced = await db.execute(
-            update(Task)
-            .where(
-                Task.id == task_id,
-                Task.incarnation_id == pending.task_incarnation_id,
-                Task.session_id == pending.session_id,
-                Task.retry_count == pending.task_retry_count,
-                Task.turn_generation == pending.task_turn_generation,
-                Task.status == pending.task_status,
-                Task.status.in_(["in_progress", "executing"]),
-            )
-            .values(status=Task.status)
+        current_task = await lock_task_effect_access(
+            request,
+            task,
+            db,
+            allow_chat_share=True,
         )
-        if fenced.rowcount != 1:
+        if (
+            current_task.incarnation_id != pending.task_incarnation_id
+            or current_task.session_id != pending.session_id
+            or current_task.retry_count != pending.task_retry_count
+            or current_task.turn_generation != pending.task_turn_generation
+            or current_task.status != pending.task_status
+            or current_task.status not in {"in_progress", "executing"}
+        ):
             await db.rollback()
             ask_user_registry.discard(pending.request_id)
             raise HTTPException(410, "提问对应的 Task 代次已失效")
-        current_task = await db.get(Task, task_id, populate_existing=True)
-        if current_task is None:
-            await db.rollback()
-            raise HTTPException(410, "提问对应的 Task 代次已失效")
-        await require_task_access(request, current_task, db)
 
         # 持久化一条人类可读的回答记录（system_event 进 chat 历史）
         db.add(LogEntry(
@@ -450,36 +435,28 @@ async def ask_user_submit(
 
         async def fulfill_under_exact_fence() -> None:
             try:
-                final_fence = await db.execute(
-                    update(Task)
-                    .where(
-                        Task.id == task_id,
-                        Task.incarnation_id == pending.task_incarnation_id,
-                        Task.session_id == pending.session_id,
-                        Task.retry_count == pending.task_retry_count,
-                        Task.turn_generation == pending.task_turn_generation,
-                        Task.status == pending.task_status,
-                        Task.status.in_(["in_progress", "executing"]),
-                    )
-                    .values(status=Task.status)
+                final_task = await lock_task_effect_access(
+                    request,
+                    current_task,
+                    db,
+                    allow_chat_share=True,
                 )
-                if final_fence.rowcount != 1:
+                if (
+                    final_task.incarnation_id != pending.task_incarnation_id
+                    or final_task.session_id != pending.session_id
+                    or final_task.retry_count != pending.task_retry_count
+                    or final_task.turn_generation
+                    != pending.task_turn_generation
+                    or final_task.status != pending.task_status
+                    or final_task.status not in {"in_progress", "executing"}
+                ):
                     ask_user_registry.discard(pending.request_id)
                     raise HTTPException(410, "提问对应的 Task 代次已失效")
-                final_task = await db.get(
-                    Task,
-                    task_id,
-                    populate_existing=True,
-                )
-                if final_task is None:
-                    ask_user_registry.discard(pending.request_id)
-                    raise HTTPException(410, "提问对应的 Task 代次已失效")
-                await require_task_access(request, final_task, db)
 
                 # ``set_result`` is synchronous and runs while the exact Task
-                # row writer fence is still held. A retry/status/turn
-                # transition can only win before this fence (and be rejected
-                # above) or after the old hook received its authorized answer.
+                # and ACL/role writer fences are still held. A retry, ACL, or
+                # role transition can only win before this fence (and be
+                # rejected above) or after the old hook received its answer.
                 fulfilled = ask_user_registry.fulfill_answer(
                     request_id,
                     claim_id,

@@ -267,8 +267,9 @@ async def test_capability_admission_loses_cleanly_to_concurrent_wal_receipt(
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,

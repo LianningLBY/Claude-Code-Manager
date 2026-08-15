@@ -256,6 +256,12 @@ async def _assert_trigger_blocks(session_factory, statement: str, values=None):
         await db.rollback()
 
 
+async def _assert_statement_succeeds(session_factory, statement: str, values=None):
+    async with session_factory() as db:
+        await db.execute(text(statement), values or {})
+        await db.commit()
+
+
 @pytest.mark.asyncio
 async def test_sqlite_effect_permit_fences_exact_authorization_graph_only(
     tmp_path,
@@ -499,7 +505,9 @@ async def test_sqlite_effect_permit_fences_exact_authorization_graph_only(
         {"grant": ids["grant"]},
     )
 
-    share_cases = (
+    # Cross-CCM federation shares change the execution trust boundary and
+    # remain fenced until the exact remote effect has a known outcome.
+    federation_share_cases = (
         (
             "task_shares",
             "task_id",
@@ -521,6 +529,43 @@ async def test_sqlite_effect_permit_fences_exact_authorization_graph_only(
             "shared_to_open_id, shared_to_ccm_url, status",
             "'insert-project', 'https://insert-project.invalid', 'active'",
         ),
+    )
+    for (
+        table,
+        owner_column,
+        active_owner,
+        other_owner,
+        active_row,
+        other_row,
+        extra_columns,
+        extra_values,
+    ) in federation_share_cases:
+        await _assert_trigger_blocks(
+            factory,
+            f"INSERT INTO {table} ({owner_column}, {extra_columns}) "
+            f"VALUES (:owner, {extra_values})",
+            {"owner": active_owner},
+        )
+        await _assert_trigger_blocks(
+            factory,
+            f"UPDATE {table} SET {owner_column} = :other WHERE id = :row",
+            {"other": other_owner, "row": active_row},
+        )
+        await _assert_trigger_blocks(
+            factory,
+            f"UPDATE {table} SET {owner_column} = :active WHERE id = :row",
+            {"active": active_owner, "row": other_row},
+        )
+        await _assert_trigger_blocks(
+            factory,
+            f"DELETE FROM {table} WHERE id = :row",
+            {"row": active_row},
+        )
+
+    # Team shares are Manager-local ACL rows. They neither change the Task
+    # principal nor move execution across a CCM boundary, so insert, both
+    # directions of UPDATE, and DELETE stay available during remote I/O.
+    team_share_cases = (
         (
             "team_task_shares",
             "task_id",
@@ -551,24 +596,36 @@ async def test_sqlite_effect_permit_fences_exact_authorization_graph_only(
         other_row,
         extra_columns,
         extra_values,
-    ) in share_cases:
-        await _assert_trigger_blocks(
+    ) in team_share_cases:
+        await _assert_statement_succeeds(
             factory,
             f"INSERT INTO {table} ({owner_column}, {extra_columns}) "
             f"VALUES (:owner, {extra_values})",
             {"owner": active_owner},
         )
-        await _assert_trigger_blocks(
+        # OLD side of the mutation references the active Task/Project.
+        await _assert_statement_succeeds(
             factory,
             f"UPDATE {table} SET {owner_column} = :other WHERE id = :row",
             {"other": other_owner, "row": active_row},
         )
-        await _assert_trigger_blocks(
+        await _assert_statement_succeeds(
+            factory,
+            f"UPDATE {table} SET {owner_column} = :active WHERE id = :row",
+            {"active": active_owner, "row": active_row},
+        )
+        # NEW side of the mutation references the active Task/Project.
+        await _assert_statement_succeeds(
             factory,
             f"UPDATE {table} SET {owner_column} = :active WHERE id = :row",
             {"active": active_owner, "row": other_row},
         )
-        await _assert_trigger_blocks(
+        await _assert_statement_succeeds(
+            factory,
+            f"UPDATE {table} SET {owner_column} = :other WHERE id = :row",
+            {"other": other_owner, "row": other_row},
+        )
+        await _assert_statement_succeeds(
             factory,
             f"DELETE FROM {table} WHERE id = :row",
             {"row": active_row},

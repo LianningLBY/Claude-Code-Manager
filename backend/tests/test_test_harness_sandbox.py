@@ -280,6 +280,49 @@ async def test_docker_cleanup_requires_exact_labels_before_removal(monkeypatch):
     assert all(call[1] != "rm" for call in calls)
 
 
+@pytest.mark.asyncio
+async def test_docker_cleanup_accepts_resource_removed_by_concurrent_executor(
+    monkeypatch,
+):
+    run_id = "a" * 32
+    lease_id = "b" * 32
+    nonce = "c" * 48
+    container_id = "d" * 64
+    calls: list[list[str]] = []
+    ps_calls = 0
+
+    async def runner(argv: list[str], _timeout: float) -> tuple[int, str]:
+        nonlocal ps_calls
+        calls.append(argv)
+        if argv[1] == "ps":
+            ps_calls += 1
+            return (0, container_id) if ps_calls == 1 else (0, "")
+        if argv[1] == "inspect":
+            # The other executor removed the exact container after this
+            # executor discovered it but before identity inspection.
+            return 1, ""
+        if argv[1:3] == ["network", "ls"]:
+            return 0, ""
+        raise AssertionError(argv)
+
+    monkeypatch.setattr("shutil.which", lambda _value: "/usr/bin/docker")
+    runtime = DockerTestHarnessSandboxRuntime(
+        enabled=True,
+        runner=runner,
+        probe_ttl_seconds=0,
+    )
+
+    cleaned = await runtime.cleanup_identity(
+        run_id=run_id,
+        lease_id=lease_id,
+        lease_nonce=nonce,
+    )
+
+    assert cleaned == 1
+    assert ps_calls == 2
+    assert all(call[1] != "rm" for call in calls)
+
+
 class _ManagedRuntime:
     def __init__(self, *, fail: BaseException | None = None):
         self.fail = fail
@@ -532,6 +575,68 @@ async def test_sandbox_manager_persists_identity_before_cleanup(db_factory):
     assert cleaned.status == "cleaned"
     assert cleaned.cleanup_status == "completed"
     assert runtime.cleaned == [(run.id, lease.id, lease.lease_nonce)]
+
+
+@pytest.mark.asyncio
+async def test_cross_manager_late_sandbox_failure_cannot_replace_cleanup_success(
+    db_factory,
+):
+    run = await _fixed_url_run(db_factory)
+    provisioner = SandboxManager(
+        runtime=_ManagedRuntime(),
+        db_factory=db_factory,
+    )
+    lease = await provisioner.provision(run.id)
+    success_started = asyncio.Event()
+    failure_started = asyncio.Event()
+    release_success = asyncio.Event()
+    release_failure = asyncio.Event()
+
+    class ControlledCleanupRuntime:
+        def __init__(self, *, started, release, failure=None):
+            self.started = started
+            self.release = release
+            self.failure = failure
+
+        async def cleanup_identity(self, **_identity):
+            self.started.set()
+            await self.release.wait()
+            if self.failure is not None:
+                raise self.failure
+            return 1
+
+    winner = SandboxManager(
+        runtime=ControlledCleanupRuntime(
+            started=success_started,
+            release=release_success,
+        ),
+        db_factory=db_factory,
+    )
+    late_failure = SandboxManager(
+        runtime=ControlledCleanupRuntime(
+            started=failure_started,
+            release=release_failure,
+            failure=RuntimeError("late sandbox cleanup failure"),
+        ),
+        db_factory=db_factory,
+    )
+
+    winning_cleanup = asyncio.create_task(winner.cleanup(run.id))
+    await asyncio.wait_for(success_started.wait(), timeout=1)
+    losing_cleanup = asyncio.create_task(late_failure.cleanup(run.id))
+    await asyncio.wait_for(failure_started.wait(), timeout=1)
+    release_success.set()
+    cleaned = await asyncio.wait_for(winning_cleanup, timeout=2)
+    assert cleaned is not None and cleaned.cleanup_status == "completed"
+    release_failure.set()
+    with pytest.raises(RuntimeError, match="late sandbox cleanup failure"):
+        await asyncio.wait_for(losing_cleanup, timeout=2)
+
+    async with db_factory() as db:
+        durable = await db.get(SandboxLeaseModel, lease.id)
+        assert durable is not None
+        assert durable.cleanup_status == "completed"
+        assert durable.cleanup_error is None
 
 
 @pytest.mark.asyncio

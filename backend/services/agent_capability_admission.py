@@ -742,6 +742,10 @@ async def admit_agent_terminal_action_locked(
         request_output_log_id=output.id,
         request_terminal_log_id=terminal.id,
         request_native_turn_id=native_turn_id,
+        request_execution_user_id=task.execution_user_id,
+        request_execution_user_role=task.execution_user_role,
+        request_execution_mode=task.execution_mode,
+        request_execution_principal_kind=task.execution_principal_kind,
     )
     db.add(outbox)
     task.status = "waiting_capability"

@@ -28,6 +28,7 @@ from backend.services.claude_auth_projection import (
     prepare_claude_auth_projection,
     remove_claude_auth_projection,
 )
+from backend.services.cancellation import settle_awaitable
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.stream_parser import StreamParser
 from backend.services.task_agent_isolation import (
@@ -172,17 +173,7 @@ class _DiscussionClaudeSecurityContext:
 
 async def _settle_despite_cancellation(awaitable):
     """Settle a finite lifecycle operation before delivering cancellation."""
-    operation = asyncio.ensure_future(awaitable)
-    cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            if cancellation is None:
-                cancellation = exc
-        except BaseException:
-            break
-    return operation, cancellation
+    return await settle_awaitable(awaitable)
 
 
 class DiscussionService:

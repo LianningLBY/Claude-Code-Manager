@@ -1064,8 +1064,8 @@ async def test_dispatch_loop_serializes_recovery_before_plan_claim_registration(
             return instance, reservation
         return None, None
 
-    async def claim(_db, *, instance):
-        assert instance.id == 987654
+    async def claim(_db, *, instance_id):
+        assert instance_id == 987654
         events.append("claim")
         return (765432, 9)
 

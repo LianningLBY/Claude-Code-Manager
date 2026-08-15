@@ -296,6 +296,9 @@ async def _seed_claimed_worker_handoff(
         )
         db.add(task)
         await db.flush()
+        request_payload["worker_turn_handoff_incarnation_id"] = (
+            task.incarnation_id
+        )
         source = LogEntry(
             task_id=task.id,
             task_retry_count=retry_count,
@@ -326,6 +329,7 @@ async def _seed_claimed_worker_handoff(
             "worker_turn_handoff_id": handoff_id,
             "worker_turn_handoff_retry_count": retry_count,
             "worker_turn_handoff_from_generation": from_generation,
+            "worker_turn_handoff_incarnation_id": task.incarnation_id,
         }
         db.add(
             WorkerTurnHandoffReceipt(

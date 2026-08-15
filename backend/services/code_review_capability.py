@@ -53,7 +53,10 @@ from backend.services.structured_code_review import (
     build_structured_review_prompt,
     parse_structured_review_output,
 )
-from backend.services.task_creation import stage_task_record
+from backend.services.task_creation import (
+    stage_task_record,
+    system_task_execution_principal_values,
+)
 from backend.services.task_termination import (
     LocalTaskGeneration,
     TaskTerminationConflict,
@@ -1057,6 +1060,7 @@ class CodeReviewCapabilityExecutor:
                     or locked_developer.created_by
                 ),
                 worker_id=None,
+                **system_task_execution_principal_values(),
             )
             staged_run = CodeReviewRun(
                 capability_invocation_id=locked_invocation.id,

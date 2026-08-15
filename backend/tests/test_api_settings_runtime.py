@@ -1,5 +1,14 @@
 """Tests for /api/settings/runtime — frontend PTY mode toggle."""
+import asyncio
+from types import SimpleNamespace
+
 import pytest
+
+from backend.config import settings
+from backend.services.task_creation import (
+    delegated_task_execution_principal_values,
+    task_execution_principal_values,
+)
 
 
 @pytest.mark.asyncio
@@ -12,7 +21,7 @@ async def test_get_runtime_settings(client):
     assert "codex_app_server_enabled" in data
     assert "codex_main_mcp_enabled" in data
     assert "codex_monitor_enabled" in data
-    assert "agent_sandbox_unrestricted_enabled" in data
+    assert "agent_sandbox_unrestricted_enabled" not in data
 
 
 @pytest.mark.asyncio
@@ -20,8 +29,6 @@ async def test_get_runtime_settings(client):
 async def test_runtime_settings_reports_effective_codex_main_mcp_capability(
     client, monkeypatch, enabled,
 ):
-    from backend.config import settings
-
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", enabled)
 
     get_resp = await client.get("/api/settings/runtime")
@@ -39,42 +46,69 @@ async def test_runtime_settings_reports_effective_codex_main_mcp_capability(
 
 
 @pytest.mark.asyncio
-async def test_toggle_agent_unrestricted_sandbox_roundtrip(
-    client,
-    session_factory,
+async def test_removed_agent_unrestricted_setting_is_rejected(client):
+    response = await client.put(
+        "/api/settings/runtime",
+        json={"agent_sandbox_unrestricted_enabled": True},
+    )
+
+    assert response.status_code == 422
+
+
+def test_task_principal_builder_rejects_mixed_admin_system_identity():
+    with pytest.raises(ValueError, match="system Task principal must be member"):
+        task_execution_principal_values(
+            user_id=None,
+            role="admin",
+            principal_kind="system",
+        )
+
+
+def test_task_principal_builder_maps_roles_without_an_override_switch():
+    assert task_execution_principal_values(
+        user_id=17,
+        role="admin",
+        principal_kind="user",
+    )["execution_mode"] == "unrestricted"
+    assert task_execution_principal_values(
+        user_id=18,
+        role="member",
+        principal_kind="user",
+    )["execution_mode"] == "sandbox"
+
+
+@pytest.mark.parametrize(
+    ("origin_kind", "expected_kind", "user_id", "role", "mode"),
+    [
+        ("user", "delegated_user", 17, "admin", "unrestricted"),
+        ("user", "delegated_user", 18, "member", "sandbox"),
+        (
+            "deployment_token",
+            "delegated_deployment_token",
+            None,
+            "super_admin",
+            "unrestricted",
+        ),
+        ("system", "system", None, "member", "sandbox"),
+    ],
+)
+def test_task_principal_builder_maps_worker_delegation(
+    origin_kind,
+    expected_kind,
+    user_id,
+    role,
+    mode,
 ):
-    from backend.config import settings
-    from backend.main import instance_manager
-    from backend.models.global_settings import GlobalSettings
-
-    previous = instance_manager.agent_sandbox_unrestricted_enabled
-    try:
-        enabled = await client.put(
-            "/api/settings/runtime",
-            json={"agent_sandbox_unrestricted_enabled": True},
-        )
-        assert enabled.status_code == 200, enabled.text
-        assert enabled.json()["agent_sandbox_unrestricted_enabled"] is True
-        assert instance_manager.agent_sandbox_unrestricted_enabled is True
-        async with session_factory() as db:
-            row = await db.get(GlobalSettings, 1)
-            assert row.agent_sandbox_unrestricted_enabled is True
-
-        observed = await client.get("/api/settings/runtime")
-        assert observed.json()["agent_sandbox_unrestricted_enabled"] is True
-
-        disabled = await client.put(
-            "/api/settings/runtime",
-            json={"agent_sandbox_unrestricted_enabled": False},
-        )
-        assert disabled.status_code == 200, disabled.text
-        assert disabled.json()["agent_sandbox_unrestricted_enabled"] is False
-        assert instance_manager.agent_sandbox_unrestricted_enabled is False
-    finally:
-        instance_manager.set_agent_sandbox_unrestricted_enabled(previous)
-        # The isolated DB is discarded after this test. This assertion also
-        # proves the environment remains only the fallback default.
-        assert isinstance(settings.agent_sandbox_unrestricted_enabled, bool)
+    assert delegated_task_execution_principal_values(
+        user_id=user_id,
+        role=role,
+        principal_kind=origin_kind,
+    ) == {
+        "execution_user_id": user_id,
+        "execution_user_role": role,
+        "execution_mode": mode,
+        "execution_principal_kind": expected_kind,
+    }
 
 
 @pytest.mark.asyncio
@@ -107,10 +141,12 @@ async def test_toggle_pty_mode_roundtrip(client):
 
 @pytest.mark.asyncio
 async def test_toggle_off_drains_idle_sessions(client):
+    from types import SimpleNamespace
     from unittest.mock import AsyncMock
     from backend.main import instance_manager
 
     class FakeBackend:
+        _pool = SimpleNamespace(_sessions={})
         drain_idle_sessions = AsyncMock(return_value=2)
 
     old_backend = instance_manager._pty_backend
@@ -128,6 +164,86 @@ async def test_toggle_off_drains_idle_sessions(client):
     finally:
         instance_manager._pty_backend = old_backend
         instance_manager._pty_enabled = old_enabled
+
+
+@pytest.mark.asyncio
+async def test_first_runtime_settings_create_holds_worker_drain_fence(
+    tmp_path,
+    monkeypatch,
+):
+    """The singleton bootstrap commit must happen before the drain fence."""
+
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.api.settings import update_runtime_settings
+    from backend.database import Base
+    from backend.main import instance_manager
+    from backend.schemas.global_settings import RuntimeSettingsUpdate
+    from backend.services.worker_node_control import begin_worker_node_drain
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'worker-runtime-fence.db'}",
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(
+        engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    mutation_paused = asyncio.Event()
+    release_mutation = asyncio.Event()
+
+    async def pause_after_fence():
+        mutation_paused.set()
+        await release_mutation.wait()
+        return 0
+
+    async def claim_drain():
+        async with factory() as drain_db:
+            await begin_worker_node_drain(drain_db, claim="c" * 64)
+            await drain_db.commit()
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    monkeypatch.setattr(
+        instance_manager,
+        "drain_idle_pty_sessions",
+        pause_after_fence,
+    )
+    old_enabled = instance_manager._pty_enabled
+    instance_manager._pty_enabled = True
+    update_task = None
+    drain_task = None
+    try:
+        async with factory() as update_db:
+            request = SimpleNamespace(
+                state=SimpleNamespace(user_role="admin"),
+            )
+            update_task = asyncio.create_task(update_runtime_settings(
+                request,
+                RuntimeSettingsUpdate(use_pty_mode=False),
+                update_db,
+            ))
+            await asyncio.wait_for(mutation_paused.wait(), timeout=2)
+            drain_task = asyncio.create_task(claim_drain())
+            await asyncio.sleep(0.05)
+            assert not drain_task.done()
+            release_mutation.set()
+            response = await asyncio.wait_for(update_task, timeout=2)
+            assert response.use_pty_mode is False
+            await asyncio.wait_for(drain_task, timeout=2)
+    finally:
+        release_mutation.set()
+        if update_task is not None and not update_task.done():
+            await update_task
+        if drain_task is not None and not drain_task.done():
+            await drain_task
+        instance_manager._pty_enabled = old_enabled
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

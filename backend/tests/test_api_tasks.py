@@ -9,6 +9,357 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.tests.group_acl_test_helpers import (
+    grant_group_project_access,
+    revoke_group_membership_at_effect_fence,
+)
+from backend.tests.test_auth_ws_security import (
+    _create_user,
+    secured_client as secured_client,
+)
+
+
+_SYSTEM_EXECUTION_PRINCIPAL = {
+    "execution_user_id": None,
+    "execution_user_role": "member",
+    "execution_mode": "sandbox",
+    "execution_principal_kind": "system",
+}
+
+
+async def _seed_group_project_control_task(
+    session_factory,
+    *,
+    member_id: int,
+    worker: bool = False,
+    **task_values,
+):
+    """Create one Task controlled only through a group Project grant."""
+
+    from backend.models.project import Project
+    from backend.models.task import Task
+    from backend.models.worker import Worker
+
+    async with session_factory() as db:
+        project = Project(
+            name=f"task-control-effect-{member_id}-{worker}",
+            status="ready",
+        )
+        db.add(project)
+        worker_row = None
+        if worker:
+            worker_row = Worker(
+                name=f"task-control-worker-{member_id}",
+                status="ready",
+                private_ip="10.0.0.81",
+                auth_token="task-control-worker-token",
+            )
+            db.add(worker_row)
+        await db.flush()
+        values = {
+            "title": "Task control effect fence",
+            "description": "group Project authority is revoked",
+            "project_id": project.id,
+            "created_by": 999,
+            "status": "completed",
+            "worker_id": worker_row.id if worker_row is not None else None,
+        }
+        values.update(task_values)
+        task = Task(**values)
+        db.add(task)
+        await db.commit()
+        return project.id, task.id
+
+
+@pytest.mark.asyncio
+async def test_projectless_task_create_rejects_concurrent_wal_admin_demotion(
+    tmp_path,
+    monkeypatch,
+):
+    """Task commit re-locks the exact JWT role cached by authentication."""
+
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from backend.api import tasks as tasks_api
+    from backend.config import settings
+    from backend.database import Base
+    from backend.models.task import Task
+    from backend.models.user import User
+    from backend.schemas.task import TaskCreate
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'task-create-admin-role.db'}",
+        connect_args={"timeout": 2},
+    )
+    try:
+        async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql(
+                "PRAGMA journal_mode=WAL"
+            )
+            assert journal_mode.scalar_one().lower() == "wal"
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with sessions() as setup:
+            admin = User(
+                email="task-create-demoted-admin@example.com",
+                name="task-create-admin",
+                password_hash="not-used",
+                role="admin",
+                is_active=True,
+            )
+            setup.add(admin)
+            await setup.commit()
+            admin_id = admin.id
+
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                user_id=admin_id,
+                user_role="admin",
+                auth_type="jwt",
+            ),
+            headers={},
+        )
+        validation_entered = asyncio.Event()
+        release_validation = asyncio.Event()
+
+        async def blocked_skill_validation(*_args, **_kwargs):
+            validation_entered.set()
+            await release_validation.wait()
+            return None
+
+        monkeypatch.setattr(settings, "auth_token", "task-wal-auth-token")
+        monkeypatch.setattr(settings, "ccm_node_role", "manager")
+        monkeypatch.setattr(
+            tasks_api,
+            "_validate_skill_configuration",
+            blocked_skill_validation,
+        )
+
+        async def create_projectless_task():
+            async with sessions() as creator:
+                return await tasks_api.create_task(
+                    request=request,
+                    body=TaskCreate(
+                        title="Must not retain stale admin authority",
+                        description="Concurrent WAL role demotion",
+                    ),
+                    queue=MagicMock(),
+                    db=creator,
+                )
+
+        pending = asyncio.create_task(create_projectless_task())
+        await asyncio.wait_for(validation_entered.wait(), timeout=2)
+        async with sessions() as demoter:
+            changed = await demoter.execute(
+                update(User)
+                .where(User.id == admin_id, User.role == "admin")
+                .values(role="member")
+            )
+            assert changed.rowcount == 1
+            await demoter.commit()
+        release_validation.set()
+
+        with pytest.raises(HTTPException) as rejected:
+            await pending
+        assert rejected.value.status_code == 409
+        assert "changed role" in rejected.value.detail
+        async with sessions() as verify:
+            assert await verify.scalar(select(func.count(Task.id))) == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_project_task_create_locks_node_before_final_project_authority(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """The Worker node-control row remains outer to Project/User authority."""
+
+    from backend.api import tasks as tasks_api
+    from backend.models.project import Project
+
+    async with session_factory() as db:
+        project = Project(
+            name="task-create-node-order",
+            local_path="/tmp",
+            status="ready",
+        )
+        db.add(project)
+        await db.commit()
+        project_id = project.id
+
+    order = []
+    original_node_fence = tasks_api.fence_worker_node_mutation
+    original_project_fence = tasks_api.lock_project_worker_effect_access
+
+    async def record_node_fence(db):
+        order.append("node")
+        return await original_node_fence(db)
+
+    async def record_project_fence(request, observed_project_id, db):
+        order.append("project")
+        return await original_project_fence(request, observed_project_id, db)
+
+    monkeypatch.setattr(
+        tasks_api,
+        "fence_worker_node_mutation",
+        record_node_fence,
+    )
+    monkeypatch.setattr(
+        tasks_api,
+        "lock_project_worker_effect_access",
+        record_project_fence,
+    )
+
+    created = await client.post(
+        "/api/tasks",
+        json={
+            "title": "Node fence precedes Project authority",
+            "description": "lock-order regression",
+            "project_id": project_id,
+        },
+    )
+
+    assert created.status_code == 201, created.text
+    assert order[:2] == ["node", "project"]
+
+
+@pytest.mark.asyncio
+async def test_task_create_and_update_stop_when_acl_is_revoked_at_effect_fence(
+    client,
+    session_factory,
+):
+    from fastapi import HTTPException
+
+    import backend.api.tasks as tasks_api
+    from backend.models.project import Project
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        project = Project(name="task-effect-acl-race", status="ready")
+        db.add(project)
+        await db.flush()
+        task = Task(
+            title="unchanged",
+            description="unchanged",
+            project_id=project.id,
+            created_by=1,
+        )
+        db.add(task)
+        await db.commit()
+        project_id, task_id = project.id, task.id
+
+    revoked = HTTPException(403, "access revoked while waiting for writer fence")
+    with patch.object(
+        tasks_api,
+        "lock_project_worker_effect_access",
+        AsyncMock(side_effect=revoked),
+    ):
+        created = await client.post("/api/tasks", json={
+            "title": "must not exist",
+            "description": "denied",
+            "project_id": project_id,
+        })
+    with patch.object(
+        tasks_api,
+        "lock_task_effect_access",
+        AsyncMock(side_effect=revoked),
+    ):
+        updated = await client.put(
+            f"/api/tasks/{task_id}",
+            json={"title": "must not change"},
+        )
+
+    assert created.status_code == 403
+    assert updated.status_code == 403
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.title == "unchanged"
+        assert await db.scalar(
+            select(func.count(Task.id)).where(Task.title == "must not exist")
+        ) == 0
+
+
+async def _post_migration_import(client, payload):
+    """Send the explicit fail-closed principal required by Worker import."""
+
+    from backend.config import settings
+
+    previous_role = settings.ccm_node_role
+    previous_token = settings.auth_token
+    settings.ccm_node_role = "worker"
+    settings.auth_token = "worker-migration-test-token"
+    try:
+        task_id = int(payload["id"])
+        return await client.post(
+            "/api/tasks/migration-import",
+            json={
+                "migration_operation_id": f"{task_id:032x}",
+                "migration_operation_sequence": 1,
+                **payload,
+                **_SYSTEM_EXECUTION_PRINCIPAL,
+            },
+            headers={
+                "Authorization": "Bearer worker-migration-test-token"
+            },
+        )
+    finally:
+        settings.ccm_node_role = previous_role
+        settings.auth_token = previous_token
+
+
+async def _post_migration_import_rollback(client, payload):
+    """Call the drain-safe exact destination rollback as the Manager."""
+
+    from backend.config import settings
+
+    previous_role = settings.ccm_node_role
+    previous_token = settings.auth_token
+    settings.ccm_node_role = "worker"
+    settings.auth_token = "worker-migration-test-token"
+    try:
+        return await client.post(
+            "/api/tasks/migration-import/rollback",
+            json={"operation_sequence": 1, **payload},
+            headers={
+                "Authorization": "Bearer worker-migration-test-token"
+            },
+        )
+    finally:
+        settings.ccm_node_role = previous_role
+        settings.auth_token = previous_token
+
+
+async def _post_migration_import_commit(client, payload):
+    """Commit one exact destination reservation as the Manager."""
+
+    from backend.config import settings
+
+    previous_role = settings.ccm_node_role
+    previous_token = settings.auth_token
+    settings.ccm_node_role = "worker"
+    settings.auth_token = "worker-migration-test-token"
+    try:
+        return await client.post(
+            "/api/tasks/migration-import/commit",
+            json={"operation_sequence": 1, **payload},
+            headers={
+                "Authorization": "Bearer worker-migration-test-token"
+            },
+        )
+    finally:
+        settings.ccm_node_role = previous_role
+        settings.auth_token = previous_token
+
 
 # === Existing tests ===
 
@@ -29,8 +380,12 @@ async def test_create_task(client):
 
 
 @pytest.mark.asyncio
-async def test_create_task_with_explicit_id_uses_internal_service_gate(client):
+async def test_create_task_with_explicit_id_uses_internal_service_gate(
+    client,
+    monkeypatch,
+):
     from fastapi import HTTPException
+    from backend.config import settings
 
     with patch(
         "backend.api.tasks.require_internal_service",
@@ -48,15 +403,43 @@ async def test_create_task_with_explicit_id_uses_internal_service_gate(client):
     assert rejected.status_code == 403
     require_internal.assert_called_once()
 
-    # Auth-disabled installations intentionally preserve their historical
-    # fully-open semantics through the real guard.
-    allowed = await client.post("/api/tasks", json={
+    forwarded = {
         "id": 7001,
+        "source_incarnation_id": "7" * 32,
+        "source_retry_count": 0,
+        "source_turn_generation": 1,
         "title": "manager-forwarded identity",
         "description": "accepted without configured auth",
-    })
+        "execution_user_id": 41,
+        "execution_user_role": "admin",
+        "execution_mode": "unrestricted",
+        "execution_principal_kind": "delegated_user",
+    }
+    wrong_node = await client.post("/api/tasks", json=forwarded)
+    assert wrong_node.status_code == 409
+    assert "CCM_NODE_ROLE=worker" in wrong_node.text
+
+    # Explicit mirrored ids are valid only on an authenticated Worker.  A
+    # Worker never inherits the Manager's legacy auth-disabled semantics.
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    blocked = await client.post("/api/tasks", json=forwarded)
+    assert blocked.status_code == 503
+    monkeypatch.setattr(settings, "auth_token", "worker-forward-test-token")
+    client.headers["Authorization"] = "Bearer worker-forward-test-token"
+    allowed = await client.post("/api/tasks", json=forwarded)
     assert allowed.status_code == 201, allowed.text
     assert allowed.json()["id"] == 7001
+
+    # A Worker deployment token is control-plane authentication, not a public
+    # Task-creation identity. Worker-local derived Tasks use the internal
+    # allocator/service boundary; this HTTP route accepts only an explicit
+    # Manager mirror.
+    generated = await client.post("/api/tasks", json={
+        "title": "locally generated identity",
+        "description": "must not collide with the Worker mirror",
+    })
+    assert generated.status_code == 403, generated.text
+    assert "explicit Manager-mirrored Task identity" in generated.text
 
 
 @pytest.mark.asyncio
@@ -841,6 +1224,38 @@ async def test_worker_snapshot_ids_never_fall_back_to_local_user_skills(
 
 
 @pytest.mark.asyncio
+async def test_local_task_skill_snapshot_is_not_marked_worker_managed(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.config import settings
+    from backend.models.task import Task
+
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
+    response = await client.post("/api/tasks", json={
+        "title": "Local snapshot",
+        "description": "keep native principal",
+        "provider": "codex",
+        "selected_user_skills": [8123],
+        "user_skill_snapshots": [{
+            "id": 8123,
+            "name": "Manager supplied skill",
+            "description": "snapshot",
+            "content": "body",
+        }],
+    })
+
+    assert response.status_code == 201, response.text
+    async with session_factory() as db:
+        task = await db.get(Task, response.json()["id"])
+    assert task.metadata_["ccm_user_skill_snapshots"][0]["id"] == 8123
+    assert "ccm_worker_managed_task" not in task.metadata_
+    assert task.execution_principal_kind == "deployment_token"
+    assert task.execution_mode == "unrestricted"
+
+
+@pytest.mark.asyncio
 async def test_unrelated_update_allows_legacy_codex_monitor_configuration(
     client,
     session_factory,
@@ -1017,7 +1432,7 @@ async def test_migration_import_preserves_inert_status_without_waking_dispatcher
     from backend.models.task import Task
 
     with patch.object(dispatcher, "wake") as wake:
-        resp = await client.post("/api/tasks/migration-import", json={
+        resp = await _post_migration_import(client, {
             "id": 7001,
             "title": "Migrated",
             "description": "Resume an existing session",
@@ -1027,6 +1442,7 @@ async def test_migration_import_preserves_inert_status_without_waking_dispatcher
             "retry_count": 2,
             "turn_generation": 7,
             "source_status": "plan_review",
+            "source_incarnation_id": "7" * 32,
             "mode": "plan",
             "selected_user_skills": [81],
             "user_skill_snapshots": [{
@@ -1047,6 +1463,10 @@ async def test_migration_import_preserves_inert_status_without_waking_dispatcher
     assert task.session_id == "session-1"
     assert task.retry_count == 2
     assert task.turn_generation == 7
+    assert task.execution_user_id is None
+    assert task.execution_user_role == "member"
+    assert task.execution_mode == "sandbox"
+    assert task.execution_principal_kind == "system"
     assert task.selected_user_skills == [81]
     assert task.metadata_["ccm_user_skill_snapshots"] == [{
         "id": 81,
@@ -1115,7 +1535,7 @@ async def test_migration_import_maps_source_incarnation_on_existing_copy(
         ])
         await db.commit()
 
-    response = await client.post("/api/tasks/migration-import", json={
+    response = await _post_migration_import(client, {
         "id": 7004,
         "title": "current Manager mirror",
         "description": "d",
@@ -1143,7 +1563,7 @@ async def test_migration_import_maps_source_incarnation_on_existing_copy(
             select(TaskSSHGrant.id).where(TaskSSHGrant.task_id == 7004)
         ) is None
 
-    exact_refresh = await client.post("/api/tasks/migration-import", json={
+    exact_refresh = await _post_migration_import(client, {
         "id": 7004,
         "title": "bound Manager refresh",
         "description": "same logical Task",
@@ -1152,7 +1572,7 @@ async def test_migration_import_maps_source_incarnation_on_existing_copy(
     })
     assert exact_refresh.status_code == 201, exact_refresh.text
 
-    mismatched = await client.post("/api/tasks/migration-import", json={
+    mismatched = await _post_migration_import(client, {
         "id": 7004,
         "title": "stale different Manager",
         "description": "must not rebind",
@@ -1160,13 +1580,13 @@ async def test_migration_import_maps_source_incarnation_on_existing_copy(
         "source_incarnation_id": "e" * 32,
     })
     assert mismatched.status_code == 409, mismatched.text
-    omitted = await client.post("/api/tasks/migration-import", json={
+    omitted = await _post_migration_import(client, {
         "id": 7004,
         "title": "legacy identity-less Manager",
         "description": "must not overwrite a bound mirror",
         "source_status": "completed",
     })
-    assert omitted.status_code == 409, omitted.text
+    assert omitted.status_code == 422, omitted.text
 
 
 @pytest.mark.asyncio
@@ -1181,7 +1601,7 @@ async def test_migration_import_maps_source_incarnation_on_new_copy(
     )
 
     source_incarnation = "d" * 32
-    response = await client.post("/api/tasks/migration-import", json={
+    response = await _post_migration_import(client, {
         "id": 7006,
         "title": "new Manager mirror",
         "description": "d",
@@ -1197,6 +1617,400 @@ async def test_migration_import_maps_source_incarnation_on_new_copy(
     assert (
         current.metadata_[SOURCE_TASK_INCARNATION_METADATA_KEY]
         == source_incarnation
+    )
+
+
+@pytest.mark.asyncio
+async def test_migration_import_exact_rollback_survives_destination_drain(
+    client,
+    session_factory,
+):
+    """Destroy may claim the destination after import but before pointer cut."""
+
+    from sqlalchemy import delete
+
+    from backend.models.log_entry import LogEntry
+    from backend.models.task import Task
+    from backend.services.worker_node_control import begin_worker_node_drain
+
+    task_id = 7010
+    incarnation_id = "c" * 32
+    operation_id = "d" * 32
+    imported = await _post_migration_import(client, {
+        "id": task_id,
+        "title": "uncommitted destination mirror",
+        "description": "d",
+        "source_status": "completed",
+        "source_incarnation_id": incarnation_id,
+        "migration_operation_id": operation_id,
+        "retry_count": 2,
+        "turn_generation": 7,
+    })
+    assert imported.status_code == 201, imported.text
+
+    async with session_factory() as db:
+        await begin_worker_node_drain(db, claim="e" * 64)
+        await db.commit()
+
+    exact = {
+        "task_id": task_id,
+        "operation_id": operation_id,
+        "incarnation_id": incarnation_id,
+        "retry_count": 2,
+        "turn_generation": 7,
+        "source_status": "completed",
+    }
+    stale = await _post_migration_import_rollback(
+        client,
+        {**exact, "operation_id": "f" * 32},
+    )
+    assert stale.status_code == 409, stale.text
+    wrong_generation = await _post_migration_import_rollback(
+        client,
+        {**exact, "turn_generation": 8},
+    )
+    assert wrong_generation.status_code == 409, wrong_generation.text
+    async with session_factory() as db:
+        assert await db.get(Task, task_id) is not None
+
+        db.add(LogEntry(
+            instance_id=1,
+            task_id=task_id,
+            event_type="assistant",
+            content="unimported destination evidence must survive",
+        ))
+        await db.commit()
+
+    evidence_blocked = await _post_migration_import_rollback(client, exact)
+    assert evidence_blocked.status_code == 409, evidence_blocked.text
+    async with session_factory() as db:
+        assert await db.get(Task, task_id) is not None
+        assert await db.scalar(
+            select(LogEntry.id).where(LogEntry.task_id == task_id)
+        ) is not None
+        await db.execute(delete(LogEntry).where(LogEntry.task_id == task_id))
+        await db.commit()
+
+    rolled_back = await _post_migration_import_rollback(client, exact)
+    assert rolled_back.status_code == 200, rolled_back.text
+    assert rolled_back.json() == {
+        "ok": True,
+        "removed": True,
+        "task_id": task_id,
+        "operation_id": operation_id,
+        "operation_sequence": 1,
+    }
+    async with session_factory() as db:
+        assert await db.get(Task, task_id) is None
+
+
+@pytest.mark.asyncio
+async def test_migration_rollback_before_import_blocks_delayed_prepare(
+    client,
+    session_factory,
+):
+    """A lost prepare response cannot resurrect a mirror after rollback ACK."""
+
+    from backend.models.task import Task
+    from backend.models.task_migration import TaskMigrationOperation
+
+    task_id = 7013
+    incarnation_id = "2" * 32
+    operation_id = "3" * 32
+    exact = {
+        "task_id": task_id,
+        "operation_id": operation_id,
+        "operation_sequence": 1,
+        "incarnation_id": incarnation_id,
+        "retry_count": 4,
+        "turn_generation": 11,
+        "source_status": "completed",
+    }
+
+    rolled_back = await _post_migration_import_rollback(client, exact)
+    assert rolled_back.status_code == 200, rolled_back.text
+    assert rolled_back.json() == {
+        "ok": True,
+        "removed": False,
+        "task_id": task_id,
+        "operation_id": operation_id,
+        "operation_sequence": 1,
+    }
+    async with session_factory() as db:
+        operation = await db.get(TaskMigrationOperation, operation_id)
+        assert operation is not None
+        assert operation.phase == "rolled_back"
+        assert operation.active_task_id is None
+        assert await db.get(Task, task_id) is None
+
+    delayed_payload = {
+        "id": task_id,
+        "title": "must never materialize",
+        "description": "d",
+        "source_status": exact["source_status"],
+        "source_incarnation_id": incarnation_id,
+        "migration_operation_id": operation_id,
+        "migration_operation_sequence": 1,
+        "retry_count": exact["retry_count"],
+        "turn_generation": exact["turn_generation"],
+    }
+    delayed = await _post_migration_import(client, delayed_payload)
+    assert delayed.status_code == 409, delayed.text
+    assert "already rolled_back" in delayed.text
+
+    next_operation_id = "4" * 32
+    next_prepare = await _post_migration_import(client, {
+        **delayed_payload,
+        "title": "new migration generation",
+        "migration_operation_id": next_operation_id,
+        "migration_operation_sequence": 2,
+    })
+    assert next_prepare.status_code == 201, next_prepare.text
+
+    delayed_again = await _post_migration_import(client, delayed_payload)
+    assert delayed_again.status_code == 409, delayed_again.text
+    assert "stale" in delayed_again.text
+    async with session_factory() as db:
+        operations = (
+            await db.execute(
+                select(TaskMigrationOperation)
+                .where(TaskMigrationOperation.task_id == task_id)
+                .order_by(TaskMigrationOperation.operation_sequence)
+            )
+        ).scalars().all()
+        assert [operation.phase for operation in operations] == [
+            "rolled_back",
+            "prepared",
+        ]
+        assert [operation.active_task_id for operation in operations] == [
+            None,
+            task_id,
+        ]
+
+
+@pytest.mark.asyncio
+async def test_migration_rollback_before_import_uses_drain_as_durable_barrier(
+    client,
+    session_factory,
+):
+    """A drain claim may replace the tombstone because it rejects all prepares."""
+
+    from backend.models.task import Task
+    from backend.models.task_migration import TaskMigrationOperation
+    from backend.services.worker_node_control import begin_worker_node_drain
+
+    task_id = 7014
+    operation_id = "5" * 32
+    incarnation_id = "6" * 32
+    async with session_factory() as db:
+        await begin_worker_node_drain(db, claim="7" * 64)
+        await db.commit()
+
+    exact = {
+        "task_id": task_id,
+        "operation_id": operation_id,
+        "operation_sequence": 9,
+        "incarnation_id": incarnation_id,
+        "retry_count": 0,
+        "turn_generation": 2,
+        "source_status": "failed",
+    }
+    rolled_back = await _post_migration_import_rollback(client, exact)
+    assert rolled_back.status_code == 200, rolled_back.text
+    assert rolled_back.json()["removed"] is False
+
+    delayed = await _post_migration_import(client, {
+        "id": task_id,
+        "title": "drained destination",
+        "description": "d",
+        "source_status": exact["source_status"],
+        "source_incarnation_id": incarnation_id,
+        "migration_operation_id": operation_id,
+        "migration_operation_sequence": exact["operation_sequence"],
+        "retry_count": exact["retry_count"],
+        "turn_generation": exact["turn_generation"],
+    })
+    assert delayed.status_code == 409, delayed.text
+    async with session_factory() as db:
+        assert await db.get(Task, task_id) is None
+        assert await db.scalar(
+            select(TaskMigrationOperation.operation_id)
+            .where(TaskMigrationOperation.task_id == task_id)
+        ) is None
+
+
+@pytest.mark.asyncio
+async def test_committed_import_history_allows_only_a_newer_prepare(
+    client,
+    session_factory,
+):
+    from backend.models.task import Task
+    from backend.models.task_migration import TaskMigrationOperation
+
+    task_id = 7015
+    incarnation_id = "8" * 32
+    first_operation_id = "9" * 32
+    first = {
+        "task_id": task_id,
+        "operation_id": first_operation_id,
+        "operation_sequence": 1,
+        "incarnation_id": incarnation_id,
+        "retry_count": 1,
+        "turn_generation": 3,
+        "source_status": "completed",
+    }
+    imported = await _post_migration_import(client, {
+        "id": task_id,
+        "title": "first committed migration",
+        "description": "d",
+        "source_status": first["source_status"],
+        "source_incarnation_id": incarnation_id,
+        "migration_operation_id": first_operation_id,
+        "migration_operation_sequence": 1,
+        "retry_count": first["retry_count"],
+        "turn_generation": first["turn_generation"],
+    })
+    assert imported.status_code == 201, imported.text
+    committed = await _post_migration_import_commit(client, first)
+    assert committed.status_code == 200, committed.text
+    rejected_rollback = await _post_migration_import_rollback(client, first)
+    assert rejected_rollback.status_code == 409, rejected_rollback.text
+
+    second_operation_id = "a" * 32
+    second = await _post_migration_import(client, {
+        "id": task_id,
+        "title": "second migration generation",
+        "description": "d",
+        "source_status": first["source_status"],
+        "source_incarnation_id": incarnation_id,
+        "migration_operation_id": second_operation_id,
+        "migration_operation_sequence": 2,
+        "retry_count": first["retry_count"],
+        "turn_generation": first["turn_generation"],
+    })
+    assert second.status_code == 201, second.text
+
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        assert (
+            task.metadata_["worker_migration_import_reservation"]
+            ["operation_sequence"]
+            == 2
+        )
+        operations = (
+            await db.execute(
+                select(TaskMigrationOperation)
+                .where(TaskMigrationOperation.task_id == task_id)
+                .order_by(TaskMigrationOperation.operation_sequence)
+            )
+        ).scalars().all()
+        assert [operation.phase for operation in operations] == [
+            "committed",
+            "prepared",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_destination_drain_rejects_existing_migration_import_refresh(
+    client,
+    session_factory,
+):
+    """An existing inert mirror cannot mutate after node drain admission."""
+
+    from backend.models.task import Task
+    from backend.services.worker_node_control import begin_worker_node_drain
+
+    task_id = 7011
+    incarnation_id = "a" * 32
+    initial_operation_id = "b" * 32
+    imported = await _post_migration_import(client, {
+        "id": task_id,
+        "title": "original inert mirror",
+        "description": "d",
+        "source_status": "completed",
+        "source_incarnation_id": incarnation_id,
+        "migration_operation_id": initial_operation_id,
+        "retry_count": 2,
+        "turn_generation": 7,
+    })
+    assert imported.status_code == 201, imported.text
+
+    async with session_factory() as db:
+        await begin_worker_node_drain(db, claim="c" * 64)
+        await db.commit()
+
+    refreshed = await _post_migration_import(client, {
+        "id": task_id,
+        "title": "must not cross drain",
+        "description": "d",
+        "source_status": "completed",
+        "source_incarnation_id": incarnation_id,
+        "migration_operation_id": "d" * 32,
+        "retry_count": 2,
+        "turn_generation": 7,
+    })
+    assert refreshed.status_code == 409, refreshed.text
+
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current is not None
+    assert current.title == "original inert mirror"
+    assert (
+        current.metadata_["worker_migration_import_reservation"]
+        ["operation_id"]
+        == initial_operation_id
+    )
+
+
+@pytest.mark.asyncio
+async def test_committed_destination_import_can_never_be_rolled_back(
+    client,
+    session_factory,
+):
+    """Pointer-cut acknowledgement is durable, drain-safe, and idempotent."""
+
+    from backend.models.task import Task
+    from backend.services.worker_node_control import begin_worker_node_drain
+
+    exact = {
+        "task_id": 7012,
+        "operation_id": "e" * 32,
+        "incarnation_id": "f" * 32,
+        "retry_count": 3,
+        "turn_generation": 9,
+        "source_status": "completed",
+    }
+    imported = await _post_migration_import(client, {
+        "id": exact["task_id"],
+        "title": "authoritative destination",
+        "description": "d",
+        "source_status": exact["source_status"],
+        "source_incarnation_id": exact["incarnation_id"],
+        "migration_operation_id": exact["operation_id"],
+        "retry_count": exact["retry_count"],
+        "turn_generation": exact["turn_generation"],
+    })
+    assert imported.status_code == 201, imported.text
+
+    async with session_factory() as db:
+        await begin_worker_node_drain(db, claim="1" * 64)
+        await db.commit()
+
+    committed = await _post_migration_import_commit(client, exact)
+    assert committed.status_code == 200, committed.text
+    committed_again = await _post_migration_import_commit(client, exact)
+    assert committed_again.status_code == 200, committed_again.text
+
+    stale_rollback = await _post_migration_import_rollback(client, exact)
+    assert stale_rollback.status_code == 409, stale_rollback.text
+    async with session_factory() as db:
+        current = await db.get(Task, exact["task_id"])
+    assert current is not None
+    assert (
+        current.metadata_["worker_migration_import_commit_receipt"]
+        ["operation_id"]
+        == exact["operation_id"]
     )
 
 
@@ -1220,14 +2034,14 @@ async def test_migration_import_without_source_preserves_existing_incarnation(
         db.add(task)
         await db.commit()
 
-    response = await client.post("/api/tasks/migration-import", json={
+    response = await _post_migration_import(client, {
         "id": 7005,
         "title": "legacy Manager refresh",
         "description": "d",
         "source_status": "completed",
     })
 
-    assert response.status_code == 201, response.text
+    assert response.status_code == 422, response.text
     async with session_factory() as db:
         current = await db.get(Task, 7005)
     assert current is not None
@@ -1252,13 +2066,14 @@ async def test_migration_import_cannot_repurpose_existing_task_mode(
         db.add(task)
         await db.commit()
 
-    response = await client.post("/api/tasks/migration-import", json={
+    response = await _post_migration_import(client, {
         "id": 7010,
         "title": "forged Goal replacement",
         "description": "must not replace",
         "mode": "goal",
         "goal_condition": "done",
         "source_status": "cancelled",
+        "source_incarnation_id": task.incarnation_id,
     })
 
     assert response.status_code == 409, response.text
@@ -1287,12 +2102,13 @@ async def test_migration_import_cannot_refresh_existing_plan_carrier(
         db.add(task)
         await db.commit()
 
-    response = await client.post("/api/tasks/migration-import", json={
+    response = await _post_migration_import(client, {
         "id": 7011,
         "title": "replace Plan carrier",
         "description": "must not replace",
         "mode": "plan",
         "source_status": "cancelled",
+        "source_incarnation_id": task.incarnation_id,
     })
 
     assert response.status_code == 409, response.text
@@ -1312,13 +2128,14 @@ async def test_migration_import_rejects_codex_monitor_worker_copy(
     from backend.models.task import Task
 
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", True)
-    response = await client.post("/api/tasks/migration-import", json={
+    response = await _post_migration_import(client, {
         "id": 7008,
         "title": "Worker Monitor remains closed",
         "description": "d",
         "provider": "codex",
         "enabled_skills": {"monitor": True},
         "source_status": "completed",
+        "source_incarnation_id": "8" * 32,
         "user_skill_snapshots": [],
     })
 
@@ -1343,10 +2160,11 @@ async def test_migration_import_refuses_active_existing_task(client, session_fac
         db.add(task)
         await db.commit()
 
-    resp = await client.post("/api/tasks/migration-import", json={
+    resp = await _post_migration_import(client, {
         "id": 7002,
         "title": "Migrated",
         "description": "d",
+        "source_incarnation_id": task.incarnation_id,
     })
 
     assert resp.status_code == 409
@@ -1398,11 +2216,12 @@ async def test_migration_import_existing_row_uses_full_generation_cas(
         replace_generation_after_snapshot,
     )
 
-    response = await client.post("/api/tasks/migration-import", json={
+    response = await _post_migration_import(client, {
         "id": 7003,
         "title": "Stale imported copy",
         "description": "d",
         "retry_count": 4,
+        "source_incarnation_id": task.incarnation_id,
     })
 
     assert response.status_code == 409
@@ -1461,7 +2280,7 @@ async def test_migration_import_existing_row_cas_binds_observed_incarnation(
         bind_after_snapshot,
     )
 
-    response = await client.post("/api/tasks/migration-import", json={
+    response = await _post_migration_import(client, {
         "id": 7015,
         "title": "stale adoption",
         "description": "must lose",
@@ -1525,7 +2344,7 @@ async def test_migration_import_revalidates_capability_authority_after_fence(
         add_capability_after_snapshot,
     )
 
-    response = await client.post("/api/tasks/migration-import", json={
+    response = await _post_migration_import(client, {
         "id": 7016,
         "title": "stale Worker import",
         "description": "must not replace local authority",
@@ -1582,12 +2401,13 @@ async def test_migration_import_rejects_turn_generation_only_aba(
         replace_turn_after_snapshot,
     )
 
-    response = await client.post("/api/tasks/migration-import", json={
+    response = await _post_migration_import(client, {
         "id": 7009,
         "title": "Stale imported turn",
         "description": "d",
         "retry_count": 4,
         "turn_generation": 9,
+        "source_incarnation_id": task.incarnation_id,
     })
 
     assert response.status_code == 409
@@ -1634,11 +2454,12 @@ async def test_migration_import_yields_to_receipt_after_snapshot(
         receipt_wins_after_snapshot,
     )
 
-    response = await client.post("/api/tasks/migration-import", json={
+    response = await _post_migration_import(client, {
         "id": 7012,
         "title": "stale Manager mirror",
         "description": "must not overwrite the receipt generation",
         "source_status": "completed",
+        "source_incarnation_id": task.incarnation_id,
     })
 
     assert response.status_code == 409, response.text
@@ -1686,11 +2507,12 @@ async def test_migration_import_commits_before_status_publication(
         ),
         pytest.raises(RuntimeError, match="publication failed"),
     ):
-        await client.post("/api/tasks/migration-import", json={
+        await _post_migration_import(client, {
             "id": 7013,
             "title": "durable imported mirror",
             "description": "d",
             "source_status": "completed",
+            "source_incarnation_id": task.incarnation_id,
         })
 
     async with session_factory() as db:
@@ -1752,11 +2574,12 @@ async def test_migration_import_publication_yields_to_post_commit_receipt(
         new_callable=AsyncMock,
     ) as publish:
         request_task = asyncio.create_task(
-            client.post("/api/tasks/migration-import", json={
+            _post_migration_import(client, {
                 "id": 7014,
                 "title": "durable imported mirror",
                 "description": "d",
                 "source_status": "completed",
+                "source_incarnation_id": task.incarnation_id,
             })
         )
         await asyncio.wait_for(publication_waiting.wait(), timeout=2)
@@ -2028,6 +2851,644 @@ async def test_retry_task(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("remote", [False, True], ids=["local", "worker"])
+async def test_retry_rejects_group_revoked_at_final_effect_fence(
+    secured_client,
+    monkeypatch,
+    remote,
+):
+    """Retry never publishes G+1 or a Worker outbox from stale group access."""
+
+    from backend.models.project import Project
+    from backend.models.task import Task
+    from backend.models.worker import Worker
+    from backend.services.test_harness import test_harness_service
+    import backend.main as main_module
+
+    client, session_factory = secured_client
+    monkeypatch.setattr(test_harness_service, "db_factory", session_factory)
+    monkeypatch.setattr(
+        test_harness_service.child_service,
+        "db_factory",
+        session_factory,
+    )
+    member_id, member_token = await _create_user(
+        session_factory,
+        email=f"retry-effect-{remote}@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        project = Project(
+            name=f"retry-effect-{remote}-project",
+            status="ready",
+        )
+        db.add(project)
+        worker = None
+        if remote:
+            worker = Worker(
+                name="retry-effect-worker",
+                status="ready",
+                private_ip="10.0.0.77",
+                auth_token="worker-token",
+            )
+            db.add(worker)
+        await db.flush()
+        task = Task(
+            title="retry effect fence",
+            description="membership disappears at final retry admission",
+            project_id=project.id,
+            created_by=999,
+            status="failed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            codex_service_tier="default",
+            worker_id=worker.id if worker is not None else None,
+            metadata_=(
+                {"ccm_worker_remote_materialized_v1": True}
+                if remote
+                else None
+            ),
+        )
+        db.add(task)
+        await db.commit()
+        project_id = project.id
+        task_id = task.id
+    await grant_group_project_access(
+        session_factory,
+        project_id=project_id,
+        user_id=member_id,
+    )
+    # The public operation-lock check is call one. The boundary immediately
+    # before local G+1 or the remote prepared marker is call two.
+    fence = revoke_group_membership_at_effect_fence(
+        monkeypatch,
+        on_call=2,
+    )
+    proxy = MagicMock()
+    proxy.require_ready_worker = AsyncMock(return_value=worker)
+    proxy.require_worker_delegated_principal_support = AsyncMock()
+    proxy.require_worker_manual_retry_support = AsyncMock()
+    proxy.sync_task_skill_selection = AsyncMock()
+    proxy.proxy_to_worker = AsyncMock(
+        return_value={
+            "id": task_id,
+            "status": "failed",
+            "worker_id": None,
+            "shared_from_id": None,
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "codex_service_tier": "default",
+            "pending": None,
+        }
+    )
+
+    with patch.object(main_module, "worker_proxy", proxy):
+        response = await client.post(
+            f"/api/tasks/{task_id}/retry",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 2, "revoked": True}
+    if remote:
+        assert proxy.proxy_to_worker.await_count == 1
+        assert proxy.proxy_to_worker.await_args.args[1] == "GET"
+        proxy.sync_task_skill_selection.assert_awaited_once()
+    else:
+        proxy.proxy_to_worker.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "failed"
+        assert current.retry_count == 0
+        assert (
+            "ccm_worker_manual_retry_receipt_v1" not in (current.metadata_ or {})
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "initial_values"),
+    (
+        pytest.param("star", {"starred": False}, id="star"),
+        pytest.param("read", {"has_unread": True}, id="read"),
+        pytest.param("unread", {"has_unread": False}, id="unread"),
+        pytest.param("archive", {"archived": False}, id="archive"),
+    ),
+)
+async def test_task_flag_controls_reject_group_revoked_at_final_effect_fence(
+    secured_client,
+    monkeypatch,
+    action,
+    initial_values,
+):
+    """Cosmetic Task writes cannot cross a winning Project ACL revoke."""
+
+    from backend.models.task import Task
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email=f"task-flag-effect-{action}@example.com",
+        role="member",
+    )
+    project_id, task_id = await _seed_group_project_control_task(
+        session_factory,
+        member_id=member_id,
+        **initial_values,
+    )
+    await grant_group_project_access(
+        session_factory,
+        project_id=project_id,
+        user_id=member_id,
+    )
+    async with session_factory() as db:
+        before = await db.get(Task, task_id)
+        before_values = (
+            before.starred,
+            before.has_unread,
+            before.archived,
+            before.sort_order,
+        )
+
+    fence = revoke_group_membership_at_effect_fence(monkeypatch)
+    response = await client.post(
+        f"/api/tasks/{task_id}/{action}",
+        headers={"Authorization": f"Bearer {member_token}"},
+    )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "revoked": True}
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current is not None
+        assert (
+            current.starred,
+            current.has_unread,
+            current.archived,
+            current.sort_order,
+        ) == before_values
+
+
+@pytest.mark.asyncio
+async def test_star_rejects_admin_demoted_before_final_user_fence(
+    secured_client,
+    monkeypatch,
+):
+    """A stale JWT admin role cannot cross the final User writer fence."""
+
+    from backend.api import tasks as tasks_api
+    from backend.models.task import Task
+    from backend.models.user import User
+
+    client, session_factory = secured_client
+    admin_id, admin_token = await _create_user(
+        session_factory,
+        email="task-star-demoted-admin@example.com",
+        role="admin",
+    )
+    async with session_factory() as db:
+        task = Task(
+            title="Demoted admin cannot star",
+            description="d",
+            created_by=999,
+            status="completed",
+            starred=False,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    original_fence = tasks_api.lock_task_effect_access
+    demoted = False
+
+    async def demote_before_fence(*args, **kwargs):
+        nonlocal demoted
+        if not demoted:
+            async with session_factory() as demoter:
+                changed = await demoter.execute(
+                    update(User)
+                    .where(User.id == admin_id, User.role == "admin")
+                    .values(role="member")
+                )
+                assert changed.rowcount == 1
+                await demoter.commit()
+            demoted = True
+        return await original_fence(*args, **kwargs)
+
+    monkeypatch.setattr(
+        tasks_api,
+        "lock_task_effect_access",
+        demote_before_fence,
+    )
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/star",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert demoted is True
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        actor = await db.get(User, admin_id)
+        assert current.starred is False
+        assert actor.role == "member"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action",
+    (
+        pytest.param("stop-session", id="stop-session"),
+        pytest.param("cancel", id="cancel"),
+        pytest.param("delete", id="delete"),
+    ),
+)
+async def test_local_task_controls_reject_group_revoked_before_effect_gate(
+    secured_client,
+    monkeypatch,
+    action,
+):
+    """Local terminal/delete effects require fresh group authority."""
+
+    from backend.models.task import Task
+    from backend.services.test_harness_owner_fence import (
+        TEST_HARNESS_TERMINAL_GATE_KEY,
+    )
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email=f"local-control-effect-{action}@example.com",
+        role="member",
+    )
+    project_id, task_id = await _seed_group_project_control_task(
+        session_factory,
+        member_id=member_id,
+    )
+    await grant_group_project_access(
+        session_factory,
+        project_id=project_id,
+        user_id=member_id,
+    )
+    fence = revoke_group_membership_at_effect_fence(monkeypatch)
+
+    if action == "delete":
+        response = await client.delete(
+            f"/api/tasks/{task_id}",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+    else:
+        response = await client.post(
+            f"/api/tasks/{task_id}/{action}",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "revoked": True}
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current is not None
+        assert current.status == "completed"
+        assert TEST_HARNESS_TERMINAL_GATE_KEY not in (current.metadata_ or {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "action",
+    (
+        pytest.param("stop-session", id="stop-session"),
+        pytest.param("cancel", id="cancel"),
+        pytest.param("delete", id="delete"),
+    ),
+)
+async def test_worker_task_controls_reject_group_revoked_before_receipt(
+    secured_client,
+    monkeypatch,
+    action,
+):
+    """No Worker request or durable receipt may follow a winning revoke."""
+
+    import backend.main as main_module
+    from backend.models.task import Task
+    from backend.models.worker_task_termination import (
+        WorkerTaskTerminationReceipt,
+    )
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email=f"worker-control-effect-{action}@example.com",
+        role="member",
+    )
+    project_id, task_id = await _seed_group_project_control_task(
+        session_factory,
+        member_id=member_id,
+        worker=True,
+    )
+    await grant_group_project_access(
+        session_factory,
+        project_id=project_id,
+        user_id=member_id,
+    )
+    fence = revoke_group_membership_at_effect_fence(monkeypatch)
+    proxy = MagicMock()
+    proxy.task_operation_lock = MagicMock(return_value=asyncio.Lock())
+    proxy.proxy_to_worker = AsyncMock()
+    proxy.require_task_plan_delete_protocol = AsyncMock()
+    proxy.relay = MagicMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "task_migrator", None)
+
+    if action == "delete":
+        response = await client.delete(
+            f"/api/tasks/{task_id}",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+    else:
+        response = await client.post(
+            f"/api/tasks/{task_id}/{action}",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "revoked": True}
+    proxy.proxy_to_worker.assert_not_awaited()
+    proxy.require_task_plan_delete_protocol.assert_not_awaited()
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current is not None
+        assert current.status == "completed"
+        assert await db.scalar(
+            select(func.count(WorkerTaskTerminationReceipt.operation_id)).where(
+                WorkerTaskTerminationReceipt.task_id == task_id
+            )
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_completed_stop_400_settles_gate_before_later_delete(
+    client,
+    session_factory,
+):
+    """A proven no-process stop must not strand the terminal Task forever."""
+
+    from backend.models.task import Task
+    from backend.services.test_harness_owner_fence import (
+        TEST_HARNESS_TERMINAL_GATE_KEY,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            title="No-process stop may be followed by delete",
+            description="d",
+            status="completed",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    stopped = await client.post(f"/api/tasks/{task_id}/stop-session")
+
+    assert stopped.status_code == 400, stopped.text
+    assert stopped.json()["detail"] == "No running session found for this task"
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        gate = (current.metadata_ or {}).get(TEST_HARNESS_TERMINAL_GATE_KEY)
+        assert gate["task_control_effect"] == "stop_session"
+        assert gate["task_control_effect_state"] == "settled"
+
+    deleted = await client.delete(f"/api/tasks/{task_id}")
+
+    assert deleted.status_code == 200, deleted.text
+    async with session_factory() as db:
+        assert await db.get(Task, task_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_status", "expected_cancel_status"),
+    (("completed", 400), ("cancelled", 200)),
+)
+async def test_terminal_cancel_settles_gate_before_later_delete(
+    client,
+    session_factory,
+    initial_status,
+    expected_cancel_status,
+):
+    """Known no-op and idempotent cancellation cannot strand the Task."""
+
+    from backend.models.task import Task
+    from backend.services.test_harness_owner_fence import (
+        TEST_HARNESS_TERMINAL_GATE_KEY,
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            title=f"{initial_status} cancel may be followed by delete",
+            description="d",
+            status=initial_status,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    cancelled = await client.post(f"/api/tasks/{task_id}/cancel")
+
+    assert cancelled.status_code == expected_cancel_status, cancelled.text
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        gate = (current.metadata_ or {}).get(TEST_HARNESS_TERMINAL_GATE_KEY)
+        assert current.status == initial_status
+        assert gate["task_control_effect"] == "cancel"
+        assert gate["task_control_effect_state"] == "settled"
+
+    deleted = await client.delete(f"/api/tasks/{task_id}")
+
+    assert deleted.status_code == 200, deleted.text
+    async with session_factory() as db:
+        assert await db.get(Task, task_id) is None
+
+
+@pytest.mark.asyncio
+async def test_star_rejects_real_wal_group_revoke_before_final_effect_fence(
+    tmp_path,
+    monkeypatch,
+):
+    """A separately committed WAL revocation wins before the final writer."""
+
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+    from sqlalchemy import delete
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from backend.api import tasks as tasks_api
+    from backend.database import Base
+    from backend.models.project import Project
+    from backend.models.task import Task
+    from backend.models.team_share import TeamProjectShare
+    from backend.models.user import User
+    from backend.models.user_group import UserGroup, UserGroupMember
+    from backend.services.task_queue import TaskQueue
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'task-star-acl-race.db'}",
+        connect_args={"timeout": 2},
+    )
+    release_fence = asyncio.Event()
+    request_task = None
+    try:
+        async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql(
+                "PRAGMA journal_mode=WAL"
+            )
+            assert journal_mode.scalar_one().lower() == "wal"
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with sessions() as setup:
+            member = User(
+                email="task-star-wal-member@example.com",
+                name="task-star-wal-member",
+                password_hash="not-used",
+                role="member",
+                is_active=True,
+            )
+            group = UserGroup(name="task-star-wal-group", created_by=999)
+            project = Project(name="task-star-wal-project", status="ready")
+            setup.add_all([member, group, project])
+            await setup.flush()
+            membership = UserGroupMember(
+                group_id=group.id,
+                user_id=member.id,
+            )
+            task = Task(
+                title="Task star WAL authority",
+                description="revocation commits before final fence",
+                project_id=project.id,
+                created_by=999,
+                status="completed",
+                starred=False,
+            )
+            setup.add_all(
+                [
+                    membership,
+                    task,
+                    TeamProjectShare(
+                        project_id=project.id,
+                        target_type="group",
+                        target_id=group.id,
+                        shared_by=999,
+                    ),
+                ]
+            )
+            await setup.commit()
+            member_id = member.id
+            membership_id = membership.id
+            task_id = task.id
+
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                user_id=member_id,
+                user_role="member",
+                auth_type="jwt",
+            ),
+            headers={},
+        )
+        fence_entered = asyncio.Event()
+        original_fence = tasks_api.lock_task_effect_access
+
+        async def blocked_fence(*args, **kwargs):
+            fence_entered.set()
+            await release_fence.wait()
+            return await original_fence(*args, **kwargs)
+
+        monkeypatch.setattr(
+            tasks_api,
+            "lock_task_effect_access",
+            blocked_fence,
+        )
+
+        async def star_task():
+            async with sessions() as effect_db:
+                return await tasks_api.star_task(
+                    task_id,
+                    request,
+                    TaskQueue(effect_db),
+                    effect_db,
+                )
+
+        request_task = asyncio.create_task(star_task())
+        await asyncio.wait_for(fence_entered.wait(), timeout=2)
+        async with sessions() as revoker:
+            revoked = await revoker.execute(
+                delete(UserGroupMember).where(
+                    UserGroupMember.id == membership_id
+                )
+            )
+            assert revoked.rowcount == 1
+            await revoker.commit()
+        release_fence.set()
+
+        with pytest.raises(HTTPException) as rejected:
+            await asyncio.wait_for(request_task, timeout=2)
+        assert rejected.value.status_code == 403
+        async with sessions() as verify:
+            current = await verify.get(Task, task_id)
+            assert current is not None
+            assert current.starred is False
+            assert await verify.get(UserGroupMember, membership_id) is None
+    finally:
+        release_fence.set()
+        if request_task is not None and not request_task.done():
+            request_task.cancel()
+            await asyncio.gather(request_task, return_exceptions=True)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_manual_retry_freezes_the_authenticated_retry_principal(
+    client,
+    session_factory,
+):
+    """Retry is a new admission and must not inherit stale Task authority."""
+
+    from backend.models.task import Task
+
+    async with session_factory() as db:
+        task = Task(
+            title="Retry principal",
+            description="d",
+            status="failed",
+            execution_user_id=None,
+            execution_user_role="member",
+            execution_mode="sandbox",
+            execution_principal_kind="system",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    response = await client.post(f"/api/tasks/{task_id}/retry")
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        retried = await db.get(Task, task_id)
+    assert retried.status == "pending"
+    assert retried.retry_count == 1
+    assert (
+        retried.execution_user_id,
+        retried.execution_user_role,
+        retried.execution_mode,
+        retried.execution_principal_kind,
+    ) == (None, "super_admin", "unrestricted", "deployment_token")
+
+
+@pytest.mark.asyncio
 async def test_retry_fences_and_cancels_concurrent_harness_owner(
     client,
     session_factory,
@@ -2289,8 +3750,13 @@ async def test_retry_reconciles_dead_orphan_before_releasing_task(
 
     assert response.status_code == 200, response.text
     assert response.json()["status"] == "pending"
-    assert response.json()["instance_id"] is None
+    # Process/slot linkage is internal Worker/runtime state and is deliberately
+    # absent from the human Task projection.  Verify the detach in the
+    # authoritative database instead of reopening that field publicly.
+    assert "instance_id" not in response.json()
     async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task.instance_id is None
         instance = await db.get(Instance, instance_id)
         assert instance.status == "error"
         assert instance.pid is None
@@ -2471,6 +3937,59 @@ async def test_update_task(client):
     resp = await client.put(f"/api/tasks/{task_id}", json={"title": "Updated"})
     assert resp.status_code == 200
     assert resp.json()["title"] == "Updated"
+
+
+@pytest.mark.asyncio
+async def test_admin_project_move_binds_task_to_project_workspace(
+    client,
+    session_factory,
+    tmp_path,
+):
+    """Even an administrator cannot attach an arbitrary host path to a Project."""
+
+    from backend.models.project import Project
+    from backend.models.task import Task
+
+    source_root = tmp_path / "source-project"
+    target_root = tmp_path / "target-project"
+    source_root.mkdir()
+    target_root.mkdir()
+    async with session_factory() as db:
+        source = Project(
+            name="source-project-workspace",
+            status="ready",
+            local_path=str(source_root),
+        )
+        target = Project(
+            name="target-project-workspace",
+            status="ready",
+            local_path=str(target_root),
+        )
+        db.add_all([source, target])
+        await db.flush()
+        task = Task(
+            title="project workspace authority",
+            description="d",
+            project_id=source.id,
+            target_repo=str(source_root),
+        )
+        db.add(task)
+        await db.commit()
+        task_id, target_project_id = task.id, target.id
+
+    forged = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"target_repo": str(tmp_path / "forged")},
+    )
+    moved = await client.put(
+        f"/api/tasks/{task_id}",
+        json={"project_id": target_project_id},
+    )
+
+    assert forged.status_code == 400
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["project_id"] == target_project_id
+    assert moved.json()["target_repo"] == str(target_root)
 
 
 @pytest.mark.asyncio
@@ -4163,15 +5682,27 @@ async def test_delete_non_plan_in_plan_review_state_is_rejected(
 
 
 @pytest.mark.asyncio
-async def test_create_task_with_image_paths(client, session_factory):
+async def test_create_task_with_image_paths(
+    client,
+    session_factory,
+    tmp_path,
+    monkeypatch,
+):
     """image_paths are stored in task.metadata_['image_paths']."""
     from backend.models.task import Task
 
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", tmp_path)
+    image_paths = [
+        tmp_path / "11111111-1111-4111-8111-111111111111.png",
+        tmp_path / "22222222-2222-4222-8222-222222222222.jpg",
+    ]
+    for path in image_paths:
+        path.write_bytes(b"image")
     resp = await client.post("/api/tasks", json={
         "title": "Img Task",
         "description": "look at this image",
         "target_repo": "/tmp",
-        "image_paths": ["/uploads/a.png", "/uploads/b.jpg"],
+        "image_paths": [str(path) for path in image_paths],
     })
     assert resp.status_code == 201
     task_id = resp.json()["id"]
@@ -4179,7 +5710,9 @@ async def test_create_task_with_image_paths(client, session_factory):
     async with session_factory() as db:
         task = await db.get(Task, task_id)
     assert task.metadata_ is not None
-    assert task.metadata_["image_paths"] == ["/uploads/a.png", "/uploads/b.jpg"]
+    expected_paths = [str(path) for path in image_paths]
+    assert task.metadata_["file_paths"] == expected_paths
+    assert task.metadata_["image_paths"] == expected_paths
 
 
 @pytest.mark.asyncio
@@ -4199,18 +5732,49 @@ async def test_create_task_without_image_paths(client, session_factory):
 
 
 @pytest.mark.asyncio
-async def test_create_task_image_paths_not_in_response(client):
+async def test_create_task_image_paths_not_in_response(
+    client,
+    tmp_path,
+    monkeypatch,
+):
     """image_paths field is not leaked in the TaskResponse (stored in metadata_)."""
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", tmp_path)
+    image_path = tmp_path / "33333333-3333-4333-8333-333333333333.png"
+    image_path.write_bytes(b"image")
     resp = await client.post("/api/tasks", json={
         "title": "Img Task",
         "description": "check response",
         "target_repo": "/tmp",
-        "image_paths": ["/uploads/x.png"],
+        "image_paths": [str(image_path)],
     })
     assert resp.status_code == 201
     data = resp.json()
     # image_paths should not appear as a top-level key in the response schema
     assert "image_paths" not in data
+    assert "image_paths" not in (data.get("metadata_") or {})
+
+
+@pytest.mark.asyncio
+async def test_create_task_rejects_unmanaged_attachment_path(
+    client,
+    tmp_path,
+    monkeypatch,
+):
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", upload_dir)
+    outside = tmp_path / "44444444-4444-4444-8444-444444444444.txt"
+    outside.write_text("host data", encoding="utf-8")
+
+    response = await client.post("/api/tasks", json={
+        "title": "Forged attachment",
+        "description": "must fail",
+        "target_repo": "/tmp",
+        "file_paths": [str(outside)],
+    })
+
+    assert response.status_code == 422
+    assert "upload directory" in response.text
 
 
 # === max_iterations tests ===
@@ -4828,13 +6392,14 @@ async def test_update_rejects_null_or_unknown_service_tier(client):
 
 @pytest.mark.asyncio
 async def test_migration_import_preserves_fast_service_tier(client):
-    resp = await client.post("/api/tasks/migration-import", json={
+    resp = await _post_migration_import(client, {
         "id": 7091,
         "title": "Migrated Fast task",
         "description": "d",
         "provider": "codex",
         "model": "gpt-5.5",
         "codex_service_tier": "priority",
+        "source_incarnation_id": "9" * 32,
     })
 
     assert resp.status_code == 201, resp.text
@@ -4844,13 +6409,14 @@ async def test_migration_import_preserves_fast_service_tier(client):
 
 @pytest.mark.asyncio
 async def test_migration_import_rejects_incompatible_fast_service_tier(client):
-    resp = await client.post("/api/tasks/migration-import", json={
+    resp = await _post_migration_import(client, {
         "id": 7092,
         "title": "Invalid migrated Fast task",
         "description": "d",
         "provider": "codex",
         "model": "gpt-5.4-mini",
         "codex_service_tier": "priority",
+        "source_incarnation_id": "a" * 32,
     })
 
     assert resp.status_code == 422

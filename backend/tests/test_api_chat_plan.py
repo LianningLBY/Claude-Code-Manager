@@ -16,11 +16,67 @@ from backend.models.log_entry import LogEntry
 from backend.models.project import Project
 from backend.models.task_share import TaskShare
 from backend.models.worker import Worker
+from backend.models.user import User
 from backend.schemas.plan import default_plan_pipeline_config
 from backend.services.plan_tasks import capture_repo_revision
+from backend.tests.group_acl_test_helpers import (
+    grant_group_project_access,
+    grant_group_task_chat_access,
+    revoke_group_membership_at_effect_fence,
+)
+from backend.tests.test_auth_ws_security import (
+    _create_user,
+    secured_client as secured_client,
+)
 from backend.tests.worker_termination_helpers import (
     persist_active_worker_receipt,
 )
+
+
+@pytest.mark.asyncio
+async def test_worker_chat_stops_when_acl_is_revoked_at_effect_fence(
+    client,
+    session_factory,
+):
+    from fastapi import HTTPException
+
+    import backend.api.chat as chat_api
+
+    async with session_factory() as db:
+        worker = Worker(
+            name="chat-acl-race-worker",
+            status="ready",
+            private_ip="10.0.0.44",
+            auth_token="worker-token",
+        )
+        db.add(worker)
+        await db.flush()
+        task = Task(
+            title="worker chat acl race",
+            description="must not send",
+            worker_id=worker.id,
+            status="completed",
+            created_by=1,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    with patch("backend.main.worker_proxy", MagicMock()), patch.object(
+        chat_api,
+        "lock_task_effect_access",
+        AsyncMock(side_effect=HTTPException(403, "access revoked while waiting")),
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "must not reach Worker"},
+        )
+
+    assert response.status_code == 403
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(func.count(LogEntry.id)).where(LogEntry.task_id == task_id)
+        ) == 0
 
 
 async def _legacy_plan_task(session_factory, **values) -> int:
@@ -131,7 +187,7 @@ async def test_codex_fork_starts_before_selected_user_message(
         task.metadata_ = {
             "codex_account_id": "codex-a",
             "attachments": [{
-                "url": "/api/uploads/initial.png",
+                "url": "/api/uploads/33333333-3333-4333-8333-333333333333.png",
                 "name": "initial.png",
                 "is_image": True,
             }],
@@ -147,7 +203,7 @@ async def test_codex_fork_starts_before_selected_user_message(
             role="user", content="fork here", is_error=False,
             raw_json=(
                 '{"raw_content":"fork here","attachments":[{'
-                '"url":"/api/uploads/followup.txt","name":"followup.txt",'
+                '"url":"/api/uploads/22222222-2222-4222-8222-222222222222.txt","name":"followup.txt",'
                 '"is_image":false}],"file_paths":["/tmp/not-an-upload/followup.txt"]}'
             ),
         )
@@ -226,12 +282,13 @@ async def test_codex_fork_starts_before_selected_user_message(
     payload = response.json()
     assert payload["status"] == "completed"
     assert payload["mode"] == "auto"
-    assert payload["session_id"] == "thread-fork"
+    assert payload["has_session"] is True
+    assert "session_id" not in payload
     assert payload["enabled_skills"] == {"code-review": True}
     assert payload["selected_user_skills"] == [41]
     assert payload["codex_service_tier"] == "priority"
     assert payload["attention_tag"] == "等 Fork 完成后继续"
-    assert payload["metadata_"]["codex_account_id"] == "codex-a"
+    assert "codex_account_id" not in payload["metadata_"]
     assert payload["metadata_"]["forked_from_task_id"] == task_id
     assert payload["metadata_"]["forked_from_log_id"] == anchor_id
     assert payload["metadata_"]["forked_from_turn_id"] == "turn-1"
@@ -240,12 +297,8 @@ async def test_codex_fork_starts_before_selected_user_message(
     assert payload["metadata_"]["fork_seed_uploads"] == [{
         "id": "fork-seed-0",
         "filename": "followup.txt",
-        "path": str(
-            (
-                Path(__file__).resolve().parents[2] / "uploads/followup.txt"
-            ).resolve()
-        ),
-        "url": "/api/uploads/followup.txt",
+        "path": "/api/uploads/22222222-2222-4222-8222-222222222222.txt",
+        "url": "/api/uploads/22222222-2222-4222-8222-222222222222.txt",
         "is_image": False,
     }]
     read_thread.assert_awaited_once_with("/tmp/codex-home", "thread-source")
@@ -421,7 +474,7 @@ async def test_codex_fork_from_initial_prompt_creates_empty_thread(
         task.metadata_ = {
             "codex_account_id": "codex-a",
             "attachments": [{
-                "url": "/api/uploads/initial.png",
+                "url": "/api/uploads/33333333-3333-4333-8333-333333333333.png",
                 "name": "initial.png",
                 "is_image": True,
             }],
@@ -454,13 +507,14 @@ async def test_codex_fork_from_initial_prompt_creates_empty_thread(
 
     assert response.status_code == 201, response.text
     payload = response.json()
-    assert payload["session_id"] == "thread-empty"
+    assert payload["has_session"] is True
+    assert "session_id" not in payload
     assert payload["description"] is None
     assert payload["metadata_"]["forked_from_log_id"] is None
-    assert payload["metadata_"]["forked_from_turn_id"] is None
+    assert "forked_from_turn_id" not in payload["metadata_"]
     assert payload["metadata_"]["fork_seed_message"] == "start again"
     assert payload["metadata_"]["fork_seed_uploads"][0]["url"] == (
-        "/api/uploads/initial.png"
+        "/api/uploads/33333333-3333-4333-8333-333333333333.png"
     )
     assert "attachments" not in payload["metadata_"]
     assert "image_paths" not in payload["metadata_"]
@@ -578,6 +632,208 @@ async def test_codex_fork_rejects_plan_carriers_without_side_effects(
 
 
 @pytest.mark.asyncio
+async def test_codex_fork_revalidates_jwt_role_before_native_effect(
+    session_factory,
+):
+    """A stale cached admin role cannot create even an orphan native fork."""
+
+    from fastapi import HTTPException
+    from types import SimpleNamespace
+
+    from backend.api.chat import CodexForkRequest, fork_codex_task
+
+    async with session_factory() as db:
+        user = User(
+            email="stale-fork-admin@test.local",
+            name="Stale Fork Admin",
+            password_hash="unused",
+            role="member",
+            is_active=True,
+        )
+        source = Task(
+            title="stale-role fork source",
+            description="initial",
+            status="completed",
+            provider="codex",
+            session_id="thread-stale-role",
+        )
+        db.add_all([user, source])
+        await db.flush()
+        source.created_by = user.id
+        await db.commit()
+        user_id, task_id = user.id, source.id
+
+        stale_request = SimpleNamespace(
+            state=SimpleNamespace(
+                user_id=user_id,
+                user_role="admin",
+                auth_type="jwt",
+            )
+        )
+        with (
+            patch(
+                "backend.main.instance_manager.create_codex_thread",
+                new=AsyncMock(),
+            ) as create_thread,
+            patch(
+                "backend.main.instance_manager.read_codex_thread",
+                new=AsyncMock(),
+            ) as read_thread,
+            patch(
+                "backend.main.instance_manager.fork_codex_thread",
+                new=AsyncMock(),
+            ) as fork_thread,
+        ):
+            with pytest.raises(
+                HTTPException,
+                match="disabled or changed role",
+            ) as exc_info:
+                await fork_codex_task(
+                    task_id,
+                    CodexForkRequest(anchor={"type": "initial"}),
+                    stale_request,
+                    db,
+                )
+
+        assert exc_info.value.status_code == 409
+        create_thread.assert_not_awaited()
+        read_thread.assert_not_awaited()
+        fork_thread.assert_not_awaited()
+        await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_codex_fork_commits_authority_before_native_effect_without_writer_lock(
+    tmp_path,
+):
+    """Post-admission deactivation does not hold SQLite during native RPC."""
+
+    from types import SimpleNamespace
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.api.chat import CodexForkRequest, fork_codex_task
+    from backend.database import Base
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'fork-authority-fence.db'}",
+        connect_args={"timeout": 2},
+    )
+    session_factory = async_sessionmaker(
+        engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+    fork_request = None
+    deactivation = None
+    try:
+        async with session_factory() as seed_db:
+            user = User(
+                email="fenced-fork-member@test.local",
+                name="Fenced Fork Member",
+                password_hash="unused",
+                role="member",
+                is_active=True,
+            )
+            source = Task(
+                title="fenced fork source",
+                description="initial",
+                status="completed",
+                provider="codex",
+                session_id="thread-fenced-source",
+            )
+            seed_db.add_all([user, source])
+            await seed_db.flush()
+            source.created_by = user.id
+            await seed_db.commit()
+            user_id, task_id = user.id, source.id
+
+        async def create_thread(*_args, **_kwargs):
+            provider_started.set()
+            await release_provider.wait()
+            return {"id": "thread-fenced-fork"}
+
+        async def deactivate_user():
+            async with session_factory() as authority_db:
+                changed = await authority_db.execute(
+                    update(User)
+                    .where(User.id == user_id, User.is_active.is_(True))
+                    .values(is_active=False)
+                )
+                assert changed.rowcount == 1
+                await authority_db.commit()
+
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                user_id=user_id,
+                user_role="member",
+                auth_type="jwt",
+            )
+        )
+        async with session_factory() as db:
+            with (
+                patch(
+                    "backend.api.chat._codex_fork_home",
+                    return_value=("/tmp/fenced-codex-home", None),
+                ),
+                patch(
+                    "backend.main.instance_manager.create_codex_thread",
+                    new=AsyncMock(side_effect=create_thread),
+                ),
+            ):
+                fork_request = asyncio.create_task(
+                    fork_codex_task(
+                        task_id,
+                        CodexForkRequest(anchor={"type": "initial"}),
+                        request,
+                        db,
+                    )
+                )
+                await asyncio.wait_for(provider_started.wait(), timeout=1)
+                deactivation = asyncio.create_task(deactivate_user())
+                await asyncio.wait_for(deactivation, timeout=1)
+                assert not fork_request.done()
+
+                release_provider.set()
+                forked_response = await asyncio.wait_for(
+                    fork_request,
+                    timeout=2,
+                )
+
+        forked_payload = json.loads(forked_response.body)
+        assert forked_payload["has_session"] is True
+        assert "session_id" not in forked_payload
+        assert "execution_user_id" not in forked_payload
+        forked_id = forked_payload["id"]
+        async with session_factory() as db:
+            current_user = await db.get(User, user_id)
+            persisted_fork = await db.get(Task, forked_id)
+            assert current_user.is_active is False
+            assert persisted_fork is not None
+            assert persisted_fork.session_id == "thread-fenced-fork"
+            assert persisted_fork.created_by == user_id
+            assert persisted_fork.execution_user_id == user_id
+            assert persisted_fork.execution_user_role == "member"
+            assert persisted_fork.execution_mode == "sandbox"
+            assert persisted_fork.execution_principal_kind == "user"
+    finally:
+        release_provider.set()
+        for operation in (fork_request, deactivation):
+            if operation is not None and not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_codex_task_distill_routes_to_codex_provider(
     client, session_factory,
 ):
@@ -637,6 +893,193 @@ async def test_codex_task_distill_routes_to_codex_provider(
     assert kwargs["cloudrouter_store"] is sentinel_cloudrouter_store
     assert kwargs["custom_instruction"] == "focus on tests"
     assert "fix the bug" in kwargs["conversation"]
+
+
+@pytest.mark.asyncio
+async def test_distill_revalidates_jwt_role_before_provider_effect(
+    session_factory,
+):
+    """Distillation cannot use a stale administrator role snapshot."""
+
+    from fastapi import HTTPException
+    from types import SimpleNamespace
+
+    from backend.api.chat import DistillRequest, distill_task
+
+    async with session_factory() as db:
+        user = User(
+            email="stale-distill-admin@test.local",
+            name="Stale Distill Admin",
+            password_hash="unused",
+            role="member",
+            is_active=True,
+        )
+        task = Task(
+            title="stale distill source",
+            description="d",
+            status="completed",
+            provider="claude",
+        )
+        db.add_all([user, task])
+        await db.flush()
+        task.created_by = user.id
+        db.add(LogEntry(
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="evidence",
+        ))
+        await db.commit()
+        user_id, task_id = user.id, task.id
+
+        stale_request = SimpleNamespace(
+            state=SimpleNamespace(
+                user_id=user_id,
+                user_role="admin",
+                auth_type="jwt",
+            )
+        )
+        with patch(
+            "backend.services.skill_distill.distill_task_conversation",
+            new=AsyncMock(),
+        ) as distill:
+            with pytest.raises(
+                HTTPException,
+                match="disabled or changed role",
+            ) as exc_info:
+                await distill_task(
+                    task_id,
+                    stale_request,
+                    DistillRequest(),
+                    db,
+                )
+
+        assert exc_info.value.status_code == 409
+        distill.assert_not_awaited()
+        await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_distill_commits_authority_before_provider_without_writer_lock(
+    tmp_path,
+):
+    """Post-admission deactivation proceeds while the model call is running."""
+
+    from types import SimpleNamespace
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.api.chat import DistillRequest, distill_task
+    from backend.database import Base
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'distill-authority-fence.db'}",
+        connect_args={"timeout": 2},
+    )
+    session_factory = async_sessionmaker(
+        engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+
+    provider_started = asyncio.Event()
+    release_provider = asyncio.Event()
+    distill_request = None
+    deactivation = None
+    try:
+        async with session_factory() as seed_db:
+            user = User(
+                email="fenced-distill-member@test.local",
+                name="Fenced Distill Member",
+                password_hash="unused",
+                role="member",
+                is_active=True,
+            )
+            task = Task(
+                title="fenced distill source",
+                description="d",
+                status="completed",
+                provider="claude",
+            )
+            seed_db.add_all([user, task])
+            await seed_db.flush()
+            task.created_by = user.id
+            seed_db.add(LogEntry(
+                task_id=task.id,
+                event_type="user_message",
+                role="user",
+                content="frozen evidence",
+            ))
+            await seed_db.commit()
+            user_id, task_id = user.id, task.id
+
+        async def controlled_distill(**kwargs):
+            assert kwargs["task_id"] == task_id
+            assert kwargs["provider"] == "claude"
+            assert "frozen evidence" in kwargs["conversation"]
+            provider_started.set()
+            await release_provider.wait()
+            return {
+                "provider": "claude",
+                "model": "claude-test",
+                "content": "# Frozen skill",
+            }
+
+        async def deactivate_user():
+            async with session_factory() as authority_db:
+                changed = await authority_db.execute(
+                    update(User)
+                    .where(User.id == user_id, User.is_active.is_(True))
+                    .values(is_active=False)
+                )
+                assert changed.rowcount == 1
+                await authority_db.commit()
+
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                user_id=user_id,
+                user_role="member",
+                auth_type="jwt",
+            )
+        )
+        async with session_factory() as db:
+            with patch(
+                "backend.services.skill_distill.distill_task_conversation",
+                new=AsyncMock(side_effect=controlled_distill),
+            ):
+                distill_request = asyncio.create_task(
+                    distill_task(
+                        task_id,
+                        request,
+                        DistillRequest(),
+                        db,
+                    )
+                )
+                await asyncio.wait_for(provider_started.wait(), timeout=1)
+                deactivation = asyncio.create_task(deactivate_user())
+                await asyncio.wait_for(deactivation, timeout=1)
+                assert not distill_request.done()
+
+                release_provider.set()
+                result = await asyncio.wait_for(distill_request, timeout=2)
+
+        assert result["task_id"] == task_id
+        assert result["content"] == "# Frozen skill"
+        async with session_factory() as db:
+            current_user = await db.get(User, user_id)
+            assert current_user.is_active is False
+    finally:
+        release_provider.set()
+        for operation in (distill_request, deactivation):
+            if operation is not None and not operation.done():
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -1126,6 +1569,178 @@ async def test_plan_transition_revalidates_after_operation_lock(
 
 
 @pytest.mark.asyncio
+async def test_plan_approve_rejects_target_group_acl_revoked_at_final_fence(
+    secured_client,
+    monkeypatch,
+):
+    """Plan ownership cannot substitute for fresh target Task authority."""
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="plan-target-effect-member@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        project = Project(name="plan-target-effect-project", status="ready")
+        db.add(project)
+        await db.flush()
+        target = Task(
+            title="Plan target effect authority",
+            description="target is controlled only through its Project",
+            project_id=project.id,
+            created_by=999,
+            status="completed",
+        )
+        db.add(target)
+        await db.commit()
+        project_id = project.id
+        target_id = target.id
+    await grant_group_project_access(
+        session_factory,
+        project_id=project_id,
+        user_id=member_id,
+    )
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        title="Actor-owned Plan with shared target",
+        created_by=member_id,
+        plan_target_task_id=target_id,
+        status="plan_review",
+        plan_content="Change the protected target",
+    )
+    fence = revoke_group_membership_at_effect_fence(monkeypatch)
+
+    response = await client.post(
+        f"/api/tasks/{plan_id}/plan/approve",
+        headers={"Authorization": f"Bearer {member_token}"},
+        json={"confirm_stale": True},
+    )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "revoked": True}
+    async with session_factory() as db:
+        plan = await db.get(Task, plan_id)
+        target = await db.get(Task, target_id)
+        assert plan is not None
+        assert plan.status == "plan_review"
+        assert plan.plan_approved is None
+        assert target is not None
+        assert target.status == "completed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ("approve", "reject"))
+@pytest.mark.parametrize("remote", (False, True), ids=("local", "worker"))
+async def test_legacy_plan_decision_rejects_group_acl_revoked_at_final_fence(
+    secured_client,
+    monkeypatch,
+    action,
+    remote,
+):
+    """Local and Worker Plan decisions share the same final ACL fence."""
+
+    import backend.main as main_module
+    from backend.services.test_harness_owner_fence import (
+        TEST_HARNESS_TERMINAL_GATE_KEY,
+    )
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email=f"plan-decision-{action}-{remote}@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        project = Project(
+            name=f"plan-decision-project-{action}-{remote}",
+            status="ready",
+        )
+        db.add(project)
+        worker = None
+        if remote:
+            worker = Worker(
+                name=f"plan-decision-worker-{action}",
+                status="ready",
+                private_ip="10.0.0.82",
+                auth_token="plan-decision-worker-token",
+            )
+            db.add(worker)
+        await db.flush()
+        project_id = project.id
+        worker_id = worker.id if worker is not None else None
+        await db.commit()
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        title=f"Protected {action} Plan",
+        project_id=project_id,
+        created_by=999,
+        worker_id=worker_id,
+        status="plan_review",
+        plan_content="This decision requires the current Project grant",
+    )
+    await grant_group_project_access(
+        session_factory,
+        project_id=project_id,
+        user_id=member_id,
+    )
+    fence = revoke_group_membership_at_effect_fence(monkeypatch)
+    proxy = MagicMock()
+    proxy.proxy_to_worker = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.post(
+        f"/api/tasks/{plan_id}/plan/{action}",
+        headers={"Authorization": f"Bearer {member_token}"},
+        **({"json": {"confirm_stale": True}} if action == "approve" else {}),
+    )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "revoked": True}
+    proxy.proxy_to_worker.assert_not_awaited()
+    async with session_factory() as db:
+        plan = await db.get(Task, plan_id)
+        assert plan.status == "plan_review"
+        assert plan.plan_approved is None
+        assert TEST_HARNESS_TERMINAL_GATE_KEY not in (plan.metadata_ or {})
+
+
+@pytest.mark.asyncio
+async def test_plan_stop_400_settles_gate_before_later_approval(
+    client,
+    session_factory,
+):
+    """A no-process stop cannot permanently own a reviewable Plan generation."""
+
+    from backend.services.test_harness_owner_fence import (
+        TEST_HARNESS_TERMINAL_GATE_KEY,
+    )
+
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        title="Reviewable Plan survives no-process stop",
+        status="plan_review",
+        plan_content="Approve this plan after the harmless stop preflight",
+    )
+
+    stopped = await client.post(f"/api/tasks/{plan_id}/stop-session")
+
+    assert stopped.status_code == 400, stopped.text
+    async with session_factory() as db:
+        plan = await db.get(Task, plan_id)
+        gate = (plan.metadata_ or {}).get(TEST_HARNESS_TERMINAL_GATE_KEY)
+        assert plan.status == "plan_review"
+        assert gate["task_control_effect"] == "stop_session"
+        assert gate["task_control_effect_state"] == "settled"
+
+    approved = await client.post(f"/api/tasks/{plan_id}/plan/approve")
+
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "completed"
+    assert approved.json()["plan_approved"] is True
+
+
+@pytest.mark.asyncio
 async def test_plan_approve_not_found(client):
     resp = await client.post("/api/tasks/9999/plan/approve")
     assert resp.status_code == 404
@@ -1310,6 +1925,8 @@ async def test_worker_legacy_plan_receipt_blocks_manager_success_mirror(
     proxy.sync_task_skill_selection = AsyncMock()
     async with session_factory() as db:
         proxy.require_ready_worker.return_value = await db.get(Worker, worker_id)
+    proxy.require_worker_delegated_principal_support = AsyncMock()
+    proxy.require_worker_task_incarnation_support = AsyncMock()
 
     async def route_then_stage_receipt(
         _task,
@@ -1372,10 +1989,18 @@ async def test_worker_legacy_plan_receipt_blocks_manager_success_mirror(
 async def test_chat_can_start_frontend_review_goal_on_same_task(
     client,
     session_factory,
+    monkeypatch,
     tmp_path: Path,
 ):
     repo = tmp_path / "frontend-review-repo"
     repo.mkdir()
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    reference = (
+        upload_dir / "44444444-4444-4444-8444-444444444444.png"
+    )
+    reference.write_bytes(b"reference image")
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", upload_dir)
     subprocess.run(
         ["git", "init", str(repo)],
         check=True,
@@ -1437,7 +2062,7 @@ async def test_chat_can_start_frontend_review_goal_on_same_task(
         f"/api/tasks/{task_id}/frontend-review-goal",
         json={
             "message": "审查登录页桌面和移动端，修复后重新验证",
-            "file_paths": ["/tmp/login-reference.png"],
+            "file_paths": [f"/api/uploads/{reference.name}"],
             "profile": "standard",
             "max_iterations": 5,
             "expected_routing": {
@@ -1453,7 +2078,8 @@ async def test_chat_can_start_frontend_review_goal_on_same_task(
     assert data["id"] == task_id
     assert data["status"] == "pending"
     assert data["mode"] == "goal"
-    assert data["session_id"] == "test-session-123"
+    assert data["has_session"] is True
+    assert "session_id" not in data
     assert data["retry_count"] == 0
     assert data["goal_turns_used"] == 0
     assert data["goal_max_turns"] == 5
@@ -1463,20 +2089,22 @@ async def test_chat_can_start_frontend_review_goal_on_same_task(
         "profile": "standard",
         "max_iterations": 5,
     }
-    assert data["metadata_"]["frontend_review_activation"] == {
-        "message": "审查登录页桌面和移动端，修复后重新验证",
-        "file_paths": ["/tmp/login-reference.png"],
-        "secret_ids": [],
-        "restore": {
-            "mode": "auto",
-            "goal_condition": None,
-            "goal_max_turns": 30,
-            "goal_turns_used": 0,
-            "goal_last_reason": None,
-        },
-    }
+    assert "frontend_review_activation" not in data["metadata_"]
 
     async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.metadata_["frontend_review_activation"] == {
+            "message": "审查登录页桌面和移动端，修复后重新验证",
+            "file_paths": [str(reference)],
+            "secret_ids": [],
+            "restore": {
+                "mode": "auto",
+                "goal_condition": None,
+                "goal_max_turns": 30,
+                "goal_turns_used": 0,
+                "goal_last_reason": None,
+            },
+        }
         rows = list((await db.execute(
             select(LogEntry).where(
                 LogEntry.task_id == task_id,
@@ -1485,7 +2113,111 @@ async def test_chat_can_start_frontend_review_goal_on_same_task(
         )).scalars().all())
     assert len(rows) == 1
     assert rows[0].content == "审查登录页桌面和移动端，修复后重新验证"
-    assert json.loads(rows[0].raw_json)["source"] == "frontend-review-goal"
+    goal_log = json.loads(rows[0].raw_json)
+    assert goal_log["source"] == "frontend-review-goal"
+    assert goal_log["execution_principal"] == {
+        "user_id": None,
+        "role": "super_admin",
+        "mode": "unrestricted",
+        "kind": "deployment_token",
+    }
+
+
+@pytest.mark.asyncio
+async def test_frontend_review_goal_rejects_group_revoked_at_retry_fence(
+    secured_client,
+    monkeypatch,
+    tmp_path: Path,
+):
+    """Goal activation cannot publish a retry generation from stale access."""
+
+    from backend.services.test_harness import test_harness_service
+
+    client, session_factory = secured_client
+    monkeypatch.setattr(test_harness_service, "db_factory", session_factory)
+    monkeypatch.setattr(
+        test_harness_service.child_service,
+        "db_factory",
+        session_factory,
+    )
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="frontend-goal-effect@example.com",
+        role="member",
+    )
+    repo = tmp_path / "frontend-goal-effect-repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    async with session_factory() as db:
+        project = Project(
+            name="frontend-goal-effect-project",
+            local_path=str(repo),
+            status="ready",
+            preview_config={
+                "version": 1,
+                "name": "Effect fence preview",
+                "setup": [],
+                "processes": [{
+                    "name": "web",
+                    "command": [
+                        "python",
+                        "-m",
+                        "http.server",
+                        "{preview_port}",
+                    ],
+                    "cwd": ".",
+                }],
+                "url": "http://127.0.0.1:{preview_port}/",
+                "health_url": "http://127.0.0.1:{preview_port}/",
+                "startup_timeout_seconds": 30,
+            },
+        )
+        db.add(project)
+        await db.flush()
+        task = Task(
+            title="frontend goal effect fence",
+            description="must remain terminal",
+            project_id=project.id,
+            target_repo=str(repo),
+            last_cwd=str(repo),
+            status="completed",
+            session_id="frontend-goal-effect-session",
+            provider="codex",
+            model="gpt-5.6-sol",
+            created_by=999,
+        )
+        db.add(task)
+        await db.commit()
+        project_id = project.id
+        task_id = task.id
+    await grant_group_project_access(
+        session_factory,
+        project_id=project_id,
+        user_id=member_id,
+    )
+    fence = revoke_group_membership_at_effect_fence(monkeypatch)
+
+    response = await client.post(
+        f"/api/tasks/{task_id}/frontend-review-goal",
+        headers={"Authorization": f"Bearer {member_token}"},
+        json={"message": "must not activate"},
+    )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "revoked": True}
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.status == "completed"
+        assert current.retry_count == 0
+        assert current.mode == "auto"
+        assert await db.scalar(
+            select(func.count(LogEntry.id)).where(LogEntry.task_id == task_id)
+        ) == 0
 
 
 @pytest.mark.asyncio
@@ -1586,7 +2318,8 @@ async def test_chat_send_enqueues_message(client, session_factory):
     data = resp.json()
     assert data["ok"] is True
     assert data["queued"] is True
-    assert data["session_id"] == "test-session-123"
+    assert data["has_session"] is True
+    assert "session_id" not in data
     assert data["workspace_review_expected"] is False
     assert data["workspace_review_baseline_run_id"] is None
 
@@ -1600,6 +2333,7 @@ async def test_chat_send_enqueues_message(client, session_factory):
     assert kwargs["initiating_user_id"] is None
     assert kwargs["initiating_user_role"] == "super_admin"
     assert kwargs["execution_mode"] == "unrestricted"
+    assert kwargs["execution_principal_kind"] == "deployment_token"
 
     # User message broadcast to task channel before enqueue
     task_broadcasts = [
@@ -1608,6 +2342,76 @@ async def test_chat_send_enqueues_message(client, session_factory):
     ]
     assert len(task_broadcasts) == 1
     assert task_broadcasts[0][0][1]["content"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_queued_follow_up_does_not_replace_active_turn_principal(
+    client,
+    session_factory,
+):
+    """A later sender belongs to the queued envelope, not the live turn.
+
+    The Task row is the authority of the currently executing generation.  A
+    follow-up may be admitted while that generation is still running, but its
+    principal must remain only in the source Log and Dispatcher message until
+    the queue consumer atomically claims the next turn.
+    """
+
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        status="executing",
+        provider="claude",
+        model="claude-sonnet-4-6",
+    )
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        task.execution_user_id = None
+        task.execution_user_role = "member"
+        task.execution_mode = "sandbox"
+        task.execution_principal_kind = "system"
+        await db.commit()
+
+    dispatcher = _mock_dispatcher()
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    with patch("backend.main.dispatcher", dispatcher), patch(
+        "backend.main.broadcaster",
+        broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={"message": "run this after the current turn"},
+        )
+
+    assert response.status_code == 200, response.text
+    queued = dispatcher.enqueue_message.await_args.kwargs
+    assert queued["initiating_user_id"] is None
+    assert queued["initiating_user_role"] == "super_admin"
+    assert queued["execution_mode"] == "unrestricted"
+    assert queued["execution_principal_kind"] == "deployment_token"
+
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        source = await db.scalar(
+            select(LogEntry)
+            .where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+            .order_by(LogEntry.id.desc())
+        )
+    assert (
+        task.execution_user_id,
+        task.execution_user_role,
+        task.execution_mode,
+        task.execution_principal_kind,
+    ) == (None, "member", "sandbox", "system")
+    assert json.loads(source.raw_json)["execution_principal"] == {
+        "user_id": None,
+        "role": "super_admin",
+        "mode": "unrestricted",
+        "kind": "deployment_token",
+    }
 
 
 @pytest.mark.asyncio
@@ -1730,12 +2534,17 @@ async def test_chat_sender_prefix_is_display_only(session_factory):
         await db.commit()
         await db.refresh(sender)
         await db.refresh(task)
+        sender_id = sender.id
 
         mock_d = _mock_dispatcher()
         mock_broadcaster = MagicMock()
         mock_broadcaster.broadcast = AsyncMock()
         request = SimpleNamespace(
-            state=SimpleNamespace(user_id=sender.id, user_role="super_admin")
+            state=SimpleNamespace(
+                user_id=sender_id,
+                user_role="super_admin",
+                auth_type="jwt",
+            )
         )
 
         with patch("backend.main.dispatcher", mock_d), \
@@ -1762,13 +2571,69 @@ async def test_chat_sender_prefix_is_display_only(session_factory):
         )
 
     assert result["queued"] is True
-    assert mock_d.enqueue_message.call_args.kwargs["prompt"] == "[BUG] preserve this tag"
+    queued = mock_d.enqueue_message.call_args.kwargs
+    assert queued["prompt"] == "[BUG] preserve this tag"
+    assert queued["initiating_user_id"] == sender_id
+    assert queued["initiating_user_role"] == "super_admin"
+    assert queued["execution_mode"] == "unrestricted"
+    assert queued["execution_principal_kind"] == "user"
     assert stored.content == "[Alice] [BUG] preserve this tag"
-    assert json.loads(stored.raw_json)["raw_content"] == "[BUG] preserve this tag"
+    metadata = json.loads(stored.raw_json)
+    assert metadata["raw_content"] == "[BUG] preserve this tag"
+    assert metadata["execution_principal"] == {
+        "user_id": sender_id,
+        "role": "super_admin",
+        "mode": "unrestricted",
+        "kind": "user",
+    }
     assert history[-1]["raw_content"] == "[BUG] preserve this tag"
     display_event = mock_broadcaster.broadcast.call_args.args[1]
     assert display_event["content"] == "[Alice] [BUG] preserve this tag"
     assert display_event["sender_name"] == "Alice"
+
+
+@pytest.mark.asyncio
+async def test_chat_unknown_request_identity_fails_closed(session_factory):
+    """A missing auth provenance must never synthesize deployment authority."""
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, send_chat_message
+
+    async with session_factory() as db:
+        task = Task(
+            title="Unknown identity",
+            description="d",
+            target_repo="/tmp",
+            session_id="unknown-identity-session",
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+
+        mock_d = _mock_dispatcher()
+        broadcaster = MagicMock()
+        broadcaster.broadcast = AsyncMock()
+        request = SimpleNamespace(
+            state=SimpleNamespace(user_id=None, user_role="super_admin")
+        )
+        with patch("backend.main.dispatcher", mock_d), patch(
+            "backend.main.broadcaster", broadcaster,
+        ), patch(
+            "backend.api.chat.require_task_access",
+            new_callable=AsyncMock,
+        ):
+            await send_chat_message(
+                task.id,
+                ChatMessage(message="do not elevate me"),
+                request,
+                db,
+            )
+
+    kwargs = mock_d.enqueue_message.call_args.kwargs
+    assert kwargs["initiating_user_id"] is None
+    assert kwargs["initiating_user_role"] == "member"
+    assert kwargs["execution_mode"] == "sandbox"
+    assert kwargs["execution_principal_kind"] == "system"
 
 
 @pytest.mark.asyncio
@@ -1817,16 +2682,22 @@ async def test_service_token_sender_prefix_is_display_only(session_factory):
             )
         )).scalar_one()
 
-    assert mock_d.enqueue_message.call_args.kwargs["prompt"] == "[BUG] keep this raw"
+    kwargs = mock_d.enqueue_message.call_args.kwargs
+    assert kwargs["prompt"] == "[BUG] keep this raw"
+    assert kwargs["initiating_user_id"] is None
+    assert kwargs["initiating_user_role"] == "super_admin"
+    assert kwargs["execution_mode"] == "unrestricted"
+    assert kwargs["execution_principal_kind"] == "deployment_token"
     assert stored.content == "[Admin] [BUG] keep this raw"
     assert json.loads(stored.raw_json) == {
         "raw_content": "[BUG] keep this raw",
         "sender_name": "Admin",
-        "execution_principal": {
-            "user_id": None,
-            "role": "super_admin",
-            "mode": "unrestricted",
-        },
+            "execution_principal": {
+                "user_id": None,
+                "role": "super_admin",
+                "mode": "unrestricted",
+                "kind": "deployment_token",
+            },
     }
     event = mock_broadcaster.broadcast.call_args.args[1]
     assert event["content"] == "[Admin] [BUG] keep this raw"
@@ -1839,19 +2710,30 @@ async def test_member_chat_turn_is_durably_sandboxed(session_factory):
 
     from backend.api.chat import ChatMessage, send_chat_message
     async with session_factory() as db:
+        member = User(
+            email="sandbox-member@test.local",
+            name="Sandbox Member",
+            password_hash="unused",
+            role="member",
+        )
         task = Task(
             title="Member sandbox",
             description="d",
             target_repo="/tmp",
             session_id="member-sandbox-session",
         )
-        db.add(task)
+        db.add_all([member, task])
         await db.commit()
+        await db.refresh(member)
         await db.refresh(task)
+        task.created_by = member.id
+        await db.commit()
+        member_id = member.id
+        task_id = task.id
 
         mock_d = _mock_dispatcher()
         request = SimpleNamespace(state=SimpleNamespace(
-            user_id=None,
+            user_id=member_id,
             user_role="member",
             auth_type="jwt",
         ))
@@ -1864,16 +2746,17 @@ async def test_member_chat_turn_is_durably_sandboxed(session_factory):
             new_callable=AsyncMock,
         ):
             await send_chat_message(
-                task.id,
+                task_id,
                 ChatMessage(message="run safely"),
                 request,
                 db,
             )
 
     kwargs = mock_d.enqueue_message.call_args.kwargs
-    assert kwargs["initiating_user_id"] is None
+    assert kwargs["initiating_user_id"] == member_id
     assert kwargs["initiating_user_role"] == "member"
     assert kwargs["execution_mode"] == "sandbox"
+    assert kwargs["execution_principal_kind"] == "user"
 
 
 @pytest.mark.asyncio
@@ -1913,9 +2796,14 @@ async def test_shared_chat_sender_prefix_is_display_only(client, session_factory
             )
 
     assert response["queued"] is True
-    assert mock_d.enqueue_message.call_args.kwargs["prompt"] == "[TODO] keep the tag"
+    enqueue_kwargs = mock_d.enqueue_message.call_args.kwargs
+    assert enqueue_kwargs["prompt"] == "[TODO] keep the tag"
+    assert enqueue_kwargs["initiating_user_id"] is None
+    assert enqueue_kwargs["initiating_user_role"] == "member"
+    assert enqueue_kwargs["execution_mode"] == "sandbox"
+    assert enqueue_kwargs["execution_principal_kind"] == "system"
     assert isinstance(
-        mock_d.enqueue_message.call_args.kwargs["source_log_id"],
+        enqueue_kwargs["source_log_id"],
         int,
     )
     async with session_factory() as db:
@@ -2107,8 +2995,18 @@ async def test_chat_send_queues_even_when_task_busy(client, session_factory):
 
 
 @pytest.mark.asyncio
-async def test_chat_send_with_image_paths_appends_to_prompt(client, session_factory):
+async def test_chat_send_with_image_paths_appends_to_prompt(
+    client,
+    session_factory,
+    monkeypatch,
+    tmp_path,
+):
     """When image_paths are provided, the enqueued prompt includes the file list."""
+    image_one = tmp_path / "11111111-1111-4111-8111-111111111111.png"
+    image_two = tmp_path / "22222222-2222-4222-8222-222222222222.jpg"
+    image_one.write_bytes(b"first image")
+    image_two.write_bytes(b"second image")
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", tmp_path)
     task_id = await _create_task_with_session(client, session_factory)
 
     mock_d = _mock_dispatcher()
@@ -2119,13 +3017,19 @@ async def test_chat_send_with_image_paths_appends_to_prompt(client, session_fact
          patch("backend.main.broadcaster", mock_broadcaster):
         resp = await client.post(
             f"/api/tasks/{task_id}/chat",
-            json={"message": "check this", "image_paths": ["/uploads/img1.png", "/uploads/img2.jpg"]},
+            json={
+                "message": "check this",
+                "image_paths": [
+                    f"/api/uploads/{image_one.name}",
+                    f"/api/uploads/{image_two.name}",
+                ],
+            },
         )
     assert resp.status_code == 200
 
     prompt_used = mock_d.enqueue_message.call_args.kwargs["prompt"]
-    assert "/uploads/img1.png" in prompt_used
-    assert "/uploads/img2.jpg" in prompt_used
+    assert str(image_one) in prompt_used
+    assert str(image_two) in prompt_used
     assert "Read" in prompt_used  # the instruction to use the Read tool
 
 
@@ -2309,7 +3213,7 @@ async def test_codex_worker_chat_rejects_monitor_before_proxy_or_log(
 
 
 @pytest.mark.asyncio
-async def test_codex_shared_chat_rejects_monitor_before_local_side_effects(
+async def test_legacy_shared_shadow_chat_is_read_only_before_side_effects(
     client,
     session_factory,
     monkeypatch,
@@ -2359,8 +3263,8 @@ async def test_codex_shared_chat_rejects_monitor_before_local_side_effects(
         json={"message": "$monitor watch the build"},
     )
 
-    assert response.status_code == 400
-    assert "does not support Skills: monitor" in response.text
+    assert response.status_code == 410
+    assert "shared tasks are read-only" in response.text
     proxy_chat.assert_not_awaited()
     broadcaster.broadcast.assert_not_awaited()
     async with session_factory() as db:
@@ -2374,13 +3278,11 @@ async def test_codex_shared_chat_rejects_monitor_before_local_side_effects(
 
 
 @pytest.mark.asyncio
-async def test_shared_owner_rejection_leaves_no_local_ghost_message(
+async def test_legacy_shared_shadow_never_calls_remote_owner(
     client,
     session_factory,
     monkeypatch,
 ):
-    from types import SimpleNamespace
-
     from backend.models.feishu_binding import FeishuUserBinding
     from backend.models.task_share import SharedTaskReceived
     import backend.services.shared_proxy as shared_proxy_module
@@ -2414,12 +3316,7 @@ async def test_shared_owner_rejection_leaves_no_local_ghost_message(
         await db.commit()
         task_id = shadow.id
 
-    rejection = RuntimeError("owner rejected active review")
-    rejection.response = SimpleNamespace(
-        status_code=409,
-        json=lambda: {"detail": "review is still active"},
-    )
-    proxy_chat = AsyncMock(side_effect=rejection)
+    proxy_chat = AsyncMock()
     broadcaster = MagicMock(broadcast=AsyncMock())
     monkeypatch.setattr(shared_proxy_module, "proxy_chat", proxy_chat)
     monkeypatch.setattr("backend.main.broadcaster", broadcaster)
@@ -2429,8 +3326,9 @@ async def test_shared_owner_rejection_leaves_no_local_ghost_message(
         json={"message": "explain this review"},
     )
 
-    assert response.status_code == 409
-    assert response.json()["detail"] == "review is still active"
+    assert response.status_code == 410
+    assert "shared tasks are read-only" in response.text
+    proxy_chat.assert_not_awaited()
     broadcaster.broadcast.assert_not_awaited()
     async with session_factory() as db:
         stored = list((await db.execute(
@@ -2471,11 +3369,19 @@ async def test_mentioning_skill_command_mid_message_does_not_invoke_it(
 
 
 @pytest.mark.asyncio
-async def test_chat_send_with_image_paths_stores_original_message(client, session_factory):
+async def test_chat_send_with_image_paths_stores_original_message(
+    client,
+    session_factory,
+    monkeypatch,
+    tmp_path,
+):
     """LogEntry content stores the original user message (without image instruction)."""
     from backend.models.log_entry import LogEntry
     from sqlalchemy import select
 
+    image = tmp_path / "33333333-3333-4333-8333-333333333333.png"
+    image.write_bytes(b"image")
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", tmp_path)
     task_id = await _create_task_with_session(client, session_factory)
 
     mock_d = _mock_dispatcher()
@@ -2486,7 +3392,10 @@ async def test_chat_send_with_image_paths_stores_original_message(client, sessio
          patch("backend.main.broadcaster", mock_broadcaster):
         await client.post(
             f"/api/tasks/{task_id}/chat",
-            json={"message": "my message", "image_paths": ["/uploads/z.png"]},
+            json={
+                "message": "my message",
+                "image_paths": [f"/api/uploads/{image.name}"],
+            },
         )
 
     async with session_factory() as db:
@@ -3118,6 +4027,64 @@ async def test_inject_capabilities_advertise_attachment_protocol(
         "attachment_protocol": 1,
         "codex_native_inputs": True,
     }
+
+
+@pytest.mark.asyncio
+async def test_live_injection_rejects_group_chat_share_before_transport(
+    secured_client,
+):
+    """A group chat grant never authorizes live-turn steering."""
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="live-inject-group-effect@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        task = Task(
+            title="live injection effect fence",
+            description="group grant disappears before transport",
+            status="executing",
+            session_id="live-injection-effect-session",
+            provider="claude",
+            created_by=999,
+            execution_user_id=member_id,
+            execution_user_role="member",
+            execution_mode="sandbox",
+            execution_principal_kind="user",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+    await grant_group_task_chat_access(
+        session_factory,
+        task_id=task_id,
+        user_id=member_id,
+    )
+    instance_manager = MagicMock()
+    instance_manager.inject_pty_message = AsyncMock(return_value=True)
+    instance_manager.inject_codex_message = AsyncMock(return_value=True)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+
+    with (
+        patch("backend.main.instance_manager", instance_manager),
+        patch("backend.main.broadcaster", broadcaster),
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            headers={"Authorization": f"Bearer {member_token}"},
+            json={"message": "must not steer"},
+        )
+
+    assert response.status_code == 403, response.text
+    instance_manager.inject_pty_message.assert_not_awaited()
+    instance_manager.inject_codex_message.assert_not_awaited()
+    broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(func.count(LogEntry.id)).where(LogEntry.task_id == task_id)
+        ) == 0
 
 
 @pytest.mark.asyncio

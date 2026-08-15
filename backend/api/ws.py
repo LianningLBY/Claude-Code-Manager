@@ -40,6 +40,22 @@ def _ws_identity(ws: WebSocket) -> dict | None:
     """Return the authenticated WS identity, including its role."""
     auth = ws.headers.get("authorization", "")
     token = ws.query_params.get("token", "")
+    if settings.ccm_node_role == "worker":
+        # The sole Worker socket is the Manager relay/control channel.  Human
+        # JWT sessions and legacy auth-disabled super-admin semantics belong
+        # only to the authoritative Manager.
+        if not settings.auth_token:
+            return None
+        if (
+            auth.startswith("Bearer ")
+            and auth[7:] == settings.auth_token
+        ) or token == settings.auth_token:
+            return {
+                "user_id": None,
+                "role": "super_admin",
+                "auth_type": "worker_control_plane",
+            }
+        return None
     # Legacy admin token (header or query param)
     if settings.auth_token and auth.startswith("Bearer ") and auth[7:] == settings.auth_token:
         return {"user_id": None, "role": "super_admin", "auth_type": "token"}
@@ -176,7 +192,7 @@ async def _ws_plan_channel_allowed(identity: dict, plan_id: int, db=None) -> boo
 
     from backend.database import async_session
     from backend.models.plan import Plan
-    from backend.api.deps import has_project_access, has_worker_access
+    from backend.api.deps import has_project_access
 
     async def check(session) -> bool:
         plan = await session.get(Plan, plan_id)
@@ -190,10 +206,6 @@ async def _ws_plan_channel_allowed(identity: dict, plan_id: int, db=None) -> boo
         if user_id is not None and plan.created_by == user_id:
             return True
         request = _acl_request(identity)
-        if plan.worker_id is not None and await has_worker_access(
-            request, plan.worker_id, session
-        ):
-            return True
         if plan.project_id is not None and await has_project_access(
             request, plan.project_id, session
         ):
@@ -405,7 +417,26 @@ async def websocket_endpoint(ws: WebSocket):
             action = msg.get("action")
             channels = msg.get("channels", [])
 
-            if action == "subscribe" and channels:
+            if action == "worker_launch_admission_response":
+                # This reverse control message exists only on a Worker.  The
+                # HMAC is checked again by the one-shot waiter, while requiring
+                # the deployment token here prevents a local JWT administrator
+                # from acting as the Manager control plane.
+                if (
+                    settings.ccm_node_role != "worker"
+                    or identity.get("auth_type")
+                    != "worker_control_plane"
+                ):
+                    continue
+                from backend.services.worker_launch_admission import (
+                    accept_worker_launch_admission_response,
+                )
+
+                accept_worker_launch_admission_response(
+                    msg,
+                    control_token=settings.auth_token,
+                )
+            elif action == "subscribe" and channels:
                 if not isinstance(channels, list):
                     continue
                 # Stable de-duplication prevents repeated broadcaster entries
@@ -474,81 +505,4 @@ async def websocket_endpoint(ws: WebSocket):
         acl_task.cancel()
         await asyncio.gather(acl_task, return_exceptions=True)
         await broadcaster.unsubscribe(ws)
-
-
-@router.websocket("/ws/shared")
-async def shared_websocket_endpoint(ws: WebSocket):
-    """Shared task WebSocket authenticated by a revocable share token."""
-    from backend.database import async_session
-    from backend.main import broadcaster
-    from backend.models.task_share import TaskShare
-
-    token = ws.query_params.get("token", "")
-    task_id_str = ws.query_params.get("task_id", "")
-    if not token or not task_id_str:
-        await ws.close(code=4400)
-        return
-
-    try:
-        task_id = int(task_id_str)
-    except ValueError:
-        await ws.close(code=4400)
-        return
-
-    async with async_session() as db:
-        result = await db.execute(
-            select(TaskShare).where(
-                TaskShare.task_id == task_id,
-                TaskShare.share_token == token,
-                TaskShare.status == "active",
-            )
-        )
-        share = result.scalar_one_or_none()
-        if not share:
-            await ws.close(code=4403)
-            return
-        share_id = share.id
-
-    await ws.accept()
-    channel = f"task:{task_id}"
-    await broadcaster.subscribe(ws, [channel])
-    await ws.send_text(json.dumps({
-        "action": "subscribed",
-        "channels": [channel],
-    }))
-
-    async def revalidate_share() -> None:
-        try:
-            while True:
-                await asyncio.sleep(_WS_ACL_RECHECK_SECONDS)
-                async with async_session() as db:
-                    active = await db.scalar(
-                        select(TaskShare.id).where(
-                            TaskShare.id == share_id,
-                            TaskShare.task_id == task_id,
-                            TaskShare.share_token == token,
-                            TaskShare.status == "active",
-                        )
-                    )
-                if active is None:
-                    await ws.close(code=4403, reason="Task share revoked")
-                    return
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Shared WebSocket ACL revalidation failed")
-            try:
-                await ws.close(code=1011, reason="ACL revalidation failed")
-            except Exception:
-                pass
-
-    acl_task = asyncio.create_task(revalidate_share())
-    try:
-        while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        pass
-    finally:
-        acl_task.cancel()
-        await asyncio.gather(acl_task, return_exceptions=True)
         await broadcaster.unsubscribe(ws)

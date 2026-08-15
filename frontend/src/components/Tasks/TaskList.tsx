@@ -11,6 +11,12 @@ import { formatDateTime } from '../../config/timezone';
 import { useTaskReorder } from '../../hooks/useTaskReorder';
 import { getTaskStatusLabel } from './taskStatus';
 import { DeliveryRunPanel } from './DeliveryRunPanel';
+import {
+  canControlTask,
+  canManageTaskShare,
+  readStoredUserIdentity,
+  taskHasSession,
+} from './taskSharePermissions';
 
 interface TaskListProps {
   tasks: Task[];
@@ -52,6 +58,7 @@ function canRetryTask(task: Task): boolean {
 }
 
 export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat, activeTaskId, autoSortOnAccess, onBeforeArchive, onReorder }: TaskListProps) {
+  const currentUser = readStoredUserIdentity();
   const projectMap = useMemo(() => {
     const map: Record<number, { name: string; color: string | null }> = {};
     for (const p of projects) map[p.id] = { name: p.name, color: p.badge_color };
@@ -159,7 +166,14 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
     }
     onRefresh();
   }, [onRefresh, onReorder]);
-  const { draggingId, overIndex, targetProps, pointerHandleProps, ghost } = useTaskReorder(tasks, handleReordered, autoSortOnAccess);
+  const {
+    draggingId,
+    overIndex,
+    dropTargetProps,
+    targetProps,
+    pointerHandleProps,
+    ghost,
+  } = useTaskReorder(tasks, handleReordered, autoSortOnAccess);
 
   if (tasks.length === 0) {
     return <p className="text-gray-500 text-sm text-center py-8">No tasks yet</p>;
@@ -172,7 +186,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
       {tasks.map((t, idx) => (
         <div
           key={t.id}
-          {...targetProps(t, idx)}
+          {...(canControlTask(t) ? targetProps(t, idx) : dropTargetProps(t, idx))}
           className={`relative rounded-xl p-3 border transition-[opacity,border-color,box-shadow] ${
             draggingId === t.id ? 'opacity-40' : ''
           } ${overIndex === idx && draggingId !== null && draggingId !== t.id ? 'ring-2 ring-indigo-400' : ''} ${
@@ -185,7 +199,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
         >
           {/* 拖拽手柄（右下角，空间更宽裕）：卡片正文是可选中文字，整卡
               draggable 会被文本选择手势抢走，必须用显式手柄拖动 */}
-          {t.mode !== 'delivery_loop' && (
+          {canControlTask(t) && t.mode !== 'delivery_loop' && (
             <span
               {...pointerHandleProps(t, idx)}
               className="absolute bottom-1.5 right-1.5 p-1 cursor-grab active:cursor-grabbing text-gray-600 hover:text-gray-400 select-none"
@@ -217,7 +231,12 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                   <Pin size={11} className="shrink-0" />
                   <span className="truncate">{t.attention_tag}</span>
                 </span>
-              ) : editingAttentionTagId !== t.id && (
+              ) : !canControlTask(t) && t.attention_tag ? (
+                <span className="inline-flex min-w-0 max-w-[min(16rem,55vw)] items-center gap-1 rounded-md border border-amber-400/25 bg-amber-500/15 px-1.5 py-0.5 text-xs font-medium text-amber-300">
+                  <Pin size={11} className="shrink-0" />
+                  <span className="truncate">{t.attention_tag}</span>
+                </span>
+              ) : canControlTask(t) && editingAttentionTagId !== t.id && (
                 <AttentionTag
                   taskId={t.id}
                   value={t.attention_tag}
@@ -228,9 +247,13 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                   className="max-w-[min(16rem,55vw)]"
                 />
               )}
-              {t.shared_from_id && (
+              {t.access_scope === 'chat' ? (
+                <span className="text-xs bg-orange-600/30 text-orange-300 px-1.5 rounded font-medium">Shared · Chat</span>
+              ) : !canControlTask(t) ? (
+                <span className="text-xs bg-orange-600/30 text-orange-300 px-1.5 rounded font-medium">Restricted</span>
+              ) : t.shared_from_id ? (
                 <span className="text-xs bg-orange-600/30 text-orange-300 px-1.5 rounded font-medium">Shared</span>
-              )}
+              ) : null}
               {t.project_id && projectMap[t.project_id] && (() => {
                 const proj = projectMap[t.project_id!];
                 const colorDef = TAG_COLOR_OPTIONS.find((c) => c.key === proj.color);
@@ -249,7 +272,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               }`}>
                 {getTaskStatusLabel(t)}
               </span>
-              {t.mode === 'delivery_loop' && t.delivery_run_id != null && (
+              {canControlTask(t) && t.mode === 'delivery_loop' && t.delivery_run_id != null && (
                 <button
                   type="button"
                   onClick={() => setOpenDeliveryRunId((current) => (
@@ -283,7 +306,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                     {t.provider === 'codex' ? 'Codex' : 'Claude'}
                   </span>
                   <FastModeBadge task={t} />
-                  {t.mode !== 'delivery_loop' && (
+                  {canControlTask(t) && t.mode !== 'delivery_loop' && (
                     <>
                       <TaskConfigBadge task={t} onRefresh={onRefresh} />
                       <PluginsBadge task={t} onRefresh={onRefresh} />
@@ -295,21 +318,21 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
             </div>
             {/* Action buttons — always top-right aligned */}
             <div className="flex gap-1 shrink-0 items-center">
-              <button
-                onClick={() => handleStar(t.id)}
-                className={`p-1.5 transition-colors ${t.starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
-                title={t.starred ? "Unstar" : "Star"}
-              >
-                <Star size={16} fill={t.starred ? 'currentColor' : 'none'} />
-              </button>
-              <button
-                onClick={() => handleToggleUnread(t.id, t.has_unread)}
-                className={`p-1.5 transition-colors ${t.has_unread ? 'text-indigo-400 hover:text-indigo-300' : 'text-gray-600 hover:text-indigo-400'}`}
-                title={t.has_unread ? "Mark as read" : "Mark as unread"}
-              >
-                {t.has_unread ? <MailOpen size={16} /> : <Mail size={16} />}
-              </button>
-              {t.session_id && (
+              {canControlTask(t) && <button
+                  onClick={() => handleStar(t.id)}
+                  className={`p-1.5 transition-colors ${t.starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
+                  title={t.starred ? "Unstar" : "Star"}
+                >
+                  <Star size={16} fill={t.starred ? 'currentColor' : 'none'} />
+                </button>}
+              {canControlTask(t) && <button
+                  onClick={() => handleToggleUnread(t.id, t.has_unread)}
+                  className={`p-1.5 transition-colors ${t.has_unread ? 'text-indigo-400 hover:text-indigo-300' : 'text-gray-600 hover:text-indigo-400'}`}
+                  title={t.has_unread ? "Mark as read" : "Mark as unread"}
+                >
+                  {t.has_unread ? <MailOpen size={16} /> : <Mail size={16} />}
+                </button>}
+              {taskHasSession(t) && (
                 <button
                   onClick={() => onOpenChat(t)}
                   className="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600/30"
@@ -326,7 +349,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                 {copiedId === t.id ? <Check size={16} className="text-green-400" /> : <Copy size={16} />}
               </button>
               {/* Controller-owned Delivery Tasks are read-only scheduler shells. */}
-              {t.mode !== 'delivery_loop' && <div className="relative">
+              {canControlTask(t) && t.mode !== 'delivery_loop' && <div className="relative">
                 <button
                   onClick={() => {
                     setMenuOpenId(menuOpenId === t.id ? null : t.id);
@@ -353,16 +376,18 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                       </button>
                     )}
 
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setMenuOpenId(null);
-                        window.dispatchEvent(new CustomEvent('ccm-team-share-task', { detail: { task: t } }));
-                      }}
-                      className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-gray-300 hover:bg-gray-800 text-left"
-                    >
-                      <UserPlus size={14} /> Team Share
-                    </button>
+                    {canManageTaskShare(t, currentUser) && (
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setMenuOpenId(null);
+                          window.dispatchEvent(new CustomEvent('ccm-team-share-task', { detail: { task: t } }));
+                        }}
+                        className="w-full flex items-center gap-2 px-3 py-1.5 text-sm text-gray-300 hover:bg-gray-800 text-left"
+                      >
+                        <UserPlus size={14} /> Team Share
+                      </button>
+                    )}
                     {(t.background_active || ['in_progress', 'executing', 'waiting_capability'].includes(t.status)) && (
                       <button
                         onClick={() => { handleCancel(t); setMenuOpenId(null); }}
@@ -401,7 +426,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
           </div>
           {/* Row 2: title + description (full width; pr 留出右下角手柄位) */}
           <div className="mt-1 pl-[1.125rem] pr-7">
-            {t.mode !== 'delivery_loop' && editingAttentionTagId === t.id && (
+            {canControlTask(t) && t.mode !== 'delivery_loop' && editingAttentionTagId === t.id && (
               <AttentionTag
                 taskId={t.id}
                 value={t.attention_tag}
@@ -413,7 +438,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               />
             )}
             {/* Title (editable) */}
-            {t.mode !== 'delivery_loop' && editingTitleId === t.id ? (
+            {canControlTask(t) && t.mode !== 'delivery_loop' && editingTitleId === t.id ? (
               <input
                 ref={titleInputRef}
                 value={titleDraft}
@@ -466,7 +491,8 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               <p className="text-red-400 text-xs mt-1">{t.error_message}</p>
             )}
           </div>
-          {t.mode === 'delivery_loop'
+          {canControlTask(t)
+            && t.mode === 'delivery_loop'
             && t.delivery_run_id != null
             && openDeliveryRunId === t.delivery_run_id && (
             <DeliveryRunPanel

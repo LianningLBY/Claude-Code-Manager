@@ -1,13 +1,14 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import re
 import secrets
 from datetime import datetime
 from weakref import WeakKeyDictionary
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
 from sqlalchemy import (
     and_,
@@ -20,6 +21,8 @@ from sqlalchemy import (
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
+from starlette.requests import ClientDisconnect
 
 from backend.config import settings
 from backend.database import get_db
@@ -42,8 +45,12 @@ from backend.services.pr_review_actions import (
 )
 from backend.api.deps import (
     get_current_user_id,
-    get_current_user_role,
-    has_worker_access,
+    is_admin,
+    lock_project_effect_access,
+    lock_project_worker_effect_access,
+    lock_request_user_authority,
+    lock_worker_effect_access,
+    require_admin,
     require_project_access,
     require_worker_target_access,
     require_task_control,
@@ -74,6 +81,13 @@ logger = logging.getLogger(__name__)
 
 _GH_LOGIN_CACHE: str | None = None
 _GIT_COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{40}\Z")
+_PR_REVIEW_LIST_SUMMARY_MAX_BYTES = 2000
+_MAX_GITHUB_REPO_FULL_NAME_CHARS = 200
+# GitHub documents a hard 25 MB webhook payload ceiling.  Enforce the same
+# boundary before JSON parsing, HMAC work, or a repository lookup so the
+# unauthenticated endpoint never buffers an unbounded request.  The streaming
+# check remains authoritative when Content-Length is absent or dishonest.
+_MAX_GITHUB_WEBHOOK_BODY_BYTES = 25 * 1024 * 1024
 _PR_SYNCHRONIZE_LOCKS: WeakKeyDictionary[
     asyncio.AbstractEventLoop,
     dict[int, asyncio.Lock],
@@ -200,7 +214,7 @@ def _gh_login() -> str:
 def _require_current_webhook_signature(
     repo: MonitoredRepo,
     *,
-    body: bytes,
+    body: bytes | bytearray,
     signature_header: str,
 ) -> None:
     """Verify the delivery against the exact locked monitor generation."""
@@ -291,6 +305,80 @@ def _duplicate_review_response(
     }
 
 
+async def _prepare_pr_review_context_or_422(
+    db: AsyncSession,
+    repo: MonitoredRepo,
+    pr_data: dict,
+    *,
+    base_ref: str | None = None,
+) -> dict:
+    """Prepare immutable review input with a stable public size rejection."""
+
+    from backend.services.pr_review_service import (
+        PRReviewInputTooLarge,
+        prepare_pr_review_context,
+    )
+
+    try:
+        if base_ref is None:
+            return await prepare_pr_review_context(repo, pr_data)
+        return await prepare_pr_review_context(repo, pr_data, base_ref=base_ref)
+    except PRReviewInputTooLarge as exc:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+async def _create_pr_review_task_or_422(
+    db: AsyncSession,
+    repo: MonitoredRepo,
+    pr_data: dict,
+    *,
+    prepared_context: dict,
+):
+    """Create a review while keeping deterministic input limits client-visible."""
+
+    from backend.services.pr_review_service import (
+        PRReviewInputTooLarge,
+        create_pr_review_task,
+    )
+
+    try:
+        return await create_pr_review_task(
+            db,
+            repo,
+            pr_data,
+            prepared_context=prepared_context,
+        )
+    except PRReviewInputTooLarge as exc:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+async def _preflight_pr_review_prompts_or_422(
+    db: AsyncSession,
+    repo: MonitoredRepo,
+    pr_data: dict,
+    *,
+    prepared_context: dict,
+) -> None:
+    """Revalidate prompt budgets against repository policy under its lock."""
+
+    from backend.services.pr_review_service import (
+        PRReviewInputTooLarge,
+        preflight_pr_review_prompts,
+    )
+
+    try:
+        preflight_pr_review_prompts(
+            repo,
+            pr_data,
+            prepared_context=prepared_context,
+        )
+    except PRReviewInputTooLarge as exc:
+        await db.rollback()
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.get("/webhook-info")
 async def webhook_info():
     """Return the public webhook URL (from PUBLIC_BASE_URL), or null if unset."""
@@ -300,13 +388,32 @@ async def webhook_info():
 
 @router.get("/repos", response_model=list[MonitoredRepoResponse])
 async def list_repos(request: Request, db: AsyncSession = Depends(get_db)):
-    user_role = get_current_user_role(request)
-    user_id = get_current_user_id(request)
     stmt = select(MonitoredRepo).order_by(desc(MonitoredRepo.created_at))
-    if user_role not in ("admin", "super_admin"):
-        from backend.models.worker import Worker
-        owned_worker_ids = select(Worker.id).where(Worker.owner_user_id == user_id)
-        stmt = stmt.where(MonitoredRepo.worker_id.in_(owned_worker_ids))
+    if not is_admin(request):
+        user_id = get_current_user_id(request)
+        if user_id is None:
+            stmt = stmt.where(False)
+        else:
+            from backend.models.team_share import TeamProjectShare
+            from backend.models.user_group import UserGroupMember
+
+            group_ids = select(UserGroupMember.group_id).where(
+                UserGroupMember.user_id == user_id
+            )
+            project_ids = select(TeamProjectShare.project_id).where(
+                (
+                    (TeamProjectShare.target_type == "user")
+                    & (TeamProjectShare.target_id == user_id)
+                )
+                | (
+                    (TeamProjectShare.target_type == "group")
+                    & TeamProjectShare.target_id.in_(group_ids)
+                )
+            )
+            # A Worker owner administers compute capacity only. Repository
+            # visibility follows the Project ACL, and projectless monitors
+            # remain administrator-only because they have no durable owner.
+            stmt = stmt.where(MonitoredRepo.project_id.in_(project_ids))
     result = await db.execute(stmt)
     return result.scalars().all()
 
@@ -316,9 +423,92 @@ async def _require_pr_monitor_access(
     db: AsyncSession,
     repo: MonitoredRepo,
 ) -> None:
-    """Require ownership of this repo's exact execution Worker."""
-    if not await has_worker_access(request, repo.worker_id, db):
+    """Authorize monitor data independently from its compute location."""
+
+    if is_admin(request):
+        return
+    if repo.project_id is None:
         raise HTTPException(403, "No access to this PR monitor")
+    await require_project_access(request, repo.project_id, db)
+
+
+async def _reauthorize_pr_effect(
+    request: Request,
+    db: AsyncSession,
+    repo: MonitoredRepo,
+) -> None:
+    """Revalidate monitor ACL under the Project share writer fence.
+
+    Finding actions first serialize on their MonitoredRepo.  Project-derived
+    member authority can still be revoked independently, so the effect must
+    also take the Project row boundary used by TeamProjectShare add/remove and
+    re-check access after any wait.  Projectless monitors remain admin-only;
+    after the repository boundary they also fence the mutable JWT User row.
+    """
+
+    if repo.project_id is not None:
+        try:
+            await lock_project_effect_access(request, repo.project_id, db)
+        except HTTPException as exc:
+            if exc.status_code == 404:
+                raise HTTPException(
+                    409,
+                    "PR monitor Project is no longer available",
+                ) from exc
+            raise
+        return
+    await _require_pr_monitor_access(request, db, repo)
+    await lock_request_user_authority(request, db)
+
+
+async def _reauthorize_pr_topology_effect(
+    request: Request,
+    db: AsyncSession,
+    repo: MonitoredRepo,
+    *,
+    target_project_id: int | None,
+) -> None:
+    """Fence an administrator-only monitor Project move deterministically.
+
+    The repository row is already locked.  A move can involve both the old
+    and new Projects, so lock every Project in numeric order before the User
+    row.  Calling the single-Project helper twice would instead produce
+    ``old Project -> User -> new Project`` and let two opposite moves deadlock.
+    """
+
+    require_admin(request)
+    from backend.services.project_share_admission import (
+        ProjectShareAdmissionError,
+        lock_project_share_authority,
+    )
+
+    project_ids = sorted(
+        {
+            project_id
+            for project_id in (repo.project_id, target_project_id)
+            if project_id is not None
+        }
+    )
+    for project_id in project_ids:
+        try:
+            await lock_project_share_authority(db, project_id)
+        except ProjectShareAdmissionError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            if project_id == target_project_id:
+                raise HTTPException(404, "Project not found") from exc
+            raise HTTPException(
+                409,
+                "PR monitor Project is no longer available",
+            ) from exc
+    await lock_request_user_authority(request, db)
+
+
+def _pr_effect_authorizer(request: Request):
+    async def authorize(db: AsyncSession, repo: MonitoredRepo) -> None:
+        await _reauthorize_pr_effect(request, db, repo)
+
+    return authorize
 
 
 _ACTIVE_REVIEW_STATUSES = (
@@ -591,7 +781,6 @@ async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSess
     ):
         raise HTTPException(400, "Merge Queue requires panel review and exact-head CI")
     worker_id = body.worker_id
-    await require_worker_target_access(request, worker_id, db)
     if body.project_id is not None:
         from backend.models.project import Project
 
@@ -604,6 +793,12 @@ async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSess
                 400,
                 "PR monitor Worker must match the selected Project location",
             )
+    else:
+        # MonitoredRepo has no creator/owner column, so a projectless monitor
+        # cannot be safely delegated to a member. Administrators may still
+        # create the legacy standalone form and choose an exact target node.
+        require_admin(request)
+        await require_worker_target_access(request, worker_id, db)
 
     # Authorize the exact target first so the global uniqueness check cannot
     # be used by another Worker owner to enumerate monitored repositories.
@@ -612,6 +807,41 @@ async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSess
     )
     if existing.scalar_one_or_none():
         raise HTTPException(409, f"Repository '{body.repo_full_name}' already monitored")
+
+    # The checks above are deliberately optimistic.  Start a fresh mutation
+    # transaction, establish Project -> Worker -> User authority, then insert.
+    # This closes the gap
+    # where a Project share is revoked or an administrator is disabled after
+    # HTTP authentication but before the durable monitor is created.
+    await db.rollback()
+    if body.project_id is not None:
+        # Project is the shared topology boundary.  Fence its current Worker
+        # before group/User authority so Task, Plan, and Monitor creation all
+        # use Project -> Worker -> membership -> User.
+        project = await lock_project_worker_effect_access(
+            request,
+            body.project_id,
+            db,
+        )
+        if project.worker_id != worker_id:
+            raise HTTPException(
+                400,
+                "PR monitor Worker must match the selected Project location",
+            )
+    else:
+        require_admin(request)
+        await lock_worker_effect_access(request, worker_id, db)
+
+    existing = await db.execute(
+        select(MonitoredRepo).where(
+            MonitoredRepo.repo_full_name == body.repo_full_name
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            409,
+            f"Repository '{body.repo_full_name}' already monitored",
+        )
 
     repo = MonitoredRepo(
         repo_full_name=body.repo_full_name,
@@ -632,7 +862,14 @@ async def create_repo(request: Request, body: MonitoredRepoCreate, db: AsyncSess
         webhook_secret=secrets.token_hex(32),
     )
     db.add(repo)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            f"Repository '{body.repo_full_name}' already monitored",
+        ) from exc
     await db.refresh(repo)
     return repo
 
@@ -668,13 +905,39 @@ async def update_repo(
             item.model_dump() if hasattr(item, "model_dump") else item
             for item in update_data["required_checks"]
         ]
+    optimistic_project_move = (
+        "project_id" in update_data
+        and update_data["project_id"] != repo.project_id
+    )
+    if optimistic_project_move:
+        # Project binding is administrator-owned topology. Reject before
+        # inspecting active workflow state so a member cannot distinguish a
+        # busy monitor from an idle one through a forbidden move.
+        require_admin(request)
     await db.rollback()
     async with _pr_repo_write_lock(repo_id):
         try:
             repo = await lock_pr_repo_action_boundary(db, repo_id)
         except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found")
-        await _require_pr_monitor_access(request, db, repo)
+        # Recompute against the fenced row.  A request that looked like a
+        # no-op before waiting may become a real topology move if another
+        # administrator changed the Project first; the stale optimistic
+        # snapshot must never let that move bypass the admin gate or the
+        # deterministic old/new Project lock order.
+        actual_project_move = (
+            "project_id" in update_data
+            and update_data["project_id"] != repo.project_id
+        )
+        if actual_project_move:
+            await _reauthorize_pr_topology_effect(
+                request,
+                db,
+                repo,
+                target_project_id=update_data["project_id"],
+            )
+        else:
+            await _reauthorize_pr_effect(request, db, repo)
 
         changed_delivery_policy = {
             key
@@ -777,6 +1040,10 @@ async def update_repo(
             ) or "required_checks" in changed_review_policy:
                 await _withdraw_pending_merge_actions(db, repo_id=repo_id)
 
+        if "project_id" in update_data and update_data["project_id"] is None:
+            # Removing the Project would also remove the only durable member
+            # ACL. Keep projectless monitors administrator-owned.
+            require_admin(request)
         project_id = update_data.get("project_id")
         if project_id is not None:
             from backend.models.project import Project
@@ -811,7 +1078,7 @@ async def delete_repo(repo_id: int, request: Request, db: AsyncSession = Depends
             locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
         except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found")
-        await _require_pr_monitor_access(request, db, locked_repo)
+        await _reauthorize_pr_effect(request, db, locked_repo)
         delivery_run_id = await _delivery_repo_run_reference(
             db,
             repo_id=repo_id,
@@ -966,7 +1233,7 @@ async def toggle_repo(repo_id: int, request: Request, db: AsyncSession = Depends
             repo = await lock_pr_repo_action_boundary(db, repo_id)
         except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found")
-        await _require_pr_monitor_access(request, db, repo)
+        await _reauthorize_pr_effect(request, db, repo)
         if repo.enabled:
             active_delivery_run = await _delivery_repo_run_reference(
                 db,
@@ -1005,7 +1272,7 @@ async def regenerate_secret(repo_id: int, request: Request, db: AsyncSession = D
             repo = await lock_pr_repo_action_boundary(db, repo_id)
         except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found")
-        await _require_pr_monitor_access(request, db, repo)
+        await _reauthorize_pr_effect(request, db, repo)
         active_delivery_run = await _delivery_repo_run_reference(
             db,
             repo_id=repo_id,
@@ -1028,12 +1295,198 @@ async def regenerate_secret(repo_id: int, request: Request, db: AsyncSession = D
         return repo
 
 
+_REVIEW_DISPLAY_STATUSES = {
+    "pending": "Pending",
+    "waiting_ci": "Waiting for CI",
+    "reviewing": "Reviewing",
+    "publishing": "Publishing result",
+    "superseding": "Updating to a newer commit",
+    "approved": "Approved",
+    "commented": "Changes required",
+    "merged": "Merged",
+    "superseded": "Superseded",
+    "cancelled": "Cancelled",
+}
+_LEGACY_TECHNICAL_REVIEW_SUMMARY_RE = re.compile(
+    r"\AAgent recommendation: "
+    r"(?P<recommendation>approved_merged|lgtm_comment|review_comments); "
+    r"backend action: "
+    r"(?P<action>approved_merged|lgtm_comment|review_comments); "
+    r"durable nonce evidence verified\Z"
+)
+_LEGACY_HUMAN_REVIEW_SUMMARIES = {
+    "approved_merged": "Review passed and the reviewed commit was merged.",
+    "lgtm_comment": "Review passed with no blocking findings.",
+    "review_comments": "Review found changes that need to be addressed.",
+}
+
+
+def _human_facing_review_summary(review: PRReview) -> str | None:
+    """Translate only the exact technical summary emitted by older CCMs."""
+
+    value = review.review_summary
+    if not isinstance(value, str):
+        return value
+    match = _LEGACY_TECHNICAL_REVIEW_SUMMARY_RE.fullmatch(value)
+    if match is None:
+        return value
+    recommendation = match.group("recommendation")
+    action = match.group("action")
+    if recommendation != action or review.action_taken != action:
+        return value
+    return _LEGACY_HUMAN_REVIEW_SUMMARIES[action]
+
+
+def _normalized_reviewer_verdict(run) -> str | None:
+    verdict = getattr(run, "verdict", None)
+    if verdict in {"pass", "changes_required"}:
+        return verdict
+    status = getattr(run, "status", None)
+    if status == "passed":
+        return "pass"
+    if status == "changes_required":
+        return "changes_required"
+    return None
+
+
+def _reviewer_outcome_kind(run) -> str:
+    if getattr(run, "status", None) == "error":
+        return "infrastructure_error"
+    if _normalized_reviewer_verdict(run) is not None:
+        return "review_result"
+    if getattr(run, "status", None) in {"cancelled", "superseded"}:
+        return "lifecycle"
+    return "in_progress"
+
+
+def _aggregate_review_verdict(review: PRReview, runs: list) -> str | None:
+    if runs:
+        verdicts = [_normalized_reviewer_verdict(run) for run in runs]
+        if (
+            all(verdict is not None for verdict in verdicts)
+            and all(_reviewer_outcome_kind(run) == "review_result" for run in runs)
+        ):
+            return (
+                "changes_required"
+                if "changes_required" in verdicts
+                else "pass"
+            )
+        return None
+    if review.status in {"approved", "merged"} or review.action_taken in {
+        "lgtm_comment",
+        "approved_merged",
+    }:
+        return "pass"
+    if review.status == "commented" or review.action_taken == "review_comments":
+        return "changes_required"
+    return None
+
+
+def _bounded_review_list_summary(value: str | None) -> str | None:
+    """Keep collection responses small without changing detail content."""
+
+    if value is None:
+        return value
+    encoded = value.encode("utf-8")
+    if len(encoded) <= _PR_REVIEW_LIST_SUMMARY_MAX_BYTES:
+        return value
+    suffix = "…"
+    prefix = encoded[
+        : _PR_REVIEW_LIST_SUMMARY_MAX_BYTES - len(suffix.encode("utf-8"))
+    ].decode("utf-8", errors="ignore")
+    return prefix.rstrip() + suffix
+
+
+def _review_response_payload(
+    review: PRReview,
+    runs: list,
+    *,
+    include_full_summary: bool,
+) -> dict:
+    """Build the public list or detail projection for one review.
+
+    Panel rows keep ``task_id`` for old clients, but ``task_ids`` is the only
+    complete Task identity.  The list endpoint deliberately selects no role
+    body or machine result JSON and bounds human summaries; those are complete
+    only on the detail endpoint.
+    """
+
+    status_counts: dict[str, int] = {}
+    verdict_counts: dict[str, int] = {}
+    task_ids: list[int] = []
+    for run in runs:
+        status = getattr(run, "status", None) or "unknown"
+        status_counts[status] = status_counts.get(status, 0) + 1
+        verdict = _normalized_reviewer_verdict(run)
+        if verdict is not None:
+            verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+        task_id = getattr(run, "task_id", None)
+        if task_id is not None and task_id not in task_ids:
+            task_ids.append(task_id)
+    if not runs and review.task_id is not None:
+        task_ids.append(review.task_id)
+
+    aggregate_verdict = _aggregate_review_verdict(review, runs)
+    failed_run = next(
+        (run for run in runs if _reviewer_outcome_kind(run) == "infrastructure_error"),
+        None,
+    )
+    if review.status == "error" or failed_run is not None:
+        outcome_kind = "infrastructure_error"
+        display_status = "Infrastructure error"
+    elif aggregate_verdict is not None:
+        outcome_kind = "review_result"
+        display_status = _REVIEW_DISPLAY_STATUSES.get(
+            review.status,
+            "Changes required" if aggregate_verdict == "changes_required" else "Passed",
+        )
+    elif review.status in _ACTIVE_REVIEW_STATUSES:
+        outcome_kind = "in_progress"
+        display_status = _REVIEW_DISPLAY_STATUSES.get(review.status, review.status)
+    else:
+        outcome_kind = "lifecycle"
+        display_status = _REVIEW_DISPLAY_STATUSES.get(
+            review.status,
+            review.status.replace("_", " ").title(),
+        )
+
+    response_summary = _human_facing_review_summary(review)
+    display_summary = response_summary
+    if failed_run is not None and getattr(failed_run, "error_message", None):
+        role_error = (
+            f"{getattr(failed_run, 'role', 'reviewer')}: "
+            f"{failed_run.error_message}"
+        )
+        if not display_summary:
+            display_summary = role_error
+        elif failed_run.error_message not in display_summary:
+            display_summary = f"{display_summary} ({role_error})"
+
+    if not include_full_summary:
+        response_summary = _bounded_review_list_summary(response_summary)
+        display_summary = _bounded_review_list_summary(display_summary)
+
+    payload = PRReviewResponse.model_validate(review).model_dump()
+    payload.update({
+        "review_summary": response_summary,
+        "task_ids": task_ids,
+        "display_status": display_status,
+        "display_summary": display_summary,
+        "outcome_kind": outcome_kind,
+        "aggregate_verdict": aggregate_verdict,
+        "reviewer_count": len(runs),
+        "reviewer_status_counts": dict(sorted(status_counts.items())),
+        "reviewer_verdict_counts": dict(sorted(verdict_counts.items())),
+    })
+    return payload
+
+
 @router.get("/repos/{repo_id}/reviews", response_model=list[PRReviewResponse])
 async def list_reviews(
     repo_id: int,
     request: Request,
-    page: int = 1,
-    size: int = 20,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
     repo = await db.get(MonitoredRepo, repo_id)
@@ -1049,7 +1502,32 @@ async def list_reviews(
         .offset(offset)
         .limit(size)
     )
-    return result.scalars().all()
+    reviews = list(result.scalars())
+    if not reviews:
+        return []
+    reviewer_rows = (await db.execute(
+        select(
+            PRReviewerRun.pr_review_id,
+            PRReviewerRun.role,
+            PRReviewerRun.task_id,
+            PRReviewerRun.status,
+            PRReviewerRun.verdict,
+            PRReviewerRun.error_message,
+        )
+        .where(PRReviewerRun.pr_review_id.in_([review.id for review in reviews]))
+        .order_by(PRReviewerRun.pr_review_id, PRReviewerRun.id)
+    )).all()
+    runs_by_review: dict[int, list] = {}
+    for run in reviewer_rows:
+        runs_by_review.setdefault(run.pr_review_id, []).append(run)
+    return [
+        _review_response_payload(
+            review,
+            runs_by_review.get(review.id, []),
+            include_full_summary=False,
+        )
+        for review in reviews
+    ]
 
 
 @router.get("/reviews/{review_id}", response_model=PRReviewDetailResponse)
@@ -1069,6 +1547,21 @@ async def get_review(
         select(PRReviewerRun)
         .where(PRReviewerRun.pr_review_id == review.id)
         .order_by(PRReviewerRun.id)
+        .options(load_only(
+            PRReviewerRun.id,
+            PRReviewerRun.pr_review_id,
+            PRReviewerRun.role,
+            PRReviewerRun.task_id,
+            PRReviewerRun.provider,
+            PRReviewerRun.model,
+            PRReviewerRun.effort,
+            PRReviewerRun.status,
+            PRReviewerRun.verdict,
+            PRReviewerRun.result_body,
+            PRReviewerRun.error_message,
+            PRReviewerRun.created_at,
+            PRReviewerRun.completed_at,
+        ))
     )).scalars())
     findings = list((await db.execute(
         select(PRFinding)
@@ -1094,13 +1587,19 @@ async def get_review(
         by_finding.setdefault(rebuttal.finding_id, []).append(rebuttal)
     for finding in findings:
         by_run.setdefault(finding.reviewer_run_id, []).append(finding)
-    payload = PRReviewResponse.model_validate(review).model_dump()
+    payload = _review_response_payload(
+        review,
+        runs,
+        include_full_summary=True,
+    )
     from backend.services.pr_review_actions import is_current_review_snapshot
 
     payload["is_current_snapshot"] = await is_current_review_snapshot(db, review)
     payload["reviewer_runs"] = [
         PRReviewerRunResponse.model_validate(run).model_copy(
-            update={"findings": [
+            update={
+                "outcome_kind": _reviewer_outcome_kind(run),
+                "findings": [
                 PRFindingResponse.model_validate(finding).model_copy(update={
                     "rebuttals": [
                         PRFindingRebuttalResponse.model_validate(item)
@@ -1114,7 +1613,8 @@ async def get_review(
                     ),
                 })
                 for finding in by_run.get(run.id, [])
-            ]}
+                ],
+            }
         )
         for run in runs
     ]
@@ -1180,6 +1680,7 @@ async def _perform_immediate_finding_action(
                 idempotency_key=idempotency_key,
                 actor_user_id=actor_user_id,
                 human_advice=human_advice,
+                effect_authorizer=_pr_effect_authorizer(request),
             )
         except FindingActionConflict as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -1261,6 +1762,7 @@ async def create_review_finding_fix(
                 repo_id=repo_id,
                 idempotency_key=body.idempotency_key,
                 actor_user_id=actor_user_id,
+                effect_authorizer=_pr_effect_authorizer(request),
             )
         except (FindingActionConflict, FixConfirmationError) as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -1353,6 +1855,7 @@ async def download_review_finding_diff(
             locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
         except FindingActionConflict as exc:
             raise HTTPException(409, str(exc)) from exc
+        await _reauthorize_pr_effect(request, db, locked_repo)
         if not locked_repo.enabled:
             raise HTTPException(409, "PR monitor is disabled")
         action = (
@@ -1431,6 +1934,7 @@ async def confirm_review_finding_fix(
                 patch_sha256=body.patch_sha256,
                 download_receipt=body.download_receipt,
                 confirmed_by_user_id=actor_user_id,
+                effect_authorizer=_pr_effect_authorizer(request),
             )
         except FixConfirmationError as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -1465,6 +1969,7 @@ async def cancel_review_finding_fix(
                 db,
                 action_id=action_id,
                 cancelled_by_user_id=actor_user_id,
+                effect_authorizer=_pr_effect_authorizer(request),
             )
         except FixConfirmationError as exc:
             raise HTTPException(409, str(exc)) from exc
@@ -1487,7 +1992,6 @@ async def submit_finding_rebuttal(
     from backend.services.pr_review_service import (
         _gh_pr_view,
         _validated_pr_snapshot,
-        prepare_pr_review_context,
     )
 
     finding = await db.get(PRFinding, finding_id)
@@ -1532,7 +2036,8 @@ async def submit_finding_rebuttal(
         or snapshot.get("head_sha") != review.head_sha
     ):
         raise HTTPException(409, "GitHub PR subject changed before adjudication")
-    context = await prepare_pr_review_context(
+    context = await _prepare_pr_review_context_or_422(
+        db,
         repo,
         {
             "number": review.pr_number,
@@ -1568,8 +2073,12 @@ async def submit_finding_rebuttal(
     async with _pr_repo_write_lock(repo_id):
         try:
             repo = await lock_pr_repo_action_boundary(db, repo_id)
-        except FindingActionConflict:
-            repo = None
+        except FindingActionConflict as exc:
+            raise HTTPException(
+                409,
+                "Finding lifecycle changed before adjudication",
+            ) from exc
+        await _reauthorize_pr_effect(request, db, repo)
         run = (await db.execute(
             select(PRMonitorRun)
             .where(PRMonitorRun.id == run_id, PRMonitorRun.repo_id == repo_id)
@@ -1590,7 +2099,6 @@ async def submit_finding_rebuttal(
         )).scalar_one_or_none()
         if repo is None or run is None or review is None or finding is None:
             raise HTTPException(409, "Finding lifecycle changed before adjudication")
-        await _require_pr_monitor_access(request, db, repo)
         await _require_legacy_pr_effect_allowed(
             db,
             action="rebutted",
@@ -1713,11 +2221,14 @@ async def bind_monitor_developer(
     await db.rollback()
     async with _pr_repo_write_lock(repo_id):
         async with get_task_operation_lock(task_id):
-            repo = (await db.execute(
-                select(MonitoredRepo)
-                .where(MonitoredRepo.id == repo_id)
-                .with_for_update()
-            )).scalar_one_or_none()
+            try:
+                repo = await lock_pr_repo_action_boundary(db, repo_id)
+            except FindingActionConflict as exc:
+                raise HTTPException(
+                    404,
+                    "Repository not found",
+                ) from exc
+            await _reauthorize_pr_effect(request, db, repo)
             run = (await db.execute(
                 select(PRMonitorRun)
                 .where(PRMonitorRun.id == run_id, PRMonitorRun.repo_id == repo_id)
@@ -1748,7 +2259,6 @@ async def bind_monitor_developer(
                 or review.head_sha != run.current_head_sha
             ):
                 raise HTTPException(409, "PR Monitor Gate subject is incomplete")
-            await _require_pr_monitor_access(request, db, repo)
             await require_task_control(request, task, db)
             await _require_legacy_pr_effect_allowed(
                 db,
@@ -1858,7 +2368,7 @@ async def pause_monitor_run(run_id: int, request: Request, db: AsyncSession = De
             locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
         except FindingActionConflict:
             raise HTTPException(404, "Repository not found")
-        await _require_pr_monitor_access(request, db, locked_repo)
+        await _reauthorize_pr_effect(request, db, locked_repo)
         await _quiesce_monitor_runs(
             db,
             repo_id=repo_id,
@@ -1887,11 +2397,14 @@ async def unbind_monitor_developer(run_id: int, request: Request, db: AsyncSessi
     await db.rollback()
     async with _pr_repo_write_lock(repo_id):
         async with get_task_operation_lock(task_id):
-            repo = (await db.execute(
-                select(MonitoredRepo)
-                .where(MonitoredRepo.id == repo_id)
-                .with_for_update()
-            )).scalar_one_or_none()
+            try:
+                repo = await lock_pr_repo_action_boundary(db, repo_id)
+            except FindingActionConflict as exc:
+                raise HTTPException(
+                    404,
+                    "Repository not found",
+                ) from exc
+            await _reauthorize_pr_effect(request, db, repo)
             run = (await db.execute(
                 select(PRMonitorRun)
                 .where(PRMonitorRun.id == run_id, PRMonitorRun.repo_id == repo_id)
@@ -1899,7 +2412,6 @@ async def unbind_monitor_developer(run_id: int, request: Request, db: AsyncSessi
             )).scalar_one_or_none()
             if repo is None or run is None:
                 raise HTTPException(404, "Repository or PR Monitor Run not found")
-            await _require_pr_monitor_access(request, db, repo)
             if run.developer_task_id != task_id:
                 raise HTTPException(409, "Developer binding changed concurrently")
             await _require_legacy_pr_effect_allowed(
@@ -1970,11 +2482,11 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
     repo_id = repo.id
     await db.rollback()
     async with _pr_repo_write_lock(repo_id):
-        repo = (await db.execute(
-            select(MonitoredRepo)
-            .where(MonitoredRepo.id == repo_id)
-            .with_for_update()
-        )).scalar_one_or_none()
+        try:
+            repo = await lock_pr_repo_action_boundary(db, repo_id)
+        except FindingActionConflict as exc:
+            raise HTTPException(404, "Repository not found") from exc
+        await _reauthorize_pr_effect(request, db, repo)
         run = (await db.execute(
             select(PRMonitorRun)
             .where(PRMonitorRun.id == run_id, PRMonitorRun.repo_id == repo_id)
@@ -1982,7 +2494,6 @@ async def resume_monitor_run(run_id: int, request: Request, db: AsyncSession = D
         )).scalar_one_or_none()
         if repo is None or run is None:
             raise HTTPException(404, "Repository or PR Monitor Run not found")
-        await _require_pr_monitor_access(request, db, repo)
         await _require_legacy_pr_effect_allowed(
             db,
             action="resumed",
@@ -2179,6 +2690,7 @@ async def enqueue_monitor_merge(
             repo = await lock_pr_repo_action_boundary(db, repo_id)
         except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found") from exc
+        await _reauthorize_pr_effect(request, db, repo)
         run = (
             await db.execute(
                 select(PRMonitorRun)
@@ -2205,7 +2717,6 @@ async def enqueue_monitor_merge(
             ).scalar_one_or_none()
         if run is None or review is None:
             raise HTTPException(409, "PR Monitor Gate subject is incomplete")
-        await _require_pr_monitor_access(request, db, repo)
         await _require_legacy_pr_effect_allowed(
             db,
             action="enqueued for merge",
@@ -2252,18 +2763,95 @@ async def enqueue_monitor_merge(
 
 # --- Webhook endpoint ---
 
+
+async def _read_github_webhook_body(request: Request) -> bytearray:
+    """Read one exact, bounded webhook body with strict framing checks.
+
+    ASGI exposes an already de-chunked byte stream.  ``Content-Length`` is an
+    early rejection hint only; the accumulated stream length is the security
+    boundary and is compared with the declaration after EOF.  Returning the
+    original byte sequence in one bytearray lets JSON and HMAC consume the
+    same data without a second request read or an extra 25 MB copy.
+    """
+
+    raw_headers = request.scope.get("headers") or ()
+    content_lengths = [
+        value.strip()
+        for name, value in raw_headers
+        if bytes(name).lower() == b"content-length"
+    ]
+    transfer_encodings = [
+        value.strip()
+        for name, value in raw_headers
+        if bytes(name).lower() == b"transfer-encoding" and value.strip()
+    ]
+    if len(content_lengths) > 1:
+        raise HTTPException(400, "Multiple Content-Length headers are invalid")
+    if content_lengths and transfer_encodings:
+        raise HTTPException(
+            400,
+            "Content-Length and Transfer-Encoding cannot both be supplied",
+        )
+
+    declared_length: int | None = None
+    if content_lengths:
+        raw_length = content_lengths[0]
+        if not raw_length or re.fullmatch(rb"[0-9]+", raw_length) is None:
+            raise HTTPException(400, "Invalid Content-Length header")
+        # Avoid feeding an attacker-controlled, arbitrarily long decimal into
+        # ``int``.  Any 20-digit positive decimal is already far beyond 25 MB.
+        if len(raw_length) > 19:
+            raise HTTPException(413, "GitHub webhook payload is too large")
+        declared_length = int(raw_length)
+        if declared_length > _MAX_GITHUB_WEBHOOK_BODY_BYTES:
+            raise HTTPException(413, "GitHub webhook payload is too large")
+
+    body = bytearray()
+    try:
+        async for chunk in request.stream():
+            if len(chunk) > _MAX_GITHUB_WEBHOOK_BODY_BYTES - len(body):
+                raise HTTPException(
+                    413,
+                    "GitHub webhook payload is too large",
+                )
+            body.extend(chunk)
+    except ClientDisconnect as exc:
+        raise HTTPException(
+            400,
+            "GitHub webhook request body was interrupted",
+        ) from exc
+
+    if declared_length is not None and len(body) != declared_length:
+        raise HTTPException(
+            400,
+            "GitHub webhook body length does not match Content-Length",
+        )
+    return body
+
+
 @webhook_router.post("/webhook")
 async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
-    body = await request.body()
+    body = await _read_github_webhook_body(request)
 
     try:
-        payload = await request.json()
-    except Exception:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
         raise HTTPException(400, "Invalid JSON payload")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "GitHub webhook payload must be an object")
 
-    repo_full_name = payload.get("repository", {}).get("full_name")
-    if not repo_full_name:
+    if "repository" not in payload:
         return {"status": "ignored", "reason": "no repository info"}
+    repository = payload["repository"]
+    if not isinstance(repository, dict):
+        raise HTTPException(400, "repository must be an object")
+    if "full_name" not in repository or repository["full_name"] == "":
+        return {"status": "ignored", "reason": "no repository info"}
+    repo_full_name = repository["full_name"]
+    if not isinstance(repo_full_name, str):
+        raise HTTPException(400, "repository.full_name must be a string")
+    if len(repo_full_name) > _MAX_GITHUB_REPO_FULL_NAME_CHARS:
+        raise HTTPException(400, "repository.full_name is too long")
 
     result = await db.execute(
         select(MonitoredRepo).where(MonitoredRepo.repo_full_name == repo_full_name)
@@ -2434,8 +3022,6 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
 
     if action == "synchronize":
         from backend.services.pr_review_service import (
-            create_pr_review_task,
-            prepare_pr_review_context,
             verify_pr_review_snapshot_current,
         )
 
@@ -2454,7 +3040,8 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         # Fetch and validate every model-visible byte before terminating the
         # old generation. A transient GitHub/context failure therefore leaves
         # the still-running review untouched and lets GitHub retry delivery.
-        prepared_context = await prepare_pr_review_context(
+        prepared_context = await _prepare_pr_review_context_or_422(
+            db,
             repo,
             replacement_data,
         )
@@ -2498,6 +3085,12 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             await verify_pr_review_snapshot_current(
                 locked_repo,
                 replacement_data,
+            )
+            await _preflight_pr_review_prompts_or_422(
+                db,
+                locked_repo,
+                replacement_data,
+                prepared_context=prepared_context,
             )
 
             # Re-run idempotency at the actual write barrier. This prevents a
@@ -2567,7 +3160,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             # pinned to the old head and reconciles independently.
             if not observed_reviews:
                 try:
-                    review = await create_pr_review_task(
+                    review = await _create_pr_review_task_or_422(
                         db,
                         locked_repo,
                         replacement_data,
@@ -2906,7 +3499,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
                 # identity. Keep supersede writes uncommitted and let
                 # replacement creation commit both review generations.
                 try:
-                    review = await create_pr_review_task(
+                    review = await _create_pr_review_task_or_422(
                         db,
                         current_repo,
                         replacement_data,
@@ -2948,8 +3541,6 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
 
     # Import and call service
     from backend.services.pr_review_service import (
-        create_pr_review_task,
-        prepare_pr_review_context,
         verify_pr_review_snapshot_current,
     )
 
@@ -2965,7 +3556,11 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         "head_repo_full_name": head_repo_full_name,
         "head_branch": head_branch,
     }
-    prepared_context = await prepare_pr_review_context(repo, review_data)
+    prepared_context = await _prepare_pr_review_context_or_422(
+        db,
+        repo,
+        review_data,
+    )
     await db.rollback()
     async with _pr_repo_write_lock(repo_id):
         db.expire_all()
@@ -2996,6 +3591,12 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             await db.rollback()
             return {"status": "ignored", "reason": policy_rejection}
         await verify_pr_review_snapshot_current(locked_repo, review_data)
+        await _preflight_pr_review_prompts_or_422(
+            db,
+            locked_repo,
+            review_data,
+            prepared_context=prepared_context,
+        )
         processed_review = await _find_processed_review(
             db,
             repo_id,
@@ -3042,7 +3643,7 @@ async def github_webhook(request: Request, db: AsyncSession = Depends(get_db)):
             await db.rollback()
             return {"status": "ignored", "reason": "PR already reviewed"}
         try:
-            review = await create_pr_review_task(
+            review = await _create_pr_review_task_or_422(
                 db,
                 locked_repo,
                 review_data,

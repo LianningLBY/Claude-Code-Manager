@@ -4,7 +4,7 @@
 
 Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊鸣的文章「我给 10 个 Claude Code 打工」。
 
-> **⚠️ 重要安全提示：** 本项目会以 `--dangerously-skip-permissions` 模式运行 Claude Code，这意味着 Claude Code 将拥有**不受限制的文件读写、命令执行和网络访问权限**，并且会自动执行 `git push` 等操作。**强烈建议在一台单独的、没有重要文件的电脑或虚拟机上部署**，避免对你的个人数据或工作环境造成意外影响。
+> **⚠️ 重要安全提示：** 管理员、超级管理员和单 Token 部署发起的普通 Task 会以 unrestricted 模式运行（Claude Code 使用 `--dangerously-skip-permissions`），能够不受限制地读写文件、执行命令、访问网络并自动执行 `git push` 等操作。Member 回合和 Browser/PR Review/Delivery/Planner 等专用任务使用各自的受限协议。仍强烈建议把 CCM 部署在没有重要个人数据的独立电脑或虚拟机上。
 
 ## 功能
 
@@ -677,10 +677,23 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 配置共享限流，因为应用内状态按进程隔离。
 
 Task 的运行权限按每一回合的实际发起账号决定：管理员和超级管理员发起的普通
-Task 回合使用 unrestricted 环境；Member 发起的回合进入 fail-closed sandbox。
+Task 回合使用 unrestricted 环境，单 Token 部署的 `AUTH_TOKEN` 也按
+`super_admin` 运行；Member 发起的回合进入 fail-closed sandbox。
 发起者身份会随消息持久化并在启动前复验，重试不会借后台 system 身份提权。
+同一 CCM 内的 Team Share 只分配 Project/Task ACL，不改变消息发起者的运行权限。
+Worker 是无前端的完整 CCM 计算节点：Manager 先校验 ACL 和角色，再把普通 Task
+回合转换成 delegated principal 交给 Worker；Worker Token 只认证控制面，不能
+自行变成超级管理员。legacy 跨 CCM Share 仍以 system sandbox 运行；Browser、
+PR Review、Delivery、Planner/Reviewer 等专用任务也始终保留各自的隔离协议。
 Task SSH Profile 和 grant 仅由管理员配置；Member sandbox 只映射当前消息已验证
 的附件和授权能力，不会开放其他 Task 或整个 uploads 目录。
+
+团队权限矩阵：
+
+- `super_admin/admin` 可创建、配置和分配 Project，并可管理所有 Project/Task。
+- `member` 默认看不到任何 Project/Task，也不能创建 Task；获得 Project ACL 后可查看该 Project，并在其中创建和操作 Task。
+- Task 的创建者或管理员可把该 Task 以 chat 权限分享给用户/用户组；Task Share 不等于 Project ACL，不能据此创建同 Project 的新 Task。
+- Worker 的所有者只管理计算节点，不会因此获得节点上 Project/Task 的数据权限；Worker 没有独立前端，任务、日志和权限仍以 Manager 为准。
 
 ### PTY 模式
 
@@ -773,6 +786,7 @@ socket 才会被清理；未知或已被替换的 socket 继续 fail-closed。Ch
 | `WORKER_SSH_KEY_PATH` | (必填) | SSH 私钥 `.pem` 文件路径 |
 | `WORKER_SSH_USER` | `ubuntu` | Worker EC2 的 SSH 用户名 |
 | `WORKER_ENABLED` | `true` | 是否启用 Worker 功能 |
+| `CCM_NODE_ROLE` | `manager` | 数据库节点身份；Worker bootstrap 自动写 `worker`，绑定后不可原地切换 |
 | `WORKER_INSTANCE_TYPE` | (继承 Manager) | 覆盖 Worker 的 EC2 实例类型 |
 | `WORKER_IMAGE_ID` | (继承 Manager) | 覆盖 Worker 的 AMI ID |
 
@@ -936,6 +950,7 @@ CCM 支持将任务分发到远程 EC2 Worker 节点执行，突破单机并发�
 **核心能力：**
 - **一键创建** — Workers 页面点 +，自动创建 EC2、部署代码、安装依赖、启动服务（配置从 Manager 自身继承，无需手动填写 AMI/机型/子网）
 - **任务转发** — 创建任务或修改已有任务时选择执行 Worker，所有 Chat/Stop/Retry/Plan 操作自动代理，前端零感知
+- **角色委托** — Worker Token 只认证 Manager 控制面；普通 Task 每个回合都继承 Manager 验证后的用户角色（管理员/超级管理员 unrestricted，Member sandbox），Worker 不使用自己的 User 表解释 Manager User ID
 - **实时迁移** — 任务可随时在本机和 Worker 之间迁移，session 文件和工作目录自动同步，`--resume` 无缝衔接
 - **WebSocket 中继** — 每个 Worker 一条 WS 连接，日志实时中继到 Manager 并存储副本，断线自动重连+补全
 - **生命周期管理** — 支持关机（保留数据）/开机/销毁（自动迁回全部任务），健康检查每 30s 自动恢复降级 Worker

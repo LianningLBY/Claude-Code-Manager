@@ -15,7 +15,7 @@ import weakref
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import AsyncIterator
+from typing import AsyncIterator, Awaitable, Callable
 
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -290,6 +290,9 @@ async def install_test_harness_owner_terminal_gate(
     identity: TestHarnessOwnerIdentity,
     *,
     reason: str,
+    locked_owner_validator: (
+        Callable[[AsyncSession], Awaitable[None]] | None
+    ) = None,
 ) -> Task:
     """Durably close Run/Workspace/child admission for one owner generation.
 
@@ -315,6 +318,13 @@ async def install_test_harness_owner_terminal_gate(
         raise TestHarnessOwnerFenceError(
             "Harness owner Task incarnation or generation changed"
         )
+    if locked_owner_validator is not None:
+        # The Task writer is now held.  Let specialized terminalizers prove
+        # any external authority (for example, an exact live Worker receipt
+        # lease) inside this same transaction before the durable gate write.
+        # Sampling that authority before the Task lock wait would allow an
+        # expired owner to commit the gate after it finally acquires the row.
+        await locked_owner_validator(db)
     owner = (
         await db.execute(
             select(Task).where(

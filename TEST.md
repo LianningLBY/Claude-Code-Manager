@@ -35,6 +35,7 @@ cd frontend && npx tsc --noEmit
 |------|---------|
 | `test_protected_paths_cover_all_git_credential_sources` | 已存在的 repo `.git/credentials` 继续进入 deny 列表；不存在的叶子路径不生成 Bubblewrap 挂载，父 `.git` deny 保持不变 |
 | `test_codex_app_server.py::test_task_ssh_profile_collapses_only_redundant_nested_denies` | 父目录已 deny 时折叠冗余子 deny，避免 Bubblewrap 在只读父挂载中创建子挂载点；若中间 workspace 已重新开放则保留子 deny，精确只读例外仍可覆盖父 deny |
+| `test_task_agent_isolation.py::test_claude_isolation_collapses_missing_key_below_denied_managed_root` / `test_task_ssh_sharing.py::test_stale_profile_key_is_collapsed_under_managed_root_for_claude` | Claude 2.1.168 的 Task settings 同样折叠已被 managed 根目录完全覆盖的缺失/陈旧 key 子路径；父根仍保留 `denyRead`、`denyWrite` 与 credential deny，sibling prefix 和精确 Git `allowRead` 不受影响 |
 
 #### `test_tmp_space_manager.py` — `/tmp` 压力保护
 
@@ -135,6 +136,10 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_delete_task` | DELETE 删除任务 |
 | `test_cancel_task` | 取消任务 |
 | `test_retry_task` | 重试任务 |
+| `test_task_flag_controls_reject_group_revoked_at_final_effect_fence` / `test_star_rejects_real_wal_group_revoke_before_final_effect_fence` | star/read/unread/archive 在最终 Project→Task→membership→User writer fence 重验 group ACL；SQLite WAL 双 session 中撤权先提交时不产生 Task effect |
+| `test_local_task_controls_reject_group_revoked_before_effect_gate` / `test_worker_task_controls_reject_group_revoked_before_receipt` | stop/cancel/delete 在本机 Harness gate 或 Worker termination/delete receipt 落库前重验 ACL；撤权胜出时无进程/网络 effect、无 durable receipt |
+| `test_star_rejects_admin_demoted_before_final_user_fence` | HTTP 鉴权后并发降级 admin 时，最终 User exact-role fence 拒绝 stale 管理员 effect |
+| `test_completed_stop_400_settles_gate_before_later_delete` / `test_terminal_cancel_settles_gate_before_later_delete` | 已确定无进程/幂等终态的 stop/cancel 将 control gate 标为 settled，同时保留 Harness gate，使下一次 fresh-ACL delete 可接管而不会永久锁死 Task |
 | `test_attention_tag_create_update_and_clear_preserves_system_tags` | 关注标签会裁剪首尾空白、可清空，且不改写系统内部 `tags` |
 | `test_cloned_task_inherits_attention_tag_unless_overridden` | Clone 默认继承关注标签，显式覆盖或清空时按请求处理 |
 | `test_create_task_defaults_to_standard_service_tier` / `test_create_fast_codex_task_persists_priority` | Task 默认持久化 Standard，Codex Fast 持久化 `priority` |
@@ -159,6 +164,8 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_plan_reject_not_plan_review` | 非 plan_review 状态 reject 返回 400 |
 | `test_plan_approve_success` | plan_review 状态 approve → status=completed、plan_approved=True，且不启动执行 turn |
 | `test_plan_reject_success` | plan_review 状态 reject → status=cancelled, plan_approved=False |
+| `test_plan_approve_rejects_target_group_acl_revoked_at_final_fence` / `test_legacy_plan_decision_rejects_group_acl_revoked_at_final_fence` | Legacy Plan approve 同时锁定 Plan+target ACL；本机/Worker approve/reject 在最终 gate 前撤权时不提交 decision、不发 Worker 请求 |
+| `test_plan_stop_400_settles_gate_before_later_approval` | plan_review 无进程 stop 返回 400 后仅 settle control receipt，后续 fresh-ACL approve 可接管同一 Harness terminal gate |
 | `test_plan_approve_not_found` | 不存在的 task approve 返回 404 |
 | `test_plan_reject_not_found` | 不存在的 task reject 返回 404 |
 | `test_codex_fast_rejects_unsupported_chat_model_before_logging` | Fast Task 的一次性模型覆盖若不支持 `priority`，在消息落库和执行前拒绝 |
@@ -1444,6 +1451,9 @@ Plan/Worker 销毁门禁重点覆盖：
 |------|---------|
 | `test_destroy_finds_dispatch_receipt_by_frozen_worker_identity` | destroy 直接按 receipt 冻结的 Worker identity 查证；Run/Plan 改绑、脱离或 Run 丢失都不能隐藏 uncertain remote boundary |
 | `test_destroy_rejects_forged_cleaned_worker_plan_runtime` / `test_destroy_rejects_cleaned_runtime_with_wrong_generation` | terminal Run 逐 Step/generation/attempt 审计 runtime aggregate，伪造 `cleaned` shape 或错代 receipt 仍 fail closed |
+| `test_clean_proof_rejects_late_worker_local_harness_run` | terminal 高区 owner 在 clean proof 后启动 Harness 必须被 node fence 拒绝，不能留下 Run/Event |
+| `test_migration_finish_rejects_target_destroying_after_remote_create` / `test_migration_import_exact_rollback_survives_destination_drain` | destination import 与 destroy 竞态只清理 exact nonce/incarnation/retry/turn mirror；Manager 指针已切换或目标已有日志/证据时 fail closed |
+| `test_active_receipt_blocks_completed_only_autonomous_admission` 及 permission relay drain 用例 | stop ACK 后的 PTY autonomous、permission、Log/Sub-Agent late producer 仍受 node-first writer fence，clean proof 后不能提交 |
 
 ### 真机冒烟（收养一台已有 EC2 跑完整 bootstrap）
 

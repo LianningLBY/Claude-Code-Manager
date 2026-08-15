@@ -13,6 +13,8 @@ import stat
 from typing import Iterable
 from urllib.parse import urlsplit
 
+from backend.services.cancellation import await_task_completion
+
 
 class DeliveryWorkspaceError(RuntimeError):
     pass
@@ -159,14 +161,8 @@ async def _await_shielded_cleanup(
     never be released while its Controller Git process is still alive.
     """
 
-    cancellation = delayed_cancel
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-        except BaseException:
-            break
+    cancellation = await await_task_completion(cleanup)
+    cancellation = cancellation or delayed_cancel
     cleanup.result()
     if cancellation is not None:
         raise cancellation
@@ -194,13 +190,7 @@ async def _git(
     )
     delayed_cancel: asyncio.CancelledError | None = None
     try:
-        while not spawn.done():
-            try:
-                await asyncio.shield(spawn)
-            except asyncio.CancelledError as exc:
-                delayed_cancel = exc
-            except BaseException:
-                break
+        delayed_cancel = await await_task_completion(spawn)
         process = spawn.result()
     except OSError as exc:
         if delayed_cancel is not None:

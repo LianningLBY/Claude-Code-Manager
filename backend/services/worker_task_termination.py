@@ -37,9 +37,19 @@ from backend.models.worker_task_termination import (
 )
 from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.services.pr_review_runtime import is_pr_sandbox_task
+from backend.services.cancellation import finish_awaitable
 from backend.services.skill_context import is_worker_managed_task_metadata
+from backend.services.worker_node_control import (
+    fence_worker_node_receipt_resolution,
+    require_worker_node_destroy_cleanup_claim,
+)
 
 logger = logging.getLogger(__name__)
+
+WORKER_DESTROY_DRAIN_CLAIM_HEADER = "X-CCM-Worker-Drain-Claim"
+WORKER_DESTROY_TASK_INCARCATION_HEADER = "X-CCM-Destroy-Task-Incarnation"
+WORKER_DESTROY_TASK_RETRY_HEADER = "X-CCM-Destroy-Task-Retry"
+WORKER_DESTROY_TASK_TURN_HEADER = "X-CCM-Destroy-Task-Turn"
 
 TERMINAL_TASK_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "conflict"}
@@ -329,6 +339,77 @@ def no_active_worker_task_termination_predicate(
             WorkerTaskTerminationReceipt.operation_id != allow_operation_id
         )
     return ~exists(active)
+
+
+_RUNTIME_IDENTITY_UNSET = object()
+
+
+def worker_task_runtime_persistence_predicate(
+    *,
+    task_retry_count: int | None,
+    task_turn_generation: int | None,
+    instance_id: int | None = None,
+    session_id: str | None = None,
+    pty_background_generation: str | None | object = _RUNTIME_IDENTITY_UNSET,
+):
+    """Allow only one exact pre-stop generation to finish output persistence.
+
+    An active ``stop_session`` receipt freezes the Worker's local Task
+    incarnation, retry, turn, Instance and optional PTY epoch before effects.
+    Phase-one destroy may let callbacks matching that complete identity append
+    their final audit/output while the stop consumer drains.  No predicate in
+    this exception is based on ``task_id`` alone, and it never grants launch,
+    status-generation advancement, or a different termination operation.
+    """
+
+    if (
+        type(task_retry_count) is not int
+        or type(task_turn_generation) is not int
+    ):
+        return no_active_worker_task_termination_predicate()
+    exact = [
+        WorkerTaskTerminationReceipt.active_task_id == Task.id,
+        WorkerTaskTerminationReceipt.side == "worker",
+        WorkerTaskTerminationReceipt.operation == "stop_session",
+        WorkerTaskTerminationReceipt.status.in_(("accepted", "executing")),
+        or_(
+            and_(
+                WorkerTaskTerminationReceipt.source_task_incarnation_id.is_(None),
+                Task.incarnation_id.is_(None),
+            ),
+            WorkerTaskTerminationReceipt.source_task_incarnation_id
+            == Task.incarnation_id,
+        ),
+        WorkerTaskTerminationReceipt.source_task_retry_count
+        == task_retry_count,
+        WorkerTaskTerminationReceipt.source_task_turn_generation
+        == task_turn_generation,
+    ]
+    if instance_id is not None:
+        exact.append(
+            WorkerTaskTerminationReceipt.source_task_instance_id == instance_id
+        )
+    if session_id is not None:
+        exact.append(
+            WorkerTaskTerminationReceipt.source_task_session_id == session_id
+        )
+    if pty_background_generation is not _RUNTIME_IDENTITY_UNSET:
+        exact.append(
+            (
+                WorkerTaskTerminationReceipt
+                .source_task_pty_background_generation.is_(None)
+                if pty_background_generation is None
+                else WorkerTaskTerminationReceipt
+                .source_task_pty_background_generation
+                == pty_background_generation
+            )
+        )
+    return or_(
+        no_active_worker_task_termination_predicate(),
+        exists(
+            select(WorkerTaskTerminationReceipt.operation_id).where(*exact)
+        ),
+    )
 
 
 def worker_task_termination_authority_predicate(
@@ -1913,6 +1994,10 @@ async def stage_worker_receipt(
     operation: str,
     request_payload: dict,
     request_digest: str,
+    destroy_drain_claim: str | None = None,
+    destroy_task_incarnation_id: str | None = None,
+    destroy_task_retry_count: int | None = None,
+    destroy_task_turn_generation: int | None = None,
 ) -> WorkerTaskTerminationReceipt:
     """Commit Worker ``accepted`` and its Task/handoff gate before effects."""
 
@@ -1923,6 +2008,27 @@ async def stage_worker_receipt(
         payload=request_payload,
         digest=request_digest,
     )
+    # Global Worker admission order is NodeControl -> Task -> receipt.  A
+    # destroy claim may be installed while the HTTP request is waiting on its
+    # per-Task in-process lock, so the earlier route-level Task read is not an
+    # admission fence.  Start a fresh transaction and serialize here, at the
+    # actual durable prepare boundary.
+    await db.rollback()
+    node_draining = await fence_worker_node_receipt_resolution(db)
+    destroy_cleanup = bool(
+        node_draining
+        and destroy_drain_claim is not None
+        and operation == "stop_session"
+        and isinstance(destroy_task_incarnation_id, str)
+        and bool(destroy_task_incarnation_id)
+        and type(destroy_task_retry_count) is int
+        and type(destroy_task_turn_generation) is int
+    )
+    if not node_draining and destroy_drain_claim is not None:
+        await db.rollback()
+        raise WorkerTaskTerminationConflict(
+            "Worker destroy cleanup claim was supplied before node drain"
+        )
     task = (
         await db.execute(
             select(Task)
@@ -1936,6 +2042,15 @@ async def stage_worker_receipt(
     ).scalar_one_or_none()
     if task is None:
         raise WorkerTaskTerminationConflict("Worker Task is absent or non-local")
+    if destroy_cleanup and (
+        task.incarnation_id != destroy_task_incarnation_id
+        or task.retry_count != destroy_task_retry_count
+        or task.turn_generation != destroy_task_turn_generation
+    ):
+        await db.rollback()
+        raise WorkerTaskTerminationConflict(
+            "Worker destroy cleanup Task incarnation or generation changed"
+        )
     if operation == "supersede" and not is_pr_sandbox_task(task):
         raise WorkerTaskTerminationConflict(
             "supersede termination is restricted to review sandbox Tasks"
@@ -1958,7 +2073,26 @@ async def stage_worker_receipt(
             raise WorkerTaskTerminationConflict(
                 "termination operation id was reused with a different request"
             )
+        # This exact receipt crossed the node fence before phase one. Replaying
+        # it is read/continuation of already-durable ownership, not admission
+        # of a new stop effect, so it remains idempotent without a destroy
+        # header. The later executor/ACK paths retain their own exact gates.
         return existing
+    if node_draining:
+        if not destroy_cleanup:
+            await db.rollback()
+            raise WorkerTaskTerminationConflict(
+                "Worker node destruction has begun; only exact claimed "
+                "stop_session cleanup is admitted"
+            )
+        try:
+            await require_worker_node_destroy_cleanup_claim(
+                db,
+                claim=destroy_drain_claim,
+            )
+        except (ValueError, HTTPException) as exc:
+            await db.rollback()
+            raise WorkerTaskTerminationConflict(str(exc)) from exc
     active = await active_worker_task_termination_receipt(
         db, task_id, for_update=True
     )
@@ -2249,10 +2383,16 @@ async def _worker_task_is_safe_terminal(
         or task.pty_background_generation is not None
     ):
         return None
-    owner = await db.scalar(
-        select(Instance.id).where(Instance.current_task_id == task.id)
+    from backend.services.worker_drain_proof import (
+        exact_worker_task_terminal_cleanup_is_proven,
     )
-    return task if owner is None else None
+
+    proven = await exact_worker_task_terminal_cleanup_is_proven(
+        db,
+        task,
+        source_status=receipt.source_task_status,
+    )
+    return task if proven else None
 
 
 async def _mark_worker_task_superseded(
@@ -2874,6 +3014,101 @@ async def _execute_owned_worker_receipt(
 ) -> WorkerTaskTerminationReceipt:
     """Run effects and finalize only under one exact execution token."""
 
+    # Every receipt, including one admitted from an already-terminal source,
+    # installs the exact durable Harness terminal gate and drains the complete
+    # owner graph.  A terminal status alone is not cleanup evidence: Browser
+    # child and Workspace cleanup can legitimately outlive it.
+    from backend.services.test_harness import (
+        TestHarnessService,
+        test_harness_service,
+    )
+    from backend.services.test_harness_owner_fence import (
+        TestHarnessOwnerIdentity,
+    )
+
+    if not fence.source_task_incarnation_id:
+        raise WorkerTaskTerminationConflict(
+            "Worker termination receipt has no durable Task incarnation"
+        )
+    expected_harness_owner = TestHarnessOwnerIdentity(
+        task_id=fence.task_id,
+        incarnation_id=fence.source_task_incarnation_id,
+        retry_count=fence.source_task_retry_count,
+        turn_generation=fence.source_task_turn_generation,
+        status=fence.source_task_status,
+    )
+    harness_service = test_harness_service
+    configured_bind = getattr(
+        getattr(harness_service, "db_factory", None),
+        "kw",
+        {},
+    ).get("bind")
+    if configured_bind is not db.bind:
+        harness_service = TestHarnessService(
+            db_factory=async_sessionmaker(
+                db.bind,
+                class_=AsyncSession,
+                expire_on_commit=False,
+            )
+        )
+
+    async def require_live_receipt_after_owner_lock(
+        locked_db: AsyncSession,
+    ) -> None:
+        """Prove this exact lease after the Harness Task writer is held."""
+
+        locked_receipt = await active_worker_task_termination_receipt(
+            locked_db,
+            fence.task_id,
+            for_update=True,
+        )
+        lease_valid_at = datetime.utcnow()
+        if (
+            not worker_task_termination_authority_matches(
+                locked_receipt,
+                operation_id=fence.operation_id,
+                operation=fence.operation,
+                execution_token=fence.execution_token,
+                state_version=fence.state_version,
+                lease_valid_at=lease_valid_at,
+            )
+            or locked_receipt is None
+            or locked_receipt.request_digest != fence.request_digest
+        ):
+            raise WorkerTaskTerminationConflict(
+                "Worker termination execution lease is no longer authoritative"
+            )
+
+    # Establish the ordinary Worker Task -> receipt writer order before
+    # entering graph cleanup.  The terminal-gate callback below repeats the
+    # proof in the gate's own transaction, so a lease that expires between
+    # these two boundaries still cannot authorize the durable effect.
+    try:
+        await _commit_worker_execution_authority_barrier(db, fence)
+    except WorkerTaskTerminationConflict:
+        await db.rollback()
+        current = await db.get(
+            WorkerTaskTerminationReceipt,
+            fence.operation_id,
+            populate_existing=True,
+        )
+        if current is None:
+            raise
+        return current
+
+    try:
+        async with harness_service.owner_stop_fence(
+            fence.task_id,
+            reason="Worker termination receipt drained owner graph",
+            expected_identity=expected_harness_owner,
+            locked_owner_validator=require_live_receipt_after_owner_lock,
+        ):
+            pass
+    except Exception as exc:
+        raise WorkerTaskTerminationConflict(
+            f"Worker owner graph cleanup could not be proven: {exc}"
+        ) from exc
+
     already_terminal = await _worker_task_is_safe_terminal(db, fence)
     if already_terminal is None:
 
@@ -2883,21 +3118,6 @@ async def _execute_owned_worker_receipt(
         from backend.api.tasks import (
             _cancel_local_task_impl,
             _stop_task_session_local_impl,
-        )
-        from backend.services.test_harness_owner_fence import (
-            TestHarnessOwnerIdentity,
-        )
-
-        if not fence.source_task_incarnation_id:
-            raise WorkerTaskTerminationConflict(
-                "Worker termination receipt has no durable Task incarnation"
-            )
-        expected_harness_owner = TestHarnessOwnerIdentity(
-            task_id=fence.task_id,
-            incarnation_id=fence.source_task_incarnation_id,
-            retry_count=fence.source_task_retry_count,
-            turn_generation=fence.source_task_turn_generation,
-            status=fence.source_task_status,
         )
 
         current = await db.get(Task, fence.task_id, populate_existing=True)
@@ -3168,10 +3388,23 @@ async def persist_worker_preflight_rejection(
         )
     except WorkerTaskTerminationConflict:
         return None
+    # The stage attempt rolled back before this fallback.  Reacquire the
+    # node-wide receipt-resolution fence in a fresh transaction instead of
+    # reusing any pre-stage snapshot: drain may have won during that rollback.
+    # Existing exact receipts remain replayable, but the drain claim itself is
+    # the durable proof that a missing operation had no side effect, so a new
+    # rejected tombstone must never be created after drain.
     await db.rollback()
+    node_draining = await fence_worker_node_receipt_resolution(db)
     task = (
         await db.execute(
-            select(Task).where(Task.id == task_id).with_for_update()
+            select(Task)
+            .where(
+                Task.id == task_id,
+                Task.worker_id.is_(None),
+                Task.shared_from_id.is_(None),
+            )
+            .with_for_update()
         )
     ).scalar_one_or_none()
     if task is None:
@@ -3185,7 +3418,19 @@ async def persist_worker_preflight_rejection(
         )
     ).scalar_one_or_none()
     if existing is not None:
-        return existing
+        if (
+            existing.task_id == task_id
+            and existing.side == "worker"
+            and existing.operation == operation
+            and existing.request_digest == request_digest
+            and existing.request_payload == payload
+        ):
+            return existing
+        await db.rollback()
+        return None
+    if node_draining:
+        await db.rollback()
+        return None
     now = datetime.utcnow()
     result_payload = {
         "version": 2,
@@ -3662,6 +3907,7 @@ async def apply_manager_result(
         _WORKER_TURN_HANDOFF_CLEAR_VALUES,
         _settle_manager_handoff_receipt,
         apply_authoritative_worker_task,
+        canonical_delegated_principal_payload,
         read_worker_task_generation,
         worker_task_generation,
         worker_task_generation_predicates,
@@ -3739,10 +3985,24 @@ async def apply_manager_result(
     observed = worker_task_generation(task, expected_worker_id=receipt.worker_id)
     if observed is None:
         raise WorkerTaskTerminationConflict("Manager Worker generation is invalid")
+    terminal_snapshot = dict(result_payload["task"])
+    terminal_principal = canonical_delegated_principal_payload(task)
+    if terminal_principal is None:
+        raise WorkerTaskTerminationConflict(
+            "Manager Task execution principal is invalid"
+        )
+    # Termination receipt v2 intentionally carries only node-neutral Task
+    # lifecycle fields.  It is an authority-reducing operation: the exact
+    # Manager receipt and generation prove which remote Task was stopped, and
+    # the Manager remains the principal authority.  Supply the Manager's
+    # canonical delegated projection solely to the common mirror CAS instead
+    # of weakening that CAS or trusting a node-local Worker principal field.
+    terminal_snapshot["incarnation_id"] = task.incarnation_id
+    terminal_snapshot.update(terminal_principal)
     resulting = await apply_authoritative_worker_task(
         db,
         observed,
-        result_payload["task"],
+        terminal_snapshot,
         metadata_updates=(
             {PR_REVIEW_SUPERSEDED_METADATA_KEY: True}
             if receipt.operation == "supersede"
@@ -4297,17 +4557,7 @@ async def finalize_manager_task_delete_receipt(
 async def _finish_delete_finalize_despite_cancellation(
     awaitable: Awaitable[ManagerTaskDeleteOutcome],
 ) -> ManagerTaskDeleteOutcome:
-    operation = asyncio.create_task(awaitable)
-    cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-    result = operation.result()
-    if cancellation is not None:
-        raise cancellation
-    return result
+    return await finish_awaitable(awaitable)
 
 
 async def reconcile_manager_task_delete_receipt(
@@ -4545,6 +4795,13 @@ async def reconcile_manager_receipt(
     route = type("TerminationRoute", (), {
         "id": receipt.task_id,
         "worker_id": receipt.worker_id,
+        # Destroy-only PUT admission must carry the exact generation frozen
+        # by this receipt.  A task_id/worker_id-only synthetic route cannot
+        # produce the generation-bound cleanup headers and otherwise makes
+        # every active Task destroy stop permanently fail after its first GET.
+        "incarnation_id": receipt.source_task_incarnation_id,
+        "retry_count": receipt.source_task_retry_count,
+        "turn_generation": receipt.source_task_turn_generation,
     })()
     path = (
         f"/api/tasks/{receipt.task_id}/termination-receipts/"

@@ -13,6 +13,7 @@ from backend.models.project import Project
 from backend.services import delivery_setup
 from backend.services.delivery_setup import (
     DeliverySetupConflictError,
+    DeliverySetupPermissionError,
     DeliverySetupUnavailableError,
     discover_delivery_required_checks,
     ensure_default_delivery_monitor,
@@ -252,6 +253,81 @@ async def _project(session_factory, *, suffix: str) -> Project:
 
 
 @pytest.mark.asyncio
+async def test_existing_monitor_lookup_never_takes_repo_lock():
+    statements = []
+
+    class EmptyResult:
+        @staticmethod
+        def scalars():
+            return ()
+
+    class RecordingSession:
+        async def execute(self, statement):
+            statements.append(statement)
+            return EmptyResult()
+
+    identity = delivery_setup._ProjectIdentity(
+        project_id=1,
+        repo_full_name="acme/lock-order",
+        default_branch="main",
+        git_url="https://github.com/acme/lock-order.git",
+    )
+
+    assert await delivery_setup._existing_monitor(
+        RecordingSession(),
+        identity,
+    ) is None
+    assert len(statements) == 1
+    assert getattr(statements[0], "_for_update_arg", None) is None
+
+
+@pytest.mark.asyncio
+async def test_monitor_bootstrap_accepts_concurrent_compatible_winner(
+    session_factory,
+    monkeypatch,
+):
+    project = await _project(session_factory, suffix="concurrent-winner")
+
+    async def fake_discovery(repo: str, branch: str):
+        assert repo == "acme/delivery-setup-concurrent-winner"
+        assert branch == "main"
+        async with session_factory() as winner_db:
+            winner_db.add(MonitoredRepo(
+                repo_full_name=repo,
+                project_id=project.id,
+                webhook_secret="winner-secret",
+                enabled=True,
+                auto_merge=False,
+                provider="codex",
+                review_mode="panel",
+                wait_for_ci=False,
+                required_checks=[],
+                auto_repair=True,
+                max_repair_attempts=3,
+                merge_queue_mode="manual",
+                default_branch=branch,
+                allowed_authors=[],
+                status="active",
+            ))
+            await winner_db.commit()
+        return [], "no_declared_required_checks"
+
+    monkeypatch.setattr(
+        delivery_setup,
+        "discover_delivery_required_checks",
+        fake_discovery,
+    )
+
+    async with session_factory() as db:
+        setup = await ensure_default_delivery_monitor(db, project.id)
+
+    assert setup.created is False
+    assert setup.repo.webhook_secret == "winner-secret"
+    async with session_factory() as db:
+        assert await db.scalar(select(func.count(MonitoredRepo.id))) == 1
+
+
+@pytest.mark.asyncio
 async def test_monitor_bootstrap_is_conservative_and_idempotent(
     session_factory,
     monkeypatch,
@@ -301,6 +377,31 @@ async def test_monitor_bootstrap_adds_trusted_ci_to_existing_empty_monitor(
     monkeypatch,
 ):
     project = await _project(session_factory, suffix="existing-empty")
+    lock_order: list[str] = []
+    real_repo_lock = delivery_setup.lock_pr_repo_action_boundary
+    real_project_lock = delivery_setup._lock_project_identity
+
+    async def tracked_repo_lock(db, repo_id):
+        lock_order.append("repo")
+        return await real_repo_lock(db, repo_id)
+
+    async def tracked_project_lock(db, project_id):
+        lock_order.append("project")
+        return await real_project_lock(db, project_id)
+
+    async def authorize(_db):
+        lock_order.append("authority")
+
+    monkeypatch.setattr(
+        delivery_setup,
+        "lock_pr_repo_action_boundary",
+        tracked_repo_lock,
+    )
+    monkeypatch.setattr(
+        delivery_setup,
+        "_lock_project_identity",
+        tracked_project_lock,
+    )
     async with session_factory() as db:
         db.add(
             MonitoredRepo(
@@ -337,9 +438,14 @@ async def test_monitor_bootstrap_adds_trusted_ci_to_existing_empty_monitor(
     )
 
     async with session_factory() as db:
-        setup = await ensure_default_delivery_monitor(db, project.id)
+        setup = await ensure_default_delivery_monitor(
+            db,
+            project.id,
+            create_authorizer=authorize,
+        )
 
     assert setup.created is False
+    assert lock_order == ["repo", "project", "authority"]
     assert setup.repo.wait_for_ci is True
     assert setup.repo.required_checks == [
         {
@@ -348,6 +454,54 @@ async def test_monitor_bootstrap_adds_trusted_ci_to_existing_empty_monitor(
             "app_slug": "github-actions",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_member_strict_bootstrap_cannot_mutate_existing_monitor(
+    session_factory,
+    monkeypatch,
+):
+    project = await _project(session_factory, suffix="member-strict")
+    async with session_factory() as db:
+        repo = MonitoredRepo(
+            repo_full_name="acme/delivery-setup-member-strict",
+            project_id=project.id,
+            webhook_secret="existing",
+            review_mode="panel",
+            wait_for_ci=False,
+            required_checks=[],
+            merge_queue_mode="manual",
+            default_branch="main",
+        )
+        db.add(repo)
+        await db.commit()
+        repo_id = repo.id
+
+    async def unexpected_discovery(*_args, **_kwargs):
+        raise AssertionError("member strict setup must not discover or mutate CI")
+
+    monkeypatch.setattr(
+        delivery_setup,
+        "discover_delivery_required_checks",
+        unexpected_discovery,
+    )
+
+    async with session_factory() as db:
+        with pytest.raises(
+            DeliverySetupPermissionError,
+            match="administrator must refresh",
+        ):
+            await ensure_default_delivery_monitor(
+                db,
+                project.id,
+                allow_create=False,
+                strict_branch_protection=True,
+            )
+
+    async with session_factory() as db:
+        unchanged = await db.get(MonitoredRepo, repo_id)
+        assert unchanged.wait_for_ci is False
+        assert unchanged.required_checks == []
 
 
 @pytest.mark.asyncio
@@ -391,6 +545,23 @@ async def test_quick_start_creates_monitor_and_delivery_from_one_message(
     monkeypatch.setattr(settings, "delivery_loop_enabled", True)
     monkeypatch.setattr(settings, "capability_core_enabled", True)
     monkeypatch.setattr(delivery_api, "_wake_controller", lambda: None)
+    topology_calls: list[tuple[int, int]] = []
+    real_topology_lock = delivery_api._lock_delivery_admission_topology
+
+    async def observed_topology_lock(request, db, *, project_id, monitored_repo_id):
+        topology_calls.append((project_id, monitored_repo_id))
+        await real_topology_lock(
+            request,
+            db,
+            project_id=project_id,
+            monitored_repo_id=monitored_repo_id,
+        )
+
+    monkeypatch.setattr(
+        delivery_api,
+        "_lock_delivery_admission_topology",
+        observed_topology_lock,
+    )
 
     async def fake_discovery(repo: str, branch: str):
         return (
@@ -421,6 +592,11 @@ async def test_quick_start_creates_monitor_and_delivery_from_one_message(
 
     assert response.status_code == 201, response.text
     assert replay.status_code == 201, replay.text
+    assert len(topology_calls) == 2
+    assert {project_id for project_id, _repo_id in topology_calls} == {
+        project.id
+    }
+    assert len({repo_id for _project_id, repo_id in topology_calls}) == 1
     body = response.json()
     assert replay.json()["id"] == body["id"]
     assert body["title"] == "Fix login redirects"

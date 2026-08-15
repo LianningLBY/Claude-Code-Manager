@@ -4,6 +4,11 @@ import type { Task, Project, TagItem } from '../api/client';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { TaskForm } from '../components/Tasks/TaskForm';
 import { TaskList } from '../components/Tasks/TaskList';
+import {
+  canControlTask,
+  canManageTaskShare,
+  readStoredUserIdentity,
+} from '../components/Tasks/taskSharePermissions';
 import { ChatView } from '../components/Chat/ChatView';
 import { LoopChatView } from '../components/Chat/LoopChatView';
 import { ProjectSelect } from '../components/ProjectSelect';
@@ -85,7 +90,9 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   useEffect(() => {
     const teamHandler = (e: Event) => {
       const task = (e as CustomEvent).detail?.task;
-      if (task) setTeamSharingTask(task);
+      if (task && canManageTaskShare(task, readStoredUserIdentity())) {
+        setTeamSharingTask(task);
+      }
     };
     window.addEventListener('ccm-team-share-task', teamHandler);
     return () => window.removeEventListener('ccm-team-share-task', teamHandler);
@@ -684,7 +691,17 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     document.addEventListener('mouseup', onUp);
   }, [sidebarWidth]);
 
+  const teamShareModal = teamSharingTask && (
+    <TeamShareModal
+      type="task"
+      itemId={teamSharingTask.id}
+      itemTitle={teamSharingTask.title || `Task #${teamSharingTask.id}`}
+      onClose={() => setTeamSharingTask(null)}
+    />
+  );
+
   if (splitMode) {
+    const currentUserIdentity = readStoredUserIdentity();
     const sidebarStatusColors: Record<string, string> = {
       pending: 'bg-yellow-500',
       in_progress: 'bg-blue-500',
@@ -700,7 +717,8 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       cancelled: 'bg-gray-500',
     };
     return (
-      <div className="flex h-[calc(100vh-49px)] -m-4">
+      <>
+        <div className="flex h-[calc(100vh-49px)] -m-4">
         {sidebarOpen && (
           <div className="shrink-0 flex flex-col border-r border-gray-800 bg-gray-900/50" style={{ width: sidebarWidth }}>
             <div className="px-3 py-2 border-b border-gray-800 flex items-center justify-between shrink-0">
@@ -722,10 +740,11 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                 const proj = t.project_id ? projects.find((p) => p.id === t.project_id) : undefined;
                 const colorDef = proj ? TAG_COLOR_OPTIONS.find((c) => c.key === proj.badge_color) : undefined;
                 const deliveryOwned = isDeliveryOwnedTask(t);
+                const taskControlAllowed = canControlTask(t);
                 return (
                 <div
                   key={t.id}
-                  {...(deliveryOwned
+                  {...(deliveryOwned || !taskControlAllowed
                     ? sidebarReorder.dropTargetProps(t, idx)
                     : sidebarReorder.itemProps(t, idx))}
                   data-testid={`task-sidebar-row-${t.id}`}
@@ -770,25 +789,27 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
                     )}
                   </div>
                   <div className="flex items-center gap-1.5 mt-1 ml-4" onClick={(e) => e.stopPropagation()}>
-                    {!deliveryOwned && <PluginsBadge task={t} onRefresh={refresh} />}
+                    {taskControlAllowed && !deliveryOwned && <PluginsBadge task={t} onRefresh={refresh} />}
                     <SubAgentsBadge task={t} />
                     <span className="flex-1" />
-                    <button
+                    {taskControlAllowed && <button
                       onClick={async () => { await api.starTask(t.id); refresh(); }}
                       className={`p-1 transition-colors ${t.starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
                       title={t.starred ? 'Unstar' : 'Star'}
                     >
                       <Star size={13} fill={t.starred ? 'currentColor' : 'none'} />
-                    </button>
-                    {!deliveryOwned && (
+                    </button>}
+                    {taskControlAllowed && !deliveryOwned && (
                       <>
-                        <button
-                          onClick={() => window.dispatchEvent(new CustomEvent('ccm-share-task', { detail: { task: t } }))}
-                          className="p-1 text-gray-600 hover:text-blue-400 transition-colors"
-                          title="Share"
-                        >
-                          <Share2 size={13} />
-                        </button>
+                        {canManageTaskShare(t, currentUserIdentity) && (
+                          <button
+                            onClick={() => window.dispatchEvent(new CustomEvent('ccm-team-share-task', { detail: { task: t } }))}
+                            className="p-1 text-gray-600 hover:text-blue-400 transition-colors"
+                            title="Team Share"
+                          >
+                            <Share2 size={13} />
+                          </button>
+                        )}
                         <button
                           onClick={async () => { await api.archiveTask(t.id); skipFreezeOnce.current = true; refresh(); }}
                           className="p-1 text-gray-600 hover:text-amber-400 transition-colors"
@@ -843,7 +864,9 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         <div className="flex-1 min-w-0">
           {chatPanel}
         </div>
-      </div>
+        </div>
+        {teamShareModal}
+      </>
     );
   }
 
@@ -852,14 +875,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       {taskListContent}
       {chatPanel}
 
-      {teamSharingTask && (
-        <TeamShareModal
-          type="task"
-          itemId={teamSharingTask.id}
-          itemTitle={teamSharingTask.title || `Task #${teamSharingTask.id}`}
-          onClose={() => setTeamSharingTask(null)}
-        />
-      )}
+      {teamShareModal}
     </div>
   );
 }

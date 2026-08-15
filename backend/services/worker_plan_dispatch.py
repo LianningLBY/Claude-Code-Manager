@@ -17,7 +17,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.instance import Instance
-from backend.models.plan import Plan, PlanInputRequest
+from backend.models.plan import Plan, PlanInputRequest, PlanVersion
 from backend.models.plan_agent import (
     PlanAgentRun,
     PlanAgentRuntimeReceipt,
@@ -206,6 +206,10 @@ def validate_worker_plan_outcome_graph(
     if not isinstance(raw_steps, list) or not isinstance(raw_inputs, list):
         raise WorkerPlanDispatchConflict(
             "Worker Plan terminal child collections are invalid"
+        )
+    if len(raw_inputs) != interaction_count:
+        raise WorkerPlanDispatchConflict(
+            "Worker Plan interaction count does not match its InputRequests"
         )
 
     step_ids: set[int] = set()
@@ -435,7 +439,7 @@ def validate_worker_terminal_outcome_graph(
     plan_id: int,
     run_id: int,
 ) -> None:
-    """Require the completed/failed subset used by exact cancellation races."""
+    """Require a complete immutable terminal graph after an exact cancel race."""
 
     validate_worker_plan_outcome_graph(
         payload,
@@ -443,10 +447,29 @@ def validate_worker_terminal_outcome_graph(
         run_id=run_id,
     )
     remote = payload["run"]
-    if remote.get("status") not in {"completed", "failed"}:
+    if remote.get("status") not in {"completed", "failed", "cancelled"}:
         raise WorkerPlanDispatchConflict(
             "Worker Plan terminal cancellation-race status is invalid"
         )
+    if remote["status"] == "cancelled":
+        # The common graph validator above proves that every Step/Input is
+        # terminal and every available edge closes.  Cancellation may win in
+        # any stage, but it cannot publish a Version: Version creation and a
+        # completed Run are one Worker transaction.  Reject a damaged or
+        # malicious Worker that tries to advance Manager Plan state through
+        # the cancellation path.
+        if (
+            remote.get("result_version_id") is not None
+            or payload["versions"]
+            or any(
+                step.get("plan_version_id") is not None
+                for step in remote.get("steps", [])
+            )
+        ):
+            raise WorkerPlanDispatchConflict(
+                "Worker cancelled Plan unexpectedly published a result"
+            )
+        return
     if remote["status"] == "failed":
         if (
             remote.get("error") is None
@@ -687,6 +710,8 @@ def worker_mirror_cleanup_is_clean(
     plan: Plan,
     run: PlanAgentRun,
     steps: Sequence[PlanAgentStep],
+    input_requests: Sequence[PlanInputRequest],
+    versions: Sequence[PlanVersion],
     runtime_receipts: Sequence[PlanAgentRuntimeReceipt],
     dispatch_receipts: Sequence[PlanAgentWorkerDispatchReceipt],
 ) -> bool:
@@ -721,6 +746,13 @@ def worker_mirror_cleanup_is_clean(
         or run.last_execution_started_at is not None
         or run.open_input_request_id is not None
         or run.finished_at is None
+        or isinstance(run.interaction_count, bool)
+        or not isinstance(run.interaction_count, int)
+        or run.interaction_count < 0
+        or isinstance(run.max_interactions, bool)
+        or not isinstance(run.max_interactions, int)
+        or run.max_interactions < 0
+        or run.interaction_count > run.max_interactions
     ):
         return False
 
@@ -767,7 +799,9 @@ def worker_mirror_cleanup_is_clean(
             return False
         historical_receipts: Sequence[PlanAgentWorkerDispatchReceipt] = ()
         imported_boundary = True
+        legacy_proof = True
     elif run.status == "cancelled" and run.cancellation_target_generation is not None:
+        legacy_proof = False
         # An exact Worker cancellation ACK advances Manager G to G+1. Input
         # answering may itself advance G before the dispatcher creates a new
         # receipt, so cancellation history may contain honest gaps (including
@@ -779,30 +813,59 @@ def worker_mirror_cleanup_is_clean(
             or not isinstance(target_generation, int)
             or target_generation < 0
             or run.generation != target_generation + 1
-            or any(generation > target_generation for generation in receipt_generations)
+            or any(
+                generation > target_generation + 1
+                for generation in receipt_generations
+            )
         ):
             return False
         target_receipt = receipts_by_generation.get(target_generation)
-        if target_receipt is not None and (
-            target_receipt.settlement_reason,
-            target_receipt.remote_status,
-        ) not in {
-            ("not_launched", None),
-            ("remote_absent", None),
-            ("remote_cancelled", "cancelled"),
-            ("remote_pause", "waiting_user"),
-        }:
-            return False
-        historical_receipts = tuple(
-            receipt
-            for generation, receipt in sorted(receipts_by_generation.items())
-            if generation < target_generation
-        )
+        successor_receipt = receipts_by_generation.get(target_generation + 1)
+        if successor_receipt is not None:
+            # G already settled as waiting_user before exact cancellation.
+            # Preserve that immutable pause and record the cancellation
+            # readback as G+1; the Run itself is also G+1 with target marker G.
+            if (
+                target_receipt is None
+                or (
+                    target_receipt.settlement_reason,
+                    target_receipt.remote_status,
+                )
+                != ("remote_pause", "waiting_user")
+                or (
+                    successor_receipt.settlement_reason,
+                    successor_receipt.remote_status,
+                )
+                != ("remote_pause", "cancelled")
+            ):
+                return False
+            historical_receipts = tuple(
+                receipt
+                for generation, receipt in sorted(receipts_by_generation.items())
+                if generation <= target_generation
+            )
+        else:
+            if target_receipt is not None and (
+                target_receipt.settlement_reason,
+                target_receipt.remote_status,
+            ) not in {
+                ("not_launched", None),
+                ("remote_absent", None),
+                ("remote_pause", "waiting_user"),
+                ("remote_pause", "cancelled"),
+            }:
+                return False
+            historical_receipts = tuple(
+                receipt
+                for generation, receipt in sorted(receipts_by_generation.items())
+                if generation < target_generation
+            )
         imported_boundary = any(
             receipt.settlement_reason == "remote_pause"
             for receipt in dispatch_receipts
         )
     else:
+        legacy_proof = False
         if run.cancellation_target_generation is not None:
             return False
         # New, non-ACK terminals have one receipt for every Manager claim from
@@ -835,6 +898,7 @@ def worker_mirror_cleanup_is_clean(
         return False
 
     remote_step_ids: set[int] = set()
+    steps_by_id: dict[int, PlanAgentStep] = {}
     for step in steps:
         if (
             isinstance(step.id, bool)
@@ -857,6 +921,144 @@ def worker_mirror_cleanup_is_clean(
         ):
             return False
         remote_step_ids.add(step.worker_step_id)
+        steps_by_id[step.id] = step
+
+    remote_input_ids: set[int] = set()
+    inputs_by_id: dict[int, PlanInputRequest] = {}
+    input_source_ids: set[int] = set()
+    for input_request in input_requests:
+        source = steps_by_id.get(input_request.source_step_id)
+        if (
+            isinstance(input_request.id, bool)
+            or not isinstance(input_request.id, int)
+            or input_request.id <= 0
+            or input_request.run_id != run.id
+            or input_request.plan_id != plan.id
+            or input_request.worker_id != worker_id
+            or isinstance(input_request.worker_input_request_id, bool)
+            or not isinstance(input_request.worker_input_request_id, int)
+            or input_request.worker_input_request_id <= 0
+            or input_request.worker_input_request_id in remote_input_ids
+            or source is None
+            or input_request.source_step_id in input_source_ids
+            or source.input_request_id != input_request.id
+            or source.step_type != input_request.requested_by
+            or input_request.status not in {"answered", "cancelled"}
+            or input_request.opened_at is None
+            or (
+                input_request.status == "answered"
+                and input_request.answered_at is None
+            )
+        ):
+            return False
+        remote_input_ids.add(input_request.worker_input_request_id)
+        input_source_ids.add(input_request.source_step_id)
+        inputs_by_id[input_request.id] = input_request
+
+    if any(
+        step.input_request_id is not None
+        and (
+            step.input_request_id not in inputs_by_id
+            or inputs_by_id[step.input_request_id].source_step_id != step.id
+        )
+        for step in steps
+    ):
+        return False
+
+    if not legacy_proof and len(input_requests) != run.interaction_count:
+        return False
+
+    remote_version_ids: set[int] = set()
+    versions_by_id: dict[int, PlanVersion] = {}
+    for version in versions:
+        producer = steps_by_id.get(version.produced_by_step_id)
+        reviewer = (
+            steps_by_id.get(version.reviewed_by_step_id)
+            if version.reviewed_by_step_id is not None
+            else None
+        )
+        if (
+            isinstance(version.id, bool)
+            or not isinstance(version.id, int)
+            or version.id <= 0
+            or version.plan_id != plan.id
+            or version.worker_id != worker_id
+            or isinstance(version.worker_version_id, bool)
+            or not isinstance(version.worker_version_id, int)
+            or version.worker_version_id <= 0
+            or version.worker_version_id in remote_version_ids
+            or version.produced_by_run_id != run.id
+            or producer is None
+            or producer.plan_version_id != version.id
+            or producer.step_type != "planner"
+            or (
+                version.reviewed_by_step_id is not None
+                and (
+                    reviewer is None
+                    or reviewer.step_type != "reviewer"
+                )
+            )
+        ):
+            return False
+        remote_version_ids.add(version.worker_version_id)
+        versions_by_id[version.id] = version
+
+    if any(
+        step.plan_version_id is not None
+        and (
+            step.plan_version_id not in versions_by_id
+            or versions_by_id[step.plan_version_id].produced_by_step_id != step.id
+        )
+        for step in steps
+    ):
+        return False
+
+    draft_step = (
+        steps_by_id.get(run.draft_step_id)
+        if run.draft_step_id is not None
+        else None
+    )
+    if run.draft_step_id is not None and (
+        draft_step is None or draft_step.step_type != "planner"
+    ):
+        return False
+    if not legacy_proof:
+        if run.status == "completed":
+            result = versions_by_id.get(run.result_version_id)
+            if (
+                len(versions) != 1
+                or result is None
+                or draft_step is None
+                or result.produced_by_step_id != draft_step.id
+                or draft_step.plan_version_id != result.id
+                or draft_step.status != "completed"
+                or run.draft_content != result.content
+                or run.draft_repo_revision != result.repo_revision
+            ):
+                return False
+        elif (
+            run.result_version_id is not None
+            or versions
+            or any(step.plan_version_id is not None for step in steps)
+        ):
+            return False
+
+    had_waiting_user_import = any(
+        receipt.settlement_reason == "remote_pause"
+        and receipt.remote_status == "waiting_user"
+        for receipt in dispatch_receipts
+    )
+    # A waiting_user readback can only be accepted with one exact open
+    # InputRequest and its source Step. Those rows are durable imported
+    # evidence even after a later answer/cancel turns the Input terminal; if
+    # either collection disappears, the Worker still holds the only complete
+    # graph and node destruction must fail closed. A completed outcome likewise
+    # always has at least its producing Planner Step.
+    if (
+        (had_waiting_user_import and (not steps or not input_requests))
+        or (run.status == "completed" and not steps)
+    ):
+        return False
     # Worker Step generations belong to the Worker's local Run and are not
     # comparable with Manager claim generations. Their mirror can only have
     # entered this database through a remote_pause outcome (or the explicit
@@ -884,6 +1086,24 @@ async def worker_mirror_run_is_clean(
                 select(PlanAgentStep)
                 .where(PlanAgentStep.run_id == run.id)
                 .order_by(PlanAgentStep.id)
+            )
+        ).scalars()
+    )
+    input_requests = list(
+        (
+            await db.execute(
+                select(PlanInputRequest)
+                .where(PlanInputRequest.run_id == run.id)
+                .order_by(PlanInputRequest.id)
+            )
+        ).scalars()
+    )
+    versions = list(
+        (
+            await db.execute(
+                select(PlanVersion)
+                .where(PlanVersion.produced_by_run_id == run.id)
+                .order_by(PlanVersion.version_number, PlanVersion.id)
             )
         ).scalars()
     )
@@ -918,6 +1138,8 @@ async def worker_mirror_run_is_clean(
         plan=plan,
         run=run,
         steps=steps,
+        input_requests=input_requests,
+        versions=versions,
         runtime_receipts=runtime_receipts,
         dispatch_receipts=dispatch_receipts,
     )
@@ -972,7 +1194,7 @@ def _validate_receipt_identity(
             run.generation != generation
             and not (
                 allow_cancelling_successor
-                and run.status == "cancelling"
+                and run.status in {"cancelling", "cancelled"}
                 and run.cancellation_target_generation == generation
                 and run.generation == generation + 1
             )
@@ -1426,12 +1648,9 @@ async def finalize_worker_mirror_cancellation(
     payload_digest: str,
     remote_state: str,
 ) -> PlanAgentRun:
-    """Publish terminal Manager state after exact cancelled/absent proof."""
+    """Publish terminal Manager state only after exact pre-import absence."""
 
-    if not _valid_digest(payload_digest) or remote_state not in {
-        "absent",
-        "cancelled",
-    }:
+    if not _valid_digest(payload_digest) or remote_state != "absent":
         raise WorkerPlanDispatchConflict(
             "Worker Plan cancellation outcome identity is invalid"
         )
@@ -1500,10 +1719,7 @@ async def finalize_worker_mirror_cancellation(
         None,
     )
     if target_receipt is not None and target_receipt.status != "settled":
-        if remote_state == "cancelled":
-            reason = "remote_cancelled"
-            remote_status = "cancelled"
-        elif target_receipt.status == "prepared":
+        if target_receipt.status == "prepared":
             reason = "not_launched"
             remote_status = None
         else:
@@ -1644,6 +1860,7 @@ async def apply_worker_terminal_after_cancellation_race(
             "Worker Plan terminal cancellation-race intent changed"
         )
 
+    cancelled_outcome = payload["run"]["status"] == "cancelled"
     observation_generation = target_generation
     dispatch_receipt = next(
         (
@@ -1690,22 +1907,30 @@ async def apply_worker_terminal_after_cancellation_race(
             "Worker Plan terminal outcome lost its dispatch receipt"
         )
 
-    # Clear the G+1 cancellation shape and let the ordinary exact outcome
-    # importer commit the restored generation, mirrored children and terminal
-    # receipt in one transaction.
-    run.status = "running"
-    run.cancellation_target_generation = None
-    run.generation = observation_generation
-    run.error = None
-    run.updated_at = datetime.utcnow()
+    # A completed/failed outcome beat the cancellation and restores the
+    # Worker's terminal generation. A cancelled outcome is the cancellation
+    # success itself: preserve Manager G+1 + target G while importing every
+    # child and settling receipt G atomically.
+    if not cancelled_outcome:
+        run.status = "running"
+        run.cancellation_target_generation = None
+        run.generation = observation_generation
+        run.error = None
+        run.updated_at = datetime.utcnow()
     from backend.services.plan_service import apply_worker_plan_outcome
 
-    return await apply_worker_plan_outcome(
-        db,
-        plan=plan,
-        run=run,
-        worker_id=worker_id,
-        expected_generation=observation_generation,
-        payload=payload,
-        worker_dispatch_receipt_id=dispatch_receipt.id,
-    )
+    try:
+        return await apply_worker_plan_outcome(
+            db,
+            plan=plan,
+            run=run,
+            worker_id=worker_id,
+            expected_generation=observation_generation,
+            payload=payload,
+            worker_dispatch_receipt_id=dispatch_receipt.id,
+            allow_cancelling_successor=cancelled_outcome,
+        )
+    except RuntimeError as exc:
+        raise WorkerPlanDispatchConflict(
+            f"Worker Plan terminal graph could not be imported: {exc}"
+        ) from exc

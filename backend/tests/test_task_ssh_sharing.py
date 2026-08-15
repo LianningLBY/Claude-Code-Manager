@@ -1,3 +1,4 @@
+import json
 import tempfile
 from pathlib import Path
 
@@ -13,6 +14,9 @@ from backend.models.team_share import TeamTaskShare
 from backend.services import task_sharing
 from backend.services import task_ssh_access
 from backend.services.task_creation import purge_task_access_grants
+from backend.services.task_agent_isolation import (
+    generate_claude_task_isolation_settings,
+)
 from backend.services.task_ssh_access import (
     TaskSSHAccessError,
     replace_task_ssh_grants,
@@ -76,7 +80,39 @@ async def _seed_task_profile(db_factory, *, with_grant: bool = False):
 
 
 @pytest.mark.asyncio
-async def test_existing_team_share_invalidates_legacy_ssh_grant(db_factory):
+async def test_stale_profile_key_is_collapsed_under_managed_root_for_claude(
+    db_factory,
+):
+    """A missing Profile leaf stays protected without breaking every Bash."""
+
+    _project_id, task_id, profile_id = await _seed_task_profile(db_factory)
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        profile = await db.get(SSHProfile, profile_id)
+        protected = await task_ssh_protected_paths(db, task=task)
+
+    managed_root = str(Path(settings.ssh_key_storage_dir))
+    assert not Path(profile.key_path).exists()
+    assert managed_root in protected
+    assert profile.key_path in protected
+
+    path = generate_claude_task_isolation_settings(task_id, protected)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    filesystem = payload["sandbox"]["filesystem"]
+    credential_paths = {
+        entry["path"]
+        for entry in payload["sandbox"]["credentials"]["files"]
+    }
+    assert managed_root in filesystem["denyRead"]
+    assert managed_root in filesystem["denyWrite"]
+    assert managed_root in credential_paths
+    assert profile.key_path not in filesystem["denyRead"]
+    assert profile.key_path not in filesystem["denyWrite"]
+    assert profile.key_path not in credential_paths
+
+
+@pytest.mark.asyncio
+async def test_local_team_share_keeps_exact_ssh_grant_valid(db_factory):
     _project_id, task_id, profile_id = await _seed_task_profile(
         db_factory,
         with_grant=True,
@@ -92,16 +128,16 @@ async def test_existing_team_share_invalidates_legacy_ssh_grant(db_factory):
         await db.commit()
         task = await db.get(Task, task_id)
         snapshots = await task_ssh_grant_snapshots(db, task)
-        assert snapshots[0]["valid"] is False
-        assert snapshots[0]["invalid_reason"] == "team_task_shared"
-        assert await valid_task_ssh_capabilities(db, task) == set()
-        with pytest.raises(TaskSSHAccessError, match="team_task_shared"):
-            await resolve_task_ssh_profile(
-                db,
-                task_id=task_id,
-                profile_id=profile_id,
-                required_capability="read",
-            )
+        assert snapshots[0]["valid"] is True
+        assert snapshots[0]["invalid_reason"] is None
+        assert await valid_task_ssh_capabilities(db, task) == {"read"}
+        resolved = await resolve_task_ssh_profile(
+            db,
+            task_id=task_id,
+            profile_id=profile_id,
+            required_capability="read",
+        )
+        assert resolved.id == profile_id
 
 
 @pytest.mark.asyncio

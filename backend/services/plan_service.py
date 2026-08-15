@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from functools import wraps
@@ -41,6 +43,7 @@ from backend.services.worker_task_termination import (
     active_worker_task_termination_receipt,
     no_active_worker_task_termination_predicate,
 )
+from backend.services.worker_node_control import fence_worker_node_mutation
 from backend.schemas.plan_resource import (
     PlanApplicationAttemptResource,
     PlanApplicationResource,
@@ -68,8 +71,16 @@ TERMINAL_PLAN_DELIVERY_STATUSES = frozenset(
 PLAN_RUN_HANDLE_GENERATION = 0
 _plan_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 _target_plan_locks: defaultdict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+_held_target_plan_locks: ContextVar[tuple[object | None, frozenset[int]]] = ContextVar(
+    "held_target_plan_locks",
+    default=(None, frozenset()),
+)
 LockedPlanAuthorizationCallback = Callable[[AsyncSession, Plan], Awaitable[None]]
 LockedPlanCreationAuthorizationCallback = Callable[
+    [AsyncSession],
+    Awaitable[None],
+]
+PlanEffectBoundaryAuthorizationCallback = Callable[
     [AsyncSession],
     Awaitable[None],
 ]
@@ -486,15 +497,39 @@ async def resolve_uncertain_plan_application(
     return plan_ids, receipt.target_task_id
 
 
-def _serialize_related_plan_creation(function):
-    """Keep the target fence through COUNT, INSERT, and commit in-process."""
+@asynccontextmanager
+async def related_plan_creation_lock(target_task_id: int | None):
+    """Keep one target's Plan admission serialized, with reentrant nesting."""
+
+    if target_task_id is None:
+        yield
+        return
+    current_task = asyncio.current_task()
+    owner_task, held = _held_target_plan_locks.get()
+    if owner_task is current_task and target_task_id in held:
+        yield
+        return
+    async with _target_plan_locks[target_task_id]:
+        nested = held if owner_task is current_task else frozenset()
+        token = _held_target_plan_locks.set(
+            (current_task, nested | {target_task_id})
+        )
+        try:
+            yield
+        finally:
+            _held_target_plan_locks.reset(token)
+
+
+def serialize_related_plan_creation(function):
+    """Keep target reads, COUNT, INSERT, and commit serialized in-process."""
 
     @wraps(function)
     async def wrapped(*args, **kwargs):
         target_task_id = kwargs.get("target_task_id")
-        if target_task_id is None:
-            return await function(*args, **kwargs)
-        async with _target_plan_locks[target_task_id]:
+        body = kwargs.get("body")
+        if target_task_id is None and body is not None:
+            target_task_id = getattr(body, "target_task_id", None)
+        async with related_plan_creation_lock(target_task_id):
             return await function(*args, **kwargs)
 
     return wrapped
@@ -663,26 +698,20 @@ async def fence_plan_worker(
     leave a fresh durable pointer to the machine being terminated.
     """
 
-    if worker_id is None:
-        return
-    fenced = await db.execute(
-        update(Worker)
-        .where(
-            Worker.id == worker_id,
-            Worker.status.notin_(("destroying", "terminated")),
-            or_(
-                Worker.bootstrap_step.is_(None),
-                Worker.bootstrap_step != "destroy",
-            ),
-        )
-        .values(status=Worker.status, updated_at=Worker.updated_at)
+    from backend.services.worker_assignment import (
+        WorkerAssignmentConflict,
+        fence_ready_worker_assignment,
     )
-    if fenced.rowcount != 1:
+
+    try:
+        await fence_ready_worker_assignment(db, worker_id)
+    except WorkerAssignmentConflict as exc:
         await db.rollback()
         raise HTTPException(
             409,
-            "Plan Worker is unavailable or is changing lifecycle state",
-        )
+            "Plan Worker is unavailable or is changing lifecycle state: "
+            f"{exc.detail}",
+        ) from exc
 
 
 def _public_attachments(items: list[dict] | None) -> list[dict] | None:
@@ -726,6 +755,9 @@ async def stage_plan_with_run(
     base_version_id: int | None = None,
     run_type: str = "initial",
     capability_execution_id: int | None = None,
+    authorize_effect_boundary: (
+        PlanEffectBoundaryAuthorizationCallback | None
+    ) = None,
     authorize_locked_creation: (
         LockedPlanCreationAuthorizationCallback | None
     ) = None,
@@ -739,6 +771,23 @@ async def stage_plan_with_run(
     Plan and Run ids are available.
     """
 
+    if authorize_effect_boundary is not None:
+        # Public adapters establish Worker-node -> Project -> Task -> Worker ->
+        # group -> User authority here.  This service re-enters the already
+        # locked Task/Worker rows below; the callback keeps every authority row
+        # locked through the Plan/Run commit.
+        try:
+            await authorize_effect_boundary(db)
+        except BaseException:
+            await asyncio.shield(db.rollback())
+            raise
+    else:
+        # On a Worker the node-control row is the outermost producer fence.
+        # Keep it locked through the Plan/Run flush and the caller's eventual
+        # commit so a destroy proof can neither miss an in-flight Run nor be
+        # followed by a newly committed one. Manager databases deliberately
+        # treat this as a no-op.
+        await fence_worker_node_mutation(db)
     now = datetime.utcnow()
     await fence_plan_target_task(
         db,
@@ -824,7 +873,7 @@ async def stage_plan_with_run(
     return plan, run
 
 
-@_serialize_related_plan_creation
+@serialize_related_plan_creation
 async def create_plan_with_run(
     db: AsyncSession,
     *,
@@ -847,6 +896,9 @@ async def create_plan_with_run(
     forked_from_version_id: int | None = None,
     base_version_id: int | None = None,
     run_type: str = "initial",
+    authorize_effect_boundary: (
+        PlanEffectBoundaryAuthorizationCallback | None
+    ) = None,
     authorize_locked_creation: (
         LockedPlanCreationAuthorizationCallback | None
     ) = None,
@@ -875,6 +927,7 @@ async def create_plan_with_run(
         forked_from_version_id=forked_from_version_id,
         base_version_id=base_version_id,
         run_type=run_type,
+        authorize_effect_boundary=authorize_effect_boundary,
         authorize_locked_creation=authorize_locked_creation,
     )
     await db.commit()
@@ -901,6 +954,9 @@ async def create_plan_run(
     target_branch: str | None,
     worker_id: int | None,
     source_run_id: int | None = None,
+    authorize_effect_boundary: (
+        PlanEffectBoundaryAuthorizationCallback | None
+    ) = None,
     authorize_locked_plan: LockedPlanAuthorizationCallback | None = None,
 ) -> PlanAgentRun:
     """Create one Run under the Plan's durable active-run fence."""
@@ -921,6 +977,18 @@ async def create_plan_run(
     expected_target_task_id = plan.target_task_id
 
     await _end_plan_routing_read(db)
+    if authorize_effect_boundary is not None:
+        # Public adapters establish Worker-node -> Project -> Task -> Worker ->
+        # group -> User authority here.  The service re-enters Task/Worker and
+        # then appends Plan; authorizing from the later Plan callback would
+        # append Project after Task and deadlock with share revocation.
+        try:
+            await authorize_effect_boundary(db)
+        except BaseException:
+            await asyncio.shield(db.rollback())
+            raise
+    else:
+        await fence_worker_node_mutation(db)
     await fence_plan_target_task(
         db,
         target_task_id=expected_target_task_id,
@@ -1373,6 +1441,11 @@ async def answer_input_request(
     # conditional writer sequence below also gives PostgreSQL/MySQL one global
     # row-lock order, so answer and every cancellation path cannot deadlock.
     await db.rollback()
+    # Answering an open request reactivates the Run.  Serialize that producer
+    # transition before Invocation/Execution/Run locks so a Worker drain that
+    # has already begun cannot turn a resting ``waiting_user`` Run back into
+    # executable work after the node-wide snapshot.
+    await fence_worker_node_mutation(db)
     now = datetime.utcnow()
 
     if capability_owned:
@@ -1506,6 +1579,30 @@ async def decide_version(
         if version.human_decision == decision:
             return version
         raise HTTPException(409, f"Version was already {version.human_decision}")
+    # This service can also run inside a headless Worker.  The node singleton
+    # is the outermost durable producer fence there and a no-op on the
+    # Manager.  API adapters may already hold it together with Project/Task
+    # authority; taking the same row again in the same transaction is
+    # idempotent and keeps direct/internal callers fail-closed.
+    await fence_worker_node_mutation(db)
+    plan_fenced = await db.execute(
+        update(Plan)
+        .where(
+            Plan.id == plan.id,
+            Plan.lock_version == plan.lock_version,
+            Plan.current_version_id == expected_current_version_id,
+            Plan.active_run_id.is_(None),
+            Plan.archived_at.is_(None),
+            Plan.target_task_id == plan.target_task_id,
+            Plan.project_id == plan.project_id,
+            Plan.created_by == plan.created_by,
+        )
+        # Portable Plan writer fence: SELECT FOR UPDATE is ignored by SQLite.
+        .values(updated_at=Plan.updated_at)
+    )
+    if plan_fenced.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(409, "Plan changed while deciding the Version")
     changed = await db.execute(
         update(PlanVersion)
         .where(
@@ -1537,7 +1634,11 @@ async def materialize_execution_task(
     confirm_stale: bool,
     approve_if_pending: bool,
     actor_id: int | None,
+    execution_principal: dict[str, object] | None = None,
     execution_metadata: dict | None = None,
+    authorize_effect_boundary: (
+        PlanEffectBoundaryAuthorizationCallback | None
+    ) = None,
     authorize_locked_plan: LockedPlanAuthorizationCallback | None = None,
 ) -> PlanExecutionTaskResult:
     """Idempotently apply one standalone Plan Version as an execution Task.
@@ -1548,6 +1649,41 @@ async def materialize_execution_task(
     Authorization and post-commit wake/broadcast behavior remain adapter
     concerns and must be handled by the caller.
     """
+
+    from backend.services.task_creation import (
+        TASK_EXECUTION_MODES,
+        TASK_EXECUTION_PRINCIPAL_KINDS,
+        TASK_EXECUTION_ROLES,
+        task_execution_principal_values,
+        system_task_execution_principal_values,
+    )
+
+    principal_fields = dict(
+        execution_principal or system_task_execution_principal_values()
+    )
+    if set(principal_fields) != {
+        "execution_user_id",
+        "execution_user_role",
+        "execution_mode",
+        "execution_principal_kind",
+    }:
+        raise ValueError("invalid execution Task principal shape")
+    role = principal_fields["execution_user_role"]
+    mode = principal_fields["execution_mode"]
+    kind = principal_fields["execution_principal_kind"]
+    if (
+        role not in TASK_EXECUTION_ROLES
+        or mode not in TASK_EXECUTION_MODES
+        or kind not in TASK_EXECUTION_PRINCIPAL_KINDS
+    ):
+        raise ValueError("invalid execution Task principal")
+    expected_principal = task_execution_principal_values(
+        user_id=principal_fields["execution_user_id"],
+        role=role,
+        principal_kind=kind,
+    )
+    if principal_fields != expected_principal:
+        raise ValueError("execution Task principal role/mode mismatch")
 
     async def existing_execution_task_result() -> PlanExecutionTaskResult | None:
         """Return the immutable winner without revalidating mutable Plan state."""
@@ -1689,10 +1825,19 @@ async def materialize_execution_task(
         # CAS miss.
         await db.rollback()
 
-        # All Plan admission paths use Worker -> Plan lock order.  Taking the
-        # Worker lifecycle fence first prevents a standalone create-Run
-        # (Worker -> Plan) from deadlocking with execution materialization
-        # (formerly Plan -> Worker) on PostgreSQL/MySQL.
+        # Public execution admission establishes Worker-node -> Project ->
+        # Worker -> group -> User before the Plan aggregate.  The Worker fence
+        # below re-enters that already-held row in the same transaction.
+        if authorize_effect_boundary is not None:
+            try:
+                await authorize_effect_boundary(db)
+            except BaseException:
+                await asyncio.shield(db.rollback())
+                raise
+
+        # All Plan admission paths keep Worker before Plan.  Taking the Worker
+        # lifecycle fence here prevents a standalone create-Run from
+        # deadlocking with execution materialization on PostgreSQL/MySQL.
         await fence_plan_worker(db, worker_id=expected_worker_id)
 
         # This conditional write is the cross-process writer fence.  The
@@ -1875,6 +2020,10 @@ async def materialize_execution_task(
                 created_by=actor_id,
                 mode="auto",
                 metadata_=metadata,
+                # Worker placement is not an authorization downgrade.  This
+                # implementation Task retains the native Manager principal;
+                # the Worker transport converts it to a delegated envelope.
+                **principal_fields,
             )
             application = PlanApplication(
                 plan_id=plan.id,
@@ -3573,6 +3722,7 @@ async def apply_worker_plan_outcome(
     expected_generation: int,
     payload: dict,
     worker_dispatch_receipt_id: int | None = None,
+    allow_cancelling_successor: bool = False,
 ) -> PlanAgentRun:
     """Import one exact Worker pause while keeping Manager ids authoritative."""
 
@@ -3588,6 +3738,7 @@ async def apply_worker_plan_outcome(
     if isinstance(raw_remote, dict) and raw_remote.get("status") in {
         "completed",
         "failed",
+        "cancelled",
     }:
         from backend.services.worker_plan_dispatch import (
             WorkerPlanDispatchConflict,
@@ -3655,12 +3806,29 @@ async def apply_worker_plan_outcome(
             raise RuntimeError(
                 "Worker Plan result Version number does not extend its exact base"
             )
+    ordinary_owner = run.status == "running" and run.generation == expected_generation
+    cancelling_target_observation = bool(
+        allow_cancelling_successor
+        and remote.status == "cancelled"
+        and run.status == "cancelling"
+        and run.cancellation_target_generation == expected_generation
+        and run.generation == expected_generation + 1
+    )
+    cancelling_successor_observation = bool(
+        allow_cancelling_successor
+        and remote.status == "cancelled"
+        and run.status == "cancelling"
+        and run.cancellation_target_generation == expected_generation - 1
+        and run.generation == expected_generation
+    )
+    cancelling_successor = bool(
+        cancelling_target_observation or cancelling_successor_observation
+    )
     if (
         plan.worker_id != worker_id
         or run.worker_id != worker_id
         or plan.active_run_id != run.id
-        or run.status != "running"
-        or run.generation != expected_generation
+        or not (ordinary_owner or cancelling_successor)
         or remote.id != run.id
         or remote.plan_id != plan.id
         or remote.status not in {"waiting_user", "completed", "failed", "cancelled"}
@@ -3823,6 +3991,9 @@ async def apply_worker_plan_outcome(
         source = step_by_remote.get(item.source_step_id)
         if source is None:
             raise RuntimeError("Worker InputRequest has no imported source Step")
+        normalized_questions = [
+            question.model_dump(mode="json") for question in item.questions
+        ]
         if input_request is None:
             input_request = PlanInputRequest(
                 plan_id=plan.id,
@@ -3832,9 +4003,7 @@ async def apply_worker_plan_outcome(
                 source_step_id=source.id,
                 requested_by=item.requested_by,
                 reason=item.reason,
-                questions=[
-                    question.model_dump(mode="json") for question in item.questions
-                ],
+                questions=normalized_questions,
                 status=item.status,
                 answers=item.answers,
                 response_text=item.response_text,
@@ -3847,8 +4016,22 @@ async def apply_worker_plan_outcome(
             )
             db.add(input_request)
             await db.flush()
-        elif input_request.run_id != run.id or input_request.plan_id != plan.id:
-            raise RuntimeError("Worker InputRequest mapping collides with another Run")
+        elif (
+            input_request.run_id != run.id
+            or input_request.plan_id != plan.id
+            or input_request.source_step_id != source.id
+            or input_request.requested_by != item.requested_by
+            or input_request.reason != item.reason
+            or input_request.questions != normalized_questions
+            or input_request.opened_at != item.opened_at
+            or input_request.created_at != item.created_at
+        ):
+            # Answer status/timestamps and attachment paths deliberately remain
+            # Manager-owned: an answer can be durable locally before its exact
+            # replay reaches the Worker, and Worker upload paths use another
+            # namespace. The request identity and question graph are immutable
+            # in both domains and must match on every readback.
+            raise RuntimeError("Worker InputRequest mapping changed immutable content")
         input_by_remote[item.id] = input_request
         source.input_request_id = input_request.id
 
@@ -3907,6 +4090,7 @@ async def apply_worker_plan_outcome(
             generation=expected_generation,
             reason="remote_pause",
             remote_status=remote.status,
+            allow_cancelling_successor=cancelling_successor,
         )
     await db.commit()
     await db.refresh(run)

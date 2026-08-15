@@ -10,12 +10,14 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import select
 
 import backend.main as main_module
 import backend.services.worker_plan_dispatch as worker_plan_dispatch_module
 from backend.models.plan import Plan
 from backend.models.plan_agent import (
     PlanAgentRun,
+    PlanAgentStep,
     PlanAgentWorkerDispatchReceipt,
     PlanAgentWorkerImportReceipt,
 )
@@ -178,6 +180,41 @@ def _failed_payload(graph: _Graph) -> dict:
     }
 
 
+def _cancelled_payload(graph: _Graph) -> dict:
+    payload = _failed_payload(graph)
+    payload["run"] = {
+        **payload["run"],
+        "status": "cancelled",
+        "current_stage": "planner",
+        "error": "Cancelled by user",
+        "steps": [
+            {
+                "id": 900_000 + graph.run_id,
+                "run_id": graph.run_id,
+                "plan_id": graph.plan_id,
+                "plan_version_id": None,
+                "input_request_id": None,
+                "step_type": "planner",
+                "round": 1,
+                "generation": 0,
+                "provider": "codex",
+                "model": "gpt-test",
+                "effort": "high",
+                "route_slot": "primary",
+                "status": "cancelled",
+                "output": "durable cancelled recovery evidence",
+                "error": "Cancelled by user",
+                "last_delta_at": graph.updated_at,
+                "streamed_output_chars": 35,
+                "last_event_type": "turn.cancelled",
+                "started_at": graph.created_at,
+                "finished_at": graph.updated_at,
+            }
+        ],
+    }
+    return payload
+
+
 @pytest.mark.asyncio
 async def test_restart_requeues_only_prepared_worker_claim(
     db_factory,
@@ -269,6 +306,66 @@ async def test_restart_replays_exact_cancellation_and_imports_terminal_winner(
 
 
 @pytest.mark.asyncio
+async def test_restart_replays_exact_cancellation_and_imports_cancelled_graph(
+    db_factory,
+    monkeypatch,
+):
+    graph = await _seed_graph(
+        db_factory,
+        receipt_status="remote_possible",
+        generation=0,
+    )
+    async with db_factory() as db:
+        await fence_worker_mirror_cancellation(
+            db,
+            plan_id=graph.plan_id,
+            run_id=graph.run_id,
+            worker_id=graph.worker_id,
+            generation=graph.generation,
+            payload_digest="a" * 64,
+        )
+
+    cancelled = _cancelled_payload(graph)
+    proxy = AsyncMock()
+    proxy.cancel_versioned_plan_run.return_value = {
+        "protocol": 1,
+        "state": "terminal",
+        "plan_id": graph.plan_id,
+        "run_id": graph.run_id,
+        "payload_digest": "a" * 64,
+        "base_worker_version_id": cancelled["base_worker_version_id"],
+        "run": cancelled["run"],
+        "versions": cancelled["versions"],
+    }
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = _dispatcher(db_factory)
+
+    assert await dispatcher._recover_versioned_plan_runs() is False
+    await dispatcher._running_tasks[f"worker-plan-{graph.run_id}"]
+
+    async with db_factory() as db:
+        plan = await db.get(Plan, graph.plan_id)
+        run = await db.get(PlanAgentRun, graph.run_id)
+        receipt = await db.get(PlanAgentWorkerDispatchReceipt, graph.receipt_id)
+        steps = list(
+            (
+                await db.execute(
+                    select(PlanAgentStep).where(PlanAgentStep.run_id == graph.run_id)
+                )
+            ).scalars()
+        )
+        assert plan is not None and plan.active_run_id is None
+        assert run is not None and run.status == "cancelled"
+        assert run.generation == 1
+        assert run.cancellation_target_generation == 0
+        assert receipt is not None and receipt.status == "settled"
+        assert receipt.settlement_reason == "remote_pause"
+        assert receipt.remote_status == "cancelled"
+        assert len(steps) == 1
+        assert steps[0].output == "durable cancelled recovery evidence"
+
+
+@pytest.mark.asyncio
 async def test_restart_exact_cancellation_ack_loss_rearms_recovery(
     db_factory,
     monkeypatch,
@@ -341,10 +438,13 @@ async def test_exact_cancel_recovery_progresses_after_old_lifecycle_is_reaped(
     proxy = AsyncMock()
     proxy.cancel_versioned_plan_run.return_value = {
         "protocol": 1,
-        "state": "cancelled",
+        "state": "absent",
         "plan_id": graph.plan_id,
         "run_id": graph.run_id,
         "payload_digest": "a" * 64,
+        "base_worker_version_id": None,
+        "run": None,
+        "versions": [],
     }
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
     dispatcher = _dispatcher(db_factory)
@@ -543,13 +643,13 @@ async def test_restart_remote_absence_is_proved_before_requeue(
     ),
     [
         (WorkerPlanRemoteAbsent, "queued", "remote_absent", None, 1),
-        (
-            WorkerPlanRemoteCancelled,
-            "cancelled",
-            "remote_cancelled",
-            "cancelled",
-            1,
-        ),
+            (
+                WorkerPlanRemoteCancelled,
+                "cancelled",
+                "remote_absent",
+                None,
+                1,
+            ),
         (
             WorkerPlanRemoteIdentityConflict,
             "failed",

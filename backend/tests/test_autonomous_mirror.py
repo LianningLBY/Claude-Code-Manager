@@ -33,6 +33,11 @@ from backend.models.sub_agent import SubAgentSession
 from backend.models.worker_task_termination import (
     WorkerTaskTerminationReceipt,
 )
+from backend.services.task_events import (
+    PTY_TERMINAL_PUBLICATION_EVENT_TYPE,
+    build_pty_terminal_publication_payload,
+    parse_pty_terminal_publication_payload,
+)
 
 
 async def _make_inst_task(db_factory):
@@ -47,10 +52,20 @@ async def _make_inst_task(db_factory):
         return inst.id, task.id
 
 
-def _make_im(db_factory):
+def _make_im(db_factory, *, initialize_pty: bool = False):
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
-    return InstanceManager(db_factory, broadcaster), broadcaster
+    if initialize_pty:
+        return InstanceManager(db_factory, broadcaster), broadcaster
+    # These tests exercise InstanceManager's persistence and mirror methods by
+    # installing explicit bare/fake PTY backends where needed.  Starting a
+    # real claude_pty BridgeHub for every helper call leaks one HTTPServer
+    # thread/listener until process exit and can exhaust a full pytest run.
+    with patch(
+        "backend.services.instance_manager.settings.use_pty_mode",
+        False,
+    ):
+        return InstanceManager(db_factory, broadcaster), broadcaster
 
 
 def _active_worker_termination_receipt(
@@ -120,6 +135,26 @@ async def _entries(db_factory, task_id):
             select(LogEntry).where(LogEntry.task_id == task_id).order_by(LogEntry.id)
         )
         return result.scalars().all()
+
+
+def test_terminal_publication_parser_rejects_semantic_event_tampering():
+    raw = build_pty_terminal_publication_payload(
+        task_id=42,
+        incarnation_id="a" * 32,
+        retry_count=2,
+        turn_generation=3,
+        session_id="parser-session",
+        source_background_generation="parser-generation",
+        status="completed",
+        instance_id=7,
+        started_at=datetime(2026, 8, 14, 1, 2, 3),
+        completed_at=datetime(2026, 8, 14, 1, 3, 4),
+    )
+    payload = json.loads(raw)
+    payload["events"][2]["data"]["new_status"] = "failed"
+
+    with pytest.raises(ValueError, match="event batch is invalid"):
+        parse_pty_terminal_publication_payload(json.dumps(payload))
 
 
 async def _wait_for_pty_background_state(
@@ -697,6 +732,12 @@ class TestFullMirrorBackend:
             model_override="claude-opus-4-8",
             queue_timestamp=12.5,
             queue_admission_fence=retry_fence,
+            initiating_user_id=None,
+            initiating_user_role="member",
+            execution_mode="sandbox",
+            execution_principal_kind="system",
+            attachment_paths=(),
+            ssh_agent_socket_snapshot=None,
         )
 
     async def test_source_less_empty_pty_reply_is_not_reenqueued(
@@ -2653,9 +2694,15 @@ class TestFullMirrorBackend:
         )
         await asyncio.wait_for(publication_entered.wait(), 1)
         async with db_factory() as db:
-            assert (
-                await db.get(Task, task_id)
-            ).pty_background_generation is None
+            task = await db.get(Task, task_id)
+            assert task.pty_background_generation is None
+            assert await db.scalar(
+                select(LogEntry.id).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type
+                    == PTY_TERMINAL_PUBLICATION_EVENT_TYPE,
+                )
+            ) is not None
 
         async def simulate_on_exit_reuse():
             async with im.pty_background_transition(
@@ -2684,6 +2731,133 @@ class TestFullMirrorBackend:
             assert (
                 await db.get(Task, task_id)
             ).pty_background_generation is None
+            assert await db.scalar(
+                select(LogEntry.id).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type
+                    == PTY_TERMINAL_PUBLICATION_EVENT_TYPE,
+                )
+            ) is None
+
+    async def test_terminal_publication_failure_is_recovered_from_outbox(
+        self, db_factory
+    ):
+        im, broadcaster = _make_im(db_factory)
+        _instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "terminal-recovery-session"
+        generation = "terminal-recovery-generation"
+
+        class Session:
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+
+        session = Session()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.session_id = session_id
+            task.pty_background_generation = generation
+            await db.commit()
+
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            session,
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        state.terminal_seen = True
+        broadcaster.broadcast.side_effect = RuntimeError("socket unavailable")
+
+        assert await im._try_complete_pty_background_generation(state) is True
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.pty_background_generation is None
+            outbox_id = await db.scalar(
+                select(LogEntry.id).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type
+                    == PTY_TERMINAL_PUBLICATION_EVENT_TYPE,
+                )
+            )
+            assert outbox_id is not None
+
+        broadcaster.broadcast.reset_mock()
+        broadcaster.broadcast.side_effect = None
+        assert await im.recover_pty_terminal_publications() == (1, 0)
+        assert broadcaster.broadcast.await_count == 2
+        async with db_factory() as db:
+            assert await db.get(LogEntry, outbox_id) is None
+
+    async def test_ambiguous_terminal_publication_is_retained_until_retry_supersedes(
+        self, db_factory
+    ):
+        im, broadcaster = _make_im(db_factory)
+        instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "terminal-aba-session"
+        generation = "terminal-aba-generation"
+
+        class Session:
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+
+        session = Session()
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.session_id = session_id
+            task.pty_background_generation = generation
+            await db.commit()
+
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            session,
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        state.terminal_seen = True
+        broadcaster.broadcast.side_effect = RuntimeError("first publish fails")
+        assert await im._try_complete_pty_background_generation(state) is True
+        broadcaster.broadcast.reset_mock()
+        broadcaster.broadcast.side_effect = None
+
+        # Same generation with a changed committed snapshot is ambiguous ABA:
+        # it must neither broadcast nor delete the durable blocker.
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.instance_id = instance_id
+            await db.commit()
+        assert await im.recover_pty_terminal_publications() == (0, 1)
+        broadcaster.broadcast.assert_not_awaited()
+        async with db_factory() as db:
+            outbox_id = await db.scalar(
+                select(LogEntry.id).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type
+                    == PTY_TERMINAL_PUBLICATION_EVENT_TYPE,
+                )
+            )
+            assert outbox_id is not None
+
+        # A strictly newer retry is durable supersession evidence. Recovery
+        # deletes the old marker without publishing its stale events.
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.retry_count = 1
+            await db.commit()
+        assert await im.recover_pty_terminal_publications() == (1, 0)
+        broadcaster.broadcast.assert_not_awaited()
+        async with db_factory() as db:
+            assert await db.get(LogEntry, outbox_id) is None
 
     async def test_autonomous_turn_clears_marker_only_after_exact_sentinel(
         self, db_factory
@@ -2746,7 +2920,7 @@ class TestFullMirrorBackend:
             task = await db.get(Task, task_id)
             assert task.status == "completed"
             assert task.background_active is False
-        terminal_handler.assert_awaited_once_with(task_id)
+        terminal_handler.assert_awaited_once_with(task_id, generation)
         task_events = [
             call.args[1]
             for call in broadcaster.broadcast.await_args_list
@@ -2757,6 +2931,143 @@ class TestFullMirrorBackend:
             and event.get("background_active") is False
             for event in task_events
         )
+
+    async def test_worker_phase_one_drain_allows_exact_background_terminal(
+        self,
+        db_factory,
+        monkeypatch,
+    ):
+        """Phase one lets an admitted exact callback finish before the seal."""
+
+        from backend.config import settings
+        from backend.services.worker_node_control import (
+            begin_worker_node_drain,
+        )
+
+        _instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "drain-first-terminal-session"
+        generation = "drain-first-terminal-generation"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = generation
+            await db.commit()
+
+        class Session:
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+
+        im, broadcaster = _make_im(db_factory)
+        terminal_handler = AsyncMock()
+        im.pty_background_completion_handler = terminal_handler
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            Session(),
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        state.terminal_seen = True
+        watcher = state.watcher
+        monkeypatch.setattr(settings, "ccm_node_role", "worker")
+        async with db_factory() as db:
+            await begin_worker_node_drain(db, claim="8" * 64)
+            await db.commit()
+
+        try:
+            assert await im._try_complete_pty_background_generation(
+                state
+            )
+            terminal_handler.assert_awaited_once_with(task_id, generation)
+            assert broadcaster.broadcast.await_count > 0
+            assert (task_id, session_id) not in im._pty_background_states
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                assert task.status == "completed"
+                assert task.pty_background_generation is None
+        finally:
+            if watcher is not None:
+                await asyncio.gather(watcher, return_exceptions=True)
+
+    async def test_worker_drain_between_handler_and_staging_finishes_terminal(
+        self,
+        db_factory,
+        monkeypatch,
+    ):
+        """A phase-one winner cannot discard an admitted terminal result."""
+
+        from backend.config import settings
+        from backend.services.worker_node_control import (
+            begin_worker_node_drain,
+        )
+
+        _instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "drain-final-publication-session"
+        generation = "drain-final-publication-generation"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = generation
+            await db.commit()
+
+        class Session:
+            has_pending_subagents = False
+            is_alive = True
+
+            def __init__(self):
+                self.session_id = session_id
+
+        monkeypatch.setattr(settings, "ccm_node_role", "worker")
+
+        async def drain_from_terminal_handler(
+            handler_task_id,
+            expected_generation,
+        ):
+            assert handler_task_id == task_id
+            assert expected_generation == generation
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                assert task.pty_background_generation == generation
+                await db.rollback()
+            async with db_factory() as db:
+                await begin_worker_node_drain(db, claim="9" * 64)
+                await db.commit()
+
+        im, broadcaster = _make_im(db_factory)
+        terminal_handler = AsyncMock(side_effect=drain_from_terminal_handler)
+        im.pty_background_completion_handler = terminal_handler
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            Session(),
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        state.terminal_seen = True
+        watcher = state.watcher
+        try:
+            assert await im._try_complete_pty_background_generation(
+                state
+            )
+            terminal_handler.assert_awaited_once_with(task_id, generation)
+            assert broadcaster.broadcast.await_count > 0
+            assert (task_id, session_id) not in im._pty_background_states
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                assert task.status == "completed"
+                assert task.pty_background_generation is None
+        finally:
+            if watcher is not None:
+                await asyncio.gather(watcher, return_exceptions=True)
 
     async def test_exact_background_state_remains_waitable_after_removal(
         self, db_factory
@@ -3062,6 +3373,164 @@ class TestFullMirrorBackend:
             task = await db.get(Task, task_id)
             assert task.status == "failed"
             assert task.background_active is False
+
+    async def test_worker_phase_one_drain_allows_exact_watchdog_cleanup(
+        self,
+        db_factory,
+        monkeypatch,
+    ):
+        """Phase one lets an admitted exact watchdog converge existing work."""
+
+        from backend.config import settings
+        from backend.services.worker_node_control import (
+            begin_worker_node_drain,
+        )
+
+        _instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "drain-watchdog-session"
+        generation = "drain-watchdog-generation"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = generation
+            await db.commit()
+
+        class Session:
+            has_pending_subagents = False
+
+            def __init__(self):
+                self.session_id = session_id
+                self.is_alive = True
+                self.stop_calls = 0
+
+            async def stop(self):
+                self.stop_calls += 1
+                self.is_alive = False
+
+        session = Session()
+        im, broadcaster = _make_im(db_factory)
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            session,
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        state.started_monotonic = 0
+        watcher = state.watcher
+        monkeypatch.setattr(
+            "backend.services.instance_manager.PTY_BACKGROUND_MAX_SECONDS",
+            0,
+        )
+        monkeypatch.setattr(settings, "ccm_node_role", "worker")
+        async with db_factory() as db:
+            await begin_worker_node_drain(db, claim="a" * 64)
+            await db.commit()
+
+        try:
+            assert await im._fail_pty_background_generation(state)
+            assert session.stop_calls == 1
+            assert session.is_alive is False
+            assert (task_id, session_id) not in im._pty_background_states
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                assert task.status == "failed"
+                assert task.pty_background_generation is None
+            assert broadcaster.broadcast.await_count > 0
+        finally:
+            if watcher is not None:
+                await asyncio.gather(watcher, return_exceptions=True)
+
+    async def test_worker_drain_after_watchdog_stop_keeps_publication(
+        self,
+        db_factory,
+        monkeypatch,
+    ):
+        """A committed exact cleanup remains publishable until phase two."""
+
+        from backend.config import settings
+        from backend.services.worker_node_control import (
+            begin_worker_node_drain,
+        )
+
+        _instance_id, task_id = await _make_inst_task(db_factory)
+        session_id = "drain-watchdog-publication-session"
+        generation = "drain-watchdog-publication-generation"
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "completed"
+            task.session_id = session_id
+            task.completed_at = datetime.utcnow()
+            task.pty_background_generation = generation
+            await db.commit()
+
+        class Session:
+            has_pending_subagents = False
+
+            def __init__(self):
+                self.session_id = session_id
+                self.is_alive = True
+
+            async def stop(self):
+                self.is_alive = False
+
+        session = Session()
+        im, broadcaster = _make_im(db_factory)
+        state = im.register_pty_background_generation(
+            task_id,
+            session_id,
+            generation,
+            session,
+            task_retry_count=0,
+            task_turn_generation=0,
+        )
+        state.started_monotonic = 0
+        monkeypatch.setattr(
+            "backend.services.instance_manager.PTY_BACKGROUND_MAX_SECONDS",
+            0,
+        )
+        monkeypatch.setattr(settings, "ccm_node_role", "worker")
+
+        stop_committed = asyncio.Event()
+        release_stop_result = asyncio.Event()
+        real_stop = im.stop_detached_pty_background_generation
+
+        async def stop_then_hold_result(*args, **kwargs):
+            stopped = await real_stop(*args, **kwargs)
+            assert stopped is True
+            stop_committed.set()
+            await release_stop_result.wait()
+            return stopped
+
+        monkeypatch.setattr(
+            im,
+            "stop_detached_pty_background_generation",
+            stop_then_hold_result,
+        )
+        watchdog = asyncio.create_task(
+            im._fail_pty_background_generation(state)
+        )
+        try:
+            await asyncio.wait_for(stop_committed.wait(), 1)
+            async with db_factory() as db:
+                await begin_worker_node_drain(db, claim="b" * 64)
+                await db.commit()
+            release_stop_result.set()
+            assert await asyncio.wait_for(watchdog, 1) is True
+            assert session.is_alive is False
+            async with db_factory() as db:
+                task = await db.get(Task, task_id)
+                assert task.status == "failed"
+                assert task.pty_background_generation is None
+            assert broadcaster.broadcast.await_count > 0
+        finally:
+            release_stop_result.set()
+            if not watchdog.done():
+                watchdog.cancel()
+                await asyncio.gather(watchdog, return_exceptions=True)
 
     async def test_detached_watchdog_suppresses_old_events_after_retry_wins(
         self, db_factory, monkeypatch
@@ -5328,9 +5797,25 @@ class TestFullMirrorBackend:
         with patch(
             "backend.services.pty_full_mirror.FullMirrorCCMBackend", fake_cls
         ):
-            im, _ = _make_im(db_factory)
+            im, _ = _make_im(db_factory, initialize_pty=True)
         fake_cls.assert_called_once_with(im)
         assert im._pty_enabled is True
+
+    def test_make_im_default_does_not_construct_bridgehub_backend(
+        self,
+        db_factory,
+    ):
+        """Persistence-only helpers must not accumulate PTY listeners."""
+
+        fake_cls = MagicMock()
+        with patch(
+            "backend.services.pty_full_mirror.FullMirrorCCMBackend",
+            fake_cls,
+        ):
+            managers = [_make_im(db_factory)[0] for _ in range(24)]
+
+        fake_cls.assert_not_called()
+        assert all(manager._pty_enabled is False for manager in managers)
 
 
 class TestWorkerTerminationReceiptPtyAdmission:
@@ -5758,7 +6243,7 @@ class TestWorkerTerminationReceiptPtyAdmission:
             assert task.pty_background_generation is None
         broadcaster.broadcast.assert_not_awaited()
 
-    async def test_active_receipt_drops_matching_detached_event(
+    async def test_active_receipt_allows_matching_detached_event_persistence(
         self,
         db_factory,
     ):
@@ -5784,7 +6269,7 @@ class TestWorkerTerminationReceiptPtyAdmission:
             {
                 "event_type": "message",
                 "role": "assistant",
-                "content": "must not persist after receipt admission",
+                "content": "exact final output before receipt cleanup",
                 "autonomous": True,
             },
             detached_autonomous=True,
@@ -5794,12 +6279,14 @@ class TestWorkerTerminationReceiptPtyAdmission:
             expected_task_turn_generation=0,
         )
 
-        assert await _entries(db_factory, task_id) == []
+        entries = await _entries(db_factory, task_id)
+        assert len(entries) == 1
+        assert entries[0].content == "exact final output before receipt cleanup"
         async with db_factory() as db:
             task = await db.get(Task, task_id)
-            assert task.has_unread is False
+            assert task.has_unread is True
             assert task.pty_background_generation == generation
-        broadcaster.broadcast.assert_not_awaited()
+        broadcaster.broadcast.assert_awaited()
 
     async def test_active_receipt_blocks_native_subagent_creation(
         self,

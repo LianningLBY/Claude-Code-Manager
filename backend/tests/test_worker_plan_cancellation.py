@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -12,10 +13,12 @@ import pytest
 import backend.main as main_module
 import backend.api.plan_resources as plan_resources_module
 import backend.services.worker_proxy as worker_proxy_module
+from backend.config import settings
 from backend.models.plan import Plan, PlanInputRequest, PlanVersion
 from backend.api.plan_resources import _worker_run_import_digest
 from backend.models.plan_agent import (
     PlanAgentRun,
+    PlanAgentStep,
     PlanAgentWorkerDispatchReceipt,
     PlanAgentWorkerImportReceipt,
 )
@@ -30,10 +33,13 @@ from backend.services.plan_service import (
     plan_operation_lock,
 )
 from backend.services.worker_plan_dispatch import (
+    WorkerPlanDispatchConflict,
     fence_worker_mirror_cancellation,
+    finalize_worker_mirror_cancellation,
     mark_worker_dispatch_remote_possible,
     worker_mirror_run_is_clean,
 )
+from backend.services.worker_node_control import begin_worker_node_drain
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -116,8 +122,16 @@ def _proxy_with_ready_worker() -> WorkerProxy:
             "payload_digest": "a" * 64,
             "run": {"id": 777, "plan_id": 776, "status": "running"},
         },
+        {
+            "protocol": 1,
+            "state": "cancelled",
+            "plan_id": 776,
+            "run_id": 777,
+            "payload_digest": "a" * 64,
+            "run": {"id": 777, "plan_id": 776, "status": "cancelled"},
+        },
     ],
-    ids=["wrong-run-id", "non-cancelled-status"],
+    ids=["wrong-run-id", "non-cancelled-status", "legacy-status-only-ack"],
 )
 async def test_worker_proxy_rejects_2xx_without_exact_cancelled_receipt(
     monkeypatch,
@@ -167,15 +181,53 @@ async def test_worker_proxy_rejects_2xx_invalid_json_receipt(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_worker_proxy_accepts_only_exact_cancelled_receipt(monkeypatch):
-    receipt = {
+@pytest.mark.parametrize(
+    "hidden_field",
+    ["base", "versions"],
+)
+async def test_worker_proxy_rejects_absent_cancel_with_hidden_graph(
+    monkeypatch,
+    hidden_field,
+):
+    payload = {
         "protocol": 1,
-        "state": "cancelled",
+        "state": "absent",
         "plan_id": 776,
         "run_id": 777,
         "payload_digest": "a" * 64,
-        "run": {"id": 777, "plan_id": 776, "status": "cancelled"},
+        "base_worker_version_id": None,
+        "run": None,
+        "versions": [],
     }
+    if hidden_field == "base":
+        payload["base_worker_version_id"] = 91
+    else:
+        payload["versions"] = [{"id": 92}]
+    _http_client_for_cancel_receipt(monkeypatch, payload=payload)
+
+    with pytest.raises(
+        RuntimeError,
+        match="non-terminal exact Plan cancellation receipt",
+    ):
+        await _proxy_with_ready_worker().cancel_versioned_plan_run(
+            41,
+            777,
+            plan_id=776,
+            payload_digest="a" * 64,
+        )
+
+
+@pytest.mark.asyncio
+async def test_worker_proxy_accepts_only_complete_cancelled_terminal_graph(monkeypatch):
+    receipt = _terminal_cancel_receipt(
+        SimpleNamespace(
+            plan_id=776,
+            run_id=777,
+            payload_digest="a" * 64,
+            started_at=datetime.utcnow(),
+        ),
+        status="cancelled",
+    )
     _http_client_for_cancel_receipt(monkeypatch, payload=receipt)
 
     result = await _proxy_with_ready_worker().cancel_versioned_plan_run(
@@ -186,6 +238,31 @@ async def test_worker_proxy_accepts_only_exact_cancelled_receipt(monkeypatch):
     )
 
     assert result is receipt
+
+
+@pytest.mark.asyncio
+async def test_worker_proxy_rejects_cancelled_graph_that_publishes_version(monkeypatch):
+    graph = SimpleNamespace(
+        plan_id=776,
+        run_id=777,
+        payload_digest="a" * 64,
+        started_at=datetime.utcnow(),
+    )
+    receipt = _terminal_cancel_receipt(graph, status="completed")
+    receipt["run"]["status"] = "cancelled"
+    receipt["run"]["error"] = "Cancelled by user"
+    _http_client_for_cancel_receipt(monkeypatch, payload=receipt)
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid terminal Plan outcome graph",
+    ):
+        await _proxy_with_ready_worker().cancel_versioned_plan_run(
+            41,
+            graph.run_id,
+            plan_id=graph.plan_id,
+            payload_digest=graph.payload_digest,
+        )
 
 
 @pytest.mark.asyncio
@@ -304,7 +381,32 @@ def _terminal_cancel_receipt(
     versions = []
     steps = []
     result_version_id = None
-    if status == "completed":
+    if status == "cancelled":
+        steps = [
+            {
+                "id": planner_step_id,
+                "run_id": graph.run_id,
+                "plan_id": graph.plan_id,
+                "plan_version_id": None,
+                "input_request_id": None,
+                "step_type": "planner",
+                "round": 1,
+                "generation": 0,
+                "provider": "codex",
+                "model": "gpt-test",
+                "effort": "high",
+                "route_slot": "primary",
+                "status": "cancelled",
+                "output": "partial remote plan evidence",
+                "error": "Cancelled by user",
+                "last_delta_at": timestamp,
+                "streamed_output_chars": 28,
+                "last_event_type": "turn.cancelled",
+                "started_at": timestamp,
+                "finished_at": timestamp,
+            }
+        ]
+    elif status == "completed":
         result_version_id = version_id
         steps = [
             {
@@ -406,7 +508,13 @@ def _terminal_cancel_receipt(
         "review_verdict": "approve" if status == "completed" else None,
         "review_feedback": None,
         "review_exhausted": False,
-        "error": None if status == "completed" else "remote failure",
+        "error": (
+            None
+            if status == "completed"
+            else "Cancelled by user"
+            if status == "cancelled"
+            else "remote failure"
+        ),
         "created_at": timestamp,
         "updated_at": timestamp,
         "finished_at": timestamp,
@@ -425,6 +533,52 @@ def _terminal_cancel_receipt(
     }
 
 
+def _cancelled_receipt_with_input(graph) -> dict:
+    """Build the terminal form of a previously imported waiting_user graph."""
+
+    receipt = _terminal_cancel_receipt(graph, status="cancelled")
+    step = receipt["run"]["steps"][0]
+    input_id = 600_000 + graph.run_id
+    step.update(
+        {
+            "input_request_id": input_id,
+            "status": "completed",
+            "error": None,
+            "last_event_type": "turn.completed",
+        }
+    )
+    receipt["run"]["interaction_count"] = 1
+    receipt["run"]["input_requests"] = [
+        {
+            "id": input_id,
+            "plan_id": graph.plan_id,
+            "run_id": graph.run_id,
+            "source_step_id": step["id"],
+            "requested_by": "planner",
+            "reason": "Need a durable choice",
+            "questions": [
+                {
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope should be used?",
+                    "response_type": "text",
+                    "options": [],
+                    "required": True,
+                }
+            ],
+            "status": "cancelled",
+            "answers": None,
+            "response_text": None,
+            "attachments": None,
+            "answered_by": None,
+            "opened_at": graph.started_at.isoformat(),
+            "answered_at": None,
+            "created_at": graph.started_at.isoformat(),
+        }
+    ]
+    return receipt
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "corruption",
@@ -435,6 +589,7 @@ def _terminal_cancel_receipt(
         "base-version-mismatch",
         "zero-step-id",
         "negative-counter",
+        "interaction-input-count-mismatch",
         "nan-execution-seconds",
         "missing-finished-at",
         "step-version-reciprocal-mismatch",
@@ -485,6 +640,8 @@ async def test_worker_proxy_rejects_malformed_terminal_outcome_graph(
         receipt["versions"][0]["produced_by_step_id"] = 0
     elif corruption == "negative-counter":
         receipt["run"]["interaction_count"] = -1
+    elif corruption == "interaction-input-count-mismatch":
+        receipt["run"]["interaction_count"] = 1
     elif corruption == "nan-execution-seconds":
         receipt["run"]["execution_seconds"] = float("nan")
     elif corruption == "missing-finished-at":
@@ -495,6 +652,7 @@ async def test_worker_proxy_rejects_malformed_terminal_outcome_graph(
         "input-step-reciprocal-mismatch",
         "non-terminal-input-status",
     }:
+        receipt["run"]["interaction_count"] = 1
         input_id = 700_000 + graph.run_id
         reviewer_step_id = 600_000 + graph.run_id
         receipt["run"]["steps"].append(
@@ -799,6 +957,92 @@ async def test_manager_mirror_keeps_durable_cancelling_without_strict_remote_ack
 
 
 @pytest.mark.asyncio
+async def test_manager_rejects_legacy_status_only_cancelled_ack(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    graph = await _seed_worker_plan_run(session_factory)
+    cancel_remote = AsyncMock(
+        return_value={
+            "protocol": 1,
+            "state": "cancelled",
+            "plan_id": graph.plan_id,
+            "run_id": graph.run_id,
+            "payload_digest": graph.payload_digest,
+        }
+    )
+    stop_lifecycle = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main_module,
+        "worker_proxy",
+        SimpleNamespace(cancel_versioned_plan_run=cancel_remote),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(stop_plan_run_lifecycle=stop_lifecycle),
+    )
+
+    response = await client.post(f"/api/plan-runs/{graph.run_id}/cancel")
+
+    assert response.status_code == 503, response.text
+    assert "could not be cancelled safely" in response.text
+    stop_lifecycle.assert_awaited_once_with(graph.run_id, None)
+    await _assert_worker_mirror_cancellation_fenced(session_factory, graph)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hidden_field", ["run", "base", "versions"])
+async def test_manager_rejects_absent_ack_with_hidden_graph(
+    client,
+    session_factory,
+    monkeypatch,
+    hidden_field,
+):
+    graph = await _seed_worker_plan_run(session_factory)
+    remote = {
+        "protocol": 1,
+        "state": "absent",
+        "plan_id": graph.plan_id,
+        "run_id": graph.run_id,
+        "payload_digest": graph.payload_digest,
+        "base_worker_version_id": None,
+        "run": None,
+        "versions": [],
+    }
+    if hidden_field == "run":
+        remote["run"] = {
+            "id": graph.run_id,
+            "plan_id": graph.plan_id,
+            "status": "cancelled",
+        }
+    elif hidden_field == "base":
+        remote["base_worker_version_id"] = 91
+    else:
+        remote["versions"] = [{"id": 92}]
+    cancel_remote = AsyncMock(return_value=remote)
+    stop_lifecycle = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main_module,
+        "worker_proxy",
+        SimpleNamespace(cancel_versioned_plan_run=cancel_remote),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(stop_plan_run_lifecycle=stop_lifecycle),
+    )
+
+    response = await client.post(f"/api/plan-runs/{graph.run_id}/cancel")
+
+    assert response.status_code == 503, response.text
+    assert "could not be cancelled safely" in response.text
+    stop_lifecycle.assert_awaited_once_with(graph.run_id, None)
+    await _assert_worker_mirror_cancellation_fenced(session_factory, graph)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "missing_on_plan_run_get",
     (2, 3),
@@ -978,13 +1222,7 @@ async def test_lifecycle_reap_settles_repeated_cancellation_after_lock_release(
 ):
     graph = await _seed_worker_plan_run(session_factory)
     cancel_remote = AsyncMock(
-        return_value={
-            "protocol": 1,
-            "state": "cancelled",
-            "plan_id": graph.plan_id,
-            "run_id": graph.run_id,
-            "payload_digest": graph.payload_digest,
-        }
+        return_value=_terminal_cancel_receipt(graph, status="cancelled")
     )
     stop_entered = asyncio.Event()
     release_stop = asyncio.Event()
@@ -1041,20 +1279,9 @@ async def test_manager_mirror_terminalizes_after_exact_ack_and_replay_skips_rpc(
     session_factory,
     monkeypatch,
 ):
-    graph = await _seed_worker_plan_run(session_factory)
+    graph = await _seed_worker_plan_run(session_factory, generation=0)
     cancel_remote = AsyncMock(
-        return_value={
-            "protocol": 1,
-            "state": "cancelled",
-            "plan_id": graph.plan_id,
-            "run_id": graph.run_id,
-            "payload_digest": graph.payload_digest,
-            "run": {
-                "id": graph.run_id,
-                "plan_id": graph.plan_id,
-                "status": "cancelled",
-            },
-        }
+        return_value=_terminal_cancel_receipt(graph, status="cancelled")
     )
     stop_lifecycle = AsyncMock(return_value=True)
     monkeypatch.setattr(
@@ -1093,7 +1320,262 @@ async def test_manager_mirror_terminalizes_after_exact_ack_and_replay_skips_rpc(
         assert run.worker_id == graph.worker_id
         assert run.last_execution_started_at is None
         assert run.finished_at is not None
+        steps = list(
+            (
+                await db.execute(
+                    select(PlanAgentStep).where(PlanAgentStep.run_id == graph.run_id)
+                )
+            ).scalars()
+        )
+        assert len(steps) == 1
+        assert steps[0].worker_id == graph.worker_id
+        assert steps[0].output == "partial remote plan evidence"
+        receipt = (
+            await db.execute(
+                select(PlanAgentWorkerDispatchReceipt)
+                .where(PlanAgentWorkerDispatchReceipt.run_id == graph.run_id)
+                .order_by(PlanAgentWorkerDispatchReceipt.run_generation.desc())
+            )
+        ).scalars().first()
+        assert receipt is not None
+        assert receipt.settlement_reason == "remote_pause"
+        assert receipt.remote_status == "cancelled"
+        assert await worker_mirror_run_is_clean(db, run_id=graph.run_id)
         assert run.error == "Cancelled by user"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_graph_after_waiting_pause_uses_successor_receipt(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    graph = await _seed_worker_plan_run(
+        session_factory,
+        run_status="waiting_user",
+        generation=0,
+    )
+    remote = _cancelled_receipt_with_input(graph)
+    remote_step = remote["run"]["steps"][0]
+    remote_input = remote["run"]["input_requests"][0]
+    async with session_factory() as db:
+        run = await db.get(PlanAgentRun, graph.run_id)
+        receipt = (
+            await db.execute(
+                select(PlanAgentWorkerDispatchReceipt).where(
+                    PlanAgentWorkerDispatchReceipt.run_id == graph.run_id
+                )
+            )
+        ).scalar_one()
+        step = PlanAgentStep(
+            run_id=graph.run_id,
+            plan_id=graph.plan_id,
+            worker_id=graph.worker_id,
+            worker_step_id=remote_step["id"],
+            generation=remote_step["generation"],
+            step_type=remote_step["step_type"],
+            round=remote_step["round"],
+            provider=remote_step["provider"],
+            model=remote_step["model"],
+            effort=remote_step["effort"],
+            route_slot=remote_step["route_slot"],
+            status=remote_step["status"],
+            output=remote_step["output"],
+            error=remote_step["error"],
+            last_delta_at=graph.started_at,
+            streamed_output_chars=remote_step["streamed_output_chars"],
+            last_event_type=remote_step["last_event_type"],
+            started_at=graph.started_at,
+            finished_at=graph.started_at,
+        )
+        db.add(step)
+        await db.flush()
+        input_request = PlanInputRequest(
+            plan_id=graph.plan_id,
+            run_id=graph.run_id,
+            worker_id=graph.worker_id,
+            worker_input_request_id=remote_input["id"],
+            source_step_id=step.id,
+            requested_by=remote_input["requested_by"],
+            reason=remote_input["reason"],
+            questions=remote_input["questions"],
+            status="open",
+            idempotency_key=f"worker:{graph.worker_id}:input:{remote_input['id']}",
+            opened_at=graph.started_at,
+            created_at=graph.started_at,
+        )
+        db.add(input_request)
+        await db.flush()
+        step.input_request_id = input_request.id
+        assert run is not None
+        run.open_input_request_id = input_request.id
+        run.interaction_count = 1
+        settled_at = datetime.utcnow()
+        receipt.status = "settled"
+        receipt.settlement_reason = "remote_pause"
+        receipt.remote_status = "waiting_user"
+        receipt.settled_at = settled_at
+        receipt.updated_at = settled_at
+        await db.commit()
+
+    drifted_remote = deepcopy(remote)
+    drifted_remote["run"]["input_requests"][0]["questions"][0][
+        "question"
+    ] = "A different immutable question"
+    cancel_remote = AsyncMock(side_effect=[drifted_remote, remote])
+    stop_lifecycle = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        main_module,
+        "worker_proxy",
+        SimpleNamespace(cancel_versioned_plan_run=cancel_remote),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "dispatcher",
+        SimpleNamespace(stop_plan_run_lifecycle=stop_lifecycle),
+    )
+
+    rejected = await client.post(f"/api/plan-runs/{graph.run_id}/cancel")
+    response = await client.post(f"/api/plan-runs/{graph.run_id}/cancel")
+
+    assert rejected.status_code == 409, rejected.text
+    assert "InputRequest mapping changed immutable content" in rejected.text
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "cancelled"
+    async with session_factory() as db:
+        run = await db.get(PlanAgentRun, graph.run_id)
+        receipts = list(
+            (
+                await db.execute(
+                    select(PlanAgentWorkerDispatchReceipt)
+                    .where(PlanAgentWorkerDispatchReceipt.run_id == graph.run_id)
+                    .order_by(PlanAgentWorkerDispatchReceipt.run_generation)
+                )
+            ).scalars()
+        )
+        assert run is not None and run.status == "cancelled"
+        assert run.generation == 1
+        assert run.cancellation_target_generation == 0
+        assert [
+            (item.run_generation, item.settlement_reason, item.remote_status)
+            for item in receipts
+        ] == [
+            (0, "remote_pause", "waiting_user"),
+            (1, "remote_pause", "cancelled"),
+        ]
+        input_request = (
+            await db.execute(
+                select(PlanInputRequest).where(
+                    PlanInputRequest.run_id == graph.run_id
+                )
+            )
+        ).scalar_one()
+        step = (
+            await db.execute(
+                select(PlanAgentStep).where(PlanAgentStep.run_id == graph.run_id)
+            )
+        ).scalar_one()
+        assert input_request.status == "cancelled"
+        assert input_request.cancelled_at is not None
+        assert step.input_request_id == input_request.id
+        assert await worker_mirror_run_is_clean(db, run_id=graph.run_id)
+
+        # Cardinality, not merely non-emptiness, closes multi-interaction
+        # history. Keep a second complete Step/Input pair, then remove the first
+        # pair's Input: one surviving pair must not hide that evidence loss.
+        second_step = PlanAgentStep(
+            run_id=graph.run_id,
+            plan_id=graph.plan_id,
+            worker_id=graph.worker_id,
+            worker_step_id=remote_step["id"] + 1,
+            generation=1,
+            step_type="planner",
+            round=1,
+            provider="claude",
+            status="cancelled",
+            started_at=graph.started_at,
+            finished_at=graph.started_at,
+        )
+        db.add(second_step)
+        await db.flush()
+        second_input = PlanInputRequest(
+            plan_id=graph.plan_id,
+            run_id=graph.run_id,
+            worker_id=graph.worker_id,
+            worker_input_request_id=remote_input["id"] + 1,
+            source_step_id=second_step.id,
+            requested_by="planner",
+            questions=[],
+            status="cancelled",
+            idempotency_key=(
+                f"worker:{graph.worker_id}:input:{remote_input['id'] + 1}"
+            ),
+            opened_at=graph.started_at,
+            cancelled_at=graph.started_at,
+            created_at=graph.started_at,
+        )
+        db.add(second_input)
+        await db.flush()
+        second_step.input_request_id = second_input.id
+        run.interaction_count = 2
+        await db.commit()
+        assert await worker_mirror_run_is_clean(db, run_id=graph.run_id)
+
+        step.input_request_id = None
+        await db.delete(input_request)
+        await db.commit()
+        assert not await worker_mirror_run_is_clean(db, run_id=graph.run_id)
+
+
+@pytest.mark.asyncio
+async def test_legacy_remote_cancelled_without_imported_graph_is_not_clean(
+    session_factory,
+):
+    graph = await _seed_worker_plan_run(session_factory, generation=0)
+    async with session_factory() as db:
+        plan = await db.get(Plan, graph.plan_id)
+        run = await db.get(PlanAgentRun, graph.run_id)
+        receipt = (
+            await db.execute(
+                select(PlanAgentWorkerDispatchReceipt).where(
+                    PlanAgentWorkerDispatchReceipt.run_id == graph.run_id
+                )
+            )
+        ).scalar_one()
+        assert plan is not None and run is not None
+        plan.active_run_id = None
+        run.status = "cancelled"
+        run.generation = 1
+        run.cancellation_target_generation = 0
+        run.last_execution_started_at = None
+        run.finished_at = datetime.utcnow()
+        receipt.status = "settled"
+        receipt.settlement_reason = "remote_cancelled"
+        receipt.remote_status = "cancelled"
+        receipt.settled_at = datetime.utcnow()
+        await db.commit()
+
+        assert not await worker_mirror_run_is_clean(db, run_id=graph.run_id)
+
+
+@pytest.mark.asyncio
+async def test_absence_finalizer_rejects_legacy_status_only_cancelled_state(
+    session_factory,
+):
+    async with session_factory() as db:
+        with pytest.raises(
+            WorkerPlanDispatchConflict,
+            match="cancellation outcome identity is invalid",
+        ):
+            await finalize_worker_mirror_cancellation(
+                db,
+                plan_id=1,
+                run_id=1,
+                worker_id=1,
+                target_generation=0,
+                payload_digest="a" * 64,
+                remote_state="cancelled",
+            )
 
 
 @pytest.mark.asyncio
@@ -1163,6 +1645,35 @@ async def test_worker_terminal_outcome_wins_exact_manager_cancellation(
             assert version is not None
             assert version.worker_version_id == remote["run"]["result_version_id"]
             assert plan.current_version_id == version.id
+            await db.delete(version)
+            await db.flush()
+            assert not await worker_mirror_run_is_clean(
+                db,
+                run_id=graph.run_id,
+            )
+            await db.rollback()
+
+            imported_steps = list(
+                (
+                    await db.execute(
+                        select(PlanAgentStep).where(
+                            PlanAgentStep.run_id == graph.run_id
+                        )
+                    )
+                ).scalars()
+            )
+            producer = next(
+                imported_step
+                for imported_step in imported_steps
+                if imported_step.step_type == "planner"
+                and imported_step.plan_version_id is not None
+            )
+            await db.delete(producer)
+            await db.commit()
+            assert not await worker_mirror_run_is_clean(
+                db,
+                run_id=graph.run_id,
+            )
         else:
             assert run.result_version_id is None
             assert run.error == "remote failure"
@@ -1490,6 +2001,8 @@ async def test_cancel_before_import_tombstone_blocks_late_import_and_audits(
     assert first.status_code == 200, first.text
     assert replay.status_code == 200, replay.text
     assert first.json()["state"] == replay.json()["state"] == "absent"
+    assert first.json()["base_worker_version_id"] is None
+    assert first.json()["versions"] == []
     assert late_import.status_code == 409
     assert "cancelled before admission" in late_import.text
     assert audit.status_code == 200, audit.text
@@ -1534,7 +2047,9 @@ async def test_import_winner_exact_cancel_is_idempotent_and_receipt_survives_del
 
     assert first.status_code == 200, first.text
     assert replay.status_code == 200, replay.text
-    assert first.json()["state"] == replay.json()["state"] == "cancelled"
+    assert first.json()["state"] == replay.json()["state"] == "terminal"
+    assert first.json()["run"]["status"] == "cancelled"
+    assert first.json()["versions"] == replay.json()["versions"] == []
     async with session_factory() as db:
         receipt = await db.get(PlanAgentWorkerImportReceipt, 8401)
         run = await db.get(PlanAgentRun, 8401)
@@ -1567,6 +2082,44 @@ async def test_import_winner_exact_cancel_is_idempotent_and_receipt_survives_del
     assert cancel_after_delete.json()["state"] == "absent"
     async with session_factory() as db:
         assert await db.get(PlanAgentWorkerImportReceipt, 8401) is not None
+
+
+@pytest.mark.asyncio
+async def test_worker_drain_claim_rejects_late_exact_plan_cancel(
+    client,
+    session_factory,
+    monkeypatch,
+    worker_control_plane_auth,
+):
+    """A drain-first Worker must not publish a late cancelled Plan graph."""
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    body = _worker_import_body(plan_id=8411, run_id=8412)
+    imported = await client.post("/api/plans/worker-import", json=body)
+    assert imported.status_code == 200, imported.text
+    digest = imported.json()["import_payload_digest"]
+
+    async with session_factory() as db:
+        run_before = await db.get(PlanAgentRun, 8412)
+        receipt_before = await db.get(PlanAgentWorkerImportReceipt, 8412)
+        assert run_before is not None
+        assert receipt_before is not None and receipt_before.outcome == "imported"
+        status_before = run_before.status
+        await begin_worker_node_drain(db, claim="d" * 64)
+        await db.commit()
+
+    response = await client.post(
+        "/api/plan-runs/8412/worker-import-cancel",
+        json=_exact_cancel_body(plan_id=8411, payload_digest=digest),
+    )
+
+    assert response.status_code == 409, response.text
+    assert "destruction has begun" in response.text
+    async with session_factory() as db:
+        run_after = await db.get(PlanAgentRun, 8412)
+        receipt_after = await db.get(PlanAgentWorkerImportReceipt, 8412)
+        assert run_after is not None and run_after.status == status_before
+        assert receipt_after is not None and receipt_after.outcome == "imported"
 
 
 @pytest.mark.asyncio

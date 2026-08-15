@@ -42,7 +42,7 @@ export interface BrowserReviewJob {
   inline_tool: boolean;
   status: BrowserReviewStatus;
   stage: string;
-  url: string;
+  url: string | null;
   network_policy: 'external_public' | 'managed_preview';
   goal: string;
   provider: 'claude' | 'codex' | 'capture' | 'openai-responses';
@@ -133,10 +133,10 @@ export interface WorkspaceReviewRun {
   goal: string;
   status: WorkspaceReviewStatus;
   stage: string;
-  workspace_path: string;
+  workspace_path: string | null;
   git_head: string;
   workspace_fingerprint: string;
-  preview_config: WorkspacePreviewConfig;
+  preview_config: WorkspacePreviewConfig | null;
   preview_url: string | null;
   stale: boolean;
   report: string | null;
@@ -542,8 +542,6 @@ export interface RuntimeSettings {
   codex_main_mcp_enabled?: boolean;
   /** Absent on pre-PR7B2 runtimes; unknown must fail closed for Monitor. */
   codex_monitor_enabled?: boolean;
-  /** Absent on older Workers; unknown must keep the restricted sandbox. */
-  agent_sandbox_unrestricted_enabled?: boolean;
   auto_sort_on_access: boolean;
   /** 会话上下文利用率达到该比例自动压缩换新 session（0-1，有效值） */
   context_compact_threshold: number;
@@ -752,8 +750,6 @@ export interface SystemConfig {
   /** Server gate defaults on; each ordinary Task still needs explicit policy. */
   auto_capability_enabled?: boolean;
   delivery_loop_enabled?: boolean;
-  /** High-risk deployment switch for executable Claude/Codex Agent turns. */
-  agent_sandbox_unrestricted_enabled?: boolean;
 }
 
 export type AutoCapabilityKey = 'plan' | 'code_review';
@@ -772,21 +768,20 @@ export interface TaskRoutingExpectation {
 
 export interface Task {
   id: number;
-  worker_id: number | null;
-  created_by: number | null;
+  worker_id?: number | null;
+  created_by?: number | null;
   title: string;
   description: string | null;
   status: string;
   priority: number;
   project_id: number | null;
-  target_repo: string | null;
+  target_repo?: string | null;
   target_branch: string;
   result_branch: string | null;
   merge_status: string;
-  instance_id: number | null;
   retry_count: number;
   turn_generation: number;
-  max_retries: number;
+  max_retries?: number;
   mode: string;
   capability_policy?: AutoCapabilityPolicy | null;
   delivery_run_id?: number | null;
@@ -795,12 +790,12 @@ export interface Task {
   delivery_activity?: string | null;
   delivery_outcome?: string | null;
   delivery_terminal?: 'ready_to_merge' | 'merged' | null;
-  todo_file_path: string | null;
+  todo_file_path?: string | null;
   loop_progress: string | null;
   max_iterations: number;
   must_complete: boolean;
-  goal_condition: string | null;
-  goal_evaluator_model: string | null;
+  goal_condition?: string | null;
+  goal_evaluator_model?: string | null;
   goal_max_turns: number;
   goal_turns_used: number;
   goal_last_reason: string | null;
@@ -816,12 +811,10 @@ export interface Task {
   plan_target_task_id: number | null;
   supersedes_plan_task_id: number | null;
   plan_approved_at: string | null;
-  plan_approved_by: number | null;
   plan_applied_at: string | null;
-  plan_applied_to_session_id: string | null;
   plan_execution_task_id: number | null;
   canonical_plan_id: number | null;
-  plan_pipeline_config: PlanPipelineConfig | null;
+  plan_pipeline_config?: PlanPipelineConfig | null;
   plan_stage?: string | null;
   plan_stage_round?: number | null;
   plan_stage_provider?: string | null;
@@ -831,8 +824,10 @@ export interface Task {
   starred: boolean;
   archived: boolean;
   has_unread: boolean;
-  session_id: string | null;
-  error_message: string | null;
+  has_session: boolean;
+  access_scope: 'control' | 'chat';
+  is_worker_managed: boolean;
+  error_message?: string | null;
   provider: string;
   model: string | null;
   effort_level: string | null;
@@ -842,20 +837,16 @@ export interface Task {
   timeout_hours?: number | null;
   last_accessed_at?: string | null;
   sort_order?: number | null;
-  enable_workflows: boolean;
-  enabled_skills: Record<string, boolean> | null;
-  selected_user_skills: number[] | null;
+  enable_workflows?: boolean;
+  enabled_skills?: Record<string, boolean> | null;
+  selected_user_skills?: number[] | null;
   shared_from_id: number | null;
   active_sub_agents: number;
   background_active?: boolean;
   tags: string[] | null;
   attention_tag?: string | null;
   metadata_: {
-    file_paths?: string[];
-    image_paths?: string[];
     attachments?: FileAttachment[];
-    secret_ids?: number[];
-    codex_account_id?: string;
     forked_from_task_id?: number;
     forked_from_log_id?: number | null;
     forked_from_turn_id?: string;
@@ -869,14 +860,7 @@ export interface Task {
     plan_review_exhausted?: boolean;
     revised_from_plan_task_id?: number;
     plan_superseded_by_task_id?: number;
-    ccm_worker_managed_task?: boolean;
-    ccm_user_skill_snapshots?: unknown[];
     frontend_review?: FrontendReviewConfig;
-    frontend_review_activation?: {
-      message: string;
-      file_paths?: string[];
-      secret_ids?: number[];
-    };
   } | null;
   context_window_usage: {
     input_tokens: number;
@@ -1419,25 +1403,17 @@ export type DeliveryActivity = 'ready' | 'running' | 'waiting' | 'paused' | 'ter
 
 export interface DeliveryRun {
   id: number;
-  created_by: number | null;
   project_id: number;
   monitored_repo_id: number | null;
   source_todo_id: number | null;
   developer_task_id: number | null;
   pr_monitor_run_id: number | null;
-  worktree_id: number | null;
   title: string;
   requirements: string;
-  requirements_hash: string;
-  policy_hash: string;
   base_branch: string;
   delivery_branch: string;
-  workspace_path: string | null;
   base_sha: string | null;
   head_sha: string | null;
-  head_tree_sha: string | null;
-  patch_sha256: string | null;
-  head_generation: number;
   pr_number: number | null;
   pr_url: string | null;
   phase: DeliveryPhase;
@@ -1455,7 +1431,6 @@ export interface DeliveryRun {
   max_cycles: number;
   no_progress_count: number;
   max_no_progress: number;
-  next_reconcile_at: string | null;
   created_at: string;
   updated_at: string;
   completed_at: string | null;
@@ -1467,17 +1442,13 @@ export interface DeliveryCycle {
   run_id: number;
   cycle_number: number;
   status: string;
+  state_version: number;
   trigger_kind: string;
   trigger_payload: Record<string, unknown>;
   base_sha: string | null;
   start_head_sha: string | null;
   result_head_sha: string | null;
-  result_head_tree_sha: string | null;
-  result_patch_sha256: string | null;
-  plan_invocation_id: number | null;
   plan_version_id: number | null;
-  review_invocation_id: number | null;
-  review_result_id: number | null;
   review_verdict: string | null;
   review_summary: string | null;
   frontend_review_run_id: string | null;
@@ -1501,15 +1472,9 @@ export interface DeliveryTurn {
   generation: number;
   purpose: string;
   trigger_kind: string;
-  trigger_payload: Record<string, unknown>;
   status: string;
   task_id: number | null;
-  task_retry_count: number | null;
-  task_instance_id: number | null;
   task_started_at: string | null;
-  task_session_id: string | null;
-  checkpoint: Record<string, unknown> | null;
-  checkpoint_status: string | null;
   attempts: number;
   last_error: string | null;
   created_at: string;
@@ -1523,15 +1488,10 @@ export interface DeliveryTransition {
   state_version: number;
   cause: string;
   actor_kind: string;
-  actor_id: string | null;
-  before_state: Record<string, unknown>;
-  after_state: Record<string, unknown>;
-  metadata: Record<string, unknown> | null;
   created_at: string;
 }
 
 export interface DeliveryRunDetail extends DeliveryRun {
-  policy_snapshot: Record<string, unknown>;
   cycles: DeliveryCycle[];
   turns: DeliveryTurn[];
   transitions: DeliveryTransition[];
@@ -1549,9 +1509,6 @@ export interface DeliveryAgentActivity {
   activity_kind: string;
   headline: string;
   detail: string | null;
-  task_id: number | null;
-  source_kind: string;
-  source_id: string | null;
   started_at: string | null;
   first_output_at: string | null;
   last_activity_at: string | null;
@@ -1580,8 +1537,19 @@ export interface DeliveryTimelineEvent {
 
 export interface DeliveryPlanInputProjection {
   plan_id: number;
-  run: PlanRun;
-  request: PlanInputRequest;
+  run: {
+    id: number;
+    generation: number;
+    status: string;
+    current_stage: string;
+  };
+  request: {
+    id: number;
+    requested_by: string;
+    reason: string | null;
+    questions: PlanQuestion[];
+    status: string;
+  };
 }
 
 export interface DeliveryFrontendReviewProgress {
@@ -1671,6 +1639,15 @@ export interface PRReview {
   task_id: number | null;
   status: string;
   review_summary: string | null;
+  /** Additive human-facing projection. Older CCM servers omit these fields. */
+  task_ids?: number[];
+  reviewer_count?: number;
+  reviewer_status_counts?: Record<string, number>;
+  reviewer_verdict_counts?: Record<string, number>;
+  aggregate_verdict?: 'pass' | 'changes_required' | null;
+  display_status?: string | null;
+  display_summary?: string | null;
+  outcome_kind?: PRReviewOutcomeKind;
   action_taken: string | null;
   merge_method: 'merge' | 'squash' | 'fast-forward' | null;
   ci_status: string | null;
@@ -1794,11 +1771,15 @@ export interface PRReviewerRun {
   effort: string | null;
   status: string;
   verdict: string | null;
+  result_body?: string | null;
+  outcome_kind?: PRReviewOutcomeKind;
   error_message: string | null;
   created_at: string;
   completed_at: string | null;
   findings: PRFinding[];
 }
+
+export type PRReviewOutcomeKind = 'in_progress' | 'review_result' | 'infrastructure_error' | 'lifecycle';
 
 export interface PoolUsageWindow {
   utilization: number | null;
@@ -2045,11 +2026,13 @@ export interface CodexLoginStatus {
 }
 
 
+export type TeamUserRole = 'super_admin' | 'admin' | 'member';
+
 export interface TeamUser {
   id: number;
   email: string;
   name: string;
-  role: string;
+  role: TeamUserRole;
   avatar_url: string;
 }
 
@@ -2352,7 +2335,7 @@ export const api = {
 
   // Global Settings
   getRuntimeSettings: () => request<RuntimeSettings>('/api/settings/runtime'),
-  updateRuntimeSettings: (data: Partial<Pick<RuntimeSettings, 'use_pty_mode' | 'agent_sandbox_unrestricted_enabled' | 'auto_sort_on_access' | 'context_compact_threshold'>>) =>
+  updateRuntimeSettings: (data: Partial<Pick<RuntimeSettings, 'use_pty_mode' | 'auto_sort_on_access' | 'context_compact_threshold'>>) =>
     request<RuntimeSettings>('/api/settings/runtime', { method: 'PUT', body: JSON.stringify(data) }),
   getCapacitySettings: () => request<CapacitySettings>('/api/settings/capacity'),
   updateCapacitySettings: (maxConcurrentInstances: number | null) =>
@@ -2718,8 +2701,7 @@ export const api = {
     request<{
       ok: boolean;
       pid: number;
-      instance_id: number;
-      session_id: string;
+      has_session: boolean;
       applied_plan_task_ids?: number[];
       applied_plan_version_ids?: number[];
       plan_application_receipt_key?: string;
@@ -3249,7 +3231,7 @@ export const api = {
   // Team CCM
   getTeamUsers: () => request<TeamUser[]>('/api/team/users'),
   updateTeamUserRole: (userId: number, role: 'admin' | 'member') =>
-    request<{ ok: boolean; user_id: number; role: string }>(`/api/team/users/${userId}/role`, {
+    request<{ ok: boolean; user_id: number; role: TeamUserRole }>(`/api/team/users/${userId}/role`, {
       method: 'PUT',
       body: JSON.stringify({ role }),
     }),

@@ -56,12 +56,6 @@ SQLITE_TASK_SSH_EFFECT_TRIGGER_NAMES = (
     "trg_task_ssh_effect_project_share_insert",
     "trg_task_ssh_effect_project_share_update",
     "trg_task_ssh_effect_project_share_delete",
-    "trg_task_ssh_effect_team_task_share_insert",
-    "trg_task_ssh_effect_team_task_share_update",
-    "trg_task_ssh_effect_team_task_share_delete",
-    "trg_task_ssh_effect_team_project_share_insert",
-    "trg_task_ssh_effect_team_project_share_update",
-    "trg_task_ssh_effect_team_project_share_delete",
 )
 
 
@@ -409,86 +403,6 @@ END
     """
 CREATE TRIGGER IF NOT EXISTS trg_task_ssh_effect_project_share_delete
 BEFORE DELETE ON project_shares
-FOR EACH ROW
-WHEN EXISTS (
-    SELECT 1
-    FROM task_ssh_effect_receipts AS receipt
-    JOIN tasks AS task ON task.id = receipt.task_id
-    WHERE task.project_id = OLD.project_id AND receipt.status = 'running'
-)
-BEGIN
-    SELECT RAISE(ABORT, 'Task SSH effect sharing is busy');
-END
-""",
-    """
-CREATE TRIGGER IF NOT EXISTS trg_task_ssh_effect_team_task_share_insert
-BEFORE INSERT ON team_task_shares
-FOR EACH ROW
-WHEN EXISTS (
-    SELECT 1 FROM task_ssh_effect_receipts AS receipt
-    WHERE receipt.task_id = NEW.task_id AND receipt.status = 'running'
-)
-BEGIN
-    SELECT RAISE(ABORT, 'Task SSH effect sharing is busy');
-END
-""",
-    """
-CREATE TRIGGER IF NOT EXISTS trg_task_ssh_effect_team_task_share_update
-BEFORE UPDATE ON team_task_shares
-FOR EACH ROW
-WHEN EXISTS (
-    SELECT 1 FROM task_ssh_effect_receipts AS receipt
-    WHERE receipt.status = 'running'
-      AND receipt.task_id IN (OLD.task_id, NEW.task_id)
-)
-BEGIN
-    SELECT RAISE(ABORT, 'Task SSH effect sharing is busy');
-END
-""",
-    """
-CREATE TRIGGER IF NOT EXISTS trg_task_ssh_effect_team_task_share_delete
-BEFORE DELETE ON team_task_shares
-FOR EACH ROW
-WHEN EXISTS (
-    SELECT 1 FROM task_ssh_effect_receipts AS receipt
-    WHERE receipt.task_id = OLD.task_id AND receipt.status = 'running'
-)
-BEGIN
-    SELECT RAISE(ABORT, 'Task SSH effect sharing is busy');
-END
-""",
-    """
-CREATE TRIGGER IF NOT EXISTS trg_task_ssh_effect_team_project_share_insert
-BEFORE INSERT ON team_project_shares
-FOR EACH ROW
-WHEN EXISTS (
-    SELECT 1
-    FROM task_ssh_effect_receipts AS receipt
-    JOIN tasks AS task ON task.id = receipt.task_id
-    WHERE task.project_id = NEW.project_id AND receipt.status = 'running'
-)
-BEGIN
-    SELECT RAISE(ABORT, 'Task SSH effect sharing is busy');
-END
-""",
-    """
-CREATE TRIGGER IF NOT EXISTS trg_task_ssh_effect_team_project_share_update
-BEFORE UPDATE ON team_project_shares
-FOR EACH ROW
-WHEN EXISTS (
-    SELECT 1
-    FROM task_ssh_effect_receipts AS receipt
-    JOIN tasks AS task ON task.id = receipt.task_id
-    WHERE receipt.status = 'running'
-      AND task.project_id IN (OLD.project_id, NEW.project_id)
-)
-BEGIN
-    SELECT RAISE(ABORT, 'Task SSH effect sharing is busy');
-END
-""",
-    """
-CREATE TRIGGER IF NOT EXISTS trg_task_ssh_effect_team_project_share_delete
-BEFORE DELETE ON team_project_shares
 FOR EACH ROW
 WHEN EXISTS (
     SELECT 1

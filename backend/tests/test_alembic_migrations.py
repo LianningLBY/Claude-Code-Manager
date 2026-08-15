@@ -8,6 +8,7 @@ Ensures:
 import importlib.util
 import io
 import json
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -23,6 +24,8 @@ from sqlalchemy import (
     CheckConstraint,
     ForeignKeyConstraint,
     Integer,
+    JSON,
+    String,
     UniqueConstraint,
     create_engine,
     inspect,
@@ -35,6 +38,8 @@ from sqlalchemy.schema import CreateTable
 # All ORM models must be imported so Base.metadata is complete.
 from backend.database import Base
 import backend.models.task  # noqa: F401
+import backend.models.task_id_allocator  # noqa: F401
+import backend.models.task_migration  # noqa: F401
 import backend.models.instance  # noqa: F401
 import backend.models.project  # noqa: F401
 import backend.models.project_todo  # noqa: F401
@@ -55,6 +60,7 @@ import backend.models.code_review  # noqa: F401
 import backend.models.delivery  # noqa: F401
 import backend.models.worker_task_termination  # noqa: F401
 import backend.models.discussion  # noqa: F401
+import backend.models.user_group  # noqa: F401
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 PUBLISHED_PLAN_REVISION = "b6e1f4a2c9d7"
@@ -92,6 +98,15 @@ CAPACITY_PR_LOOP_MERGE_REVISION = "c5e7a9d1f3b6"
 AGENT_SANDBOX_RUNTIME_OVERRIDE_REVISION = "e6a2c4f8b190"
 DELIVERY_FRONTEND_REVIEW_REVISION = "a7d4e9c2f610"
 DELIVERY_PREVIEW_PROFILES_REVISION = "b8e4d2f6a1c9"
+REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION = "a7d3f9c2e610"
+TASK_EXECUTION_PRINCIPAL_REVISION = "b8e4a0d3f721"
+REMOVE_TEAM_SHARE_SSH_FENCES_REVISION = "c9f5b1e7d402"
+TASK_ID_NAMESPACE_REVISION = "d0a6c8e4f2b1"
+UNIQUE_USER_GROUP_MEMBERSHIP_REVISION = "e1b7d9f3a5c2"
+WORKER_NODE_DRAIN_REVISION = "f2c8a4e6d1b0"
+TASK_MIGRATION_OPERATION_REVISION = "a3d9b5f7c1e4"
+WORKER_DESTROY_LIFECYCLE_NONCE_REVISION = "b4e1c7d9f203"
+WORKER_RENAME_TAG_OUTBOX_REVISION = "c4a8e2f6b190"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
@@ -102,7 +117,7 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = DELIVERY_PREVIEW_PROFILES_REVISION
+CURRENT_HEAD_REVISION = WORKER_RENAME_TAG_OUTBOX_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -131,6 +146,2779 @@ def _run_alembic(cfg: Config, func, *args):
     async_url = db_url.replace("sqlite:///", "sqlite+aiosqlite:///")
     with patch("backend.config.settings.database_url", async_url):
         func(cfg, *args)
+
+
+@pytest.mark.parametrize(
+    ("migration_file", "kind"),
+    [
+        ("b8e4a0d3f721_add_task_execution_principal.py", "principal"),
+        ("d0a6c8e4f2b1_add_task_id_namespace_allocator.py", "singleton"),
+        ("f2c8a4e6d1b0_add_worker_node_drain_control.py", "singleton"),
+        ("a3d9b5f7c1e4_add_task_migration_operations.py", "singleton"),
+    ],
+)
+def test_postgresql_check_probe_accepts_server_rewritten_any_and_casts(
+    migration_file,
+    kind,
+):
+    """Expected CHECKs are compared after PostgreSQL canonicalizes them."""
+
+    module = _load_revision_migration(
+        migration_file,
+        f"postgresql_check_probe_{kind}_{migration_file[:4]}",
+    )
+    if kind == "principal":
+        expected = {
+            **module._TASK_CHECKS,
+            module._TASK_GATE: module._TASK_GATE_SQL,
+        }
+        actual_names = set(module._TASK_CHECKS)
+    else:
+        gate_sql = (
+            module._GATE_SQL
+            if hasattr(module, "_GATE_SQL")
+            else module._DOWNGRADE_GATE_SQL
+        )
+        expected = {
+            **module._CHECKS,
+            module._DOWNGRADE_GATE: gate_sql,
+        }
+        actual_names = set(module._CHECKS)
+
+    rewritten = (
+        "CHECK (((execution_user_role)::text = ANY "
+        "((ARRAY['member'::character varying, "
+        "'admin'::character varying])::text[])))"
+    )
+    canonical_definitions = {
+        name: rewritten if index == 0 else f"CHECK (({index} = {index}))"
+        for index, name in enumerate(expected, start=1)
+    }
+    first_name = next(iter(expected))
+    canonical_definitions[first_name] = rewritten
+    actual_definitions = {
+        name: canonical_definitions[name]
+        for name in actual_names
+    }
+
+    bind = MagicMock()
+    bind.execute.side_effect = [
+        None,
+        [
+            (name, definition, True)
+            for name, definition in actual_definitions.items()
+        ],
+        [
+            (name, definition, True)
+            for name, definition in canonical_definitions.items()
+        ],
+        None,
+    ]
+    with patch.object(module.op, "get_bind", return_value=bind):
+        if kind == "principal":
+            present = module._postgresql_canonical_check_state(
+                module._TASK_TABLE,
+                module._TASK_COLUMN_SPECS,
+                module._TASK_CHECKS,
+                gate_name=module._TASK_GATE,
+                gate_sql=module._TASK_GATE_SQL,
+            )
+        else:
+            present = set(module._postgresql_canonical_checks())
+
+    assert present == actual_names
+
+
+def test_enable_workflows_boolean_inversion_is_dialect_neutral(tmp_path):
+    db_path = str(tmp_path / "enable-workflows-inversion.db")
+    cfg = _alembic_cfg(db_path)
+    _run_alembic(cfg, command.upgrade, "2d287d9865fc")
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO tasks "
+            "(id, title, description, status, priority, disable_workflows) "
+            "VALUES (1, 'disabled', 'd', 'pending', 0, 1), "
+            "(2, 'enabled', 'd', 'pending', 0, 0)"
+        ))
+    engine.dispose()
+
+    _run_alembic(cfg, command.upgrade, "0aa352edf132")
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT id, enable_workflows FROM tasks ORDER BY id"
+        )).all() == [(1, 0), (2, 1)]
+    engine.dispose()
+
+    _run_alembic(cfg, command.downgrade, "2d287d9865fc")
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT id, disable_workflows FROM tasks ORDER BY id"
+        )).all() == [(1, 1), (2, 0)]
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("migration_file", "json_column"),
+    [
+        ("69d5cf74de62_add_sort_order_and_tags_to_projects.py", "tags"),
+        ("f3a8b2c1d9e0_add_env_files_to_projects.py", "env_files"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("dialect_name", "expected_default"),
+    [
+        ("mysql", "(JSON_ARRAY())"),
+        ("postgresql", "'[]'"),
+    ],
+)
+def test_project_json_defaults_are_dialect_compatible(
+    migration_file,
+    json_column,
+    dialect_name,
+    expected_default,
+):
+    module = _load_revision_migration(
+        migration_file,
+        f"json_default_{json_column}_{dialect_name}",
+    )
+    bind = SimpleNamespace(
+        dialect=SimpleNamespace(name=dialect_name, is_mariadb=False),
+    )
+    batch = MagicMock()
+    batch_context = MagicMock()
+    batch_context.__enter__.return_value = batch
+    with (
+        patch.object(module.op, "get_bind", return_value=bind),
+        patch.object(
+            module.op,
+            "batch_alter_table",
+            return_value=batch_context,
+        ),
+    ):
+        module.upgrade()
+
+    columns = [call.args[0] for call in batch.add_column.call_args_list]
+    target = next(column for column in columns if column.name == json_column)
+    assert str(target.server_default.arg) == expected_default
+
+
+def test_project_model_json_defaults_compile_on_all_dialects():
+    project_table = backend.models.project.Project.__table__
+    expected_defaults = {
+        "mysql": "DEFAULT (JSON_ARRAY())",
+        "postgresql": "DEFAULT '[]'",
+        "sqlite": "DEFAULT '[]'",
+    }
+
+    for dialect in (mysql.dialect(), postgresql.dialect(), sqlite.dialect()):
+        ddl = str(CreateTable(project_table).compile(dialect=dialect))
+        assert ddl.count(expected_defaults[dialect.name]) >= 2
+
+
+class TestTaskIdNamespaceMigration:
+    def test_postgresql_downgrade_replay_skips_lock_after_table_drop(self):
+        module = _load_revision_migration(
+            "d0a6c8e4f2b1_add_task_id_namespace_allocator.py",
+            "task_id_postgresql_absent_table",
+        )
+        bind = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+        inspector = MagicMock()
+        inspector.has_table.return_value = False
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module.op, "execute") as execute,
+        ):
+            module._acquire_transactional_fence(downgrade=True)
+
+        execute.assert_not_called()
+
+    def test_upgrade_replays_create_before_seed_or_revision_stamp(
+        self,
+        tmp_path,
+    ):
+        """A committed CREATE with no singleton row must resume safely."""
+
+        from backend.models.task_id_allocator import TaskIdAllocator
+
+        db_path = str(tmp_path / "task-id-create-crash.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            REMOVE_TEAM_SHARE_SSH_FENCES_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        TaskIdAllocator.__table__.create(engine)
+        with engine.begin() as conn:
+            # The metadata hook normally seeds test databases.  Removing that
+            # row reproduces a non-transactional DDL crash after CREATE but
+            # before the migration's INSERT/version stamp.
+            conn.execute(text("DELETE FROM task_id_allocators"))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, TASK_ID_NAMESPACE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT id, node_role, next_worker_task_id "
+                "FROM task_id_allocators"
+            )).one() == (1, None, 1_000_000_000)
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == TASK_ID_NAMESPACE_REVISION
+        engine.dispose()
+
+    def test_downgrade_replays_drop_before_revision_stamp(self, tmp_path):
+        """A committed DROP with the old Alembic stamp is an idempotent suffix."""
+
+        db_path = str(tmp_path / "task-id-drop-crash.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_ID_NAMESPACE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE task_id_allocators"))
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            REMOVE_TEAM_SHARE_SSH_FENCES_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "task_id_allocators" not in inspect(engine).get_table_names()
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == REMOVE_TEAM_SHARE_SSH_FENCES_REVISION
+        engine.dispose()
+
+    def test_upgrade_seeds_singleton_and_allows_unbound_downgrade(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "task-id-namespace.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            REMOVE_TEAM_SHARE_SSH_FENCES_REVISION,
+        )
+        assert "task_id_allocators" not in inspect(
+            create_engine(f"sqlite:///{db_path}")
+        ).get_table_names()
+
+        _run_alembic(cfg, command.upgrade, "head")
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT id, node_role, next_worker_task_id "
+                "FROM task_id_allocators"
+            )).one()
+        assert tuple(row) == (1, None, 1_000_000_000)
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            REMOVE_TEAM_SHARE_SSH_FENCES_REVISION,
+        )
+        assert "task_id_allocators" not in inspect(engine).get_table_names()
+        engine.dispose()
+
+
+    @pytest.mark.parametrize(
+        "unsafe_state",
+        ["manager-role", "worker-role", "high-task"],
+    )
+    def test_downgrade_refuses_to_reopen_collision_risk(
+        self,
+        tmp_path,
+        unsafe_state,
+    ):
+        db_path = str(tmp_path / f"task-id-{unsafe_state}.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, "head")
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            if unsafe_state in {"manager-role", "worker-role"}:
+                conn.execute(text(
+                    "UPDATE task_id_allocators SET node_role = :node_role "
+                    "WHERE id = 1"
+                ), {"node_role": unsafe_state.removesuffix("-role")})
+            else:
+                conn.execute(
+                    backend.models.task.Task.__table__.insert().values(
+                        id=1_000_000_000,
+                        title="reserved high row",
+                        description="d",
+                        status="completed",
+                    )
+                )
+
+        expected = (
+            "after Task-id namespace binding"
+            if unsafe_state in {"manager-role", "worker-role"}
+            else "high-range Tasks"
+        )
+        with pytest.raises(RuntimeError, match=expected):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                REMOVE_TEAM_SHARE_SSH_FENCES_REVISION,
+            )
+        assert "task_id_allocators" in inspect(engine).get_table_names()
+        engine.dispose()
+
+
+class TestUniqueUserGroupMembershipMigration:
+    @pytest.mark.parametrize("direction", ("upgrade", "downgrade"))
+    def test_sqlite_offline_batch_reflection_is_refused(self, direction):
+        module = _load_revision_migration(
+            "e1b7d9f3a5c2_unique_user_group_membership.py",
+            f"unique_membership_sqlite_offline_{direction}",
+        )
+        bind = MagicMock()
+        bind.dialect.name = "sqlite"
+        with (
+            patch.object(module, "_is_offline", return_value=True),
+            patch.object(module.op, "get_bind", return_value=bind),
+            pytest.raises(RuntimeError, match="online SQLite batch reflection"),
+        ):
+            getattr(module, direction)()
+
+    @pytest.mark.parametrize("dialect_name", ("mysql", "mariadb"))
+    def test_mysql_family_uses_self_join_delete(self, dialect_name):
+        module = _load_revision_migration(
+            "e1b7d9f3a5c2_unique_user_group_membership.py",
+            f"dedupe_{dialect_name}",
+        )
+        bind = SimpleNamespace(
+            dialect=SimpleNamespace(name=dialect_name),
+        )
+        with (
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(module.op, "execute") as execute,
+        ):
+            module._delete_duplicate_memberships()
+
+        sql = execute.call_args.args[0]
+        assert sql.startswith("DELETE duplicate FROM user_group_members")
+        assert "INNER JOIN user_group_members AS keeper" in sql
+
+    def test_upgrade_deduplicates_rows_and_enforces_uniqueness(self, tmp_path):
+        db_path = str(tmp_path / "unique-user-group-membership.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_ID_NAMESPACE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO user_group_members (id, group_id, user_id) "
+                "VALUES (10, 7, 11), (12, 7, 11), (13, 7, 12)"
+            ))
+
+        _run_alembic(cfg, command.upgrade, CURRENT_HEAD_REVISION)
+
+        inspector = inspect(engine)
+        constraints = {
+            constraint["name"]: tuple(constraint["column_names"])
+            for constraint in inspector.get_unique_constraints(
+                "user_group_members"
+            )
+        }
+        assert constraints["uq_user_group_member"] == (
+            "group_id",
+            "user_id",
+        )
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT id, group_id, user_id FROM user_group_members "
+                "ORDER BY id"
+            )).all()
+        assert [tuple(row) for row in rows] == [
+            (10, 7, 11),
+            (13, 7, 12),
+        ]
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "INSERT INTO user_group_members (group_id, user_id) "
+                    "VALUES (7, 11)"
+                ))
+        engine.dispose()
+
+
+    def test_replays_committed_upgrade_and_downgrade_before_stamp(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "unique-membership-stamp-replay.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            UNIQUE_USER_GROUP_MEMBERSHIP_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE alembic_version SET version_num = :revision"),
+                {"revision": TASK_ID_NAMESPACE_REVISION},
+            )
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            UNIQUE_USER_GROUP_MEMBERSHIP_REVISION,
+        )
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            TASK_ID_NAMESPACE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE alembic_version SET version_num = :revision"),
+                {"revision": UNIQUE_USER_GROUP_MEMBERSHIP_REVISION},
+            )
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            TASK_ID_NAMESPACE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert not any(
+            tuple(item.get("column_names") or ()) == ("group_id", "user_id")
+            for item in inspect(engine).get_unique_constraints(
+                "user_group_members"
+            )
+        )
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == TASK_ID_NAMESPACE_REVISION
+        engine.dispose()
+
+
+class TestRoleAndShareMigrationReplay:
+    @pytest.mark.parametrize("direction", ("upgrade", "downgrade"))
+    def test_remove_setting_sqlite_offline_is_refused(self, direction):
+        module = _load_revision_migration(
+            "a7d3f9c2e610_remove_agent_sandbox_unrestricted_setting.py",
+            f"sqlite_offline_{direction}",
+        )
+        bind = MagicMock()
+        bind.dialect.name = "sqlite"
+        with (
+            patch.object(module, "_is_offline", return_value=True),
+            patch.object(module.op, "get_bind", return_value=bind),
+            pytest.raises(RuntimeError, match="online SQLite batch reflection"),
+        ):
+            getattr(module, direction)()
+
+    def test_task_principal_sqlite_offline_upgrade_is_refused(self):
+        module = _load_revision_migration(
+            "b8e4a0d3f721_add_task_execution_principal.py",
+            "sqlite_offline_upgrade",
+        )
+        bind = MagicMock()
+        bind.dialect.name = "sqlite"
+        with (
+            patch.object(module, "_is_offline", return_value=True),
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module.op, "get_bind", return_value=bind),
+            pytest.raises(RuntimeError, match="online SQLite batch reflection"),
+        ):
+            module.upgrade()
+
+    @pytest.mark.parametrize(
+        ("migration_file", "table_name"),
+        [
+            (
+                "d0a6c8e4f2b1_add_task_id_namespace_allocator.py",
+                "task_id_allocators",
+            ),
+            (
+                "f2c8a4e6d1b0_add_worker_node_drain_control.py",
+                "worker_node_controls",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("initial_state", ("canonical", "canonical_gated"))
+    def test_mysql_singleton_downgrade_gate_precedes_drop_and_replays(
+        self,
+        migration_file,
+        table_name,
+        initial_state,
+    ):
+        module = _load_revision_migration(
+            migration_file,
+            f"mysql_singleton_gate_{table_name}_{initial_state}",
+        )
+        states = iter(
+            ["canonical", "canonical_gated", "absent"]
+            if initial_state == "canonical"
+            else ["canonical_gated", "absent"]
+        )
+        events: list[str] = []
+        with (
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module, "_acquire_transactional_fence"),
+            patch.object(module, "_table_state", side_effect=lambda **_kw: next(states)),
+            patch.object(module, "_seed_or_validate_singleton"),
+            patch.object(module, "_assert_downgrade_safe"),
+            patch.object(module, "_is_mysql_family", return_value=True),
+            patch.object(
+                module.op,
+                "create_check_constraint",
+                side_effect=lambda *_a, **_kw: events.append("gate"),
+            ),
+            patch.object(
+                module.op,
+                "drop_table",
+                side_effect=lambda *_a, **_kw: events.append("drop"),
+            ),
+        ):
+            module.downgrade()
+
+        assert events[-1:] == ["drop"]
+        if initial_state == "canonical":
+            assert events == ["gate", "drop"]
+        else:
+            assert events == ["drop"]
+
+    def test_remove_setting_rejects_foreign_boolean_default(self):
+        module = _load_revision_migration(
+            "a7d3f9c2e610_remove_agent_sandbox_unrestricted_setting.py",
+            "foreign_default",
+        )
+        inspector = MagicMock()
+        inspector.get_columns.return_value = [{
+            "name": "agent_sandbox_unrestricted_enabled",
+            "type": sqlite.BOOLEAN(),
+            "nullable": True,
+            "default": "1",
+        }]
+        with (
+            patch.object(module.op, "get_bind", return_value=object()),
+            patch.object(module.sa, "inspect", return_value=inspector),
+        ):
+            with pytest.raises(RuntimeError, match="foreign shape"):
+                module._column_present()
+
+    def test_remove_setting_replays_committed_ddl_before_stamp(self, tmp_path):
+        db_path = str(tmp_path / "remove-setting-stamp-replay.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE alembic_version SET version_num = :revision"),
+                {"revision": DELIVERY_FRONTEND_REVIEW_REVISION},
+            )
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION,
+        )
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            DELIVERY_FRONTEND_REVIEW_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE alembic_version SET version_num = :revision"),
+                {"revision": REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION},
+            )
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            DELIVERY_FRONTEND_REVIEW_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        columns = {
+            item["name"]
+            for item in inspect(engine).get_columns("global_settings")
+        }
+        assert "agent_sandbox_unrestricted_enabled" in columns
+        engine.dispose()
+
+    def test_task_principal_replays_partial_upgrade_and_both_stamps(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "task-principal-partial-replay.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE tasks ADD COLUMN execution_user_id INTEGER"
+            ))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, TASK_EXECUTION_PRINCIPAL_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        task_columns = {
+            item["name"] for item in inspect(engine).get_columns("tasks")
+        }
+        assert {
+            "execution_user_id",
+            "execution_user_role",
+            "execution_mode",
+            "execution_principal_kind",
+        } <= task_columns
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE alembic_version SET version_num = :revision"),
+                {"revision": REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION},
+            )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, TASK_EXECUTION_PRINCIPAL_REVISION)
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE alembic_version SET version_num = :revision"),
+                {"revision": TASK_EXECUTION_PRINCIPAL_REVISION},
+            )
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        task_columns = {
+            item["name"] for item in inspect(engine).get_columns("tasks")
+        }
+        assert "execution_principal_kind" not in task_columns
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION
+        engine.dispose()
+
+    @pytest.mark.parametrize("task_phase", ("new", "gated"))
+    def test_mysql_task_principal_downgrade_gates_before_any_drop(
+        self,
+        task_phase,
+    ):
+        """A crash after the first gate resumes without an unguarded window."""
+
+        module = _load_revision_migration(
+            "b8e4a0d3f721_add_task_execution_principal.py",
+            f"mysql_gate_order_{task_phase}",
+        )
+        phases = {
+            module._TASK_TABLE: iter(
+                (["new", "gated", "old"] if task_phase == "new" else [
+                    "gated",
+                    "old",
+                ])
+            ),
+            module._OUTBOX_TABLE: iter(["new", "gated", "old"]),
+        }
+        events: list[tuple[str, str]] = []
+
+        def reflected_phase(table_name, *_args, **_kwargs):
+            return next(phases[table_name])
+
+        def install_gate(table_name, *_args, **_kwargs):
+            events.append(("gate", table_name))
+
+        def drop_schema(table_name, *_args, **_kwargs):
+            events.append(("drop", table_name))
+
+        with (
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module, "_acquire_transactional_fence"),
+            patch.object(module, "_table_phase", side_effect=reflected_phase),
+            patch.object(module, "_assert_downgrade_safe"),
+            patch.object(module, "_is_mysql_family", return_value=True),
+            patch.object(
+                module,
+                "_mysql_install_gate",
+                side_effect=install_gate,
+            ),
+            patch.object(
+                module,
+                "_mysql_drop_principal_schema",
+                side_effect=drop_schema,
+            ),
+        ):
+            module.downgrade()
+
+        first_drop = next(
+            index for index, event in enumerate(events) if event[0] == "drop"
+        )
+        assert ("gate", module._OUTBOX_TABLE) in events[:first_drop]
+        if task_phase == "new":
+            assert ("gate", module._TASK_TABLE) in events[:first_drop]
+        else:
+            assert ("gate", module._TASK_TABLE) not in events
+        assert events[first_drop:] == [
+            ("drop", module._OUTBOX_TABLE),
+            ("drop", module._TASK_TABLE),
+        ]
+
+    def test_team_share_trigger_migration_replays_both_stamp_suffixes(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "team-share-trigger-stamp-replay.db")
+        cfg = _alembic_cfg(db_path)
+        trigger_names = {
+            "trg_task_ssh_effect_team_task_share_insert",
+            "trg_task_ssh_effect_team_task_share_update",
+            "trg_task_ssh_effect_team_task_share_delete",
+            "trg_task_ssh_effect_team_project_share_insert",
+            "trg_task_ssh_effect_team_project_share_update",
+            "trg_task_ssh_effect_team_project_share_delete",
+        }
+
+        def present_triggers() -> set[str]:
+            engine = create_engine(f"sqlite:///{db_path}")
+            try:
+                with engine.connect() as conn:
+                    return set(conn.execute(text(
+                        "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+                    )).scalars()) & trigger_names
+            finally:
+                engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            REMOVE_TEAM_SHARE_SSH_FENCES_REVISION,
+        )
+        assert not present_triggers()
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE alembic_version SET version_num = :revision"),
+                {"revision": TASK_EXECUTION_PRINCIPAL_REVISION},
+            )
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            REMOVE_TEAM_SHARE_SSH_FENCES_REVISION,
+        )
+        assert not present_triggers()
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            TASK_EXECUTION_PRINCIPAL_REVISION,
+        )
+        assert present_triggers() == trigger_names
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text("UPDATE alembic_version SET version_num = :revision"),
+                {"revision": REMOVE_TEAM_SHARE_SSH_FENCES_REVISION},
+            )
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            TASK_EXECUTION_PRINCIPAL_REVISION,
+        )
+        assert present_triggers() == trigger_names
+
+
+class TestWorkerNodeDrainControlMigration:
+    def test_metadata_create_all_seed_is_pristine_and_downgradable(
+        self,
+        tmp_path,
+    ):
+        from backend.models.worker import WorkerNodeControl
+
+        db_path = str(tmp_path / "worker-node-metadata-seed.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            UNIQUE_USER_GROUP_MEMBERSHIP_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        Base.metadata.create_all(
+            engine,
+            tables=[WorkerNodeControl.__table__],
+        )
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT id, drain_claim, active_login_attempt_id, "
+                "active_login_kind, drain_started_at, updated_at "
+                "FROM worker_node_controls"
+            )).one() == (1, None, None, None, None, None)
+        engine.dispose()
+
+        # A metadata-created canonical table can be adopted by the migration,
+        # stamped, and removed again while the protocol remains unused.
+        _run_alembic(cfg, command.upgrade, WORKER_NODE_DRAIN_REVISION)
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            UNIQUE_USER_GROUP_MEMBERSHIP_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "worker_node_controls" not in inspect(engine).get_table_names()
+        engine.dispose()
+
+    def test_upgrade_replays_create_before_seed_or_revision_stamp(
+        self,
+        tmp_path,
+    ):
+        """A CREATE/INSERT split crash must preserve the canonical table."""
+
+        from backend.models.worker import WorkerNodeControl
+
+        db_path = str(tmp_path / "worker-node-create-crash.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            UNIQUE_USER_GROUP_MEMBERSHIP_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        WorkerNodeControl.__table__.create(engine)
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM worker_node_controls"))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, WORKER_NODE_DRAIN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT id, drain_claim, active_login_attempt_id, "
+                "active_login_kind, drain_started_at, updated_at "
+                "FROM worker_node_controls"
+            )).one() == (1, None, None, None, None, None)
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == WORKER_NODE_DRAIN_REVISION
+        engine.dispose()
+
+    def test_downgrade_replays_drop_before_revision_stamp(self, tmp_path):
+        db_path = str(tmp_path / "worker-node-drop-crash.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, WORKER_NODE_DRAIN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE worker_node_controls"))
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            UNIQUE_USER_GROUP_MEMBERSHIP_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "worker_node_controls" not in inspect(engine).get_table_names()
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == UNIQUE_USER_GROUP_MEMBERSHIP_REVISION
+        engine.dispose()
+
+    def test_pristine_upgrade_downgrade_upgrade(self, tmp_path):
+        db_path = str(tmp_path / "worker-node-drain-control.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            UNIQUE_USER_GROUP_MEMBERSHIP_REVISION,
+        )
+
+        _run_alembic(cfg, command.upgrade, WORKER_NODE_DRAIN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "worker_node_controls" in inspect(engine).get_table_names()
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT id, drain_claim, active_login_attempt_id, "
+                "active_login_kind FROM worker_node_controls"
+            )).one() == (1, None, None, None)
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            UNIQUE_USER_GROUP_MEMBERSHIP_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "worker_node_controls" not in inspect(engine).get_table_names()
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, WORKER_NODE_DRAIN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT id FROM worker_node_controls"
+            )).scalar_one() == 1
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        ("column", "value"),
+        [
+            ("drain_claim", "a" * 64),
+            ("active_login_attempt_id", "b" * 32),
+            ("active_login_kind", "codex"),
+            ("drain_started_at", "2026-08-14 00:00:00"),
+            ("runtime_seal_claim", "c" * 64),
+            ("runtime_sealed_at", "2026-08-14 00:00:01"),
+            ("updated_at", "2026-08-14 00:00:00"),
+        ],
+    )
+    def test_downgrade_refuses_durable_node_evidence(
+        self,
+        tmp_path,
+        column,
+        value,
+    ):
+        db_path = str(tmp_path / f"worker-node-drain-{column}.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, WORKER_NODE_DRAIN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            if column in {"drain_claim", "drain_started_at"}:
+                conn.execute(
+                    text(
+                        "UPDATE worker_node_controls "
+                        "SET drain_claim = :drain_claim, "
+                        "drain_started_at = :drain_started_at WHERE id = 1"
+                    ),
+                    {
+                        "drain_claim": (
+                            value if column == "drain_claim" else "a" * 64
+                        ),
+                        "drain_started_at": (
+                            value
+                            if column == "drain_started_at"
+                            else "2026-08-14 00:00:00"
+                        ),
+                    },
+                )
+            elif column in {"runtime_seal_claim", "runtime_sealed_at"}:
+                claim = value if column == "runtime_seal_claim" else "c" * 64
+                conn.execute(
+                    text(
+                        "UPDATE worker_node_controls "
+                        "SET drain_claim = :claim, "
+                        "drain_started_at = :drain_started_at, "
+                        "runtime_seal_claim = :claim, "
+                        "runtime_sealed_at = :runtime_sealed_at WHERE id = 1"
+                    ),
+                    {
+                        "claim": claim,
+                        "drain_started_at": "2026-08-14 00:00:00",
+                        "runtime_sealed_at": (
+                            value
+                            if column == "runtime_sealed_at"
+                            else "2026-08-14 00:00:01"
+                        ),
+                    },
+                )
+            else:
+                conn.execute(
+                    text(
+                        f"UPDATE worker_node_controls SET {column} = :value "
+                        "WHERE id = 1"
+                    ),
+                    {"value": value},
+                )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="Worker node drain/login evidence exists",
+        ):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                UNIQUE_USER_GROUP_MEMBERSHIP_REVISION,
+            )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "worker_node_controls" in inspect(engine).get_table_names()
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == WORKER_NODE_DRAIN_REVISION
+        engine.dispose()
+
+    def test_postgresql_downgrade_takes_exclusive_control_table_lock(self):
+        module = _load_revision_migration(
+            "f2c8a4e6d1b0_add_worker_node_drain_control.py",
+            "worker_node_postgresql_lock",
+        )
+        bind = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+        inspector = MagicMock()
+        inspector.has_table.return_value = True
+
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module.op, "execute") as execute,
+        ):
+            module._acquire_transactional_fence(downgrade=True)
+
+        inspector.has_table.assert_called_once_with(module._TABLE)
+        assert str(execute.call_args.args[0]) == (
+            "LOCK TABLE worker_node_controls IN ACCESS EXCLUSIVE MODE"
+        )
+
+    def test_postgresql_downgrade_replay_skips_lock_after_table_drop(self):
+        module = _load_revision_migration(
+            "f2c8a4e6d1b0_add_worker_node_drain_control.py",
+            "worker_node_postgresql_absent_table",
+        )
+        bind = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+        inspector = MagicMock()
+        inspector.has_table.return_value = False
+
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module.op, "execute") as execute,
+        ):
+            module._acquire_transactional_fence(downgrade=True)
+
+        inspector.has_table.assert_called_once_with(module._TABLE)
+        execute.assert_not_called()
+
+    def test_mysql_upgrade_adopts_created_table_before_seed_or_stamp(self):
+        module = _load_revision_migration(
+            "f2c8a4e6d1b0_add_worker_node_drain_control.py",
+            "worker_node_mysql_upgrade_replay",
+        )
+        with (
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module, "_acquire_transactional_fence"),
+            patch.object(
+                module,
+                "_table_state",
+                side_effect=("canonical", "canonical"),
+            ),
+            patch.object(module, "_create_table") as create_table,
+            patch.object(module, "_seed_or_validate_singleton") as seed,
+        ):
+            module.upgrade()
+
+        create_table.assert_not_called()
+        seed.assert_called_once_with()
+
+    @pytest.mark.parametrize("initial_state", ("canonical", "canonical_gated"))
+    def test_mysql_downgrade_gate_precedes_drop_and_replays(
+        self,
+        initial_state,
+    ):
+        module = _load_revision_migration(
+            "f2c8a4e6d1b0_add_worker_node_drain_control.py",
+            f"worker_node_mysql_downgrade_{initial_state}",
+        )
+        states = iter(
+            ("canonical", "canonical_gated", "absent")
+            if initial_state == "canonical"
+            else ("canonical_gated", "absent")
+        )
+        events: list[str] = []
+        with (
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module, "_acquire_transactional_fence"),
+            patch.object(
+                module,
+                "_table_state",
+                side_effect=lambda **_kwargs: next(states),
+            ),
+            patch.object(
+                module,
+                "_assert_downgrade_safe",
+                side_effect=lambda: events.append("safe"),
+            ),
+            patch.object(module, "_is_mysql_family", return_value=True),
+            patch.object(
+                module.op,
+                "create_check_constraint",
+                side_effect=lambda *_args, **_kwargs: events.append("gate"),
+            ) as create_gate,
+            patch.object(
+                module.op,
+                "drop_table",
+                side_effect=lambda *_args, **_kwargs: events.append("drop"),
+            ),
+        ):
+            module.downgrade()
+
+        assert events == (
+            ["safe", "gate", "safe", "drop"]
+            if initial_state == "canonical"
+            else ["safe", "safe", "drop"]
+        )
+        assert "drain_started_at IS NULL" in module._GATE_SQL
+        if initial_state == "canonical":
+            create_gate.assert_called_once_with(
+                module._DOWNGRADE_GATE,
+                module._TABLE,
+                module._GATE_SQL,
+            )
+        else:
+            create_gate.assert_not_called()
+
+    def test_mysql_table_state_rejects_unenforced_control_check(self):
+        module = _load_revision_migration(
+            "f2c8a4e6d1b0_add_worker_node_drain_control.py",
+            "worker_node_mysql_unenforced_check",
+        )
+        inspector = MagicMock()
+        inspector.has_table.return_value = True
+        inspector.get_columns.return_value = [
+            {
+                "name": name,
+                "type": kind() if length is None else kind(length=length),
+                "nullable": nullable,
+                "default": None,
+            }
+            for name, (kind, length, nullable) in {
+                "id": (module.sa.Integer, None, False),
+                "drain_claim": (module.sa.String, 64, True),
+                "runtime_seal_claim": (module.sa.String, 64, True),
+                "active_login_attempt_id": (module.sa.String, 64, True),
+                "active_login_kind": (module.sa.String, 32, True),
+                "drain_started_at": (module.sa.DateTime, None, True),
+                "runtime_sealed_at": (module.sa.DateTime, None, True),
+                "updated_at": (module.sa.DateTime, None, True),
+            }.items()
+        ]
+        inspector.get_pk_constraint.return_value = {
+            "constrained_columns": ["id"]
+        }
+        inspector.get_unique_constraints.return_value = []
+        inspector.get_foreign_keys.return_value = []
+        inspector.get_check_constraints.return_value = [
+            {"name": name, "sqltext": sqltext}
+            for name, sqltext in module._CHECKS.items()
+        ]
+        engine_result = MagicMock()
+        engine_result.scalars.return_value.all.return_value = ["InnoDB"]
+        bind = MagicMock(
+            dialect=SimpleNamespace(
+                name="mysql",
+                is_mariadb=False,
+                server_version_info=(8, 0, 36),
+            )
+        )
+        bind.execute.return_value = engine_result
+
+        with (
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(
+                module,
+                "_mysql_enforced_checks",
+                return_value={"ck_worker_node_controls_singleton"},
+            ),
+            pytest.raises(RuntimeError, match="CHECK constraints are not enforced"),
+        ):
+            module._table_state()
+
+    def test_mysql_enforcement_query_filters_not_enforced_checks(self):
+        module = _load_revision_migration(
+            "f2c8a4e6d1b0_add_worker_node_drain_control.py",
+            "worker_node_mysql_enforcement_query",
+        )
+        bind = MagicMock(
+            dialect=SimpleNamespace(name="mysql", is_mariadb=False)
+        )
+        bind.execute.return_value = [
+            ("ck_worker_node_controls_singleton", "YES"),
+            ("ck_worker_node_controls_drain_phase", "NO"),
+        ]
+        with patch.object(module.op, "get_bind", return_value=bind):
+            assert module._mysql_enforced_checks() == {
+                "ck_worker_node_controls_singleton"
+            }
+        statement, params = bind.execute.call_args.args
+        assert "ENFORCED" in str(statement)
+        assert params == {"table": module._TABLE}
+
+
+class TestWorkerDestroyLifecycleNonceMigration:
+    migration_file = (
+        "b4e1c7d9f203_add_worker_destroy_lifecycle_nonce.py"
+    )
+
+    def test_pristine_upgrade_downgrade_upgrade(self, tmp_path):
+        db_path = str(tmp_path / "worker-destroy-lifecycle-nonce.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_MIGRATION_OPERATION_REVISION)
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_DESTROY_LIFECYCLE_NONCE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        columns = {
+            item["name"]: item
+            for item in inspect(engine).get_columns("workers")
+        }
+        nonce = columns["destroy_lifecycle_nonce"]
+        assert isinstance(nonce["type"], String)
+        assert nonce["type"].length == 32
+        assert nonce["nullable"] is True
+        receipt = columns["destroy_termination_receipt"]
+        assert isinstance(receipt["type"], JSON)
+        assert receipt["nullable"] is True
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            TASK_MIGRATION_OPERATION_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        worker_columns = _get_table_columns(engine, "workers")
+        assert "destroy_lifecycle_nonce" not in worker_columns
+        assert "destroy_termination_receipt" not in worker_columns
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_DESTROY_LIFECYCLE_NONCE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        worker_columns = _get_table_columns(engine, "workers")
+        assert worker_columns["destroy_lifecycle_nonce"] == "VARCHAR(32)"
+        assert worker_columns["destroy_termination_receipt"] == "JSON"
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        ("preexisting_column", "column_type"),
+        [
+            ("destroy_lifecycle_nonce", "VARCHAR(32)"),
+            ("destroy_termination_receipt", "JSON"),
+        ],
+    )
+    def test_upgrade_replays_partial_add_before_revision_stamp(
+        self,
+        tmp_path,
+        preexisting_column,
+        column_type,
+    ):
+        db_path = str(
+            tmp_path / f"worker-destroy-add-crash-{preexisting_column}.db"
+        )
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_MIGRATION_OPERATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                f"ALTER TABLE workers ADD COLUMN {preexisting_column} "
+                f"{column_type}"
+            ))
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_DESTROY_LIFECYCLE_NONCE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == WORKER_DESTROY_LIFECYCLE_NONCE_REVISION
+        worker_columns = _get_table_columns(engine, "workers")
+        assert worker_columns["destroy_lifecycle_nonce"] == "VARCHAR(32)"
+        assert worker_columns["destroy_termination_receipt"] == "JSON"
+        engine.dispose()
+
+    def test_downgrade_replays_drop_before_revision_stamp(self, tmp_path):
+        db_path = str(tmp_path / "worker-destroy-drop-crash.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_DESTROY_LIFECYCLE_NONCE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE workers DROP COLUMN destroy_termination_receipt"
+            ))
+            conn.execute(text(
+                "ALTER TABLE workers DROP COLUMN destroy_lifecycle_nonce"
+            ))
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            TASK_MIGRATION_OPERATION_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        worker_columns = _get_table_columns(engine, "workers")
+        assert "destroy_lifecycle_nonce" not in worker_columns
+        assert "destroy_termination_receipt" not in worker_columns
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == TASK_MIGRATION_OPERATION_REVISION
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        ("case", "status", "bootstrap_step", "nonce", "receipt"),
+        [
+            ("nonce", "ready", None, "d" * 32, None),
+            (
+                "termination-receipt",
+                "ready",
+                None,
+                None,
+                '{"phase":"submitted"}',
+            ),
+            ("destroying-status", "destroying", None, None, None),
+            ("destroy-step", "ready", "destroy", None, None),
+        ],
+    )
+    def test_downgrade_refuses_destroy_lifecycle_evidence(
+        self,
+        tmp_path,
+        case,
+        status,
+        bootstrap_step,
+        nonce,
+        receipt,
+    ):
+        db_path = str(tmp_path / f"worker-destroy-evidence-{case}.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_DESTROY_LIFECYCLE_NONCE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO workers "
+                    "(name, status, bootstrap_step, "
+                    "destroy_lifecycle_nonce, destroy_termination_receipt, "
+                    "created_at, updated_at) "
+                    "VALUES ('destroy evidence', :status, :bootstrap_step, "
+                    ":nonce, :receipt, '2026-08-14 00:00:00', "
+                    "'2026-08-14 00:00:00')"
+                ),
+                {
+                    "status": status,
+                    "bootstrap_step": bootstrap_step,
+                    "nonce": nonce,
+                    "receipt": receipt,
+                },
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="Worker destroy lifecycle evidence exists",
+        ):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                TASK_MIGRATION_OPERATION_REVISION,
+            )
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "destroy_lifecycle_nonce" in _get_table_columns(
+            engine,
+            "workers",
+        )
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == WORKER_DESTROY_LIFECYCLE_NONCE_REVISION
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        ("column", "column_type", "reflected_type"),
+        [
+            ("destroy_lifecycle_nonce", "VARCHAR(16)", "VARCHAR(16)"),
+            ("destroy_termination_receipt", "TEXT", "TEXT"),
+        ],
+    )
+    def test_upgrade_rejects_foreign_existing_column_shape(
+        self,
+        tmp_path,
+        column,
+        column_type,
+        reflected_type,
+    ):
+        db_path = str(tmp_path / f"worker-destroy-foreign-{column}.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_MIGRATION_OPERATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                f"ALTER TABLE workers ADD COLUMN {column} {column_type}"
+            ))
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="foreign shape"):
+            _run_alembic(
+                cfg,
+                command.upgrade,
+                WORKER_DESTROY_LIFECYCLE_NONCE_REVISION,
+            )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == TASK_MIGRATION_OPERATION_REVISION
+        assert _get_table_columns(engine, "workers")[column] == reflected_type
+        engine.dispose()
+
+    @pytest.mark.parametrize("json_check_present", (True, False))
+    def test_mariadb_longtext_json_alias_requires_exact_validation_check(
+        self,
+        json_check_present,
+    ):
+        module = _load_revision_migration(
+            self.migration_file,
+            f"worker_destroy_mariadb_json_{json_check_present}",
+        )
+        inspector = MagicMock()
+        inspector.has_table.return_value = True
+        inspector.get_columns.return_value = [
+            {
+                "name": "destroy_lifecycle_nonce",
+                "type": String(32),
+                "nullable": True,
+                "default": None,
+            },
+            {
+                "name": "destroy_termination_receipt",
+                "type": mysql.LONGTEXT(),
+                "nullable": True,
+                "default": None,
+            },
+        ]
+        inspector.get_check_constraints.return_value = (
+            [{
+                "name": "destroy_termination_receipt",
+                "sqltext": (
+                    "json_valid(`destroy_termination_receipt`)"
+                ),
+            }]
+            if json_check_present
+            else []
+        )
+        inspector.get_pk_constraint.return_value = {
+            "constrained_columns": ["id"]
+        }
+        inspector.get_indexes.return_value = []
+        inspector.get_unique_constraints.return_value = []
+        inspector.get_foreign_keys.return_value = []
+        with (
+            patch.object(module.op, "get_bind", return_value=object()),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module, "_is_mariadb", return_value=True),
+        ):
+            if json_check_present:
+                assert module._column_state() == "canonical"
+            else:
+                with pytest.raises(RuntimeError, match="JSON_VALID"):
+                    module._column_state()
+
+    @pytest.mark.parametrize("initial_state", ("canonical", "canonical_gated"))
+    def test_mysql_downgrade_gate_precedes_drop_and_replays(
+        self,
+        initial_state,
+    ):
+        module = _load_revision_migration(
+            self.migration_file,
+            f"worker_destroy_mysql_gate_{initial_state}",
+        )
+        states = iter(
+            ("canonical", "canonical_gated", "absent")
+            if initial_state == "canonical"
+            else ("canonical_gated", "absent")
+        )
+        events: list[str] = []
+        with (
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module, "_acquire_transactional_fence"),
+            patch.object(
+                module,
+                "_column_state",
+                side_effect=lambda **_kwargs: next(states),
+            ),
+            patch.object(
+                module,
+                "_assert_downgrade_safe",
+                side_effect=lambda: events.append("safe"),
+            ),
+            patch.object(module, "_is_mysql_family", return_value=True),
+            patch.object(
+                module.op,
+                "create_check_constraint",
+                side_effect=lambda *_args, **_kwargs: events.append("gate"),
+            ) as create_gate,
+            patch.object(
+                module,
+                "_drop_columns",
+                side_effect=lambda **_kwargs: events.append("drop"),
+            ),
+        ):
+            module.downgrade()
+
+        expected = (
+            ["safe", "gate", "safe", "drop"]
+            if initial_state == "canonical"
+            else ["safe", "safe", "drop"]
+        )
+        assert events == expected
+        if initial_state == "canonical":
+            create_gate.assert_called_once_with(
+                module._MYSQL_DOWNGRADE_GATE,
+                module._TABLE,
+                module._MYSQL_DOWNGRADE_GATE_SQL,
+            )
+        else:
+            create_gate.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("is_mariadb", "drop_gate"),
+        [(False, "DROP CHECK"), (True, "DROP CONSTRAINT")],
+    )
+    def test_mysql_family_drops_gate_and_columns_in_one_atomic_alter(
+        self,
+        is_mariadb,
+        drop_gate,
+    ):
+        module = _load_revision_migration(
+            self.migration_file,
+            f"worker_destroy_atomic_drop_{is_mariadb}",
+        )
+        with (
+            patch.object(module, "_is_mysql_family", return_value=True),
+            patch.object(module, "_is_mariadb", return_value=is_mariadb),
+            patch.object(module.op, "execute") as execute,
+        ):
+            module._drop_columns(state="canonical_gated")
+
+        execute.assert_called_once()
+        assert str(execute.call_args.args[0]) == (
+            f"ALTER TABLE workers {drop_gate} "
+            "ck_workers_destroy_nonce_no_downgrade_use, "
+            "DROP COLUMN destroy_termination_receipt, "
+            "DROP COLUMN destroy_lifecycle_nonce"
+        )
+
+    def test_offline_downgrade_fails_closed(self):
+        module = _load_revision_migration(
+            self.migration_file,
+            "worker_destroy_offline_downgrade",
+        )
+        with (
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_is_offline", return_value=True),
+            patch.object(module, "_drop_columns") as drop,
+            pytest.raises(RuntimeError, match="offline downgrade is refused"),
+        ):
+            module.downgrade()
+        drop.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("table_present", "lock_count"),
+        [(True, 1), (False, 0)],
+    )
+    def test_postgresql_downgrade_lock_is_replay_safe(
+        self,
+        table_present,
+        lock_count,
+    ):
+        module = _load_revision_migration(
+            self.migration_file,
+            f"worker_destroy_postgresql_lock_{table_present}",
+        )
+        bind = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+        inspector = MagicMock()
+        inspector.has_table.return_value = table_present
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module.op, "execute") as execute,
+        ):
+            module._acquire_transactional_fence(downgrade=True)
+
+        inspector.has_table.assert_called_once_with(module._TABLE)
+        assert execute.call_count == lock_count
+        if table_present:
+            assert str(execute.call_args.args[0]) == (
+                "LOCK TABLE workers IN ACCESS EXCLUSIVE MODE"
+            )
+
+
+class TestWorkerRenameTagOutboxMigration:
+    migration_file = "c4a8e2f6b190_add_worker_rename_tag_outbox.py"
+
+    def test_pristine_upgrade_downgrade_upgrade(self, tmp_path):
+        db_path = str(tmp_path / "worker-rename-tag-outbox.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_DESTROY_LIFECYCLE_NONCE_REVISION,
+        )
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_RENAME_TAG_OUTBOX_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        columns = {
+            item["name"]: item
+            for item in inspect(engine).get_columns("workers")
+        }
+        generation = columns["rename_generation"]
+        assert type(generation["type"]).__name__.upper() == "INTEGER"
+        assert generation["nullable"] is False
+        module = _load_revision_migration(
+            self.migration_file,
+            "worker_rename_default_shape",
+        )
+        assert module._default_is_zero(generation["default"])
+        outbox = columns["rename_tag_outbox"]
+        assert isinstance(outbox["type"], JSON)
+        assert outbox["nullable"] is True
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            WORKER_DESTROY_LIFECYCLE_NONCE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        columns = _get_table_columns(engine, "workers")
+        assert "rename_generation" not in columns
+        assert "rename_tag_outbox" not in columns
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_RENAME_TAG_OUTBOX_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        columns = _get_table_columns(engine, "workers")
+        assert columns["rename_generation"] == "INTEGER"
+        assert columns["rename_tag_outbox"] == "JSON"
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        ("preexisting_column", "column_ddl"),
+        [
+            (
+                "rename_generation",
+                "rename_generation INTEGER DEFAULT 0 NOT NULL",
+            ),
+            ("rename_tag_outbox", "rename_tag_outbox JSON"),
+        ],
+    )
+    def test_upgrade_replays_partial_add_before_revision_stamp(
+        self,
+        tmp_path,
+        preexisting_column,
+        column_ddl,
+    ):
+        db_path = str(
+            tmp_path / f"worker-rename-add-crash-{preexisting_column}.db"
+        )
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_DESTROY_LIFECYCLE_NONCE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                f"ALTER TABLE workers ADD COLUMN {column_ddl}"
+            ))
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_RENAME_TAG_OUTBOX_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        columns = _get_table_columns(engine, "workers")
+        assert columns["rename_generation"] == "INTEGER"
+        assert columns["rename_tag_outbox"] == "JSON"
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == WORKER_RENAME_TAG_OUTBOX_REVISION
+        engine.dispose()
+
+    @pytest.mark.parametrize("drop_generation", (False, True))
+    def test_downgrade_replays_partial_drop_before_revision_stamp(
+        self,
+        tmp_path,
+        drop_generation,
+    ):
+        db_path = str(
+            tmp_path / f"worker-rename-drop-crash-{drop_generation}.db"
+        )
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_RENAME_TAG_OUTBOX_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE workers DROP COLUMN rename_tag_outbox"
+            ))
+            if drop_generation:
+                conn.execute(text(
+                    "ALTER TABLE workers DROP COLUMN rename_generation"
+                ))
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            WORKER_DESTROY_LIFECYCLE_NONCE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        columns = _get_table_columns(engine, "workers")
+        assert "rename_generation" not in columns
+        assert "rename_tag_outbox" not in columns
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == WORKER_DESTROY_LIFECYCLE_NONCE_REVISION
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        ("column", "column_ddl"),
+        [
+            (
+                "rename_generation",
+                "rename_generation INTEGER DEFAULT 1 NOT NULL",
+            ),
+            (
+                "rename_generation",
+                "rename_generation INTEGER DEFAULT 0",
+            ),
+            ("rename_tag_outbox", "rename_tag_outbox TEXT"),
+            ("rename_tag_outbox", "rename_tag_outbox JSON NOT NULL"),
+        ],
+    )
+    def test_upgrade_rejects_foreign_existing_column_shape(
+        self,
+        tmp_path,
+        column,
+        column_ddl,
+    ):
+        db_path = str(
+            tmp_path / f"worker-rename-foreign-{column}-{len(column_ddl)}.db"
+        )
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_DESTROY_LIFECYCLE_NONCE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                f"ALTER TABLE workers ADD COLUMN {column_ddl}"
+            ))
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="foreign shape"):
+            _run_alembic(
+                cfg,
+                command.upgrade,
+                WORKER_RENAME_TAG_OUTBOX_REVISION,
+            )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == WORKER_DESTROY_LIFECYCLE_NONCE_REVISION
+        assert column in _get_table_columns(engine, "workers")
+        engine.dispose()
+
+    @pytest.mark.parametrize("json_check_present", (True, False))
+    def test_mariadb_longtext_json_alias_requires_exact_validation_check(
+        self,
+        json_check_present,
+    ):
+        module = _load_revision_migration(
+            self.migration_file,
+            f"worker_rename_mariadb_json_{json_check_present}",
+        )
+        inspector = MagicMock()
+        inspector.has_table.return_value = True
+        inspector.get_columns.return_value = [
+            {
+                "name": "rename_generation",
+                "type": Integer(),
+                "nullable": False,
+                "default": "0",
+            },
+            {
+                "name": "rename_tag_outbox",
+                "type": mysql.LONGTEXT(),
+                "nullable": True,
+                "default": None,
+            },
+        ]
+        inspector.get_check_constraints.return_value = (
+            [{
+                "name": "rename_tag_outbox",
+                "sqltext": "json_valid(`rename_tag_outbox`)",
+            }]
+            if json_check_present
+            else []
+        )
+        inspector.get_indexes.return_value = []
+        inspector.get_unique_constraints.return_value = []
+        inspector.get_foreign_keys.return_value = []
+        with (
+            patch.object(module.op, "get_bind", return_value=object()),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module, "_is_mariadb", return_value=True),
+        ):
+            if json_check_present:
+                assert module._column_state() == "canonical"
+            else:
+                with pytest.raises(RuntimeError, match="JSON alias"):
+                    module._column_state()
+
+    def test_postgresql_jsonb_is_not_adopted_as_canonical_json(self):
+        module = _load_revision_migration(
+            self.migration_file,
+            "worker_rename_postgresql_jsonb",
+        )
+        inspector = MagicMock()
+        inspector.has_table.return_value = True
+        inspector.get_columns.return_value = [
+            {
+                "name": "rename_generation",
+                "type": Integer(),
+                "nullable": False,
+                "default": "0",
+            },
+            {
+                "name": "rename_tag_outbox",
+                "type": postgresql.JSONB(),
+                "nullable": True,
+                "default": None,
+            },
+        ]
+        inspector.get_check_constraints.return_value = []
+        inspector.get_pk_constraint.return_value = {
+            "constrained_columns": ["id"]
+        }
+        inspector.get_indexes.return_value = []
+        inspector.get_unique_constraints.return_value = []
+        inspector.get_foreign_keys.return_value = []
+        with (
+            patch.object(module.op, "get_bind", return_value=object()),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module, "_is_mariadb", return_value=False),
+            pytest.raises(RuntimeError, match="rename_tag_outbox.*foreign"),
+        ):
+            module._column_state()
+
+    def test_downgrade_refuses_pending_cloud_rename(self, tmp_path):
+        db_path = str(tmp_path / "worker-rename-pending-outbox.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_RENAME_TAG_OUTBOX_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO workers "
+                    "(name, status, rename_generation, rename_tag_outbox, "
+                    "created_at, updated_at) VALUES "
+                    "('rename pending', 'ready', 1, :outbox, "
+                    "'2026-08-14 00:00:00', '2026-08-14 00:00:00')"
+                ),
+                {"outbox": '{"generation":1}'},
+            )
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="rename outboxes are pending"):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                WORKER_DESTROY_LIFECYCLE_NONCE_REVISION,
+            )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == WORKER_RENAME_TAG_OUTBOX_REVISION
+        engine.dispose()
+
+    def test_postgresql_offline_upgrade_emits_canonical_columns(self):
+        module = _load_revision_migration(
+            self.migration_file,
+            "worker_rename_postgresql_offline_upgrade",
+        )
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with patch.object(module, "op", Operations(context)):
+            module.upgrade()
+
+        ddl = " ".join(output.getvalue().lower().split())
+        assert (
+            "alter table workers add column rename_generation "
+            "integer default 0 not null" in ddl
+        )
+        assert (
+            "alter table workers add column rename_tag_outbox json" in ddl
+        )
+
+    def test_mysql_offline_upgrade_fails_closed(self):
+        module = _load_revision_migration(
+            self.migration_file,
+            "worker_rename_mysql_offline_upgrade",
+        )
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="mysql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with (
+            patch.object(module, "op", Operations(context)),
+            pytest.raises(RuntimeError, match="refuses MySQL/MariaDB"),
+        ):
+            module.upgrade()
+        assert output.getvalue() == ""
+
+    def test_offline_downgrade_fails_closed(self):
+        module = _load_revision_migration(
+            self.migration_file,
+            "worker_rename_offline_downgrade",
+        )
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with (
+            patch.object(module, "op", Operations(context)),
+            pytest.raises(RuntimeError, match="offline downgrade is refused"),
+        ):
+            module.downgrade()
+        assert output.getvalue() == ""
+
+    @pytest.mark.parametrize("initial_state", ("canonical", "canonical_gated"))
+    def test_mysql_downgrade_gate_precedes_atomic_drop_and_replays(
+        self,
+        initial_state,
+    ):
+        module = _load_revision_migration(
+            self.migration_file,
+            f"worker_rename_mysql_gate_{initial_state}",
+        )
+        states = iter(
+            ("canonical", "canonical_gated", "absent")
+            if initial_state == "canonical"
+            else ("canonical_gated", "absent")
+        )
+        events: list[str] = []
+        with (
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module, "_acquire_transactional_fence"),
+            patch.object(
+                module,
+                "_column_state",
+                side_effect=lambda **_kwargs: next(states),
+            ),
+            patch.object(
+                module,
+                "_pending_outbox_count",
+                side_effect=lambda: (events.append("safe"), 0)[1],
+            ),
+            patch.object(module, "_is_mysql_family", return_value=True),
+            patch.object(
+                module.op,
+                "create_check_constraint",
+                side_effect=lambda *_args, **_kwargs: events.append("gate"),
+            ) as create_gate,
+            patch.object(
+                module,
+                "_drop_canonical_columns",
+                side_effect=lambda **_kwargs: events.append("drop"),
+            ),
+        ):
+            module.downgrade()
+
+        assert events == (
+            ["safe", "gate", "safe", "drop"]
+            if initial_state == "canonical"
+            else ["safe", "safe", "drop"]
+        )
+        if initial_state == "canonical":
+            create_gate.assert_called_once_with(
+                module._MYSQL_DOWNGRADE_GATE,
+                module._TABLE,
+                module._MYSQL_DOWNGRADE_GATE_SQL,
+            )
+        else:
+            create_gate.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("is_mariadb", "drop_gate"),
+        [(False, "DROP CHECK"), (True, "DROP CONSTRAINT")],
+    )
+    def test_mysql_family_drops_gate_and_columns_in_one_atomic_alter(
+        self,
+        is_mariadb,
+        drop_gate,
+    ):
+        module = _load_revision_migration(
+            self.migration_file,
+            f"worker_rename_atomic_drop_{is_mariadb}",
+        )
+        with (
+            patch.object(module, "_is_mysql_family", return_value=True),
+            patch.object(module, "_is_mariadb", return_value=is_mariadb),
+            patch.object(module.op, "execute") as execute,
+        ):
+            module._drop_canonical_columns(state="canonical_gated")
+
+        execute.assert_called_once()
+        assert str(execute.call_args.args[0]) == (
+            f"ALTER TABLE workers {drop_gate} "
+            "ck_workers_rename_tag_no_downgrade_use, "
+            "DROP COLUMN rename_tag_outbox, "
+            "DROP COLUMN rename_generation"
+        )
+
+    def test_mysql_column_state_rejects_unenforced_downgrade_gate(self):
+        module = _load_revision_migration(
+            self.migration_file,
+            "worker_rename_unenforced_gate",
+        )
+        inspector = MagicMock()
+        inspector.has_table.return_value = True
+        inspector.get_columns.return_value = [
+            {
+                "name": "rename_generation",
+                "type": Integer(),
+                "nullable": False,
+                "default": "0",
+            },
+            {
+                "name": "rename_tag_outbox",
+                "type": JSON(),
+                "nullable": True,
+                "default": None,
+            },
+        ]
+        inspector.get_check_constraints.return_value = [{
+            "name": module._MYSQL_DOWNGRADE_GATE,
+            "sqltext": module._MYSQL_DOWNGRADE_GATE_SQL,
+        }]
+        inspector.get_pk_constraint.return_value = {
+            "constrained_columns": ["id"]
+        }
+        inspector.get_indexes.return_value = []
+        inspector.get_unique_constraints.return_value = []
+        inspector.get_foreign_keys.return_value = []
+        with (
+            patch.object(module.op, "get_bind", return_value=object()),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module, "_is_mariadb", return_value=False),
+            patch.object(module, "_is_mysql_family", return_value=True),
+            patch.object(module, "_mysql_enforced_checks", return_value=set()),
+            pytest.raises(RuntimeError, match="not enforced"),
+        ):
+            module._column_state(allow_gate=True)
+
+    @pytest.mark.parametrize(
+        ("table_present", "lock_count"),
+        [(True, 1), (False, 0)],
+    )
+    def test_postgresql_downgrade_lock_is_replay_safe(
+        self,
+        table_present,
+        lock_count,
+    ):
+        module = _load_revision_migration(
+            self.migration_file,
+            f"worker_rename_postgresql_lock_{table_present}",
+        )
+        bind = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+        inspector = MagicMock()
+        inspector.has_table.return_value = table_present
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module.op, "execute") as execute,
+        ):
+            module._acquire_transactional_fence(downgrade=True)
+
+        inspector.has_table.assert_called_once_with(module._TABLE)
+        assert execute.call_count == lock_count
+        if table_present:
+            assert str(execute.call_args.args[0]) == (
+                "LOCK TABLE workers IN ACCESS EXCLUSIVE MODE"
+            )
+
+    def test_sqlite_revision_writer_fence_uses_exact_direction(self):
+        module = _load_revision_migration(
+            self.migration_file,
+            "worker_rename_sqlite_fence",
+        )
+        result = MagicMock(rowcount=1)
+        bind = MagicMock(dialect=SimpleNamespace(name="sqlite"))
+        bind.execute.return_value = result
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module.op, "get_bind", return_value=bind),
+        ):
+            module._acquire_transactional_fence(downgrade=False)
+            upgrade_call = bind.execute.call_args
+            module._acquire_transactional_fence(downgrade=True)
+            downgrade_call = bind.execute.call_args
+
+        assert upgrade_call.args[1] == {
+            "expected_revision": module.down_revision
+        }
+        assert downgrade_call.args[1] == {
+            "expected_revision": module.revision
+        }
+
+
+def _task_migration_values(**overrides):
+    values = {
+        "operation_id": "a" * 32,
+        "operation_sequence": 1,
+        "side": "manager",
+        "active_task_id": 101,
+        "task_id": 101,
+        "task_incarnation_id": "b" * 32,
+        "retry_count": 0,
+        "turn_generation": 0,
+        "source_worker_id": None,
+        "target_worker_id": 7,
+        "source_status": "plan_review",
+        "phase": "claimed",
+        "instance_id": None,
+        "started_at": None,
+        "completed_at": None,
+        "created_at": datetime(2026, 8, 14),
+        "updated_at": datetime(2026, 8, 14),
+    }
+    values.update(overrides)
+    return values
+
+
+class TestTaskMigrationOperationMigration:
+    migration_file = (
+        "a3d9b5f7c1e4_add_task_migration_operations.py"
+    )
+
+    def test_task_migration_upgrade_creates_canonical_table_and_accepts_all_values(
+        self,
+        tmp_path,
+    ):
+        from backend.models.task_migration import (
+            TASK_MIGRATION_PHASES,
+            TASK_MIGRATION_SOURCE_STATUSES,
+            TaskMigrationOperation,
+        )
+
+        db_path = str(tmp_path / "task-migration-operation.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_MIGRATION_OPERATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+
+        assert set(inspector.get_table_names()) >= {
+            "task_migration_operations"
+        }
+        assert {
+            column["name"] for column in inspector.get_columns(
+                "task_migration_operations"
+            )
+        } == {
+            "operation_id",
+            "operation_sequence",
+            "side",
+            "active_task_id",
+            "task_id",
+            "task_incarnation_id",
+            "retry_count",
+            "turn_generation",
+            "source_worker_id",
+            "target_worker_id",
+            "source_status",
+            "phase",
+            "instance_id",
+            "started_at",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        }
+        assert tuple(
+            inspector.get_pk_constraint(
+                "task_migration_operations"
+            )["constrained_columns"]
+        ) == ("operation_id",)
+        assert {
+            item["name"]: tuple(item["column_names"])
+            for item in inspector.get_unique_constraints(
+                "task_migration_operations"
+            )
+        } == {
+            "uq_task_migration_active_task": ("active_task_id",),
+            "uq_task_migration_task_sequence": (
+                "task_id",
+                "operation_sequence",
+            ),
+        }
+        assert inspector.get_foreign_keys("task_migration_operations") == []
+        assert {
+            item["name"]
+            for item in inspector.get_check_constraints(
+                "task_migration_operations"
+            )
+        } == {
+            "ck_task_migration_active_slot",
+            "ck_task_migration_generation",
+            "ck_task_migration_identity",
+            "ck_task_migration_incarnation_hex",
+            "ck_task_migration_operation_id_hex",
+            "ck_task_migration_phase",
+            "ck_task_migration_route",
+            "ck_task_migration_side_phase",
+            "ck_task_migration_source_status",
+        }
+
+        routes = ((None, 7), (8, None), (8, 9))
+        count = max(
+            len(TASK_MIGRATION_PHASES),
+            len(TASK_MIGRATION_SOURCE_STATUSES),
+        )
+        rows = []
+        for index in range(count):
+            source_worker_id, target_worker_id = routes[index % len(routes)]
+            task_id = 101 + index
+            phase = TASK_MIGRATION_PHASES[index % len(TASK_MIGRATION_PHASES)]
+            side = "worker" if phase == "prepared" else "manager"
+            if side == "worker":
+                source_worker_id = None
+                target_worker_id = None
+            rows.append(_task_migration_values(
+                operation_id=f"{index + 1:032x}",
+                operation_sequence=index + 1,
+                side=side,
+                active_task_id=(
+                    None
+                    if phase in {"committed", "rolled_back"}
+                    else task_id
+                ),
+                task_id=task_id,
+                task_incarnation_id=f"{index + 11:032x}",
+                source_worker_id=source_worker_id,
+                target_worker_id=target_worker_id,
+                source_status=TASK_MIGRATION_SOURCE_STATUSES[
+                    index % len(TASK_MIGRATION_SOURCE_STATUSES)
+                ],
+                phase=phase,
+            ))
+        with engine.begin() as conn:
+            conn.execute(TaskMigrationOperation.__table__.insert(), rows)
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT COUNT(*) FROM task_migration_operations"
+            )).scalar_one() == count
+        engine.dispose()
+
+    def test_task_migration_unique_active_task_slot_is_enforced(self, tmp_path):
+        from backend.models.task_migration import TaskMigrationOperation
+
+        db_path = str(tmp_path / "task-migration-unique.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_MIGRATION_OPERATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                TaskMigrationOperation.__table__.insert().values(
+                    **_task_migration_values()
+                )
+            )
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    TaskMigrationOperation.__table__.insert().values(
+                        **_task_migration_values(
+                            operation_id="c" * 32,
+                            operation_sequence=2,
+                            task_incarnation_id="d" * 32,
+                        )
+                    )
+                )
+        engine.dispose()
+
+    def test_task_migration_unique_task_sequence_is_enforced(self, tmp_path):
+        from backend.models.task_migration import TaskMigrationOperation
+
+        db_path = str(tmp_path / "task-migration-sequence-unique.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_MIGRATION_OPERATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                TaskMigrationOperation.__table__.insert().values(
+                    **_task_migration_values(
+                        active_task_id=None,
+                        phase="rolled_back",
+                    )
+                )
+            )
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    TaskMigrationOperation.__table__.insert().values(
+                        **_task_migration_values(
+                            operation_id="c" * 32,
+                            active_task_id=None,
+                            phase="committed",
+                        )
+                    )
+                )
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        ("case", "overrides"),
+        [
+            ("short-operation", {"operation_id": "a" * 31}),
+            ("uppercase-operation", {"operation_id": "A" * 32}),
+            (
+                "non-hex-incarnation",
+                {"task_incarnation_id": "g" * 32},
+            ),
+            ("foreign-phase", {"phase": "settled"}),
+            ("foreign-side", {"side": "relay"}),
+            ("foreign-source-status", {"source_status": "executing"}),
+            ("zero-operation-sequence", {"operation_sequence": 0}),
+            ("negative-retry", {"retry_count": -1}),
+            ("negative-generation", {"turn_generation": -1}),
+            ("invalid-task", {"task_id": 0, "active_task_id": 0}),
+            ("invalid-instance", {"instance_id": 0}),
+            (
+                "invalid-worker",
+                {"source_worker_id": 0, "target_worker_id": None},
+            ),
+            (
+                "same-worker",
+                {"source_worker_id": 7, "target_worker_id": 7},
+            ),
+            (
+                "both-local",
+                {"source_worker_id": None, "target_worker_id": None},
+            ),
+            ("missing-active-slot", {"active_task_id": None}),
+            ("wrong-active-slot", {"active_task_id": 102}),
+            (
+                "manager-prepared",
+                {"side": "manager", "phase": "prepared"},
+            ),
+            (
+                "worker-claimed",
+                {
+                    "side": "worker",
+                    "phase": "claimed",
+                    "source_worker_id": None,
+                    "target_worker_id": None,
+                },
+            ),
+            (
+                "terminal-active-slot",
+                {"phase": "committed", "active_task_id": 101},
+            ),
+        ],
+    )
+    def test_task_migration_constraints_reject_invalid_operations(
+        self,
+        tmp_path,
+        case,
+        overrides,
+    ):
+        from backend.models.task_migration import TaskMigrationOperation
+
+        db_path = str(tmp_path / f"task-migration-invalid-{case}.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_MIGRATION_OPERATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(
+                    TaskMigrationOperation.__table__.insert().values(
+                        **_task_migration_values(**overrides)
+                    )
+                )
+        engine.dispose()
+
+    def test_task_migration_upgrade_replays_create_before_revision_stamp(
+        self,
+        tmp_path,
+    ):
+        from backend.models.task_migration import TaskMigrationOperation
+
+        db_path = str(tmp_path / "task-migration-create-crash.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, WORKER_NODE_DRAIN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        TaskMigrationOperation.__table__.create(engine)
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, TASK_MIGRATION_OPERATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == TASK_MIGRATION_OPERATION_REVISION
+        engine.dispose()
+
+    def test_task_migration_upgrade_rejects_foreign_existing_table(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "task-migration-foreign-table.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, WORKER_NODE_DRAIN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE task_migration_operations "
+                "(operation_id VARCHAR(32) PRIMARY KEY)"
+            ))
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="foreign column set"):
+            _run_alembic(
+                cfg,
+                command.upgrade,
+                TASK_MIGRATION_OPERATION_REVISION,
+            )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == WORKER_NODE_DRAIN_REVISION
+        engine.dispose()
+
+    def test_task_migration_downgrade_replays_drop_before_revision_stamp(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "task-migration-drop-crash.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_MIGRATION_OPERATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE task_migration_operations"))
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, WORKER_NODE_DRAIN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "task_migration_operations" not in inspect(
+            engine
+        ).get_table_names()
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == WORKER_NODE_DRAIN_REVISION
+        engine.dispose()
+
+    def test_task_migration_downgrade_refuses_rows_then_replays_both_directions(
+        self,
+        tmp_path,
+    ):
+        from backend.models.task_migration import TaskMigrationOperation
+
+        db_path = str(tmp_path / "task-migration-downgrade.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, TASK_MIGRATION_OPERATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(
+                TaskMigrationOperation.__table__.insert().values(
+                    **_task_migration_values()
+                )
+            )
+        engine.dispose()
+
+        with pytest.raises(
+            RuntimeError,
+            match="Task migration operations exist",
+        ):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                WORKER_NODE_DRAIN_REVISION,
+            )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "task_migration_operations" in inspect(engine).get_table_names()
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == TASK_MIGRATION_OPERATION_REVISION
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM task_migration_operations"))
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, WORKER_NODE_DRAIN_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "task_migration_operations" not in inspect(
+            engine
+        ).get_table_names()
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, TASK_MIGRATION_OPERATION_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert "task_migration_operations" in inspect(engine).get_table_names()
+        engine.dispose()
+
+    @pytest.mark.parametrize("initial_state", ("canonical", "canonical_gated"))
+    def test_task_migration_mysql_downgrade_gate_precedes_drop_and_replays(
+        self,
+        initial_state,
+    ):
+        module = _load_revision_migration(
+            self.migration_file,
+            f"task_migration_mysql_gate_{initial_state}",
+        )
+        states = iter(
+            ("canonical", "canonical_gated", "absent")
+            if initial_state == "canonical"
+            else ("canonical_gated", "absent")
+        )
+        events: list[str] = []
+        with (
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module, "_acquire_transactional_fence"),
+            patch.object(
+                module,
+                "_table_state",
+                side_effect=lambda **_kwargs: next(states),
+            ),
+            patch.object(
+                module,
+                "_assert_empty",
+                side_effect=lambda: events.append("empty"),
+            ),
+            patch.object(module, "_is_mysql_family", return_value=True),
+            patch.object(
+                module.op,
+                "create_check_constraint",
+                side_effect=lambda *_args, **_kwargs: events.append("gate"),
+            ) as create_gate,
+            patch.object(
+                module.op,
+                "drop_table",
+                side_effect=lambda *_args, **_kwargs: events.append("drop"),
+            ),
+        ):
+            module.downgrade()
+
+        expected = (
+            ["empty", "gate", "empty", "drop"]
+            if initial_state == "canonical"
+            else ["empty", "empty", "drop"]
+        )
+        assert events == expected
+        if initial_state == "canonical":
+            create_gate.assert_called_once_with(
+                module._DOWNGRADE_GATE,
+                module._TABLE,
+                module._DOWNGRADE_GATE_SQL,
+            )
+        else:
+            create_gate.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("dialect_name", "is_mariadb", "version", "required"),
+        [
+            ("mysql", False, (8, 0, 15), "MySQL 8.0.16"),
+            ("mysql", True, (10, 6, 0), "MariaDB 10.6.1"),
+        ],
+    )
+    def test_task_migration_mysql_unsupported_versions_fail_closed(
+        self,
+        dialect_name,
+        is_mariadb,
+        version,
+        required,
+    ):
+        module = _load_revision_migration(
+            self.migration_file,
+            f"task_migration_unsupported_{required}",
+        )
+        dialect = SimpleNamespace(
+            name=dialect_name,
+            is_mariadb=is_mariadb,
+            server_version_info=version,
+        )
+        with (
+            patch.object(
+                module.op,
+                "get_bind",
+                return_value=SimpleNamespace(dialect=dialect),
+            ),
+            patch.object(module, "_is_offline", return_value=False),
+            pytest.raises(RuntimeError, match=required),
+        ):
+            module._require_supported_mysql_family()
+
+    @pytest.mark.parametrize(
+        ("dialect_name", "is_mariadb", "version"),
+        [
+            ("mysql", False, (8, 0, 16)),
+            ("mariadb", True, (10, 6, 1)),
+        ],
+    )
+    def test_task_migration_mysql_minimum_versions_are_supported(
+        self,
+        dialect_name,
+        is_mariadb,
+        version,
+    ):
+        module = _load_revision_migration(
+            self.migration_file,
+            f"task_migration_supported_{dialect_name}",
+        )
+        dialect = SimpleNamespace(
+            name=dialect_name,
+            is_mariadb=is_mariadb,
+            server_version_info=version,
+        )
+        with (
+            patch.object(
+                module.op,
+                "get_bind",
+                return_value=SimpleNamespace(dialect=dialect),
+            ),
+            patch.object(module, "_is_offline", return_value=False),
+        ):
+            module._require_supported_mysql_family()
+
+    def test_task_migration_offline_downgrades_fail_closed(self):
+        module = _load_revision_migration(
+            self.migration_file,
+            "task_migration_offline",
+        )
+        dialect = SimpleNamespace(
+            name="mysql",
+            is_mariadb=False,
+            server_version_info=(8, 0, 36),
+        )
+        with (
+            patch.object(
+                module.op,
+                "get_bind",
+                return_value=SimpleNamespace(dialect=dialect),
+            ),
+            patch.object(module, "_is_offline", return_value=True),
+            pytest.raises(RuntimeError, match="refuses MySQL/MariaDB offline"),
+        ):
+            module._require_supported_mysql_family()
+
+        with (
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_is_offline", return_value=True),
+            patch.object(module.op, "drop_table") as drop,
+            pytest.raises(RuntimeError, match="offline downgrade is refused"),
+        ):
+            module.downgrade()
+        drop.assert_not_called()
+
+    def test_task_migration_postgresql_downgrade_takes_exclusive_lock(self):
+        module = _load_revision_migration(
+            self.migration_file,
+            "task_migration_postgresql_lock",
+        )
+        bind = SimpleNamespace(
+            dialect=SimpleNamespace(name="postgresql")
+        )
+        inspector = MagicMock()
+        inspector.has_table.return_value = True
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module.op, "execute") as execute,
+        ):
+            module._acquire_transactional_fence(downgrade=True)
+
+        inspector.has_table.assert_called_once_with(module._TABLE)
+        assert str(execute.call_args.args[0]) == (
+            "LOCK TABLE task_migration_operations IN ACCESS EXCLUSIVE MODE"
+        )
 
 
 def _load_terminal_arbitration_migration(module_suffix: str = "test"):
@@ -4776,8 +7564,11 @@ class TestFreshMigration:
         expected_tables |= {
             "browser_review_operation_receipts",
             "ssh_profiles",
+            "task_id_allocators",
+            "task_migration_operations",
             "task_ssh_grants",
             "task_ssh_effect_receipts",
+            "worker_node_controls",
         }
         assert tables == expected_tables, f"Missing tables: {expected_tables - tables}"
 
@@ -7430,14 +10221,66 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_has_one_combined_head(self, tmp_path):
+    def test_migration_graph_preserves_both_published_heads(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
-        assert script.get_heads() == [CURRENT_HEAD_REVISION]
-        assert script.get_current_head() == CURRENT_HEAD_REVISION
+        assert set(script.get_heads()) == {
+            DELIVERY_PREVIEW_PROFILES_REVISION,
+            WORKER_RENAME_TAG_OUTBOX_REVISION,
+        }
         assert (
-            script.get_revision(CURRENT_HEAD_REVISION).down_revision
+            script.get_revision(
+                DELIVERY_PREVIEW_PROFILES_REVISION
+            ).down_revision
+            == DELIVERY_FRONTEND_REVIEW_REVISION
+        )
+        assert (
+            script.get_revision(
+                WORKER_RENAME_TAG_OUTBOX_REVISION
+            ).down_revision
+            == WORKER_DESTROY_LIFECYCLE_NONCE_REVISION
+        )
+        assert (
+            script.get_revision(
+                WORKER_DESTROY_LIFECYCLE_NONCE_REVISION
+            ).down_revision
+            == TASK_MIGRATION_OPERATION_REVISION
+        )
+        assert (
+            script.get_revision(
+                TASK_MIGRATION_OPERATION_REVISION
+            ).down_revision
+            == WORKER_NODE_DRAIN_REVISION
+        )
+        assert (
+            script.get_revision(WORKER_NODE_DRAIN_REVISION).down_revision
+            == UNIQUE_USER_GROUP_MEMBERSHIP_REVISION
+        )
+        assert (
+            script.get_revision(
+                UNIQUE_USER_GROUP_MEMBERSHIP_REVISION
+            ).down_revision
+            == TASK_ID_NAMESPACE_REVISION
+        )
+        assert (
+            script.get_revision(TASK_ID_NAMESPACE_REVISION).down_revision
+            == REMOVE_TEAM_SHARE_SSH_FENCES_REVISION
+        )
+        assert (
+            script.get_revision(
+                REMOVE_TEAM_SHARE_SSH_FENCES_REVISION
+            ).down_revision
+            == TASK_EXECUTION_PRINCIPAL_REVISION
+        )
+        assert (
+            script.get_revision(TASK_EXECUTION_PRINCIPAL_REVISION).down_revision
+            == REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION
+        )
+        assert (
+            script.get_revision(
+                REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION
+            ).down_revision
             == DELIVERY_FRONTEND_REVIEW_REVISION
         )
         assert (
@@ -7931,7 +10774,22 @@ class TestPublishedMigrationHistory:
             SQLITE_TASK_SSH_EFFECT_TRIGGER_NAMES,
         )
 
-        assert trigger_names == set(SQLITE_TASK_SSH_EFFECT_TRIGGER_NAMES)
+        # This assertion targets the historical c2f8 revision.  The current
+        # ORM trigger list intentionally omits the Team Share fences removed
+        # later by c9f5, so include those historical names explicitly instead
+        # of comparing an old schema to today's runtime constants.
+        historical_team_share_triggers = {
+            "trg_task_ssh_effect_team_task_share_insert",
+            "trg_task_ssh_effect_team_task_share_update",
+            "trg_task_ssh_effect_team_task_share_delete",
+            "trg_task_ssh_effect_team_project_share_insert",
+            "trg_task_ssh_effect_team_project_share_update",
+            "trg_task_ssh_effect_team_project_share_delete",
+        }
+        assert trigger_names == (
+            set(SQLITE_TASK_SSH_EFFECT_TRIGGER_NAMES)
+            | historical_team_share_triggers
+        )
         engine.dispose()
 
         _run_alembic(
@@ -9389,6 +12247,313 @@ class TestPublishedMigrationHistory:
             assert conn.execute(text(
                 "SELECT version_num FROM alembic_version"
             )).scalar_one() == TASK_SSH_EFFECT_REVISION
+        engine.dispose()
+
+
+def test_task_execution_principal_upgrade_downgrade_upgrade(tmp_path):
+    db_path = str(tmp_path / "task-execution-principal.db")
+    cfg = _alembic_cfg(db_path)
+    _run_alembic(
+        cfg,
+        command.upgrade,
+        AGENT_SANDBOX_RUNTIME_OVERRIDE_REVISION,
+    )
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as conn:
+        trigger_sql = dict(conn.execute(text(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'trigger' ORDER BY name"
+        )).tuples().all())
+    assert {
+        "trg_task_ssh_effect_task_update",
+        "trg_task_ssh_effect_task_delete",
+        "trg_task_ssh_effect_project_share_insert",
+        "trg_task_ssh_effect_project_share_update",
+        "trg_task_ssh_effect_project_share_delete",
+        "trg_task_ssh_effect_team_project_share_insert",
+        "trg_task_ssh_effect_team_project_share_update",
+        "trg_task_ssh_effect_team_project_share_delete",
+    } <= set(trigger_sql)
+    engine.dispose()
+
+    _run_alembic(cfg, command.upgrade, TASK_EXECUTION_PRINCIPAL_REVISION)
+    engine = create_engine(f"sqlite:///{db_path}")
+    task_columns = _get_table_columns(engine, "tasks")
+    resume_columns = _get_table_columns(engine, "capability_resume_outbox")
+    assert {
+        "execution_user_id",
+        "execution_user_role",
+        "execution_mode",
+        "execution_principal_kind",
+    } <= set(task_columns)
+    assert {
+        "request_execution_user_id",
+        "request_execution_user_role",
+        "request_execution_mode",
+        "request_execution_principal_kind",
+    } <= set(resume_columns)
+    assert task_columns["execution_principal_kind"] == "VARCHAR(32)"
+    assert (
+        resume_columns["request_execution_principal_kind"] == "VARCHAR(32)"
+    )
+    with engine.connect() as conn:
+        conn.execute(text(
+            "INSERT INTO tasks "
+            "(title, description, status, priority, target_branch, "
+            "merge_status, retry_count, max_retries, mode, created_at, "
+            "execution_user_id, "
+            "execution_user_role, execution_mode, "
+            "execution_principal_kind) VALUES "
+            "('delegated admin', 'run', 'pending', 0, 'main', 'pending', "
+            "0, 2, 'auto', '2026-08-14 00:00:00', "
+            "41, 'admin', 'unrestricted', "
+            "'delegated_user')"
+        ))
+        conn.execute(text(
+            "INSERT INTO tasks "
+            "(title, description, status, priority, target_branch, "
+            "merge_status, retry_count, max_retries, mode, created_at, "
+            "execution_user_id, "
+            "execution_user_role, execution_mode, "
+            "execution_principal_kind) VALUES "
+            "('delegated member', 'run', 'pending', 0, 'main', 'pending', "
+            "0, 2, 'auto', '2026-08-14 00:00:00', "
+            "42, 'member', 'sandbox', "
+            "'delegated_user')"
+        ))
+        conn.execute(text(
+            "INSERT INTO tasks "
+            "(title, description, status, priority, target_branch, "
+            "merge_status, retry_count, max_retries, mode, created_at, "
+            "execution_user_id, "
+            "execution_user_role, execution_mode, "
+            "execution_principal_kind) VALUES "
+            "('delegated token', 'run', 'pending', 0, 'main', 'pending', "
+            "0, 2, 'auto', '2026-08-14 00:00:00', "
+            "NULL, 'super_admin', "
+            "'unrestricted', 'delegated_deployment_token')"
+        ))
+        assert dict(conn.execute(text(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'trigger' ORDER BY name"
+        )).tuples().all()) == trigger_sql
+    engine.dispose()
+
+    _run_alembic(
+        cfg,
+        command.downgrade,
+        AGENT_SANDBOX_RUNTIME_OVERRIDE_REVISION,
+    )
+    engine = create_engine(f"sqlite:///{db_path}")
+    assert "execution_mode" not in _get_table_columns(engine, "tasks")
+    assert "request_execution_mode" not in _get_table_columns(
+        engine,
+        "capability_resume_outbox",
+    )
+    with engine.connect() as conn:
+        assert dict(conn.execute(text(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'trigger' ORDER BY name"
+        )).tuples().all()) == trigger_sql
+    engine.dispose()
+
+    _run_alembic(cfg, command.upgrade, TASK_EXECUTION_PRINCIPAL_REVISION)
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT version_num FROM alembic_version"
+        )).scalar_one() == TASK_EXECUTION_PRINCIPAL_REVISION
+    engine.dispose()
+
+
+def test_task_execution_principal_downgrade_rejects_committed_user_evidence(
+    tmp_path,
+):
+    db_path = str(tmp_path / "task-execution-principal-downgrade-gate.db")
+    cfg = _alembic_cfg(db_path)
+    _run_alembic(cfg, command.upgrade, TASK_EXECUTION_PRINCIPAL_REVISION)
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO tasks "
+            "(title, description, status, priority, target_branch, "
+            "merge_status, retry_count, max_retries, mode, created_at, "
+            "execution_user_id, execution_user_role, execution_mode, "
+            "execution_principal_kind) VALUES "
+            "('durable admin authority', 'must survive', 'pending', 0, "
+            "'main', 'pending', 0, 2, 'auto', "
+            "'2026-08-14 00:00:00', 41, 'admin', 'unrestricted', 'user')"
+        ))
+    engine.dispose()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Task execution principal evidence exists",
+    ):
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION,
+        )
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT version_num FROM alembic_version"
+        )).scalar_one() == TASK_EXECUTION_PRINCIPAL_REVISION
+        assert conn.execute(text(
+            "SELECT execution_mode FROM tasks "
+            "WHERE title = 'durable admin authority'"
+        )).scalar_one() == "unrestricted"
+    assert "execution_mode" in _get_table_columns(engine, "tasks")
+    engine.dispose()
+
+
+def test_task_execution_principal_downgrade_rejects_committed_resume_evidence(
+    tmp_path,
+):
+    db_path = str(tmp_path / "task-principal-resume-downgrade-gate.db")
+    cfg = _alembic_cfg(db_path)
+    _run_alembic(cfg, command.upgrade, TASK_EXECUTION_PRINCIPAL_REVISION)
+    digest = "d" * 64
+    incarnation = "e" * 32
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO tasks "
+            "(title, description, status, priority, target_branch, "
+            "merge_status, retry_count, max_retries, mode, turn_generation, "
+            "incarnation_id, created_at) VALUES "
+            "('resume principal evidence', 'd', 'waiting_capability', 0, "
+            "'main', 'pending', 0, 2, 'auto', 3, :incarnation, "
+            "'2026-08-14 00:00:00')"
+        ), {"incarnation": incarnation})
+        task_id = conn.execute(text(
+            "SELECT id FROM tasks WHERE title = 'resume principal evidence'"
+        )).scalar_one()
+        conn.execute(text(
+            "INSERT INTO capability_invocations "
+            "(task_id, capability_key, source, purpose, status, state_version, "
+            "idempotency_key, input_payload, input_hash, subject_kind, "
+            "subject_ref, subject_hash, executor_kind, executor_config, "
+            "executor_config_hash, policy_snapshot, policy_hash, "
+            "resume_policy, max_attempts, active_task_id, created_at, "
+            "updated_at) VALUES "
+            "(:task_id, 'plan', 'human_request', 'advisory', 'failed', 1, "
+            "'principal-resume-downgrade', '{}', :digest, "
+            "'task_generation', '{}', :digest, 'plan_agent', '{}', :digest, "
+            "'{}', :digest, 'attach_only', 1, NULL, "
+            "'2026-08-14 00:00:01', '2026-08-14 00:00:01')"
+        ), {"task_id": task_id, "digest": digest})
+        invocation_id = conn.execute(text(
+            "SELECT id FROM capability_invocations "
+            "WHERE idempotency_key = 'principal-resume-downgrade'"
+        )).scalar_one()
+        conn.execute(text(
+            "INSERT INTO capability_resume_outbox "
+            "(task_id, invocation_id, active_task_id, active_invocation_id, "
+            "status, state_version, request_task_incarnation_id, "
+            "request_task_retry_count, from_turn_generation, "
+            "request_source_log_id, request_output_log_id, "
+            "request_terminal_log_id, attempt_count, "
+            "request_execution_user_id, request_execution_user_role, "
+            "request_execution_mode, request_execution_principal_kind, "
+            "created_at, updated_at) VALUES "
+            "(:task_id, :invocation_id, :task_id, :invocation_id, 'pending', "
+            "1, :incarnation, 0, 3, 11, 12, 13, 0, 55, 'admin', "
+            "'unrestricted', 'user', '2026-08-14 00:00:02', "
+            "'2026-08-14 00:00:02')"
+        ), {
+            "task_id": task_id,
+            "invocation_id": invocation_id,
+            "incarnation": incarnation,
+        })
+    engine.dispose()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Capability resume principal evidence exists",
+    ):
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            REMOVE_AGENT_SANDBOX_OVERRIDE_REVISION,
+        )
+
+    engine = create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT version_num FROM alembic_version"
+        )).scalar_one() == TASK_EXECUTION_PRINCIPAL_REVISION
+        assert conn.execute(text(
+            "SELECT request_execution_mode FROM capability_resume_outbox"
+        )).scalar_one() == "unrestricted"
+    engine.dispose()
+
+
+def test_remove_team_share_ssh_fences_upgrade_downgrade_upgrade(tmp_path):
+    db_path = str(tmp_path / "remove-team-share-ssh-fences.db")
+    cfg = _alembic_cfg(db_path)
+    team_triggers = {
+        "trg_task_ssh_effect_team_task_share_insert",
+        "trg_task_ssh_effect_team_task_share_update",
+        "trg_task_ssh_effect_team_task_share_delete",
+        "trg_task_ssh_effect_team_project_share_insert",
+        "trg_task_ssh_effect_team_project_share_update",
+        "trg_task_ssh_effect_team_project_share_delete",
+    }
+    federation_triggers = {
+        "trg_task_ssh_effect_task_share_insert",
+        "trg_task_ssh_effect_task_share_update",
+        "trg_task_ssh_effect_task_share_delete",
+        "trg_task_ssh_effect_project_share_insert",
+        "trg_task_ssh_effect_project_share_update",
+        "trg_task_ssh_effect_project_share_delete",
+    }
+
+    def trigger_names() -> set[str]:
+        engine = create_engine(f"sqlite:///{db_path}")
+        try:
+            with engine.connect() as conn:
+                return set(conn.execute(text(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'trigger' "
+                    "AND name LIKE 'trg_task_ssh_effect_%'"
+                )).scalars())
+        finally:
+            engine.dispose()
+
+    _run_alembic(cfg, command.upgrade, TASK_EXECUTION_PRINCIPAL_REVISION)
+    assert team_triggers | federation_triggers <= trigger_names()
+
+    _run_alembic(
+        cfg,
+        command.upgrade,
+        REMOVE_TEAM_SHARE_SSH_FENCES_REVISION,
+    )
+    upgraded = trigger_names()
+    assert upgraded.isdisjoint(team_triggers)
+    assert federation_triggers <= upgraded
+
+    _run_alembic(cfg, command.downgrade, TASK_EXECUTION_PRINCIPAL_REVISION)
+    downgraded = trigger_names()
+    assert team_triggers | federation_triggers <= downgraded
+
+    _run_alembic(
+        cfg,
+        command.upgrade,
+        REMOVE_TEAM_SHARE_SSH_FENCES_REVISION,
+    )
+    assert trigger_names().isdisjoint(team_triggers)
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == REMOVE_TEAM_SHARE_SSH_FENCES_REVISION
+    finally:
         engine.dispose()
 
 

@@ -37,6 +37,7 @@ from backend.models.plan_agent import (
     PlanAgentWorkerDispatchReceipt,
 )
 from backend.models.task import Task
+from backend.models.user import User
 from backend.models.test_harness import TestHarnessRun as HarnessRun
 from backend.models.user_skill import UserSkill
 from backend.models.worker import Worker
@@ -49,6 +50,7 @@ from backend.services.worker_proxy import (
 )
 from backend.services.worker_relay import WorkerRelay
 from backend.services.worker_routing_config import (
+    WORKER_MIGRATION_IMPORT_RESERVATION_KEY,
     WORKER_ROUTING_PENDING_KEY,
 )
 
@@ -62,6 +64,14 @@ class FakeBroadcaster:
 
     async def broadcast(self, channel, data):
         self.sent.append((channel, data))
+
+
+def _worker_namespace_capability() -> dict:
+    return {
+        "task_id_namespace_protocol": 1,
+        "task_id_namespace_boundary": 1_000_000_000,
+        "ccm_node_role": "worker",
+    }
 
 
 @pytest.fixture
@@ -241,6 +251,11 @@ async def test_worker_relay_shutdown_rejects_all_new_background_work(
     observed = worker_relay_module.WorkerTaskGeneration(
         task_id=12,
         worker_id=worker.id,
+        incarnation_id="1" * 32,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
         status="completed",
         retry_count=0,
         turn_generation=1,
@@ -369,12 +384,166 @@ async def _mk_task(session_factory, **fields) -> Task:
         return t
 
 
+@pytest.mark.parametrize("mapped", [False, True])
+async def test_worker_project_reuse_rejects_stale_checkout_identity(
+    db_factory,
+    session_factory,
+    monkeypatch,
+    mapped,
+):
+    """A deleted/recreated Manager Project cannot inherit an old checkout."""
+
+    async with session_factory() as db:
+        project = Project(
+            name="reused-project-name",
+            git_url="https://example.test/new-owner/new-repository.git",
+            has_remote=True,
+            local_path="/workspace/reused-project-name",
+            default_branch="main",
+            status="ready",
+        )
+        db.add(project)
+        await db.commit()
+        await db.refresh(project)
+        project_id = project.id
+    worker = await _mk_worker(
+        session_factory,
+        project_mapping=({str(project_id): 77} if mapped else {}),
+    )
+    task = await _mk_task(
+        session_factory,
+        project_id=project_id,
+    )
+    stale_remote = {
+        "id": 77,
+        "name": "reused-project-name",
+        "git_url": "https://example.test/former-owner/old-repository.git",
+        "has_remote": True,
+        "local_path": "/workspace/reused-project-name",
+        "default_branch": "main",
+        "status": "ready",
+    }
+    posted = []
+
+    class Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, **kwargs):
+            if mapped:
+                assert url.endswith("/api/projects/77")
+                return Response(stale_remote)
+            assert url.endswith("/api/projects")
+            return Response([stale_remote])
+
+        async def post(self, *args, **kwargs):
+            posted.append((args, kwargs))
+            raise AssertionError("identity mismatch must fail before Project create")
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(db_factory, relay=AsyncMock())
+
+    with pytest.raises(RuntimeError, match="源身份不一致"):
+        await proxy.ensure_worker_project(worker, task)
+
+    assert posted == []
+    async with session_factory() as db:
+        durable_worker = await db.get(Worker, worker.id)
+    assert durable_worker.project_mapping == (
+        {str(project_id): 77} if mapped else {}
+    )
+
+
+async def test_worker_project_reuse_accepts_exact_checkout_identity(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    async with session_factory() as db:
+        project = Project(
+            name="exact-worker-project",
+            git_url="https://example.test/owner/repository.git",
+            has_remote=True,
+            local_path="/workspace/exact-worker-project",
+            default_branch="develop",
+            status="ready",
+        )
+        db.add(project)
+        await db.commit()
+        await db.refresh(project)
+        project_id = project.id
+    worker = await _mk_worker(session_factory, project_mapping={})
+    task = await _mk_task(session_factory, project_id=project_id)
+    remote = {
+        "id": 91,
+        "name": "exact-worker-project",
+        "git_url": "https://example.test/owner/repository.git",
+        "has_remote": True,
+        "local_path": "/workspace/exact-worker-project",
+        "default_branch": "develop",
+        "status": "ready",
+    }
+
+    class Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [remote]
+
+    class Client:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, **kwargs):
+            assert url.endswith("/api/projects")
+            return Response()
+
+        async def post(self, *args, **kwargs):
+            raise AssertionError("an exact existing checkout must be reused")
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(db_factory, relay=AsyncMock())
+
+    assert await proxy.ensure_worker_project(worker, task) == 91
+    async with session_factory() as db:
+        durable_worker = await db.get(Worker, worker.id)
+    assert durable_worker.project_mapping == {str(project_id): 91}
+
+
 def _remote_task(task: Task, **overrides) -> dict:
     task_turn_generation = getattr(task, "turn_generation", None)
     if type(task_turn_generation) is not int:
         task_turn_generation = 0
     payload = {
         "id": task.id,
+        "incarnation_id": task.incarnation_id,
         "status": task.status,
         "retry_count": task.retry_count,
         "turn_generation": task_turn_generation,
@@ -386,6 +555,10 @@ def _remote_task(task: Task, **overrides) -> dict:
             task.completed_at.isoformat() if task.completed_at else None
         ),
         "error_message": task.error_message,
+        "execution_user_id": task.execution_user_id,
+        "execution_user_role": task.execution_user_role,
+        "execution_mode": task.execution_mode,
+        "execution_principal_kind": task.execution_principal_kind,
     }
     payload.update(overrides)
     return payload
@@ -534,6 +707,94 @@ def _relay_generation(task: Task) -> dict[str, int]:
     }
 
 
+def _sub_agent_relay_payload(
+    task: Task,
+    *,
+    remote_id: int,
+    status: str,
+    description: str = "worker child",
+    checks_done: int = 0,
+    last_summary: str | None = "do the work",
+) -> dict:
+    return {
+        "sub_agent_session_id": remote_id,
+        "description": description,
+        "agent_type": "sub_agent",
+        "source": "ccm",
+        "monitor_context": "frozen context",
+        "status": status,
+        "checks_done": checks_done,
+        "last_summary": last_summary,
+        **_relay_generation(task),
+    }
+
+
+def _internal_worker_handoff_payload(
+    task: Task,
+    *,
+    handoff_id: str,
+    message: str,
+) -> dict:
+    principal = worker_relay_module.canonical_delegated_principal_payload(task)
+    assert principal is not None
+    return {
+        "message": message,
+        "worker_turn_handoff_id": handoff_id,
+        "worker_turn_handoff_retry_count": task.retry_count,
+        "worker_turn_handoff_from_generation": task.turn_generation,
+        "worker_turn_handoff_incarnation_id": task.incarnation_id,
+        **principal,
+    }
+
+
+def _worker_task_incarnation_headers(task: Task) -> dict[str, str]:
+    assert task.incarnation_id is not None
+    return {"X-CCM-Task-Incarnation": task.incarnation_id}
+
+
+def _remote_worker_handoff_receipt(
+    task: Task,
+    request_body: dict,
+    *,
+    status: str,
+    turn_generation: int | None = None,
+) -> dict:
+    principal = worker_relay_module.canonical_delegated_principal_payload(
+        request_body
+    )
+    assert principal is not None
+    admitted_routing = (
+        (task.provider or "claude").lower(),
+        request_body.get("model") or task.model,
+        task.codex_service_tier or "default",
+    )
+    identity = worker_relay_module.worker_turn_handoff_request_identity(
+        request_body,
+        admitted_routing,
+    )
+    if turn_generation is None and status in {"claimed", "launching", "launched"}:
+        turn_generation = task.turn_generation + 1
+    return {
+        "handoff_id": request_body["worker_turn_handoff_id"],
+        "task_id": task.id,
+        "incarnation_id": task.incarnation_id,
+        "status": status,
+        "retry_count": task.retry_count,
+        "from_generation": task.turn_generation,
+        "turn_generation": turn_generation,
+        "source_log_id": 91,
+        "request_digest": worker_relay_module._handoff_payload_digest(identity),
+        "principal_digest": worker_relay_module._handoff_payload_digest(
+            principal
+        ),
+        "response": {
+            "ok": True,
+            "queued": True,
+            "session_id": task.session_id,
+        },
+    }
+
+
 async def _reserve_worker_handoff(session_factory, task: Task):
     async with session_factory() as db:
         current = await db.get(Task, task.id)
@@ -553,6 +814,10 @@ async def _reserve_worker_handoff(session_factory, task: Task):
             "worker_turn_handoff_id": handoff_id,
             "worker_turn_handoff_retry_count": task.retry_count,
             "worker_turn_handoff_from_generation": task.turn_generation,
+            "worker_turn_handoff_incarnation_id": task.incarnation_id,
+            **worker_relay_module.canonical_delegated_principal_payload(
+                current
+            ),
         }
         reserved = await worker_relay_module.reserve_worker_turn_handoff(
             db,
@@ -727,7 +992,11 @@ async def test_preexisting_harness_graph_blocks_handoff_replay_effects(
         replay,
         client=post_client,
     )
-    resumed = await relay._resume_worker_turn_handoff(worker, reserved)
+    resumed = await relay._resume_worker_turn_handoff(
+        worker,
+        reserved,
+        replay,
+    )
 
     assert posted is False
     assert resumed is False
@@ -839,14 +1108,39 @@ async def _create_manager_termination_receipt(
 
 
 def _launched_handoff_receipt(reserved) -> dict:
+    delegated_principal = (
+        worker_relay_module.canonical_delegated_principal_payload(
+            reserved
+        )
+    )
+    assert delegated_principal is not None
+    request_payload = {
+        "message": "reserved follow-up",
+        "worker_turn_handoff_id": reserved.worker_turn_handoff_id,
+        "worker_turn_handoff_retry_count": (
+            reserved.worker_turn_handoff_retry_count
+        ),
+        "worker_turn_handoff_from_generation": (
+            reserved.worker_turn_handoff_from_generation
+        ),
+        "worker_turn_handoff_incarnation_id": reserved.incarnation_id,
+        **delegated_principal,
+    }
     return {
         "handoff_id": reserved.worker_turn_handoff_id,
         "task_id": reserved.task_id,
+        "incarnation_id": reserved.incarnation_id,
         "status": "launched",
         "retry_count": reserved.worker_turn_handoff_retry_count,
         "from_generation": reserved.worker_turn_handoff_from_generation,
         "turn_generation": reserved.worker_turn_handoff_from_generation + 1,
         "source_log_id": 9001,
+        "request_digest": worker_relay_module._handoff_payload_digest(
+            request_payload
+        ),
+        "principal_digest": worker_relay_module._handoff_payload_digest(
+            delegated_principal
+        ),
         "response": {"ok": True, "queued": True},
     }
 
@@ -860,19 +1154,46 @@ def _handoff_receipt_with_status(reserved, status: str) -> dict:
 
 
 def _mock_launched_handoff_receipts(relay, session_factory) -> None:
-    async def fetch(_worker, task_id, handoff_id, **_kwargs):
+    async def fetch(
+        _worker,
+        task_id,
+        handoff_id,
+        incarnation_id,
+        **_kwargs,
+    ):
         async with session_factory() as db:
             task = await db.get(Task, task_id)
-        if task is None or task.worker_turn_handoff_id != handoff_id:
+            receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        if (
+            task is None
+            or task.worker_turn_handoff_id != handoff_id
+            or task.incarnation_id != incarnation_id
+        ):
             return None
+        assert receipt is not None
+        receipt_identity = receipt.request_payload
+        if receipt_identity.get("version") == 2:
+            receipt_identity = receipt_identity.get("identity")
+        assert isinstance(receipt_identity, dict)
+        delegated_principal = (
+            worker_relay_module.canonical_delegated_principal_payload(
+                receipt_identity
+            )
+        )
+        assert delegated_principal is not None
         return {
             "handoff_id": handoff_id,
             "task_id": task_id,
+            "incarnation_id": task.incarnation_id,
             "status": "launched",
             "retry_count": task.worker_turn_handoff_retry_count,
             "from_generation": task.worker_turn_handoff_from_generation,
             "turn_generation": task.worker_turn_handoff_from_generation + 1,
             "source_log_id": 9001,
+            "request_digest": receipt.request_digest,
+            "principal_digest": worker_relay_module._handoff_payload_digest(
+                delegated_principal
+            ),
             "response": {"ok": True, "queued": True},
         }
 
@@ -899,6 +1220,67 @@ def _routing_snapshot(
             codex_service_tier or task.codex_service_tier
         ),
         "pending": pending,
+    }
+
+
+def _worker_manual_retry_response(
+    task: Task,
+    request: dict,
+    *,
+    task_overrides: dict | None = None,
+) -> dict:
+    """Build the exact durable Worker acknowledgement for one retry POST."""
+
+    target_principal = {
+        field: request[field]
+        for field in (
+            "execution_user_id",
+            "execution_user_role",
+            "execution_mode",
+            "execution_principal_kind",
+        )
+    }
+    source_generation = {
+        "task_id": request["task_id"],
+        "worker_id": request["worker_id"],
+        "incarnation_id": request["source_incarnation_id"],
+        "status": request["expected_status"],
+        "retry_count": request["expected_retry_count"],
+        "turn_generation": request["expected_turn_generation"],
+        "principal_digest": request["source_principal_digest"],
+    }
+    result_generation = {
+        "status": "pending",
+        "retry_count": request["expected_retry_count"] + 1,
+        "turn_generation": request["expected_turn_generation"],
+    }
+    remote_task = _remote_task(
+        task,
+        status="pending",
+        retry_count=result_generation["retry_count"],
+        turn_generation=result_generation["turn_generation"],
+        completed_at=None,
+        **target_principal,
+    )
+    if task_overrides:
+        remote_task.update(task_overrides)
+    return {
+        "task": remote_task,
+        "receipt": {
+            "version": request["protocol_version"],
+            "side": "worker",
+            "state": "committed",
+            "operation_id": request["operation_id"],
+            "request_digest": request["request_digest"],
+            "source_generation": source_generation,
+            "result_generation": result_generation,
+            "source_principal_digest": request["source_principal_digest"],
+            "target_principal_digest": request["target_principal_digest"],
+            "target_principal": target_principal,
+            "committed_at": datetime.utcnow().isoformat(
+                timespec="microseconds"
+            ),
+        },
     }
 
 
@@ -936,6 +1318,7 @@ async def test_authoritative_worker_apply_preserves_supersede_marker(
         assert current.metadata_ == {
             "pr_review_id": 37,
             "pr_review_superseded": True,
+            "ccm_worker_remote_materialized_v1": True,
         }
 
 
@@ -1297,6 +1680,30 @@ async def test_worker_task_operation_lock_blocks_concurrent_reforward():
     assert forwarded.is_set()
 
 
+async def test_worker_forward_rejects_ready_destroy_recovery_worker(
+    db_factory,
+    session_factory,
+):
+    worker = await _mk_worker(
+        session_factory,
+        status="ready",
+        bootstrap_step="destroy",
+    )
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+        turn_generation=1,
+    )
+    relay = AsyncMock()
+    proxy = WorkerProxy(db_factory, relay=relay)
+
+    with pytest.raises(RuntimeError, match="destroy"):
+        await proxy._forward_task_to_worker_locked(task)
+
+    relay.subscribe_task.assert_not_awaited()
+
+
 async def test_worker_forward_preserves_pr_review_tag_through_task_create(
     monkeypatch,
 ):
@@ -1331,11 +1738,27 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
                     "gpt-5.6-sol": ["default", "priority"],
                 },
                 "pr_review_snapshot_context_version": 3,
+                "worker_delegated_principal_protocol": 1,
+                "worker_delegated_launch_admission_protocol": 2,
+                "worker_initial_generation_protocol": 1,
+                "worker_task_incarnation_proxy_version": 1,
+                **_worker_namespace_capability(),
             })
 
         async def post(self, _url, *, headers, json):
             captured_payload.update(json)
-            return Response(json)
+            return Response({
+                **json,
+                "incarnation_id": json["source_incarnation_id"],
+                "metadata_": {
+                    "ccm_source_task_incarnation_id": json[
+                        "source_incarnation_id"
+                    ]
+                },
+                "status": "pending",
+                "retry_count": json["source_retry_count"],
+                "turn_generation": json["source_turn_generation"] - 1,
+            })
 
     monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
     relay = AsyncMock()
@@ -1366,9 +1789,18 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
         tags=["pr-review"],
         attention_tag="等审核发布后再看",
         metadata_={"pr_review_id": 123},
+        incarnation_id="1" * 32,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
+        status="in_progress",
+        retry_count=0,
+        turn_generation=1,
     )
     proxy.get_worker = AsyncMock(return_value=worker)
     proxy.ensure_worker_project = AsyncMock(return_value=34)
+    proxy.require_worker_delegated_principal_support = AsyncMock()
     proxy._user_skill_snapshots = AsyncMock(return_value=[{
         "id": 5,
         "name": "Manager skill",
@@ -1398,6 +1830,499 @@ async def test_worker_forward_preserves_pr_review_tag_through_task_create(
     # metadata_ is intentionally not a public TaskCreate field; the hidden
     # termination endpoint accepts the forwarded tag only for Worker copies.
     assert not hasattr(parsed_on_worker, "metadata_")
+
+
+@pytest.mark.asyncio
+async def test_initial_worker_forward_rejects_old_principal_protocol_before_post(
+    monkeypatch,
+):
+    post = AsyncMock()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"worker_delegated_principal_protocol": 0}
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, _url, *, headers):
+            return Response()
+
+        async def post(self, *args, **kwargs):
+            return await post(*args, **kwargs)
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(None, relay=AsyncMock())
+    worker = Worker(
+        id=76,
+        name="old-principal-worker",
+        status="ready",
+        private_ip="10.0.0.76",
+        auth_token="token",
+    )
+    task = Task(
+        id=900,
+        title="must not reach old worker",
+        description="delegated authority cannot be ignored",
+        worker_id=worker.id,
+        provider="claude",
+        incarnation_id="0" * 32,
+        status="in_progress",
+        retry_count=0,
+        turn_generation=1,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
+    )
+    proxy.get_worker = AsyncMock(return_value=worker)
+
+    with pytest.raises(RuntimeError, match="delegated principal.*任务未转发"):
+        await proxy._forward_task_to_worker_locked(task)
+
+    post.assert_not_awaited()
+    proxy.relay.subscribe_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_initial_worker_forward_rejects_missing_launch_admission_before_post(
+    monkeypatch,
+):
+    post = AsyncMock()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "worker_delegated_principal_protocol": 1,
+                # Intentionally omit the final provider-boundary protocol.
+                **_worker_namespace_capability(),
+            }
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, _url, *, headers):
+            return Response()
+
+        async def post(self, *args, **kwargs):
+            return await post(*args, **kwargs)
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(None, relay=AsyncMock())
+    worker = Worker(
+        id=762,
+        name="old-launch-admission-worker",
+        status="ready",
+        private_ip="10.0.0.762",
+        auth_token="token",
+    )
+    task = Task(
+        id=904,
+        title="must not launch without final Manager permit",
+        description="mixed versions fail before mutation",
+        worker_id=worker.id,
+        provider="claude",
+        incarnation_id="6" * 32,
+        status="in_progress",
+        retry_count=0,
+        turn_generation=1,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
+    )
+    proxy.get_worker = AsyncMock(return_value=worker)
+
+    with pytest.raises(RuntimeError, match="provider launch admission"):
+        await proxy._forward_task_to_worker_locked(task)
+
+    post.assert_not_awaited()
+    proxy.relay.subscribe_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "namespace_config",
+    [
+        {},
+        {
+            "task_id_namespace_protocol": 1,
+            "task_id_namespace_boundary": 1_000_000_000,
+            "ccm_node_role": "manager",
+        },
+    ],
+    ids=["missing-protocol", "wrong-node-role"],
+)
+async def test_initial_worker_forward_rejects_invalid_id_namespace_before_effects(
+    monkeypatch,
+    namespace_config,
+):
+    post = AsyncMock()
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "worker_delegated_principal_protocol": 1,
+                "worker_delegated_launch_admission_protocol": 2,
+                **namespace_config,
+            }
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, _url, *, headers):
+            return Response()
+
+        async def post(self, *args, **kwargs):
+            return await post(*args, **kwargs)
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(None, relay=AsyncMock())
+    worker = Worker(
+        id=761,
+        name="wrong-namespace-worker",
+        status="ready",
+        private_ip="10.0.0.61",
+        auth_token="token",
+    )
+    task = Task(
+        id=901,
+        title="must not cross a mixed-version boundary",
+        description="namespace is part of task identity",
+        worker_id=worker.id,
+        provider="claude",
+        incarnation_id="a" * 32,
+        status="in_progress",
+        retry_count=0,
+        turn_generation=1,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
+    )
+    proxy.get_worker = AsyncMock(return_value=worker)
+
+    with pytest.raises(RuntimeError, match="Task ID namespace.*任务未转发"):
+        await proxy._forward_task_to_worker_locked(task)
+
+    post.assert_not_awaited()
+    proxy.relay.subscribe_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_initial_worker_forward_requires_exact_delegated_principal_ack(
+    monkeypatch,
+):
+    from backend.services.worker_proxy import (
+        WorkerTaskForwardOutcomeUncertainError,
+    )
+
+    class Response:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, _url, *, headers):
+            return Response({
+                "worker_delegated_principal_protocol": 1,
+                "worker_delegated_launch_admission_protocol": 2,
+                "worker_initial_generation_protocol": 1,
+                "worker_task_incarnation_proxy_version": 1,
+                **_worker_namespace_capability(),
+            })
+
+        async def post(self, _url, *, headers, json):
+            mismatched = dict(json)
+            mismatched["incarnation_id"] = json["source_incarnation_id"]
+            mismatched["metadata_"] = {
+                "ccm_source_task_incarnation_id": json[
+                    "source_incarnation_id"
+                ]
+            }
+            mismatched["execution_user_role"] = "member"
+            mismatched["execution_mode"] = "sandbox"
+            return Response(mismatched)
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(None, relay=AsyncMock())
+    worker = Worker(
+        id=75,
+        name="drifting-principal-worker",
+        status="ready",
+        private_ip="10.0.0.75",
+        auth_token="token",
+    )
+    task = Task(
+        id=899,
+        title="admin worker task",
+        description="retain delegated admin authority",
+        worker_id=worker.id,
+        provider="claude",
+        execution_user_id=51,
+        execution_user_role="admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="user",
+        incarnation_id="2" * 32,
+        status="in_progress",
+        retry_count=0,
+        turn_generation=1,
+    )
+    proxy.get_worker = AsyncMock(return_value=worker)
+    proxy.ensure_worker_project = AsyncMock(return_value=None)
+    proxy._user_skill_snapshots = AsyncMock(return_value=[])
+
+    with pytest.raises(
+        WorkerTaskForwardOutcomeUncertainError,
+        match="exact delegated principal",
+    ):
+        await proxy._forward_task_to_worker_locked(task)
+
+
+@pytest.mark.asyncio
+async def test_initial_worker_forward_requires_exact_incarnation_ack(
+    monkeypatch,
+):
+    from backend.services.worker_proxy import (
+        WorkerTaskForwardOutcomeUncertainError,
+    )
+
+    class Response:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, _url, *, headers):
+            return Response({
+                "worker_delegated_principal_protocol": 1,
+                "worker_delegated_launch_admission_protocol": 2,
+                "worker_initial_generation_protocol": 1,
+                "worker_task_incarnation_proxy_version": 1,
+                **_worker_namespace_capability(),
+            })
+
+        async def post(self, _url, *, headers, json):
+            return Response({
+                **json,
+                "incarnation_id": "f" * 32,
+                "metadata_": {
+                    "ccm_source_task_incarnation_id": json[
+                        "source_incarnation_id"
+                    ]
+                },
+            })
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(None, relay=AsyncMock())
+    worker = Worker(
+        id=74,
+        name="wrong-incarnation-worker",
+        status="ready",
+        private_ip="10.0.0.74",
+        auth_token="token",
+    )
+    task = Task(
+        id=898,
+        title="system worker task",
+        description="retain exact logical Task identity",
+        worker_id=worker.id,
+        provider="claude",
+        incarnation_id="e" * 32,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
+        status="in_progress",
+        retry_count=0,
+        turn_generation=1,
+    )
+    proxy.get_worker = AsyncMock(return_value=worker)
+    proxy.ensure_worker_project = AsyncMock(return_value=None)
+    proxy._user_skill_snapshots = AsyncMock(return_value=[])
+
+    with pytest.raises(
+        WorkerTaskForwardOutcomeUncertainError,
+        match="exact Task incarnation",
+    ):
+        await proxy._forward_task_to_worker_locked(task)
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value", "error"),
+    [
+        pytest.param("is_active", False, "no longer active", id="disabled"),
+        pytest.param("role", "member", "role changed", id="demoted"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_initial_worker_forward_revalidates_native_user_before_effects(
+    session_factory,
+    changed_field,
+    changed_value,
+    error,
+):
+    from backend.models.user import User
+
+    async with session_factory() as db:
+        user = User(
+            email=f"worker-principal-{changed_field}@example.com",
+            name="Worker principal",
+            password_hash="unused",
+            role="admin",
+            is_active=True,
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        user_id = user.id
+
+    worker = await _mk_worker(
+        session_factory,
+        name=f"principal-{changed_field}-worker",
+    )
+    task = await _mk_task(
+        session_factory,
+        status="pending",
+        worker_id=worker.id,
+        execution_user_id=user_id,
+        execution_user_role="admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="user",
+    )
+    async with session_factory() as db:
+        user = await db.get(User, user_id)
+        setattr(user, changed_field, changed_value)
+        await db.commit()
+
+    proxy = WorkerProxy(session_factory, relay=AsyncMock())
+    proxy.get_worker = AsyncMock()
+
+    with pytest.raises(RuntimeError, match=error):
+        await proxy.forward_task_to_worker(task)
+
+    proxy.get_worker.assert_not_awaited()
+    proxy.relay.subscribe_task.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_initial_worker_forward_takes_exact_user_writer_fence(
+    session_factory,
+    monkeypatch,
+):
+    """Principal admission must lock active/role, not trust a plain read."""
+
+    from backend.models.user import User
+
+    async with session_factory() as db:
+        user = User(
+            email="worker-principal-writer-fence@example.com",
+            name="Worker principal writer fence",
+            password_hash="unused",
+            role="admin",
+            is_active=True,
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        user_id = user.id
+
+    worker = await _mk_worker(
+        session_factory,
+        name="principal-writer-fence-worker",
+    )
+    task = await _mk_task(
+        session_factory,
+        status="in_progress",
+        turn_generation=1,
+        worker_id=worker.id,
+        execution_user_id=user_id,
+        execution_user_role="admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="user",
+    )
+
+    original_execute = AsyncSession.execute
+    user_fences: list[str] = []
+
+    async def execute_spy(session, statement, *args, **kwargs):
+        table = getattr(statement, "table", None)
+        if (
+            getattr(statement, "is_update", False)
+            and getattr(table, "name", None) == "users"
+        ):
+            user_fences.append(str(statement))
+        return await original_execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", execute_spy)
+    proxy = WorkerProxy(session_factory, relay=AsyncMock())
+
+    current = await proxy._authoritative_forward_task(task)
+
+    assert current.id == task.id
+    assert len(user_fences) == 1
+    normalized = " ".join(user_fences[0].lower().split())
+    assert "update users" in normalized
+    assert "users.is_active is true" in normalized
+    assert "users.role =" in normalized
 
 
 async def test_initial_worker_post_transport_failure_is_outcome_uncertain(
@@ -1447,10 +2372,21 @@ async def test_initial_worker_post_transport_failure_is_outcome_uncertain(
         provider="codex",
         codex_service_tier="default",
         enable_workflows=False,
+        incarnation_id="4" * 32,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
+        status="in_progress",
+        retry_count=0,
+        turn_generation=1,
     )
     proxy.get_worker = AsyncMock(return_value=worker)
     proxy.ensure_worker_project = AsyncMock(return_value=None)
     proxy._user_skill_snapshots = AsyncMock(return_value=[])
+    proxy.require_worker_delegated_principal_support = AsyncMock()
+    proxy.require_worker_initial_generation_support = AsyncMock()
+    proxy.require_worker_task_incarnation_support = AsyncMock()
 
     with pytest.raises(
         WorkerTaskForwardOutcomeUncertainError,
@@ -1463,6 +2399,17 @@ async def test_initial_worker_post_transport_failure_is_outcome_uncertain(
 
 async def test_worker_forward_syncs_related_plan_uploads(monkeypatch):
     captured_payload = {}
+    monkeypatch.setattr(settings, "worker_remote_dir", "/srv/ccm-worker")
+    image_name = "11111111-1111-4111-8111-111111111111.png"
+    notes_name = "22222222-2222-4222-8222-222222222222.txt"
+    local_paths = [
+        f"/manager/checkout/uploads/{image_name}",
+        f"/manager/checkout/uploads/{notes_name}",
+    ]
+    remote_paths = [
+        f"/srv/ccm-worker/uploads/{image_name}",
+        f"/srv/ccm-worker/uploads/{notes_name}",
+    ]
 
     class Response:
         def raise_for_status(self):
@@ -1483,6 +2430,19 @@ async def test_worker_forward_syncs_related_plan_uploads(monkeypatch):
 
         async def post(self, _url, *, headers, json):
             captured_payload.update(json)
+            captured_payload["incarnation_id"] = json[
+                "source_incarnation_id"
+            ]
+            captured_payload["metadata_"] = {
+                "ccm_source_task_incarnation_id": json[
+                    "source_incarnation_id"
+                ]
+            }
+            captured_payload["status"] = "pending"
+            captured_payload["retry_count"] = json["source_retry_count"]
+            captured_payload["turn_generation"] = (
+                json["source_turn_generation"] - 1
+            )
             return Response()
 
     monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
@@ -1506,40 +2466,47 @@ async def test_worker_forward_syncs_related_plan_uploads(monkeypatch):
         plan_target_task_id=44,
         metadata_={
             "created_from_plan_target_task_id": 44,
-            "file_paths": [
-                "/srv/uploads/mockup.png",
-                "/srv/uploads/notes.txt",
-            ],
+            "file_paths": local_paths,
             "attachments": [
                 {
-                    "url": "/api/uploads/mockup.png",
+                    "url": f"/api/uploads/{image_name}",
                     "name": "mockup.png",
                     "is_image": True,
                 },
                 {
-                    "url": "/api/uploads/notes.txt",
+                    "url": f"/api/uploads/{notes_name}",
                     "name": "notes.txt",
                     "is_image": False,
                 },
             ],
         },
+        incarnation_id="3" * 32,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
+        status="in_progress",
+        retry_count=0,
+        turn_generation=1,
     )
     proxy.get_worker = AsyncMock(return_value=worker)
     proxy.ensure_worker_project = AsyncMock(return_value=34)
+    proxy.require_worker_delegated_principal_support = AsyncMock()
+    proxy.require_worker_initial_generation_support = AsyncMock()
+    proxy.require_worker_task_incarnation_support = AsyncMock()
     proxy.push_files = AsyncMock()
     proxy._user_skill_snapshots = AsyncMock(return_value=[])
+    proxy.require_worker_delegated_principal_support = AsyncMock()
 
     await proxy._forward_task_to_worker_locked(task)
 
-    assert captured_payload["file_paths"] == [
-        "/srv/uploads/mockup.png",
-        "/srv/uploads/notes.txt",
-    ]
-    assert captured_payload["image_paths"] == ["/srv/uploads/mockup.png"]
+    assert captured_payload["file_paths"] == remote_paths
+    assert captured_payload["image_paths"] == [remote_paths[0]]
     assert captured_payload["attachments"] == task.metadata_["attachments"]
     proxy.push_files.assert_awaited_once_with(
         worker,
-        ["/srv/uploads/mockup.png", "/srv/uploads/notes.txt"],
+        local_paths,
+        remote_paths=remote_paths,
     )
 
 
@@ -1733,6 +2700,11 @@ async def test_worker_fast_fails_before_forward_when_capability_is_unproven(
             # Shape returned by an older Worker that predates service tiers.
             return {
                 "default_codex_model": "gpt-5.6-sol",
+                "worker_delegated_principal_protocol": 1,
+                "worker_delegated_launch_admission_protocol": 2,
+                "worker_initial_generation_protocol": 1,
+                "worker_task_incarnation_proxy_version": 1,
+                **_worker_namespace_capability(),
             }
 
     class Client:
@@ -1770,6 +2742,14 @@ async def test_worker_fast_fails_before_forward_when_capability_is_unproven(
         provider="codex",
         model="gpt-5.6-sol",
         codex_service_tier="priority",
+        incarnation_id="5" * 32,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
+        status="in_progress",
+        retry_count=0,
+        turn_generation=1,
     )
     proxy.get_worker = AsyncMock(return_value=worker)
     proxy.ensure_worker_project = AsyncMock(return_value=34)
@@ -1793,7 +2773,14 @@ async def test_worker_pr_review_fails_before_forward_without_snapshot_isolation(
 
         def json(self):
             # Older Workers accept the tag but run from their CCM cwd.
-            return {"default_provider": "claude"}
+            return {
+                "default_provider": "claude",
+                "worker_delegated_principal_protocol": 1,
+                "worker_delegated_launch_admission_protocol": 2,
+                "worker_initial_generation_protocol": 1,
+                "worker_task_incarnation_proxy_version": 1,
+                **_worker_namespace_capability(),
+            }
 
     class Client:
         def __init__(self, *args, **kwargs):
@@ -1828,6 +2815,14 @@ async def test_worker_pr_review_fails_before_forward_without_snapshot_isolation(
         worker_id=worker.id,
         provider="claude",
         tags=["pr-review"],
+        incarnation_id="6" * 32,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
+        status="in_progress",
+        retry_count=0,
+        turn_generation=1,
     )
     proxy.get_worker = AsyncMock(return_value=worker)
     proxy.ensure_worker_project = AsyncMock(return_value=34)
@@ -2309,7 +3304,11 @@ async def test_active_termination_receipt_fences_direct_handoff_effects(
         replay,
         client=post_client,
     )
-    resumed = await relay._resume_worker_turn_handoff(worker, reserved)
+    resumed = await relay._resume_worker_turn_handoff(
+        worker,
+        reserved,
+        replay,
+    )
 
     assert posted is False
     assert resumed is False
@@ -2523,6 +3522,8 @@ async def test_claimed_handoff_recovery_resumes_exact_generation(
         return_value=_handoff_receipt_with_status(reserved, "claimed")
     )
     relay._resume_worker_turn_handoff = AsyncMock(return_value=True)
+    replay = await relay._manager_worker_turn_handoff_request(reserved)
+    assert replay is not None
 
     recovered = await relay._resume_accepted_worker_turn_handoff(
         worker,
@@ -2534,6 +3535,8 @@ async def test_claimed_handoff_recovery_resumes_exact_generation(
     relay._resume_worker_turn_handoff.assert_awaited_once_with(
         worker,
         reserved,
+        replay,
+        client=None,
     )
     async with session_factory() as db:
         current = await db.get(Task, task.id)
@@ -2573,11 +3576,15 @@ async def test_remote_handoff_match_rejects_boolean_integer_fields(
         turn_generation=0,
     )
     reserved = await _reserve_worker_handoff(session_factory, task)
+    replay = await relay._manager_worker_turn_handoff_request(reserved)
+    assert replay is not None
     observed = replace(reserved, task_id=1)
     receipt = _handoff_receipt_with_status(observed, "launching")
+    receipt["request_digest"] = replay["request_digest"]
+    receipt["principal_digest"] = replay["principal_digest"]
     receipt[field] = malformed
 
-    assert not relay._remote_handoff_matches(observed, receipt)
+    assert not relay._remote_handoff_matches(observed, receipt, replay)
 
 
 @pytest.mark.parametrize(
@@ -2606,7 +3613,11 @@ async def test_resume_worker_handoff_validates_complete_remote_identity(
         turn_generation=8,
     )
     reserved = await _reserve_worker_handoff(session_factory, task)
+    replay = await relay._manager_worker_turn_handoff_request(reserved)
+    assert replay is not None
     receipt = _handoff_receipt_with_status(reserved, "claimed")
+    receipt["request_digest"] = replay["request_digest"]
+    receipt["principal_digest"] = replay["principal_digest"]
     if mismatched_field == "task_id":
         receipt[mismatched_field] = task.id + 1
     elif mismatched_field == "retry_count":
@@ -2633,16 +3644,35 @@ async def test_resume_worker_handoff_validates_complete_remote_identity(
         async def __aexit__(self, *_args):
             return False
 
-        async def post(self, url, **_kwargs):
+        async def get(self, url, **_kwargs):
+            assert url.endswith("/api/system/config")
+            return SimpleNamespace(
+                status_code=200,
+                json=lambda: {
+                    "worker_delegated_principal_protocol": 1,
+                    "worker_delegated_launch_admission_protocol": 2,
+                    "worker_task_incarnation_proxy_version": 1,
+                    **_worker_namespace_capability(),
+                },
+            )
+
+        async def post(self, url, **kwargs):
             assert url.endswith(
                 f"/api/tasks/{task.id}/worker-turn-handoffs/"
                 f"{reserved.worker_turn_handoff_id}/resume"
+            )
+            assert kwargs["headers"]["X-CCM-Task-Incarnation"] == (
+                task.incarnation_id
             )
             return Response()
 
     monkeypatch.setattr(worker_relay_module.httpx, "AsyncClient", Client)
 
-    resumed = await relay._resume_worker_turn_handoff(worker, reserved)
+    resumed = await relay._resume_worker_turn_handoff(
+        worker,
+        reserved,
+        replay,
+    )
 
     assert resumed is expected
 
@@ -2873,6 +3903,8 @@ async def test_worker_handoff_recovery_replays_missing_exact_post(
     relay._resume_worker_turn_handoff.assert_awaited_once_with(
         worker,
         reserved,
+        replay,
+        client=None,
     )
     async with session_factory() as db:
         current = await db.get(Task, task.id)
@@ -4010,7 +5042,11 @@ async def test_relay_plan_ready_fetches_content(relay, session_factory):
     assert task.status == "plan_review"
 
 
-async def test_relay_monitor_events_with_remote_id(relay, session_factory):
+async def test_relay_monitor_events_with_remote_id(
+    relay,
+    broadcaster,
+    session_factory,
+):
     w = await _mk_worker(session_factory)
     t = await _mk_task(session_factory, worker_id=w.id)
     relay._tasks[w.id] = {t.id}
@@ -4039,8 +5075,667 @@ async def test_relay_monitor_events_with_remote_id(relay, session_factory):
     assert ms.task_id == t.id
     assert ms.status == "completed"
     assert ms.last_summary == "fine"
+    assert json.loads(ms.meta) == {
+        "ccm_worker_mirror": {
+            "worker_id": w.id,
+            "task_incarnation_id": t.incarnation_id,
+            "remote_id": 5,
+        }
+    }
     assert len(checks) == 1
     assert checks[0].monitor_session_id == ms.id  # 本地 id，不是 remote 的 5
+    assert [payload["monitor_session_id"] for _, payload in broadcaster.sent] == [
+        ms.id,
+        ms.id,
+        ms.id,
+    ]
+
+
+async def test_relay_monitor_remote_id_collision_selects_exact_worker_mirror(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    old_worker = await _mk_worker(session_factory, name="old-monitor-worker")
+    worker = await _mk_worker(session_factory, name="current-monitor-worker")
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    relay._tasks[worker.id] = {task.id}
+    remote_id = 51
+    async with session_factory() as db:
+        historical = MonitorSession(
+            task_id=task.id,
+            remote_id=remote_id,
+            agent_type="monitor",
+            source="ccm",
+            description="historical monitor",
+            status="completed",
+            meta=json.dumps({
+                "ccm_worker_mirror": {
+                    "worker_id": old_worker.id,
+                    "task_incarnation_id": task.incarnation_id,
+                    "remote_id": remote_id,
+                }
+            }),
+        )
+        db.add(historical)
+        await db.commit()
+        historical_id = historical.id
+
+    events = [
+        {
+            "event": "monitor_session_created",
+            "monitor_session_id": remote_id,
+            "description": "current monitor",
+            **_relay_generation(task),
+        },
+        {
+            "event": "monitor_check",
+            "monitor_session_id": remote_id,
+            "check_number": 1,
+            "status": "ok",
+            "summary": "current result",
+            **_relay_generation(task),
+        },
+        {
+            "event": "monitor_session_status",
+            "monitor_session_id": remote_id,
+            "status": "completed",
+            **_relay_generation(task),
+        },
+    ]
+    for data in events:
+        await relay._handle(
+            {"channel": f"task:{task.id}", "data": data},
+            worker,
+        )
+
+    async with session_factory() as db:
+        mirrors = list(
+            (
+                await db.execute(
+                    select(MonitorSession).where(
+                        MonitorSession.task_id == task.id,
+                        MonitorSession.remote_id == remote_id,
+                    )
+                )
+            ).scalars()
+        )
+        checks = list((await db.execute(select(MonitorCheck))).scalars())
+    assert len(mirrors) == 2
+    historical = next(row for row in mirrors if row.id == historical_id)
+    current = next(row for row in mirrors if row.id != historical_id)
+    assert historical.status == "completed"
+    assert historical.description == "historical monitor"
+    assert historical.last_summary is None
+    assert current.status == "completed"
+    assert current.description == "current monitor"
+    assert current.last_summary == "current result"
+    assert json.loads(current.meta) == {
+        "ccm_worker_mirror": {
+            "worker_id": worker.id,
+            "task_incarnation_id": task.incarnation_id,
+            "remote_id": remote_id,
+        }
+    }
+    assert [check.monitor_session_id for check in checks] == [current.id]
+    assert [payload["monitor_session_id"] for _, payload in broadcaster.sent] == [
+        current.id,
+        current.id,
+        current.id,
+    ]
+
+
+async def test_relay_rejects_stale_worker_child_events_after_reassignment(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    stale_worker = await _mk_worker(session_factory, name="stale-child-worker")
+    current_worker = await _mk_worker(
+        session_factory,
+        name="current-child-worker",
+    )
+    task = await _mk_task(session_factory, worker_id=current_worker.id)
+    # A disconnected/reconnecting Worker may retain an old in-memory
+    # subscription.  The durable Task.worker_id writer fence must still win.
+    relay._tasks[stale_worker.id] = {task.id}
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event": "monitor_session_created",
+                "monitor_session_id": 61,
+                "description": "stale monitor",
+                **_relay_generation(task),
+            },
+        },
+        stale_worker,
+    )
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event": "sub_agent_session_created",
+                **_sub_agent_relay_payload(
+                    task,
+                    remote_id=9061,
+                    status="running",
+                    description="stale child",
+                ),
+            },
+        },
+        stale_worker,
+    )
+
+    async with session_factory() as db:
+        mirrors = list(
+            (
+                await db.execute(
+                    select(MonitorSession).where(
+                        MonitorSession.task_id == task.id,
+                        MonitorSession.remote_id.in_([61, 9061]),
+                    )
+                )
+            ).scalars()
+        )
+    assert mirrors == []
+    assert broadcaster.sent == []
+
+
+async def test_relay_sub_agent_created_is_idempotent_manager_mirror(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    relay._tasks[worker.id] = {task.id}
+    event = {
+        "channel": f"task:{task.id}",
+        "data": {
+            "event": "sub_agent_session_created",
+            **_sub_agent_relay_payload(
+                task,
+                remote_id=9001,
+                status="running",
+            ),
+        },
+    }
+
+    await relay._handle(event, worker)
+    await relay._handle(event, worker)
+
+    async with session_factory() as db:
+        mirrors = list(
+            (
+                await db.execute(
+                    select(MonitorSession).where(
+                        MonitorSession.task_id == task.id,
+                        MonitorSession.agent_type == "sub_agent",
+                        MonitorSession.source == "ccm",
+                    )
+                )
+            ).scalars()
+        )
+    assert len(mirrors) == 1
+    mirror = mirrors[0]
+    assert mirror.remote_id == 9001
+    assert mirror.id != mirror.remote_id
+    assert mirror.status == "running"
+    assert json.loads(mirror.meta) == {
+        "ccm_worker_mirror": {
+            "worker_id": worker.id,
+            "task_incarnation_id": task.incarnation_id,
+            "remote_id": 9001,
+        }
+    }
+    assert [data["sub_agent_session_id"] for _, data in broadcaster.sent] == [
+        mirror.id,
+        mirror.id,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("event_type", "status"),
+    [
+        ("sub_agent_session_created", "running"),
+        ("sub_agent_session_status", "completed"),
+    ],
+)
+async def test_relay_sub_agent_remote_id_collision_materializes_exact_mirror(
+    relay,
+    broadcaster,
+    session_factory,
+    event_type,
+    status,
+):
+    old_worker = await _mk_worker(session_factory, name=f"old-{event_type}")
+    worker = await _mk_worker(session_factory, name=f"current-{event_type}")
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    relay._tasks[worker.id] = {task.id}
+    remote_id = 9051 if status == "running" else 9052
+    async with session_factory() as db:
+        historical = MonitorSession(
+            task_id=task.id,
+            remote_id=remote_id,
+            agent_type="sub_agent",
+            source="ccm",
+            description="historical child",
+            interval=0,
+            max_checks=0,
+            status="completed",
+            meta=json.dumps({
+                "ccm_worker_mirror": {
+                    "worker_id": old_worker.id,
+                    "task_incarnation_id": task.incarnation_id,
+                    "remote_id": remote_id,
+                }
+            }),
+        )
+        db.add(historical)
+        await db.commit()
+        historical_id = historical.id
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event": event_type,
+                **_sub_agent_relay_payload(
+                    task,
+                    remote_id=remote_id,
+                    status=status,
+                    description="current child",
+                    checks_done=2,
+                    last_summary="current result",
+                ),
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        mirrors = list(
+            (
+                await db.execute(
+                    select(MonitorSession).where(
+                        MonitorSession.task_id == task.id,
+                        MonitorSession.remote_id == remote_id,
+                    )
+                )
+            ).scalars()
+        )
+    assert len(mirrors) == 2
+    historical = next(row for row in mirrors if row.id == historical_id)
+    current = next(row for row in mirrors if row.id != historical_id)
+    assert historical.status == "completed"
+    assert historical.description == "historical child"
+    assert current.status == status
+    assert current.description == "current child"
+    assert current.checks_done == 2
+    assert current.last_summary == "current result"
+    assert json.loads(current.meta) == {
+        "ccm_worker_mirror": {
+            "worker_id": worker.id,
+            "task_incarnation_id": task.incarnation_id,
+            "remote_id": remote_id,
+        }
+    }
+    assert broadcaster.sent == [
+        (
+            f"task:{task.id}",
+            {
+                "event": event_type,
+                **_sub_agent_relay_payload(
+                    task,
+                    remote_id=remote_id,
+                    status=status,
+                    description="current child",
+                    checks_done=2,
+                    last_summary="current result",
+                ),
+                "sub_agent_session_id": current.id,
+            },
+        )
+    ]
+
+
+async def test_relay_sub_agent_terminal_status_materializes_and_never_rewrites(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    relay._tasks[worker.id] = {task.id}
+
+    terminal = {
+        "channel": f"task:{task.id}",
+        "data": {
+            "event": "sub_agent_session_status",
+            **_sub_agent_relay_payload(
+                task,
+                remote_id=9002,
+                status="completed",
+                description="canonical child",
+                checks_done=3,
+                last_summary="canonical result",
+            ),
+        },
+    }
+    await relay._handle(terminal, worker)
+
+    duplicate = deepcopy(terminal)
+    duplicate["data"]["description"] = "late conflicting description"
+    duplicate["data"]["checks_done"] = 99
+    duplicate["data"]["last_summary"] = "late conflicting result"
+    await relay._handle(duplicate, worker)
+
+    delayed_created = deepcopy(terminal)
+    delayed_created["data"]["event"] = "sub_agent_session_created"
+    delayed_created["data"]["status"] = "running"
+    await relay._handle(delayed_created, worker)
+
+    conflicting_terminal = deepcopy(terminal)
+    conflicting_terminal["data"]["status"] = "failed"
+    await relay._handle(conflicting_terminal, worker)
+
+    async with session_factory() as db:
+        mirrors = list(
+            (
+                await db.execute(
+                    select(MonitorSession).where(
+                        MonitorSession.task_id == task.id,
+                        MonitorSession.remote_id == 9002,
+                    )
+                )
+            ).scalars()
+        )
+    assert len(mirrors) == 1
+    mirror = mirrors[0]
+    assert mirror.status == "completed"
+    assert mirror.description == "canonical child"
+    assert mirror.checks_done == 3
+    assert mirror.last_summary == "canonical result"
+    assert mirror.completed_at is not None
+    # The same terminal status may be acknowledged again, but its forwarded
+    # view is canonicalized from the durable mirror. Revival/conflict is mute.
+    assert len(broadcaster.sent) == 2
+    assert broadcaster.sent[-1][1]["sub_agent_session_id"] == mirror.id
+    assert broadcaster.sent[-1][1]["description"] == "canonical child"
+    assert broadcaster.sent[-1][1]["checks_done"] == 3
+
+
+@pytest.mark.parametrize(
+    "generation",
+    [
+        {},
+        {"task_retry_count": True, "task_turn_generation": 12},
+        {"task_retry_count": 4, "task_turn_generation": True},
+        {"task_retry_count": 4, "task_turn_generation": 11},
+    ],
+    ids=["missing", "boolean-retry", "boolean-turn", "stale-turn"],
+)
+async def test_relay_drops_sub_agent_event_without_exact_generation(
+    relay,
+    broadcaster,
+    session_factory,
+    generation,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        retry_count=4,
+        turn_generation=12,
+    )
+    relay._tasks[worker.id] = {task.id}
+    payload = _sub_agent_relay_payload(
+        task,
+        remote_id=9003,
+        status="running",
+    )
+    payload.pop("task_retry_count")
+    payload.pop("task_turn_generation")
+    payload.update(generation)
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event": "sub_agent_session_created",
+                **payload,
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        mirrors = list(
+            (
+                await db.execute(
+                    select(MonitorSession).where(
+                        MonitorSession.task_id == task.id,
+                        MonitorSession.remote_id == 9003,
+                    )
+                )
+            ).scalars()
+        )
+    assert mirrors == []
+    assert broadcaster.sent == []
+
+
+async def test_relay_sub_agent_event_rejects_wrong_existing_category(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    relay._tasks[worker.id] = {task.id}
+    async with session_factory() as db:
+        monitor = MonitorSession(
+            task_id=task.id,
+            remote_id=9004,
+            agent_type="monitor",
+            source="ccm",
+            description="must not alias",
+        )
+        db.add(monitor)
+        await db.commit()
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event": "sub_agent_session_created",
+                **_sub_agent_relay_payload(
+                    task,
+                    remote_id=9004,
+                    status="running",
+                ),
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        rows = list(
+            (
+                await db.execute(
+                    select(MonitorSession).where(
+                        MonitorSession.task_id == task.id,
+                        MonitorSession.remote_id == 9004,
+                    )
+                )
+            ).scalars()
+        )
+    assert len(rows) == 1
+    assert rows[0].agent_type == "monitor"
+    assert broadcaster.sent == []
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        "monitor_session_created",
+        "monitor_check",
+        "monitor_session_status",
+        "sub_agent_session_created",
+        "sub_agent_session_status",
+    ],
+)
+@pytest.mark.parametrize(
+    "identity_kind",
+    ["missing", "malformed", "extra-key"],
+)
+async def test_relay_child_event_fails_closed_on_ambiguous_mirror_identity(
+    relay,
+    broadcaster,
+    session_factory,
+    event_type,
+    identity_kind,
+):
+    worker = await _mk_worker(
+        session_factory,
+        name=f"ambiguous-{event_type}-{identity_kind}",
+    )
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    relay._tasks[worker.id] = {task.id}
+    remote_id = 9071
+    if identity_kind == "missing":
+        meta = None
+    elif identity_kind == "malformed":
+        meta = "not-json"
+    else:
+        meta = json.dumps({
+            "ccm_worker_mirror": {
+                "worker_id": worker.id,
+                "task_incarnation_id": task.incarnation_id,
+                "remote_id": remote_id,
+                "unexpected": True,
+            }
+        })
+    agent_type = (
+        "sub_agent" if event_type.startswith("sub_agent_") else "monitor"
+    )
+    async with session_factory() as db:
+        ambiguous = MonitorSession(
+            task_id=task.id,
+            remote_id=remote_id,
+            agent_type=agent_type,
+            source="ccm",
+            description="ambiguous existing mirror",
+            interval=0 if agent_type == "sub_agent" else 120,
+            max_checks=0 if agent_type == "sub_agent" else 50,
+            status="running",
+            meta=meta,
+        )
+        db.add(ambiguous)
+        await db.commit()
+        ambiguous_id = ambiguous.id
+
+    if event_type == "monitor_session_created":
+        data = {
+            "event": event_type,
+            "monitor_session_id": remote_id,
+            "description": "new monitor",
+            **_relay_generation(task),
+        }
+    elif event_type == "monitor_check":
+        data = {
+            "event": event_type,
+            "monitor_session_id": remote_id,
+            "check_number": 1,
+            "status": "ok",
+            "summary": "must not apply",
+            **_relay_generation(task),
+        }
+    elif event_type == "monitor_session_status":
+        data = {
+            "event": event_type,
+            "monitor_session_id": remote_id,
+            "status": "completed",
+            **_relay_generation(task),
+        }
+    else:
+        data = {
+            "event": event_type,
+            **_sub_agent_relay_payload(
+                task,
+                remote_id=remote_id,
+                status=(
+                    "completed"
+                    if event_type == "sub_agent_session_status"
+                    else "running"
+                ),
+                description="new child",
+                last_summary="must not apply",
+            ),
+        }
+
+    await relay._handle(
+        {"channel": f"task:{task.id}", "data": data},
+        worker,
+    )
+
+    async with session_factory() as db:
+        rows = list(
+            (
+                await db.execute(
+                    select(MonitorSession).where(
+                        MonitorSession.task_id == task.id,
+                        MonitorSession.remote_id == remote_id,
+                    )
+                )
+            ).scalars()
+        )
+        checks = list((await db.execute(select(MonitorCheck))).scalars())
+    assert [row.id for row in rows] == [ambiguous_id]
+    assert rows[0].status == "running"
+    assert rows[0].description == "ambiguous existing mirror"
+    assert rows[0].last_summary is None
+    assert checks == []
+    assert broadcaster.sent == []
+
+
+async def test_relay_preserves_native_sub_agent_notification_namespace(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    """Native watcher events share names but are not CCM Worker mirrors."""
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    relay._tasks[worker.id] = {task.id}
+    native_event = {
+        "event_type": "sub_agent_session_status",
+        "sub_agent_session_id": 44,
+        "agent_type": "native-agent",
+        "source": "native",
+        "status": "completed",
+    }
+
+    await relay._handle(
+        {"channel": f"task:{task.id}", "data": native_event},
+        worker,
+    )
+
+    async with session_factory() as db:
+        mirrors = list(
+            (
+                await db.execute(
+                    select(MonitorSession).where(
+                        MonitorSession.task_id == task.id,
+                        MonitorSession.remote_id == 44,
+                    )
+                )
+            ).scalars()
+        )
+    assert mirrors == []
+    assert broadcaster.sent == [(f"task:{task.id}", native_event)]
 
 
 async def test_relay_context_usage_syncs(relay, session_factory):
@@ -5592,6 +7287,165 @@ async def test_dispatch_worker_tasks_forwards(db_factory, session_factory, broad
     assert resulting.status == "executing"
 
 
+async def test_dispatch_worker_fresh_claim_uses_task_worker_user_lock_order(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    """Fresh Manager claims must match final launch-permit lock order."""
+
+    from backend.services.dispatcher import GlobalDispatcher
+
+    async with session_factory() as db:
+        user = User(
+            email="manager-worker-lock-order@example.com",
+            name="Manager Worker lock order",
+            password_hash="unused",
+            role="admin",
+            is_active=True,
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        user_id = user.id
+    worker = await _mk_worker(session_factory)
+    await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="pending",
+        execution_user_id=user_id,
+        execution_user_role="admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="user",
+    )
+
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    original_execute = AsyncSession.execute
+    write_tables: list[str] = []
+
+    async def record_writes(session, statement, *args, **kwargs):
+        table_name = getattr(
+            getattr(statement, "table", None),
+            "name",
+            None,
+        )
+        if getattr(statement, "is_update", False) and table_name in {
+            "tasks",
+            "workers",
+            "users",
+        }:
+            write_tables.append(table_name)
+        return await original_execute(session, statement, *args, **kwargs)
+
+    with patch.object(AsyncSession, "execute", new=record_writes):
+        await dispatcher._dispatch_worker_tasks()
+
+    assert write_tables[:3] == ["tasks", "workers", "users"], write_tables
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    (("is_active", False), ("role", "member")),
+    ids=("disabled", "demoted"),
+)
+async def test_dispatch_worker_fresh_claim_rejects_revoked_native_principal(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+    changed_field,
+    changed_value,
+):
+    from backend.services.dispatcher import GlobalDispatcher
+
+    async with session_factory() as db:
+        user = User(
+            email=f"manager-worker-claim-{changed_field}@example.com",
+            name="Manager Worker claim principal",
+            password_hash="unused",
+            role="admin",
+            is_active=True,
+        )
+        db.add(user)
+        await db.commit()
+        await db.refresh(user)
+        user_id = user.id
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="pending",
+        execution_user_id=user_id,
+        execution_user_role="admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="user",
+    )
+    async with session_factory() as db:
+        principal = await db.get(User, user_id)
+        setattr(principal, changed_field, changed_value)
+        await db.commit()
+
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_tasks()
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "pending"
+    assert current.turn_generation == task.turn_generation
+    proxy.forward_task_to_worker.assert_not_awaited()
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
+
+
+async def test_dispatch_worker_tasks_rejects_ready_destroy_recovery_worker(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(
+        session_factory,
+        status="ready",
+        bootstrap_step="destroy",
+    )
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="pending",
+    )
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_tasks()
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "pending"
+    assert current.turn_generation == task.turn_generation
+    proxy.forward_task_to_worker.assert_not_awaited()
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
+
+
 async def test_dispatch_worker_task_respects_running_plan_capacity(
     db_factory,
     session_factory,
@@ -5785,6 +7639,72 @@ async def test_dispatch_worker_plan_respects_running_task_capacity(
     assert broadcaster.sent == []
 
 
+async def test_dispatch_worker_plan_rejects_ready_destroy_recovery_worker(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.schemas.plan import default_plan_pipeline_config
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(
+        session_factory,
+        status="ready",
+        bootstrap_step="destroy",
+    )
+    pipeline = default_plan_pipeline_config().model_dump(mode="json")
+    async with session_factory() as db:
+        plan = Plan(
+            title="Blocked destroy Worker Plan",
+            initial_request="Do not start",
+            worker_id=worker.id,
+            pipeline_config=pipeline,
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            worker_id=worker.id,
+            run_type="initial",
+            request_text="Do not start",
+            pipeline_config=pipeline,
+            status="queued",
+            generation=0,
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+        run_id = run.id
+
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_plan_runs()
+
+    async with session_factory() as db:
+        current = await db.get(PlanAgentRun, run_id)
+        receipts = list(
+            (
+                await db.execute(
+                    select(PlanAgentWorkerDispatchReceipt).where(
+                        PlanAgentWorkerDispatchReceipt.run_id == run_id
+                    )
+                )
+            ).scalars()
+        )
+    assert current.status == "queued"
+    assert receipts == []
+    proxy.dispatch_plan_run.assert_not_awaited()
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
+
+
 async def test_dispatch_worker_plan_respects_ack_unconfirmed_cancelling_plan_capacity(
     db_factory,
     session_factory,
@@ -5896,8 +7816,9 @@ async def test_worker_task_and_plan_share_atomic_capacity_in_sqlite_wal(
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,
@@ -6441,8 +8362,9 @@ async def test_worker_plan_claim_loses_cleanly_to_wal_cancel(
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,
@@ -6588,8 +8510,9 @@ async def test_worker_plan_remote_boundary_restarts_after_wal_receipt_read(
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,
@@ -6970,8 +8893,14 @@ def _capture_initial_worker_task_create(
     release_post=None,
 ):
     class Response:
+        def __init__(self, payload):
+            self._payload = payload
+
         def raise_for_status(self):
             return None
+
+        def json(self):
+            return self._payload
 
     class Client:
         def __init__(self, *_args, **_kwargs):
@@ -6983,13 +8912,36 @@ def _capture_initial_worker_task_create(
         async def __aexit__(self, *_args):
             return False
 
+        async def get(self, _url, *, headers):
+            return Response({
+                "worker_delegated_principal_protocol": 1,
+                "worker_delegated_launch_admission_protocol": 2,
+                "worker_initial_generation_protocol": 1,
+                "worker_task_incarnation_proxy_version": 1,
+                **_worker_namespace_capability(),
+                "default_codex_model": "gpt-5.6-sol",
+                "codex_model_service_tiers": {
+                    "gpt-5.6-sol": ["default", "priority"],
+                },
+            })
+
         async def post(self, _url, *, headers, json):
-            captured_payloads.append(json)
+            captured_payloads.append(dict(json))
             if post_entered is not None:
                 post_entered.set()
             if release_post is not None:
                 await release_post.wait()
-            return Response()
+            source_incarnation_id = json["source_incarnation_id"]
+            return Response({
+                **json,
+                "incarnation_id": source_incarnation_id,
+                "metadata_": {
+                    "ccm_source_task_incarnation_id": source_incarnation_id,
+                },
+                "status": "pending",
+                "retry_count": json["source_retry_count"],
+                "turn_generation": json["source_turn_generation"] - 1,
+            })
 
     monkeypatch.setattr(
         worker_proxy_module.httpx,
@@ -7018,6 +8970,7 @@ async def test_worker_forward_reloads_authoritative_skills_after_lock_wait(
         session_factory,
         worker_id=worker.id,
         status="in_progress",
+        turn_generation=1,
         enabled_skills={"code-review": False},
         selected_user_skills=[],
     )
@@ -7069,6 +9022,7 @@ async def test_worker_forward_rejects_generation_change_after_lock_wait(
         session_factory,
         worker_id=worker.id,
         status="in_progress",
+        turn_generation=1,
     )
     captured_payloads = []
     _capture_initial_worker_task_create(
@@ -7751,15 +9705,30 @@ async def test_generic_worker_proxy_hides_other_upstream_error_bodies(
     assert "sensitive Worker traceback" not in caught.value.detail
 
 
-async def test_create_task_with_worker_id_and_explicit_id(client, session_factory):
-    await _mk_worker(session_factory, id=3)
+async def test_create_task_with_worker_id_and_explicit_id(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
     resp = await client.post("/api/tasks", json={
-        "id": 4242, "worker_id": 3, "title": "x", "description": "remote",
+        "id": 4242,
+        "source_incarnation_id": "a" * 32,
+        "source_retry_count": 0,
+        "source_turn_generation": 1,
+        "title": "x",
+        "description": "remote",
+        "execution_user_id": None,
+        "execution_user_role": "member",
+        "execution_mode": "sandbox",
+        "execution_principal_kind": "system",
     })
     assert resp.status_code in (200, 201), resp.text
     data = resp.json()
     assert data["id"] == 4242
-    assert data["worker_id"] == 3
+    assert data["worker_id"] is None
+    assert data["status"] == "pending"
+    assert data["turn_generation"] == 0
 
 
 async def test_worker_routing_config_update_confirms_remote_before_manager(
@@ -8653,6 +10622,7 @@ async def test_worker_execution_reconciles_orphan_stage_to_manager_tuple(
         provider="codex",
         model="gpt-5.6-sol",
         codex_service_tier="default",
+        metadata_={"ccm_worker_remote_materialized_v1": True},
     )
     pending = {
         "op_id": "orphan-fast-stage",
@@ -8670,13 +10640,8 @@ async def test_worker_execution_reconciles_orphan_stage_to_manager_tuple(
             assert body["codex_service_tier"] == "default"
             pending = None
             return _routing_snapshot(task)
-        assert path.endswith("/retry")
-        return _remote_task(
-            task,
-            status="pending",
-            retry_count=task.retry_count + 1,
-            completed_at=None,
-        )
+        assert path.endswith("/internal/worker-retry")
+        return _worker_manual_retry_response(task, body)
 
     proxy = AsyncMock()
     proxy.proxy_to_worker.side_effect = protocol
@@ -8688,6 +10653,71 @@ async def test_worker_execution_reconciles_orphan_stage_to_manager_tuple(
     assert response.json()["status"] == "pending"
     assert pending is None
     assert proxy.proxy_to_worker.await_count == 3
+
+
+async def test_worker_retry_revalidates_jwt_user_before_prepared_outbox(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend import database
+    from backend.api.auth import create_jwt
+    from backend.models.user import User
+
+    monkeypatch.setattr(database, "async_session", session_factory)
+
+    async with session_factory() as db:
+        admin = User(
+            email="worker-retry-demotion@example.com",
+            name="Worker retry admin",
+            password_hash="unused",
+            role="admin",
+            is_active=True,
+        )
+        db.add(admin)
+        await db.commit()
+        await db.refresh(admin)
+        admin_id = admin.id
+        admin_token = create_jwt(admin)
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="failed",
+        created_by=admin_id,
+        metadata_={"ccm_worker_remote_materialized_v1": True},
+    )
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.proxy_to_worker.return_value = _routing_snapshot(task)
+
+    async def demote_after_protocol_preflight(_worker):
+        async with session_factory() as db:
+            current = await db.get(User, admin_id)
+            current.role = "member"
+            await db.commit()
+
+    proxy.require_worker_manual_retry_support.side_effect = (
+        demote_after_protocol_preflight
+    )
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/retry",
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "changed role" in response.json()["detail"]
+    assert proxy.proxy_to_worker.await_count == 1
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "failed"
+    assert (
+        worker_relay_module.worker_manual_retry_receipt(current.metadata_)
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -8738,6 +10768,7 @@ async def test_worker_execution_admission_syncs_latest_manager_skills(
         plan_content="approved plan" if mode == "plan" else None,
         enabled_skills={"code-review": False},
         selected_user_skills=[],
+        metadata_={"ccm_worker_remote_materialized_v1": True},
     )
     admission_order = []
     worker_skill_payloads = []
@@ -8783,29 +10814,67 @@ async def test_worker_execution_admission_syncs_latest_manager_skills(
 
     async def protocol(current, method, path, body=None, **_kwargs):
         if method == "GET":
-            assert path.endswith("/routing-config/status")
-            return _routing_snapshot(current)
-        assert method == "POST"
-        assert path.endswith(f"/{action_path}")
+            if path.endswith("/routing-config/status"):
+                return _routing_snapshot(current)
+            assert mode == "plan"
+            assert "/internal/worker-plan-decisions/" in path
+            return {
+                "protocol_version": 1,
+                "state": "absent",
+                "operation_id": body["operation_id"] if body else path.rsplit("/", 1)[-1],
+                "task_id": current.id,
+            }
         if mode == "plan":
-            # Approval is a control-plane decision now. It must not synchronize
-            # execution Skills or start another Agent turn.
+            assert method == "PUT"
+            assert "/internal/worker-plan-decisions/" in path
             assert admission_order == []
-        else:
-            assert admission_order[-1] == "skills"
+            admission_order.append(action_path)
+            remote = _remote_task(
+                current,
+                status="completed",
+                completed_at=datetime.utcnow().isoformat(),
+                plan_approved=True,
+            )
+            receipt = {
+                "protocol_version": 1,
+                "side": "worker",
+                "state": "applied",
+                "action": "approve",
+                "operation_id": body["operation_id"],
+                "request_digest": body["request_digest"],
+                "request": body,
+                "result_generation": {
+                    "task_id": current.id,
+                    "incarnation_id": current.incarnation_id,
+                    "status": "completed",
+                    "retry_count": current.retry_count,
+                    "turn_generation": current.turn_generation,
+                },
+                "applied_at": datetime.utcnow().isoformat(),
+            }
+            return {"task": remote, "receipt": receipt}
+        assert method == "POST"
+        assert path.endswith(
+            "/internal/worker-retry"
+            if action_path == "retry"
+            else f"/{action_path}"
+        )
+        assert admission_order[-1] == "skills"
         admission_order.append(action_path)
+        if action_path == "retry":
+            return _worker_manual_retry_response(current, body)
         return _remote_task(
             current,
-            status="completed" if mode == "plan" else "pending",
+            status="completed",
             retry_count=current.retry_count + retry_delta,
-            completed_at=(
-                datetime.utcnow().isoformat() if mode == "plan" else None
-            ),
-            plan_approved=True if mode == "plan" else current.plan_approved,
+            completed_at=datetime.utcnow().isoformat(),
+            plan_approved=True,
         )
 
     proxy = WorkerProxy(session_factory, relay=AsyncMock())
     proxy.proxy_to_worker = AsyncMock(side_effect=protocol)
+    proxy.require_worker_delegated_principal_support = AsyncMock()
+    proxy.require_worker_manual_retry_support = AsyncMock()
     monkeypatch.setattr(
         worker_proxy_module.httpx,
         "AsyncClient",
@@ -8903,8 +10972,40 @@ async def test_migrated_inert_task_can_start_its_next_worker_turn(
             return False
 
         async def post(self, url, *, headers, json):
+            if url.endswith("/api/tasks/migration-import/commit"):
+                reservation = remote["metadata_"][
+                    WORKER_MIGRATION_IMPORT_RESERVATION_KEY
+                ]
+                assert json == {"task_id": task.id, **reservation}
+                return Response({
+                    "ok": True,
+                    "committed": True,
+                    "task_id": task.id,
+                    "operation_id": reservation["operation_id"],
+                    "operation_sequence": reservation["operation_sequence"],
+                })
+            if url.endswith("/api/tasks/migration-import/rollback"):
+                reservation = remote["metadata_"][
+                    WORKER_MIGRATION_IMPORT_RESERVATION_KEY
+                ]
+                assert json == {"task_id": task.id, **reservation}
+                return Response({
+                    "ok": True,
+                    "removed": True,
+                    "task_id": task.id,
+                    "operation_id": reservation["operation_id"],
+                    "operation_sequence": reservation["operation_sequence"],
+                })
             assert url.endswith("/api/tasks/migration-import")
             imported_statuses.append(json["source_status"])
+            reservation = {
+                "operation_id": json["migration_operation_id"],
+                "operation_sequence": json["migration_operation_sequence"],
+                "incarnation_id": json["source_incarnation_id"],
+                "retry_count": json["retry_count"],
+                "turn_generation": json["turn_generation"],
+                "source_status": json["source_status"],
+            }
             remote.update({
                 "id": json["id"],
                 "incarnation_id": json["source_incarnation_id"],
@@ -8918,10 +11019,17 @@ async def test_migrated_inert_task_can_start_its_next_worker_turn(
                     "ccm_user_skill_snapshots": json[
                         "user_skill_snapshots"
                     ],
+                    WORKER_MIGRATION_IMPORT_RESERVATION_KEY: reservation,
                 },
-                "provider": json["provider"],
-                "model": json["model"],
-                "codex_service_tier": json["codex_service_tier"],
+                    "provider": json["provider"],
+                    "model": json["model"],
+                    "codex_service_tier": json["codex_service_tier"],
+                    "execution_user_id": json["execution_user_id"],
+                    "execution_user_role": json["execution_user_role"],
+                    "execution_mode": json["execution_mode"],
+                    "execution_principal_kind": json[
+                        "execution_principal_kind"
+                    ],
             })
             return Response(remote, status_code=201)
 
@@ -8944,19 +11052,14 @@ async def test_migrated_inert_task_can_start_its_next_worker_turn(
             )
         assert method == "POST"
         if action_path == "retry":
-            assert path.endswith("/retry")
+            assert path.endswith("/internal/worker-retry")
             assert remote["status"] == "completed"
             remote.update(
                 status="pending",
                 retry_count=remote["retry_count"] + 1,
                 instance_id=None,
             )
-            return _remote_task(
-                current,
-                status="pending",
-                retry_count=remote["retry_count"],
-                completed_at=None,
-            )
+            return _worker_manual_retry_response(current, body)
         assert path.endswith("/chat")
         assert remote["status"] == "completed"
         return {
@@ -8973,6 +11076,10 @@ async def test_migrated_inert_task_can_start_its_next_worker_turn(
     proxy = WorkerProxy(db_factory, relay=relay)
     proxy.ensure_worker_project = AsyncMock(return_value=17)
     proxy.proxy_to_worker = AsyncMock(side_effect=worker_protocol)
+    proxy.require_worker_delegated_principal_support = AsyncMock()
+    proxy.require_worker_task_incarnation_support = AsyncMock()
+    proxy.require_worker_migration_import_support = AsyncMock()
+    proxy.require_worker_manual_retry_support = AsyncMock()
     migrator = TaskMigrator(
         db_factory=db_factory,
         relay=relay,
@@ -9378,6 +11485,48 @@ async def test_proxy_terminal_response_commits_normalized_generation_then_publis
             },
         )
     ]
+
+
+async def test_worker_terminal_receipt_preserves_manager_native_principal(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="in_progress",
+        execution_user_id=77,
+        execution_user_role="admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="user",
+    )
+    protocol, _state = _durable_terminal_protocol(
+        task,
+        terminal_status="cancelled",
+    )
+    proxy = AsyncMock()
+    proxy.proxy_to_worker.side_effect = protocol
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+
+    response = await client.post(f"/api/tasks/{task.id}/cancel")
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "cancelled"
+    assert {
+        "execution_user_id": current.execution_user_id,
+        "execution_user_role": current.execution_user_role,
+        "execution_mode": current.execution_mode,
+        "execution_principal_kind": current.execution_principal_kind,
+    } == {
+        "execution_user_id": 77,
+        "execution_user_role": "admin",
+        "execution_mode": "unrestricted",
+        "execution_principal_kind": "user",
+    }
 
 
 @pytest.mark.parametrize(
@@ -9799,17 +11948,19 @@ async def test_proxy_response_cannot_overwrite_same_worker_retry_aba(
         worker_id=worker.id,
         status="failed",
         error_message="old failure",
+        metadata_={"ccm_worker_remote_materialized_v1": True},
     )
 
     async def retry_completes_before_old_response(
         _task,
         method,
-        _path,
-        *_args,
+        path,
+        body=None,
         **_kwargs,
     ):
         if method == "GET":
             return _routing_snapshot(task)
+        assert path.endswith("/internal/worker-retry")
         async with session_factory() as db:
             await db.execute(
                 update(Task)
@@ -9823,14 +11974,7 @@ async def test_proxy_response_cannot_overwrite_same_worker_retry_aba(
                 )
             )
             await db.commit()
-        return _remote_task(
-            task,
-            status="pending",
-            retry_count=task.retry_count + 1,
-            session_id=None,
-            error_message=None,
-            completed_at=None,
-        )
+        return _worker_manual_retry_response(task, body)
 
     proxy = AsyncMock()
     proxy.proxy_to_worker.side_effect = retry_completes_before_old_response
@@ -10191,7 +12335,18 @@ async def test_codex_worker_chat_allows_sub_agent_command(
     proxy.sync_task_skill_selection.assert_awaited_once()
 
 
-async def test_chat_proxy_for_worker_task(client, session_factory, monkeypatch):
+async def test_chat_proxy_for_worker_task(
+    client,
+    session_factory,
+    monkeypatch,
+    tmp_path,
+):
+    upload_name = "11111111-1111-4111-8111-111111111111.txt"
+    upload_path = tmp_path / upload_name
+    upload_path.write_text("worker attachment", encoding="utf-8")
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", tmp_path)
+    monkeypatch.setattr(settings, "worker_remote_dir", "/srv/ccm-worker")
+    remote_path = f"/srv/ccm-worker/uploads/{upload_name}"
     w = await _mk_worker(session_factory)
     t = await _mk_task(session_factory, worker_id=w.id)
 
@@ -10208,11 +12363,29 @@ async def test_chat_proxy_for_worker_task(client, session_factory, monkeypatch):
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
     monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
 
-    resp = await client.post(f"/api/tasks/{t.id}/chat", json={"message": "hello worker"})
+    resp = await client.post(
+        f"/api/tasks/{t.id}/chat",
+        json={
+            "message": "hello worker",
+            "file_paths": [f"/api/uploads/{upload_name}"],
+        },
+    )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["session_id"] == "sess-1"
-    assert body["instance_id"] is None
+    assert body["has_session"] is True
+    assert "session_id" not in body
+    assert "instance_id" not in body
+    chat_call = next(
+        call
+        for call in proxy.proxy_to_worker.await_args_list
+        if call.args[1] == "POST"
+    )
+    assert chat_call.kwargs["body"]["file_paths"] == [remote_path]
+    proxy.push_files.assert_awaited_once_with(
+        w,
+        [str(upload_path)],
+        remote_paths=[remote_path],
+    )
 
     async with session_factory() as db:
         logs = (await db.execute(
@@ -10343,6 +12516,12 @@ async def test_worker_chat_commit_cancellation_arms_handoff_recovery_first(
     assert user_log is not None
     assert user_log.task_retry_count == task.retry_count
     assert user_log.task_turn_generation == task.turn_generation + 1
+    assert json.loads(user_log.raw_json)["execution_principal"] == {
+        "user_id": None,
+        "role": "super_admin",
+        "mode": "unrestricted",
+        "kind": "deployment_token",
+    }
 
 
 @pytest.mark.parametrize(
@@ -10385,11 +12564,14 @@ async def test_worker_internal_handoff_rejects_unsettled_harness_graph(
         "worker_turn_handoff_id": handoff_id,
         "worker_turn_handoff_retry_count": task.retry_count,
         "worker_turn_handoff_from_generation": task.turn_generation,
+        "worker_turn_handoff_incarnation_id": task.incarnation_id,
+        **worker_relay_module.canonical_delegated_principal_payload(task),
     }
 
     response = await client.post(
         f"/api/tasks/{task.id}/chat",
         json=payload,
+        headers={"X-CCM-Task-Incarnation": task.incarnation_id},
     )
 
     assert response.status_code == 409, response.text
@@ -10432,15 +12614,19 @@ async def test_worker_internal_chat_handoff_post_is_durable_and_idempotent(
     monkeypatch.setattr(main_module, "dispatcher", dispatcher)
     monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
     handoff_id = "a" * 32
-    payload = {
-        "message": "run this exact follow-up",
-        "worker_turn_handoff_id": handoff_id,
-        "worker_turn_handoff_retry_count": task.retry_count,
-        "worker_turn_handoff_from_generation": task.turn_generation,
-    }
+    payload = _internal_worker_handoff_payload(
+        task,
+        handoff_id=handoff_id,
+        message="run this exact follow-up",
+    )
+    headers = _worker_task_incarnation_headers(task)
 
-    first = await client.post(f"/api/tasks/{task.id}/chat", json=payload)
-    duplicate = await client.post(f"/api/tasks/{task.id}/chat", json=payload)
+    first = await client.post(
+        f"/api/tasks/{task.id}/chat", json=payload, headers=headers
+    )
+    duplicate = await client.post(
+        f"/api/tasks/{task.id}/chat", json=payload, headers=headers
+    )
 
     assert first.status_code == 200, first.text
     assert duplicate.status_code == 200, duplicate.text
@@ -10463,23 +12649,32 @@ async def test_worker_internal_chat_handoff_post_is_durable_and_idempotent(
     metadata = json.loads(logs[0].raw_json)["worker_turn_handoff"]
     assert metadata["id"] == handoff_id
     assert metadata["queue_payload"]["prompt"] == payload["message"]
+    assert metadata["queue_payload"]["initiating_user_id"] is None
+    assert metadata["queue_payload"]["initiating_user_role"] == "member"
+    assert metadata["queue_payload"]["execution_mode"] == "sandbox"
+    assert (
+        metadata["queue_payload"]["execution_principal_kind"] == "system"
+    )
     assert dispatcher.enqueue_worker_turn_handoff.await_count == 2
 
     changed = await client.post(
         f"/api/tasks/{task.id}/chat",
         json={**payload, "message": "different request"},
+        headers=headers,
     )
     assert changed.status_code == 409
 
     receipt = await client.get(
-        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}"
+        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}",
+        headers=headers,
     )
     assert receipt.status_code == 200, receipt.text
     assert receipt.json()["status"] == "accepted"
     assert "queue_payload" not in receipt.json()
     assert payload["message"] not in receipt.text
     resumed = await client.post(
-        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}/resume"
+        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}/resume",
+        headers=headers,
     )
     assert resumed.status_code == 200, resumed.text
     assert resumed.json()["resumed"] is True
@@ -10496,7 +12691,8 @@ async def test_worker_internal_chat_handoff_post_is_durable_and_idempotent(
         durable_receipt.claimed_turn_generation = task.turn_generation + 1
         await db.commit()
     launched = await client.get(
-        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}"
+        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}",
+        headers=headers,
     )
     assert launched.status_code == 200
     assert launched.json()["status"] == "launched"
@@ -10534,14 +12730,16 @@ async def test_worker_internal_handoff_duplicate_and_resume_obey_boundary(
     monkeypatch.setattr(main_module, "dispatcher", dispatcher)
     monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
     handoff_id = "b" * 32
-    payload = {
-        "message": "resume only before the provider boundary",
-        "worker_turn_handoff_id": handoff_id,
-        "worker_turn_handoff_retry_count": task.retry_count,
-        "worker_turn_handoff_from_generation": task.turn_generation,
-    }
+    payload = _internal_worker_handoff_payload(
+        task,
+        handoff_id=handoff_id,
+        message="resume only before the provider boundary",
+    )
+    headers = _worker_task_incarnation_headers(task)
 
-    first = await client.post(f"/api/tasks/{task.id}/chat", json=payload)
+    first = await client.post(
+        f"/api/tasks/{task.id}/chat", json=payload, headers=headers
+    )
     assert first.status_code == 200, first.text
     async with session_factory() as db:
         current = await db.get(Task, task.id)
@@ -10559,7 +12757,9 @@ async def test_worker_internal_handoff_duplicate_and_resume_obey_boundary(
         await db.commit()
 
     dispatcher.enqueue_worker_turn_handoff.reset_mock()
-    duplicate = await client.post(f"/api/tasks/{task.id}/chat", json=payload)
+    duplicate = await client.post(
+        f"/api/tasks/{task.id}/chat", json=payload, headers=headers
+    )
 
     assert duplicate.status_code == expected_status, duplicate.text
     if expected_status == 200:
@@ -10571,7 +12771,8 @@ async def test_worker_internal_handoff_duplicate_and_resume_obey_boundary(
 
     dispatcher.enqueue_worker_turn_handoff.reset_mock()
     resume_response = await client.post(
-        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}/resume"
+        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}/resume",
+        headers=headers,
     )
 
     assert resume_response.status_code == expected_status, resume_response.text
@@ -10610,13 +12811,15 @@ async def test_worker_handoff_rejects_tampered_structured_queue_payload(
     monkeypatch.setattr(main_module, "dispatcher", dispatcher)
     monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
     handoff_id = "d" * 32
-    payload = {
-        "message": "original exact prompt",
-        "worker_turn_handoff_id": handoff_id,
-        "worker_turn_handoff_retry_count": task.retry_count,
-        "worker_turn_handoff_from_generation": task.turn_generation,
-    }
-    first = await client.post(f"/api/tasks/{task.id}/chat", json=payload)
+    payload = _internal_worker_handoff_payload(
+        task,
+        handoff_id=handoff_id,
+        message="original exact prompt",
+    )
+    headers = _worker_task_incarnation_headers(task)
+    first = await client.post(
+        f"/api/tasks/{task.id}/chat", json=payload, headers=headers
+    )
     assert first.status_code == 200
 
     async with session_factory() as db:
@@ -10626,12 +12829,16 @@ async def test_worker_handoff_rejects_tampered_structured_queue_payload(
         receipt.queue_payload = changed
         await db.commit()
 
-    duplicate = await client.post(f"/api/tasks/{task.id}/chat", json=payload)
+    duplicate = await client.post(
+        f"/api/tasks/{task.id}/chat", json=payload, headers=headers
+    )
     stored = await client.get(
-        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}"
+        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}",
+        headers=headers,
     )
     resumed = await client.post(
-        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}/resume"
+        f"/api/tasks/{task.id}/worker-turn-handoffs/{handoff_id}/resume",
+        headers=headers,
     )
     assert duplicate.status_code == 409
     assert stored.status_code == 409
@@ -10667,45 +12874,35 @@ async def test_worker_chat_lost_http_ack_reconciles_exact_handoff_receipt(
     proxy = AsyncMock()
     proxy.require_ready_worker.return_value = worker
     proxy.relay = AsyncMock()
-    captured_handoff = None
+    captured_request = None
 
     async def route_then_lose_ack(_task, method, _path, *_args, **kwargs):
-        nonlocal captured_handoff
+        nonlocal captured_request
         if method == "GET":
             return _routing_snapshot(task)
-        captured_handoff = kwargs["body"]["worker_turn_handoff_id"]
+        captured_request = kwargs["body"]
         raise HTTPException(503, "lost Worker response")
 
     proxy.proxy_to_worker.side_effect = route_then_lose_ack
 
-    async def get_receipt(_worker, task_id, handoff_id):
+    async def get_receipt(_worker, task_id, handoff_id, incarnation_id):
         assert task_id == task.id
-        assert handoff_id == captured_handoff
-        return {
-            "handoff_id": handoff_id,
-            "task_id": task_id,
-            "status": handoff_status,
-            "retry_count": task.retry_count,
-            "from_generation": task.turn_generation,
-            "turn_generation": (
-                None
-                if handoff_status == "accepted"
-                else task.turn_generation + 1
-            ),
-            "source_log_id": 91,
-            "response": {
-                "ok": True,
-                "queued": True,
-                "session_id": task.session_id,
-            },
-        }
+        assert captured_request is not None
+        assert handoff_id == captured_request["worker_turn_handoff_id"]
+        assert incarnation_id == task.incarnation_id
+        return _remote_worker_handoff_receipt(
+            task,
+            captured_request,
+            status=handoff_status,
+        )
 
     proxy.get_worker_turn_handoff_receipt.side_effect = get_receipt
-    async def resume_receipt(_worker, task_id, handoff_id):
+    async def resume_receipt(_worker, task_id, handoff_id, incarnation_id):
         return await get_receipt(
             _worker,
             task_id,
             handoff_id,
+            incarnation_id,
         )
 
     proxy.resume_worker_turn_handoff.side_effect = resume_receipt
@@ -10718,7 +12915,8 @@ async def test_worker_chat_lost_http_ack_reconciles_exact_handoff_receipt(
     )
 
     assert response.status_code == 200, response.text
-    assert captured_handoff is not None
+    assert captured_request is not None
+    captured_handoff = captured_request["worker_turn_handoff_id"]
     proxy.get_worker_turn_handoff_receipt.assert_awaited_once()
     if should_resume:
         proxy.resume_worker_turn_handoff.assert_awaited_once()
@@ -10754,28 +12952,29 @@ async def test_worker_chat_lost_ack_mismatched_turn_fails_closed(
     proxy = AsyncMock()
     proxy.require_ready_worker.return_value = worker
     proxy.relay = AsyncMock()
-    captured_handoff = None
+    captured_request = None
 
     async def route_then_lose_ack(_task, method, _path, *_args, **kwargs):
-        nonlocal captured_handoff
+        nonlocal captured_request
         if method == "GET":
             return _routing_snapshot(task)
-        captured_handoff = kwargs["body"]["worker_turn_handoff_id"]
+        captured_request = kwargs["body"]
         raise HTTPException(503, "lost Worker response")
 
     proxy.proxy_to_worker.side_effect = route_then_lose_ack
 
-    async def get_receipt(_worker, task_id, handoff_id):
-        return {
-            "handoff_id": handoff_id,
-            "task_id": task_id,
-            "status": "launching",
-            "retry_count": task.retry_count,
-            "from_generation": task.turn_generation,
+    async def get_receipt(_worker, task_id, handoff_id, incarnation_id):
+        assert task_id == task.id
+        assert captured_request is not None
+        assert handoff_id == captured_request["worker_turn_handoff_id"]
+        assert incarnation_id == task.incarnation_id
+        return _remote_worker_handoff_receipt(
+            task,
+            captured_request,
+            status="launching",
             # Same handoff id cannot lend authority to a different turn.
-            "turn_generation": task.turn_generation + 2,
-            "response": {"ok": True, "queued": True},
-        }
+            turn_generation=task.turn_generation + 2,
+        )
 
     proxy.get_worker_turn_handoff_receipt.side_effect = get_receipt
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
@@ -10787,7 +12986,8 @@ async def test_worker_chat_lost_ack_mismatched_turn_fails_closed(
     )
 
     assert response.status_code == 503
-    assert captured_handoff is not None
+    assert captured_request is not None
+    captured_handoff = captured_request["worker_turn_handoff_id"]
     proxy.resume_worker_turn_handoff.assert_not_awaited()
     assert sum(
         call.args[1] == "POST"
@@ -11236,6 +13436,98 @@ async def test_worker_chat_sender_prefix_is_display_only(session_factory, monkey
     assert event["id"] == stored.id
     assert event["task_id"] == t.id
     assert event["timestamp"].endswith("Z")
+
+
+async def test_worker_terminal_pr_chat_separates_actor_from_sandbox_principal(
+    session_factory,
+    monkeypatch,
+):
+    """The Manager audit row must not encode admin/user + sandbox together."""
+
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+    from backend.models.user import User
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+        session_id="terminal-worker-pr-session",
+    )
+    async with session_factory() as db:
+        sender = User(
+            email="worker-terminal-pr@test.local",
+            name="Worker PR Admin",
+            password_hash="unused",
+            role="admin",
+        )
+        db.add(sender)
+        await db.commit()
+        await db.refresh(sender)
+        sender_id = sender.id
+
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.relay = AsyncMock()
+
+    async def route_then_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        return {
+            "ok": True,
+            "queued": True,
+            "session_id": task.session_id,
+        }
+
+    proxy.proxy_to_worker.side_effect = route_then_chat
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    monkeypatch.setattr(
+        "backend.api.tasks._require_pr_review_chat_allowed",
+        AsyncMock(return_value=True),
+    )
+    request = SimpleNamespace(state=SimpleNamespace(
+        user_id=sender_id,
+        user_role="admin",
+        auth_type="jwt",
+    ))
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        await _send_worker_chat(
+            current,
+            ChatMessage(message="explain this terminal review"),
+            db,
+            request,
+        )
+
+    post = next(
+        call
+        for call in proxy.proxy_to_worker.await_args_list
+        if call.args[1] == "POST"
+    )
+    forwarded = post.kwargs["body"]
+    assert forwarded["execution_user_id"] is None
+    assert forwarded["execution_user_role"] == "member"
+    assert forwarded["execution_mode"] == "sandbox"
+    assert forwarded["execution_principal_kind"] == "system"
+    async with session_factory() as db:
+        stored = await db.scalar(
+            select(LogEntry).where(
+                LogEntry.task_id == task.id,
+                LogEntry.event_type == "user_message",
+            )
+        )
+    metadata = json.loads(stored.raw_json)
+    assert metadata["execution_principal"] == {
+        "user_id": None,
+        "role": "member",
+        "mode": "sandbox",
+        "kind": "system",
+    }
+    assert metadata["actor_user_id"] == sender_id
 
 
 async def test_worker_chat_applies_exact_mirrored_plan_version(
@@ -13061,7 +15353,21 @@ async def test_monitor_delete_translates_remote_id(client, session_factory, monk
     w = await _mk_worker(session_factory)
     t = await _mk_task(session_factory, worker_id=w.id)
     async with session_factory() as db:
-        ms = MonitorSession(task_id=t.id, remote_id=5, description="m", status="running")
+        ms = MonitorSession(
+            task_id=t.id,
+            remote_id=5,
+            agent_type="monitor",
+            source="ccm",
+            description="m",
+            status="running",
+            meta=json.dumps({
+                "ccm_worker_mirror": {
+                    "worker_id": w.id,
+                    "task_incarnation_id": t.incarnation_id,
+                    "remote_id": 5,
+                }
+            }),
+        )
         db.add(ms)
         await db.commit()
         await db.refresh(ms)

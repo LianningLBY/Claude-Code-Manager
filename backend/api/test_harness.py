@@ -14,9 +14,9 @@ from starlette.background import BackgroundTask
 
 from backend.api.deps import (
     get_current_user_id,
+    lock_task_effect_access,
     require_internal_service,
     require_internal_task_incarnation,
-    require_task_access,
     require_task_control,
 )
 from backend.config import settings
@@ -40,7 +40,10 @@ from backend.services.test_harness_runtime import (
     build_saved_harness_runtime,
     harness_runtime_config_payload,
 )
-from backend.services.workspace_review import workspace_review_capability
+from backend.services.workspace_review import (
+    public_workspace_review_capability,
+    workspace_review_capability,
+)
 from backend.services.test_harness_targets import untrusted_git_target_capability
 from backend.services.test_harness_owner_fence import (
     TestHarnessOwnerIdentity,
@@ -153,9 +156,12 @@ async def get_test_harness_capabilities(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     task = await _task_or_404(task_id, db)
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     project = await db.get(Project, task.project_id) if task.project_id else None
-    workspace = workspace_review_capability(task, project)
+    workspace = public_workspace_review_capability(
+        workspace_review_capability(task, project),
+        include_suggestion=False,
+    )
     try:
         runtime = harness_runtime_config_payload(task)
     except ValueError as exc:
@@ -203,7 +209,7 @@ async def get_test_harness_runtime_config(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     task = await _task_or_404(task_id, db)
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     try:
         return harness_runtime_config_payload(task)
     except ValueError as exc:
@@ -286,13 +292,28 @@ async def start_test_harness_run(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     task = await _task_or_404(task_id, db)
-    await require_task_control(request, task, db)
+    task = await lock_task_effect_access(
+        request,
+        task,
+        db,
+        allow_chat_share=False,
+        fence_worker_node=True,
+    )
     if task.status not in {"completed", "failed", "cancelled", "conflict"}:
         raise HTTPException(
             status_code=409,
             detail="等待当前 Task 回合结束后再从界面启动测试；执行中的 Agent 可直接调用测试工具",
         )
+    locality_error = test_harness_owner_locality_error(task)
+    if locality_error is not None:
+        raise HTTPException(status_code=409, detail=locality_error)
     owner_identity = test_harness_owner_identity(task)
+    # The Harness service materializes the durable Run in its own database
+    # session under Node-control -> owner Task locks.  Commit this
+    # Node-control -> Project -> Task -> membership -> User authorization
+    # transaction first: it is the public effect's linearization point and
+    # avoids holding the same owner rows across two independent sessions.
+    await db.commit()
     return await _start(
         task=task,
         body=body,
@@ -359,7 +380,7 @@ async def list_test_harness_runs(
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
     task = await _task_or_404(task_id, db)
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     try:
         await test_harness_service.refresh_task_staleness(task_id)
     except (TestHarnessError, OSError, ValueError):
@@ -377,7 +398,7 @@ async def get_test_harness_run(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     task = await _task_or_404(task_id, db)
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     run = await test_harness_service.get_run(run_id)
     if run is None or run["task_id"] != task_id:
         raise HTTPException(status_code=404, detail="Test run not found")
@@ -503,16 +524,28 @@ async def repeat_test_harness_run(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     task = await _task_or_404(task_id, db)
-    await require_task_control(request, task, db)
+    task = await lock_task_effect_access(
+        request,
+        task,
+        db,
+        allow_chat_share=False,
+        fence_worker_node=True,
+    )
     if task.status not in {"completed", "failed", "cancelled", "conflict"}:
         raise HTTPException(
             status_code=409,
             detail="等待当前 Task 回合结束后再从界面重复测试",
         )
+    locality_error = test_harness_owner_locality_error(task)
+    if locality_error is not None:
+        raise HTTPException(status_code=409, detail=locality_error)
+    owner_identity = test_harness_owner_identity(task)
+    # See start_test_harness_run(): authorize and release the route session
+    # before the service takes its own Node/owner materialization fence.
+    await db.commit()
     source = await test_harness_service.get_run(run_id)
     if source is None or source["task_id"] != task_id:
         raise HTTPException(status_code=404, detail="Test run not found")
-    owner_identity = test_harness_owner_identity(task)
     try:
         repeated = await test_harness_service.repeat(
             run_id,
@@ -540,7 +573,7 @@ async def compare_test_harness_runs(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     task = await _task_or_404(task_id, db)
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     base = await test_harness_service.get_run(run_id)
     candidate = await test_harness_service.get_run(candidate_run_id)
     if (
@@ -566,7 +599,7 @@ async def get_test_harness_evidence(
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     task = await _task_or_404(task_id, db)
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     run = await test_harness_service.get_run(run_id)
     if run is None or run["task_id"] != task_id:
         raise HTTPException(status_code=404, detail="Test run not found")

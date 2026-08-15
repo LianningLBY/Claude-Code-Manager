@@ -27,6 +27,7 @@ from backend.services.instance_manager import (
     LiveAttachmentInjectionUnsupportedError,
     SharedProjectAgentLaunchDisabledError,
     _OutputConsumerRecord,
+    _SshAgentSocketSnapshot,
 )
 from backend.services.claude_pool import ClaudePool
 from backend.services.codex_pool import CodexPool
@@ -88,17 +89,21 @@ from backend.services.test_harness import TestHarnessService
 def _no_pty_no_skills(monkeypatch):
     """Disable optional runtimes and external isolation probes by default."""
     monkeypatch.setattr("backend.config.settings.use_pty_mode", False)
+    # Keep this override on the same MonkeyPatch undo stack as test-local
+    # overrides of the validator.  Mixing a ``patch(...): yield`` fixture with
+    # ``monkeypatch.setattr`` in a test can restore the fixture's MagicMock
+    # *after* the fixture exits, leaking a no-op validator into later modules.
+    monkeypatch.setattr(
+        "backend.services.task_agent_isolation."
+        "validate_claude_task_isolation_settings",
+        lambda *_args, **_kwargs: None,
+    )
     with patch("backend.services.skill_loader.discover_skills", return_value={}), \
          patch("backend.services.skill_loader.build_skill_prompt_file", return_value=""), \
          patch("backend.services.skill_loader.get_skill_disallowed_tools", return_value=[]), \
          patch(
              "backend.services.skill_context.build_task_skill_context",
              new=AsyncMock(return_value=""),
-         ), \
-         patch(
-             "backend.services.task_agent_isolation."
-             "validate_claude_task_isolation_settings",
-             return_value=None,
          ):
         yield
 
@@ -220,6 +225,65 @@ def test_claude_hot_runtime_fingerprint_covers_mcp_and_full_git_environment(
             "GIT_SSH_COMMAND": "ssh -i /private/key-b",
         },
     )
+
+
+def test_claude_hot_runtime_fingerprint_covers_ssh_socket_inode(tmp_path):
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text('{"permissions":{"allow":[]}}')
+    first = InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=None,
+        git_env={"SSH_AUTH_SOCK": "/run/user/1000/agent.sock"},
+        ssh_agent_socket_identity=(
+            "/run/user/1000/agent.sock",
+            1,
+            11,
+            os.geteuid(),
+        ),
+    )
+    second = InstanceManager._claude_task_runtime_fingerprint(
+        settings_path,
+        mcp_config_path=None,
+        git_env={"SSH_AUTH_SOCK": "/run/user/1000/agent.sock"},
+        ssh_agent_socket_identity=(
+            "/run/user/1000/agent.sock",
+            1,
+            12,
+            os.geteuid(),
+        ),
+    )
+    assert first != second
+
+
+def test_ssh_agent_snapshot_rejects_non_socket_and_detects_replacement(
+    tmp_path,
+    monkeypatch,
+):
+    unsafe = tmp_path / "not-a-socket"
+    unsafe.write_text("not a socket")
+    with pytest.raises(LaunchSupersededError, match="safe owned Unix socket"):
+        _SshAgentSocketSnapshot.capture(str(unsafe))
+
+    original = _SshAgentSocketSnapshot(
+        "/run/user/1000/agent.sock",
+        1,
+        11,
+        os.geteuid(),
+    )
+    monkeypatch.setattr(
+        _SshAgentSocketSnapshot,
+        "capture",
+        classmethod(
+            lambda _cls, _path: _SshAgentSocketSnapshot(
+                "/run/user/1000/agent.sock",
+                1,
+                12,
+                os.geteuid(),
+            )
+        ),
+    )
+    with pytest.raises(LaunchSupersededError, match="changed"):
+        original.assert_current()
 
 
 def _api_account_stub(tmp_path, *, api_provider="cloudrouter"):
@@ -4332,6 +4396,33 @@ async def test_launch_with_effort_level(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_provider_boundary_rejects_unmanaged_attachment_before_launch(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", upload_dir)
+    outside = tmp_path / "99999999-9999-4999-8999-999999999999.txt"
+    outside.write_text("not a managed upload", encoding="utf-8")
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+
+    with pytest.raises(
+        LaunchSupersededError,
+        match="no longer a managed upload",
+    ):
+        await manager.launch(
+            instance_id=999_999,
+            prompt="read it",
+            attachment_paths=(str(outside),),
+        )
+
+
+@pytest.mark.asyncio
 async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
     db_factory,
     monkeypatch,
@@ -4340,7 +4431,9 @@ async def test_claude_launch_injects_task_ssh_server_for_valid_grant(
     monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()
-    attachment = upload_dir / "notes.md"
+    attachment = (
+        upload_dir / "11111111-1111-4111-8111-111111111111.md"
+    )
     attachment.write_text("trusted attachment", encoding="utf-8")
     monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", upload_dir)
     monkeypatch.setattr(
@@ -4478,6 +4571,10 @@ async def test_admin_claude_unrestricted_direct_uses_explicit_allow_profile_and_
             status="executing",
             provider="claude",
             instance_id=inst.id,
+            execution_user_id=principal.id,
+            execution_user_role="admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="user",
         )
         db.add(task)
         await db.flush()
@@ -4513,6 +4610,7 @@ async def test_admin_claude_unrestricted_direct_uses_explicit_allow_profile_and_
             initiating_user_id=principal_id,
             initiating_user_role="admin",
             execution_mode="unrestricted",
+            execution_principal_kind="user",
         )
 
     validate.assert_not_called()
@@ -4554,7 +4652,9 @@ async def test_super_admin_claude_unrestricted_pty_cold_resume_uses_explicit_all
     )
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()
-    attachment = upload_dir / "outside-workspace.pdf"
+    attachment = (
+        upload_dir / "22222222-2222-4222-8222-222222222222.pdf"
+    )
     attachment.write_bytes(b"test-only attachment")
     monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", upload_dir)
     workspace = tmp_path / "workspace"
@@ -4576,6 +4676,10 @@ async def test_super_admin_claude_unrestricted_pty_cold_resume_uses_explicit_all
             status="executing",
             provider="claude",
             instance_id=inst.id,
+            execution_user_id=principal.id,
+            execution_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="user",
         )
         db.add(task)
         await db.commit()
@@ -4623,6 +4727,7 @@ async def test_super_admin_claude_unrestricted_pty_cold_resume_uses_explicit_all
         initiating_user_id=principal_id,
         initiating_user_role="super_admin",
         execution_mode="unrestricted",
+        execution_principal_kind="user",
         attachment_paths=(str(attachment),),
     )
 
@@ -4689,6 +4794,10 @@ async def test_unrestricted_retry_revalidates_principal_before_provider_launch(
             status="executing",
             provider="claude",
             instance_id=inst.id,
+            execution_user_id=principal.id,
+            execution_user_role="admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="user",
         )
         db.add(task)
         await db.commit()
@@ -4716,9 +4825,138 @@ async def test_unrestricted_retry_revalidates_principal_before_provider_launch(
                 initiating_user_id=principal_id,
                 initiating_user_role="admin",
                 execution_mode="unrestricted",
+                execution_principal_kind="user",
             )
 
     exec_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "transport", "app_server_enabled", "pty_enabled"),
+    [
+        ("claude", "claude_exec", False, False),
+        ("claude", "claude_pty", False, True),
+        ("codex", "codex_exec", False, False),
+        ("codex", "codex_app_server", True, False),
+    ],
+)
+async def test_local_user_demotion_between_precheck_and_transport_commit_blocks_provider(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    provider,
+    transport,
+    app_server_enabled,
+    pty_enabled,
+):
+    """The final Task/User/source transaction closes the role-check race."""
+
+    monkeypatch.setattr(
+        settings,
+        "codex_app_server_enabled",
+        app_server_enabled,
+    )
+    instance_id, task_id, source_id = await _make_actual_transport_scope(
+        db_factory,
+        provider=provider,
+    )
+    async with db_factory() as db:
+        principal = User(
+            email=f"boundary-admin-{transport}@example.com",
+            name="Boundary Admin",
+            password_hash="test-only",
+            role="admin",
+            is_active=True,
+        )
+        db.add(principal)
+        await db.flush()
+        task = await db.get(Task, task_id)
+        task.execution_user_id = principal.id
+        task.execution_user_role = "admin"
+        task.execution_mode = "unrestricted"
+        task.execution_principal_kind = "user"
+        await db.commit()
+        principal_id = principal.id
+
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    provider_effects = []
+    original_persist = manager._persist_actual_turn_transport
+
+    async def demote_after_principal_precheck(**kwargs):
+        # require_current_initiating_principal() has already read the admitted
+        # admin. Commit the demotion in the historical race window immediately
+        # before the final transport transaction starts.
+        async with db_factory() as db:
+            demoted = await db.execute(
+                update(User)
+                .where(User.id == principal_id, User.role == "admin")
+                .values(role="member")
+            )
+            assert demoted.rowcount == 1
+            await db.commit()
+        return await original_persist(**kwargs)
+
+    async def direct_spawn(*_args, **_kwargs):
+        provider_effects.append("direct_spawn")
+        return _make_mock_process(pid=62_000 + source_id)
+
+    async def app_server_launch(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        provider_effects.append("app_server_turn_start")
+        return 62_100 + source_id
+
+    async def pty_launch(**kwargs):
+        await kwargs["on_launch_admitted"]()
+        provider_effects.append("pty_send_prompt")
+        return 62_200 + source_id
+
+    manager._persist_actual_turn_transport = AsyncMock(
+        side_effect=demote_after_principal_precheck
+    )
+    manager._spawn_managed_direct_process = AsyncMock(
+        side_effect=direct_spawn
+    )
+    manager._launch_codex_app_server = AsyncMock(
+        side_effect=app_server_launch
+    )
+    manager._launch_pty = AsyncMock(side_effect=pty_launch)
+    if pty_enabled:
+        manager._pty_enabled = True
+        manager._pty_backend = MagicMock()
+
+    with pytest.raises(
+        LaunchSupersededError,
+        match="role or active state changed at the provider boundary",
+    ):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="must not cross the provider boundary",
+            task_id=task_id,
+            task_turn_generation=7,
+            cwd=str(tmp_path),
+            provider=provider,
+            config_dir=(
+                str(tmp_path / f"{transport}-home")
+                if provider == "codex"
+                else None
+            ),
+            source_log_id=source_id,
+            initiating_user_id=principal_id,
+            initiating_user_role="admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="user",
+        )
+
+    assert provider_effects == []
+    async with db_factory() as db:
+        principal = await db.get(User, principal_id)
+        source = await db.get(LogEntry, source_id)
+        assert principal.role == "member"
+        assert source.actual_transport is None
 
 
 @pytest.mark.asyncio
@@ -5153,19 +5391,272 @@ async def test_admin_codex_ssh_turn_uses_unrestricted_profile(
     monkeypatch,
     tmp_path,
 ):
+    import socket
+
     monkeypatch.setattr(settings, "auth_token", "manager-test-token")
     monkeypatch.setattr(settings, "codex_app_server_enabled", True)
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    agent_path = tmp_path / "admin-ssh-agent.sock"
+    agent_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    agent_socket.bind(str(agent_path))
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(agent_path))
     async with db_factory() as db:
         inst = Instance(name="admin-codex-ssh")
+        principal = User(
+            email="admin-codex-ssh@example.com",
+            name="Admin Codex SSH",
+            password_hash="test-only",
+            role="super_admin",
+            is_active=True,
+        )
         profile = _managed_ssh_profile("admin-codex-profile")
-        db.add_all([inst, profile])
+        db.add_all([inst, principal, profile])
         await db.flush()
         task = Task(
             title="Admin Codex SSH",
             status="executing",
             provider="codex",
             instance_id=inst.id,
+            execution_user_id=principal.id,
+            execution_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="user",
+        )
+        db.add(task)
+        await db.flush()
+        db.add(TaskSSHGrant(
+            task_id=task.id,
+            ssh_profile_id=profile.id,
+            profile_revision=profile.revision,
+            capabilities=["read"],
+        ))
+        await db.commit()
+        task_id, instance_id, principal_id = task.id, inst.id, principal.id
+
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    im._launch_codex_app_server = AsyncMock(return_value=45_679)
+    try:
+        await im.launch(
+            instance_id=instance_id,
+            prompt="inspect production",
+            task_id=task_id,
+            cwd=str(tmp_path),
+            provider="codex",
+            config_dir=str(tmp_path / "admin-codex-home"),
+            initiating_user_id=principal_id,
+            initiating_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="user",
+        )
+    finally:
+        agent_socket.close()
+
+    kwargs = im._launch_codex_app_server.await_args.kwargs
+    assert kwargs["sandbox_mode"] == "danger-full-access"
+    assert kwargs["task_ssh_protected_paths"] == ()
+    assert kwargs["disable_project_config"] is False
+    assert kwargs["disable_user_mcp"] is False
+    assert kwargs["disable_autonomous_features"] is False
+    assert kwargs["git_env"]["SSH_AUTH_SOCK"] == str(agent_path)
+    assert any(spec.name == "ccm_ssh" for spec in kwargs["mcp_specs"])
+
+
+@pytest.mark.asyncio
+async def test_admin_claude_ssh_grant_keeps_ambient_agent(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    import socket
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    agent_path = tmp_path / "admin-claude-ssh-agent.sock"
+    agent_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    agent_socket.bind(str(agent_path))
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(agent_path))
+
+    async with db_factory() as db:
+        instance = Instance(name="admin-claude-ssh")
+        principal = User(
+            email="admin-claude-ssh@example.com",
+            name="Admin Claude SSH",
+            password_hash="test-only",
+            role="admin",
+            is_active=True,
+        )
+        profile = _managed_ssh_profile("admin-claude-profile")
+        db.add_all([instance, principal, profile])
+        await db.flush()
+        task = Task(
+            title="Admin Claude SSH",
+            status="executing",
+            provider="claude",
+            instance_id=instance.id,
+            execution_user_id=principal.id,
+            execution_user_role="admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="user",
+        )
+        db.add(task)
+        await db.flush()
+        db.add(TaskSSHGrant(
+            task_id=task.id,
+            ssh_profile_id=profile.id,
+            profile_revision=profile.revision,
+            capabilities=["read"],
+        ))
+        await db.commit()
+        task_id = task.id
+        instance_id = instance.id
+        principal_id = principal.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    process = _make_mock_process()
+    try:
+        with patch(
+            "backend.services.instance_manager.asyncio.create_subprocess_exec",
+            new_callable=AsyncMock,
+            return_value=process,
+        ) as spawn:
+            await manager.launch(
+                instance_id=instance_id,
+                prompt="use ambient and managed SSH routes",
+                task_id=task_id,
+                cwd=str(tmp_path),
+                provider="claude",
+                config_dir=str(tmp_path / "admin-claude-home"),
+                initiating_user_id=principal_id,
+                initiating_user_role="admin",
+                execution_mode="unrestricted",
+                execution_principal_kind="user",
+            )
+        runtime_env = spawn.await_args.kwargs["env"]
+        assert runtime_env["SSH_AUTH_SOCK"] == str(agent_path)
+        argv = spawn.await_args.args
+        assert "--mcp-config" in argv
+        await asyncio.sleep(0.1)
+    finally:
+        agent_socket.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_deployment_token_unrestricted_turn_inherits_safe_ssh_agent(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    provider,
+):
+    """The deployment token has the same local SSH authority as an admin."""
+    import socket
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    agent_path = tmp_path / "ssh-agent.sock"
+    agent_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    agent_socket.bind(str(agent_path))
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(agent_path))
+
+    async with db_factory() as db:
+        inst = Instance(name=f"deployment-token-{provider}-ssh")
+        db.add(inst)
+        await db.flush()
+        task = Task(
+            title="deployment token unrestricted SSH",
+            status="executing",
+            provider=provider,
+            instance_id=inst.id,
+            execution_user_id=None,
+            execution_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="deployment_token",
+        )
+        db.add(task)
+        await db.commit()
+        task_id, instance_id = task.id, inst.id
+
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    try:
+        if provider == "codex":
+            manager._launch_codex_app_server = AsyncMock(return_value=45_680)
+            await manager.launch(
+                instance_id=instance_id,
+                prompt="use my existing SSH agent",
+                task_id=task_id,
+                cwd=str(tmp_path),
+                provider="codex",
+                config_dir=str(tmp_path / "codex-home"),
+                initiating_user_id=None,
+                initiating_user_role="super_admin",
+                execution_mode="unrestricted",
+                execution_principal_kind="deployment_token",
+            )
+            kwargs = manager._launch_codex_app_server.await_args.kwargs
+            assert kwargs["sandbox_mode"] == "danger-full-access"
+            assert kwargs["git_env"]["SSH_AUTH_SOCK"] == str(agent_path)
+        else:
+            process = _make_mock_process()
+            with patch(
+                "backend.services.instance_manager.asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+                return_value=process,
+            ) as spawn:
+                await manager.launch(
+                    instance_id=instance_id,
+                    prompt="use my existing SSH agent",
+                    task_id=task_id,
+                    cwd=str(tmp_path),
+                    provider="claude",
+                    initiating_user_id=None,
+                    initiating_user_role="super_admin",
+                    execution_mode="unrestricted",
+                    execution_principal_kind="deployment_token",
+                )
+            assert spawn.await_args.kwargs["env"]["SSH_AUTH_SOCK"] == str(
+                agent_path
+            )
+            await asyncio.sleep(0.1)
+    finally:
+        agent_socket.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_deployment_token_task_ssh_grant_keeps_ambient_agent(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    provider,
+):
+    """Managed SSH is additive for an unrestricted deployment-token turn."""
+    import socket
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    agent_path = tmp_path / "ssh-agent.sock"
+    agent_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    agent_socket.bind(str(agent_path))
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(agent_path))
+
+    async with db_factory() as db:
+        inst = Instance(name=f"deployment-token-{provider}-granted-ssh")
+        profile = _managed_ssh_profile("deployment-token-granted-profile")
+        db.add_all([inst, profile])
+        await db.flush()
+        task = Task(
+            title="deployment token managed SSH",
+            status="executing",
+            provider=provider,
+            instance_id=inst.id,
+            execution_user_id=None,
+            execution_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="deployment_token",
         )
         db.add(task)
         await db.flush()
@@ -5178,26 +5669,306 @@ async def test_admin_codex_ssh_turn_uses_unrestricted_profile(
         await db.commit()
         task_id, instance_id = task.id, inst.id
 
-    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
-    im._launch_codex_app_server = AsyncMock(return_value=45_679)
-    await im.launch(
-        instance_id=instance_id,
-        prompt="inspect production",
-        task_id=task_id,
-        cwd=str(tmp_path),
-        provider="codex",
-        config_dir=str(tmp_path / "admin-codex-home"),
-        initiating_user_role="super_admin",
-        execution_mode="unrestricted",
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    try:
+        launch_kwargs = {
+            "instance_id": instance_id,
+            "prompt": "use ambient and managed SSH routes",
+            "task_id": task_id,
+            "cwd": str(tmp_path),
+            "provider": provider,
+            "config_dir": str(tmp_path / f"{provider}-home"),
+            "initiating_user_id": None,
+            "initiating_user_role": "super_admin",
+            "execution_mode": "unrestricted",
+            "execution_principal_kind": "deployment_token",
+        }
+        if provider == "codex":
+            manager._launch_codex_app_server = AsyncMock(return_value=45_681)
+            await manager.launch(**launch_kwargs)
+            runtime = manager._launch_codex_app_server.await_args.kwargs
+            assert runtime["sandbox_mode"] == "danger-full-access"
+            assert any(spec.name == "ccm_ssh" for spec in runtime["mcp_specs"])
+            runtime_env = runtime["git_env"]
+        else:
+            process = _make_mock_process()
+            with patch(
+                "backend.services.instance_manager.asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+                return_value=process,
+            ) as spawn:
+                await manager.launch(**launch_kwargs)
+            runtime_env = spawn.await_args.kwargs["env"]
+            await asyncio.sleep(0.1)
+    finally:
+        agent_socket.close()
+
+    assert runtime_env["SSH_AUTH_SOCK"] == str(agent_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["claude", "codex"])
+async def test_delegated_admin_worker_turn_uses_worker_ssh_agent(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+    provider,
+):
+    """A Worker inherits only its own operator socket for delegated admins."""
+    import socket
+
+    monkeypatch.setattr(settings, "auth_token", "worker-test-token")
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    from backend.services import worker_launch_admission
+
+    launch_permit = AsyncMock(return_value={"admitted": True})
+    monkeypatch.setattr(
+        worker_launch_admission,
+        "request_worker_launch_admission",
+        launch_permit,
+    )
+    worker_agent_path = tmp_path / "worker-ssh-agent.sock"
+    worker_agent_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    worker_agent_socket.bind(str(worker_agent_path))
+    monkeypatch.setenv("SSH_AUTH_SOCK", str(worker_agent_path))
+
+    async with db_factory() as db:
+        instance = Instance(name=f"delegated-admin-{provider}-ssh")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="Delegated admin Worker SSH",
+            status="executing",
+            provider=provider,
+            instance_id=instance.id,
+            metadata_={"ccm_worker_managed_task": True},
+            # This id belongs to the authoritative Manager database and must
+            # not be looked up in the Worker's local users table.
+            execution_user_id=918_273,
+            execution_user_role="admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="delegated_user",
+        )
+        db.add(task)
+        await db.commit()
+        task_id, instance_id = task.id, instance.id
+
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    launch_kwargs = {
+        "instance_id": instance_id,
+        "prompt": "use the Worker node's SSH authority",
+        "task_id": task_id,
+        "cwd": str(tmp_path),
+        "provider": provider,
+        "config_dir": str(tmp_path / f"delegated-{provider}-home"),
+        # A Manager path is untrusted transport input. InstanceManager must
+        # overwrite it with the socket captured from this Worker process.
+        "git_env": {"SSH_AUTH_SOCK": "/manager/forged-agent.sock"},
+        "initiating_user_id": 918_273,
+        "initiating_user_role": "admin",
+        "execution_mode": "unrestricted",
+        "execution_principal_kind": "delegated_user",
+    }
+    try:
+        if provider == "codex":
+            manager._launch_codex_app_server = AsyncMock(return_value=45_682)
+            await manager.launch(**launch_kwargs)
+            runtime = manager._launch_codex_app_server.await_args.kwargs
+            assert runtime["sandbox_mode"] == "danger-full-access"
+            runtime_env = runtime["git_env"]
+        else:
+            process = _make_mock_process()
+            with patch(
+                "backend.services.instance_manager.asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+                return_value=process,
+            ) as spawn:
+                await manager.launch(**launch_kwargs)
+            runtime_env = spawn.await_args.kwargs["env"]
+            await asyncio.sleep(0.1)
+    finally:
+        worker_agent_socket.close()
+
+    assert runtime_env["SSH_AUTH_SOCK"] == str(worker_agent_path)
+    assert runtime_env["SSH_AUTH_SOCK"] != "/manager/forged-agent.sock"
+
+
+@pytest.mark.asyncio
+async def test_delegated_worker_launch_denial_prevents_provider_spawn(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    from backend.services import worker_launch_admission
+    from backend.services.worker_launch_admission import (
+        WorkerLaunchAdmissionError,
     )
 
-    kwargs = im._launch_codex_app_server.await_args.kwargs
-    assert kwargs["sandbox_mode"] == "danger-full-access"
-    assert kwargs["task_ssh_protected_paths"] == ()
-    assert kwargs["disable_project_config"] is False
-    assert kwargs["disable_user_mcp"] is False
-    assert kwargs["disable_autonomous_features"] is False
-    assert any(spec.name == "ccm_ssh" for spec in kwargs["mcp_specs"])
+    monkeypatch.setattr(settings, "auth_token", "worker-test-token")
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    monkeypatch.setattr(settings, "use_pty_mode", False)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    permit = AsyncMock(
+        side_effect=WorkerLaunchAdmissionError(
+            "Manager denied the delegated provider launch"
+        )
+    )
+    monkeypatch.setattr(
+        worker_launch_admission,
+        "request_worker_launch_admission",
+        permit,
+    )
+
+    async with db_factory() as db:
+        instance = Instance(name="delegated-launch-denied")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="Delegated launch denied",
+            status="executing",
+            provider="claude",
+            instance_id=instance.id,
+            turn_generation=1,
+            metadata_={"ccm_worker_managed_task": True},
+            execution_user_id=918_274,
+            execution_user_role="admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="delegated_user",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+        instance_id = instance.id
+        incarnation_id = task.incarnation_id
+
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager._spawn_managed_direct_process = AsyncMock(
+        side_effect=AssertionError("provider process must not spawn")
+    )
+    with pytest.raises(
+        LaunchSupersededError,
+        match="Manager denied the delegated provider launch",
+    ):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="do not reach the provider",
+            task_id=task_id,
+            task_turn_generation=1,
+            cwd=str(tmp_path),
+            provider="claude",
+            initiating_user_id=918_274,
+            initiating_user_role="admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="delegated_user",
+        )
+
+    manager._spawn_managed_direct_process.assert_not_awaited()
+    permit.assert_awaited_once()
+    permit_kwargs = permit.await_args.kwargs
+    assert permit_kwargs["task_id"] == task_id
+    assert permit_kwargs["incarnation_id"] == incarnation_id
+    assert permit_kwargs["retry_count"] == 0
+    assert permit_kwargs["turn_generation"] == 1
+    assert permit_kwargs["actual_transport"] == "claude_exec"
+
+
+@pytest.mark.asyncio
+async def test_worker_managed_system_launch_requires_manager_permit(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    from backend.services import worker_launch_admission
+    from backend.services.worker_launch_admission import (
+        WorkerLaunchAdmissionError,
+    )
+
+    monkeypatch.setattr(settings, "auth_token", "worker-test-token")
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    monkeypatch.setattr(settings, "use_pty_mode", False)
+    monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
+    permit = AsyncMock(
+        side_effect=WorkerLaunchAdmissionError(
+            "Manager denied the Worker system provider launch"
+        )
+    )
+    monkeypatch.setattr(
+        worker_launch_admission,
+        "request_worker_launch_admission",
+        permit,
+    )
+
+    async with db_factory() as db:
+        instance = Instance(name="worker-system-launch-denied")
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="Worker system launch denied",
+            status="executing",
+            provider="claude",
+            instance_id=instance.id,
+            turn_generation=1,
+            metadata_={"ccm_worker_managed_task": True},
+            execution_user_id=None,
+            execution_user_role="member",
+            execution_mode="sandbox",
+            execution_principal_kind="system",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+        instance_id = instance.id
+        incarnation_id = task.incarnation_id
+
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager._spawn_managed_direct_process = AsyncMock(
+        side_effect=AssertionError("provider process must not spawn")
+    )
+    with pytest.raises(
+        LaunchSupersededError,
+        match="Manager denied the Worker system provider launch",
+    ):
+        await manager.launch(
+            instance_id=instance_id,
+            prompt="do not reach the provider",
+            task_id=task_id,
+            task_turn_generation=1,
+            cwd=str(tmp_path),
+            provider="claude",
+            initiating_user_id=None,
+            initiating_user_role="member",
+            execution_mode="sandbox",
+            execution_principal_kind="system",
+        )
+
+    manager._spawn_managed_direct_process.assert_not_awaited()
+    permit.assert_awaited_once()
+    permit_kwargs = permit.await_args.kwargs
+    assert permit_kwargs["task_id"] == task_id
+    assert permit_kwargs["incarnation_id"] == incarnation_id
+    assert permit_kwargs["retry_count"] == 0
+    assert permit_kwargs["turn_generation"] == 1
+    assert permit_kwargs["actual_transport"] == "claude_exec"
+    assert permit_kwargs["execution_principal"] == {
+        "execution_user_id": None,
+        "execution_user_role": "member",
+        "execution_mode": "sandbox",
+        "execution_principal_kind": "system",
+    }
 
 
 @pytest.mark.asyncio
@@ -5290,7 +6061,6 @@ async def test_claude_pr_review_disables_all_tools_and_bypasses_pty(
 
     process = _make_mock_process(returncode=None)
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
-    im.set_agent_sandbox_unrestricted_enabled(False)
     im._pty_enabled = True
     im._pty_backend = MagicMock()
     im._launch_pty = AsyncMock(
@@ -5663,65 +6433,6 @@ async def test_claude_delivery_uses_networkless_git_read_only_profile_without_mc
 
 
 @pytest.mark.asyncio
-async def test_claude_delivery_unrestricted_switch_skips_sandbox_and_prompts(
-    db_factory,
-    tmp_path,
-):
-    from backend.services.task_agent_isolation import (
-        CLAUDE_DELIVERY_BUILTIN_TOOLS,
-    )
-
-    instance_id, task_id, workspace = await _delivery_launch_scope(
-        db_factory,
-        tmp_path,
-        provider="claude",
-        model="claude-opus-4-6",
-    )
-    process = _make_mock_process(returncode=None)
-    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
-    manager.set_agent_sandbox_unrestricted_enabled(True)
-    manager._consume_output = AsyncMock()
-
-    with (
-        patch(
-            "backend.services.instance_manager.asyncio.create_subprocess_exec",
-            new_callable=AsyncMock,
-            return_value=process,
-        ) as exec_mock,
-        patch(
-            "backend.services.task_agent_isolation."
-            "generate_claude_delivery_isolation_settings"
-        ) as generate_isolation,
-    ):
-        await manager.launch(
-            instance_id=instance_id,
-            prompt="implement the approved plan",
-            task_id=task_id,
-            cwd=workspace,
-            model="claude-opus-4-6",
-            provider="claude",
-            config_dir=str(tmp_path / "delivery-claude-home"),
-            git_env={"GH_TOKEN": "must-not-reach-model"},
-            effort_level="high",
-            codex_service_tier="default",
-        )
-
-    generate_isolation.assert_not_called()
-    argv = list(exec_mock.await_args.args)
-    expected_tools = ",".join(CLAUDE_DELIVERY_BUILTIN_TOOLS)
-    assert "--dangerously-skip-permissions" in argv
-    assert argv[argv.index("--tools") + 1] == expected_tools
-    assert argv[argv.index("--allowedTools") + 1] == expected_tools
-    assert argv[argv.index("--setting-sources") + 1] == ""
-    assert "--settings" not in argv
-    assert "AskUserQuestion" not in expected_tools
-    launched_env = exec_mock.await_args.kwargs["env"]
-    assert "GH_TOKEN" not in launched_env
-    assert "CCM_ASK_USER_TOKEN" not in launched_env
-    assert manager._pending_private_runtime_tempdirs == {}
-
-
-@pytest.mark.asyncio
 async def test_claude_delivery_pty_receives_same_exact_profile(
     db_factory,
     monkeypatch,
@@ -5788,60 +6499,6 @@ async def test_claude_delivery_pty_receives_same_exact_profile(
         "claude-delivery-security.json"
     )
     await manager._cleanup_unbound_private_runtime_tempdir(instance_id)
-
-
-@pytest.mark.asyncio
-async def test_claude_delivery_pty_unrestricted_switch_uses_direct_promptless_profile(
-    db_factory,
-    tmp_path,
-):
-    from backend.services.task_agent_isolation import (
-        CLAUDE_DELIVERY_BUILTIN_TOOLS,
-    )
-
-    instance_id, task_id, workspace = await _delivery_launch_scope(
-        db_factory,
-        tmp_path,
-        provider="claude",
-        model="claude-opus-4-6",
-    )
-    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
-    manager.set_agent_sandbox_unrestricted_enabled(True)
-    manager._pty_enabled = True
-    manager._pty_backend = MagicMock()
-    manager._launch_pty = AsyncMock(return_value=54_321)
-    manager._consume_output = AsyncMock()
-    process = _make_mock_process(returncode=None)
-
-    with patch(
-        "backend.services.instance_manager.asyncio.create_subprocess_exec",
-        new_callable=AsyncMock,
-        return_value=process,
-    ) as exec_mock:
-        pid = await manager.launch(
-            instance_id=instance_id,
-            prompt="implement the approved plan",
-            task_id=task_id,
-            cwd=workspace,
-            model="claude-opus-4-6",
-            provider="claude",
-            config_dir=str(tmp_path / "delivery-claude-home"),
-            git_env={"GH_TOKEN": "must-not-reach-model"},
-            effort_level="high",
-            codex_service_tier="default",
-        )
-
-    assert pid == process.pid
-    manager._launch_pty.assert_not_awaited()
-    argv = list(exec_mock.await_args.args)
-    expected_tools = ",".join(CLAUDE_DELIVERY_BUILTIN_TOOLS)
-    assert "--dangerously-skip-permissions" in argv
-    assert argv[argv.index("--tools") + 1] == expected_tools
-    assert argv[argv.index("--allowedTools") + 1] == expected_tools
-    assert "--mcp-config" not in argv
-    assert "AskUserQuestion" not in expected_tools
-    assert exec_mock.await_args.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
-    assert "GH_TOKEN" not in exec_mock.await_args.kwargs["env"]
 
 
 @pytest.mark.asyncio
@@ -6922,7 +7579,6 @@ async def test_claude_browser_review_disables_builtins_but_keeps_bound_mcp(
 
     process = _make_mock_process()
     im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
-    im.set_agent_sandbox_unrestricted_enabled(False)
     im.task_message_enqueuer = AsyncMock()
     with patch(
         "backend.services.instance_manager.asyncio.create_subprocess_exec",
@@ -8261,7 +8917,6 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
     db_factory, monkeypatch, tmp_path,
 ):
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
-    monkeypatch.setattr(settings, "agent_sandbox_unrestricted_enabled", True)
     async with db_factory() as db:
         inst = Instance(name="codex-registry-inst")
         db.add(inst)
@@ -8310,10 +8965,6 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
 
     assert pid == 7654
     registry_cls.assert_called_once()
-    assert (
-        registry_cls.call_args.kwargs["sandbox_unrestricted_enabled"]
-        is True
-    )
     assert registry.start_turn.await_args.kwargs["codex_home"] == str(
         codex_home.resolve()
     )
@@ -8659,6 +9310,11 @@ async def test_codex_chat_pool_rotation_delegates_to_dispatcher_and_relaunches(
             provider="codex",
             session_id="thread-rotate",
             last_cwd="/tmp",
+            metadata_={"ccm_worker_managed_task": True},
+            execution_user_id=918_275,
+            execution_user_role="admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="delegated_user",
         )
         db.add(task)
         source_id = await _bind_preflight_chat_source(db, task)
@@ -8682,6 +9338,10 @@ async def test_codex_chat_pool_rotation_delegates_to_dispatcher_and_relaunches(
         "enabled_skills": {"monitor": True},
         "task_turn_generation": task.turn_generation,
         "source_log_id": source_id,
+        "initiating_user_id": 918_275,
+        "initiating_user_role": "admin",
+        "execution_mode": "unrestricted",
+        "execution_principal_kind": "delegated_user",
     }
     im.get_recent_log_contents = AsyncMock(return_value=[])
     im.launch = AsyncMock(return_value=999)
@@ -8704,6 +9364,19 @@ async def test_codex_chat_pool_rotation_delegates_to_dispatcher_and_relaunches(
     assert launch_kwargs["resume_session_id"] == "thread-rotate"
     assert launch_kwargs["prompt"] == "continue the task"
     assert launch_kwargs["enabled_skills"] == {"monitor": True}
+    assert {
+        "initiating_user_id": launch_kwargs["initiating_user_id"],
+        "initiating_user_role": launch_kwargs["initiating_user_role"],
+        "execution_mode": launch_kwargs["execution_mode"],
+        "execution_principal_kind": launch_kwargs[
+            "execution_principal_kind"
+        ],
+    } == {
+        "initiating_user_id": 918_275,
+        "initiating_user_role": "admin",
+        "execution_mode": "unrestricted",
+        "execution_principal_kind": "delegated_user",
+    }
 
 
 @pytest.mark.asyncio
@@ -8834,7 +9507,9 @@ async def test_claude_chat_pool_rotation_migration_failure_requeues_without_swit
         initiating_user_id=None,
         initiating_user_role="member",
         execution_mode="sandbox",
+        execution_principal_kind="system",
         attachment_paths=(),
+        ssh_agent_socket_snapshot=None,
     )
     assert pool.status()["last_selected"] == "claude-a"
 
@@ -9777,7 +10452,9 @@ async def test_codex_chat_routing_error_requeues_prompt_and_cleans_failed_turn(
         initiating_user_id=None,
         initiating_user_role="member",
         execution_mode="sandbox",
+        execution_principal_kind="system",
         attachment_paths=(),
+        ssh_agent_socket_snapshot=None,
     )
     async with db_factory() as db:
         refreshed_task = await db.get(Task, task.id)
@@ -9852,7 +10529,9 @@ async def test_codex_transient_replacement_busy_requeues_exact_prompt(
         initiating_user_id=None,
         initiating_user_role="member",
         execution_mode="sandbox",
+        execution_principal_kind="system",
         attachment_paths=(),
+        ssh_agent_socket_snapshot=None,
     )
 
 
@@ -9985,7 +10664,9 @@ async def test_codex_pool_replacement_busy_requeues_exact_prompt(db_factory):
         initiating_user_id=None,
         initiating_user_role="member",
         execution_mode="sandbox",
+        execution_principal_kind="system",
         attachment_paths=(),
+        ssh_agent_socket_snapshot=None,
     )
 
 
@@ -13452,7 +14133,9 @@ async def test_chat_requeue_allows_exact_preflight_source(db_factory):
         initiating_user_id=None,
         initiating_user_role="member",
         execution_mode="sandbox",
+        execution_principal_kind="system",
         attachment_paths=(),
+        ssh_agent_socket_snapshot=None,
     )
 
 
@@ -15922,7 +16605,9 @@ async def test_chat_retry_params_preserve_unrestricted_principal_and_attachments
     )
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()
-    attachment = upload_dir / "managed.pdf"
+    attachment = (
+        upload_dir / "33333333-3333-4333-8333-333333333333.pdf"
+    )
     attachment.write_bytes(b"managed attachment")
     monkeypatch.setattr("backend.api.uploads.UPLOAD_DIR", upload_dir)
 
@@ -15942,6 +16627,10 @@ async def test_chat_retry_params_preserve_unrestricted_principal_and_attachments
             status="executing",
             provider="claude",
             instance_id=inst.id,
+            execution_user_id=principal.id,
+            execution_user_role="super_admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="user",
         )
         db.add(task)
         await db.commit()
@@ -15967,6 +16656,7 @@ async def test_chat_retry_params_preserve_unrestricted_principal_and_attachments
             initiating_user_id=principal_id,
             initiating_user_role="super_admin",
             execution_mode="unrestricted",
+            execution_principal_kind="user",
             attachment_paths=(str(attachment),),
         )
 
@@ -16065,6 +16755,10 @@ class _FakeDB:
         owner.turn_source_log_id = None
         owner.current_task_id = None
         owner.current_plan_run_id = None
+        owner.execution_user_id = None
+        owner.execution_user_role = "member"
+        owner.execution_mode = "sandbox"
+        owner.execution_principal_kind = "system"
         result.scalar_one_or_none.return_value = owner
         return result
 
@@ -16092,6 +16786,10 @@ class _FakeDB:
                 effort_level=None,
                 worker_id=None,
                 shared_from_id=None,
+                execution_user_id=None,
+                execution_user_role="member",
+                execution_mode="sandbox",
+                execution_principal_kind="system",
                 metadata_=None,
                 tags=[],
             )

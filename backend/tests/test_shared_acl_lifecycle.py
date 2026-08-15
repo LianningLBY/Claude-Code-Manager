@@ -7,7 +7,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import func, select
 
-from backend.api import sharing, team_sharing
+from backend.api import projects, sharing, team_sharing
 from backend.models.delivery import DeliveryRun
 from backend.models.log_entry import LogEntry
 from backend.models.project import Project
@@ -16,12 +16,25 @@ from backend.models.task_share import ProjectShare, SharedTaskReceived
 from backend.models.team_share import TeamProjectShare, TeamTaskShare
 from backend.models.user import User
 from backend.models.user_group import UserGroup, UserGroupMember
+from backend.schemas.project import (
+    ProjectCreate,
+    ProjectReorderItem,
+    ProjectUpdate,
+)
 from backend.services.project_share_admission import ProjectShareAdmissionError
 from backend.services.shared_relay import SharedRelay
 
 
 def _request(*, user_id: int = 7, role: str = "member"):
     return SimpleNamespace(state=SimpleNamespace(
+        user_id=user_id,
+        user_role=role,
+    ))
+
+
+def _jwt_request(*, user_id: int, role: str):
+    return SimpleNamespace(state=SimpleNamespace(
+        auth_type="jwt",
         user_id=user_id,
         user_role=role,
     ))
@@ -191,7 +204,7 @@ async def test_team_project_share_reauthorizes_after_project_lock(
         await team_sharing.share_project(
             project.id,
             team_sharing.ShareBody(target_type="user", target_id=99),
-            _request(),
+            _request(role="admin"),
             db_session,
         )
 
@@ -234,19 +247,379 @@ async def test_team_project_share_reads_and_deletes_reauthorize_inside_lock(
             await team_sharing.unshare_project(
                 project.id,
                 team_sharing.UnshareBody(target_type="user", target_id=99),
-                _request(),
+                _request(role="admin"),
                 db_session,
             )
         else:
             await team_sharing.list_project_shares(
                 project.id,
-                _request(),
+                _request(role="admin"),
                 db_session,
             )
 
     assert denied.value.status_code == 403
     assert checks == 2
     assert await db_session.get(TeamProjectShare, grant_id) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["share", "unshare", "list"])
+async def test_team_project_share_fences_cached_admin_role_after_resource_lock(
+    db_session,
+    operation,
+):
+    """A JWT authenticated before demotion cannot assign Project ACLs later."""
+
+    actor = User(
+        email=f"stale-project-admin-{operation}@example.test",
+        name="Demoted project administrator",
+        password_hash="unused",
+        role="member",
+        is_active=True,
+    )
+    project = Project(
+        name=f"stale-project-admin-{operation}",
+        status="ready",
+    )
+    db_session.add_all([actor, project])
+    await db_session.flush()
+    grant = TeamProjectShare(
+        project_id=project.id,
+        target_type="user",
+        target_id=991,
+        shared_by=actor.id,
+    )
+    if operation != "share":
+        db_session.add(grant)
+    await db_session.commit()
+    grant_id = grant.id if operation != "share" else None
+
+    request = _jwt_request(user_id=actor.id, role="admin")
+    with pytest.raises(HTTPException) as rejected:
+        if operation == "share":
+            await team_sharing.share_project(
+                project.id,
+                team_sharing.ShareBody(target_type="user", target_id=991),
+                request,
+                db_session,
+            )
+        elif operation == "unshare":
+            await team_sharing.unshare_project(
+                project.id,
+                team_sharing.UnshareBody(target_type="user", target_id=991),
+                request,
+                db_session,
+            )
+        else:
+            await team_sharing.list_project_shares(
+                project.id,
+                request,
+                db_session,
+            )
+
+    assert rejected.value.status_code == 409
+    if grant_id is None:
+        assert await db_session.scalar(
+            select(func.count())
+            .select_from(TeamProjectShare)
+            .where(TeamProjectShare.project_id == project.id)
+        ) == 0
+    else:
+        assert await db_session.get(TeamProjectShare, grant_id) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["share", "unshare", "list"])
+async def test_team_task_share_fences_cached_admin_role_after_resource_lock(
+    db_session,
+    operation,
+):
+    """Task ACL effects revalidate the current actor, not only Task ownership."""
+
+    actor = User(
+        email=f"stale-task-admin-{operation}@example.test",
+        name="Demoted task administrator",
+        password_hash="unused",
+        role="member",
+        is_active=True,
+    )
+    task = Task(
+        title=f"stale task admin {operation}",
+        description="actor authority fence",
+        created_by=987654,
+    )
+    db_session.add_all([actor, task])
+    await db_session.flush()
+    grant = TeamTaskShare(
+        task_id=task.id,
+        target_type="user",
+        target_id=992,
+        permission="chat",
+        shared_by=actor.id,
+    )
+    if operation != "share":
+        db_session.add(grant)
+    await db_session.commit()
+    grant_id = grant.id if operation != "share" else None
+
+    request = _jwt_request(user_id=actor.id, role="admin")
+    with pytest.raises(HTTPException) as rejected:
+        if operation == "share":
+            await team_sharing.share_task(
+                task.id,
+                team_sharing.ShareBody(target_type="user", target_id=992),
+                request,
+                db_session,
+            )
+        elif operation == "unshare":
+            await team_sharing.unshare_task(
+                task.id,
+                team_sharing.UnshareBody(target_type="user", target_id=992),
+                request,
+                db_session,
+            )
+        else:
+            await team_sharing.list_task_shares(
+                task.id,
+                request,
+                db_session,
+            )
+
+    assert rejected.value.status_code == 409
+    if grant_id is None:
+        assert await db_session.scalar(
+            select(func.count())
+            .select_from(TeamTaskShare)
+            .where(TeamTaskShare.task_id == task.id)
+        ) == 0
+    else:
+        assert await db_session.get(TeamTaskShare, grant_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_task_creator_cannot_share_after_concurrent_disablement(db_session):
+    actor = User(
+        email="disabled-task-creator@example.test",
+        name="Disabled task creator",
+        password_hash="unused",
+        role="member",
+        is_active=False,
+    )
+    db_session.add(actor)
+    await db_session.flush()
+    task = Task(
+        title="disabled creator share",
+        description="actor authority fence",
+        created_by=actor.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with pytest.raises(HTTPException) as rejected:
+        await team_sharing.share_task(
+            task.id,
+            team_sharing.ShareBody(target_type="user", target_id=993),
+            _jwt_request(user_id=actor.id, role="member"),
+            db_session,
+        )
+
+    assert rejected.value.status_code == 409
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(TeamTaskShare)
+        .where(TeamTaskShare.task_id == task.id)
+    ) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "role",
+        "create_group",
+        "update_group",
+        "delete_group",
+        "add_member",
+        "remove_member",
+    ],
+)
+async def test_team_admin_mutations_fence_cached_actor_role(
+    db_session,
+    operation,
+):
+    """Group/role administration cannot reuse a JWT after admin demotion."""
+
+    actor = User(
+        email=f"stale-team-admin-{operation}@example.test",
+        name="Demoted team administrator",
+        password_hash="unused",
+        role="member",
+        is_active=True,
+    )
+    target = User(
+        email=f"team-admin-target-{operation}@example.test",
+        name="Team target",
+        password_hash="unused",
+        role="admin" if operation == "role" else "member",
+        is_active=True,
+    )
+    group = UserGroup(
+        name=f"team-authority-{operation}",
+        description="before",
+    )
+    db_session.add_all([actor, target, group])
+    await db_session.flush()
+    membership = UserGroupMember(group_id=group.id, user_id=target.id)
+    if operation == "remove_member":
+        db_session.add(membership)
+    await db_session.commit()
+    membership_id = (
+        membership.id if operation == "remove_member" else None
+    )
+    request = _jwt_request(user_id=actor.id, role="admin")
+
+    with pytest.raises(HTTPException) as rejected:
+        if operation == "role":
+            await team_sharing.update_user_role(
+                target.id,
+                team_sharing.UpdateRoleBody(role="member"),
+                request,
+                db_session,
+            )
+        elif operation == "create_group":
+            await team_sharing.create_group(
+                team_sharing.GroupCreate(name="must-not-be-created"),
+                request,
+                db_session,
+            )
+        elif operation == "update_group":
+            await team_sharing.update_group(
+                group.id,
+                team_sharing.GroupCreate(name="changed", description="after"),
+                request,
+                db_session,
+            )
+        elif operation == "delete_group":
+            await team_sharing.delete_group(group.id, request, db_session)
+        elif operation == "add_member":
+            await team_sharing.add_group_member(
+                group.id,
+                team_sharing.GroupMemberAdd(user_id=target.id),
+                request,
+                db_session,
+            )
+        else:
+            await team_sharing.remove_group_member(
+                group.id,
+                target.id,
+                request,
+                db_session,
+            )
+
+    assert rejected.value.status_code == 409
+    await db_session.refresh(target)
+    assert target.role == ("admin" if operation == "role" else "member")
+    current_group = await db_session.get(UserGroup, group.id)
+    assert current_group is not None
+    assert current_group.name == f"team-authority-{operation}"
+    assert current_group.description == "before"
+    if operation == "create_group":
+        assert await db_session.scalar(
+            select(func.count())
+            .select_from(UserGroup)
+            .where(UserGroup.name == "must-not-be-created")
+        ) == 0
+    elif operation == "add_member":
+        assert await db_session.scalar(
+            select(func.count())
+            .select_from(UserGroupMember)
+            .where(
+                UserGroupMember.group_id == group.id,
+                UserGroupMember.user_id == target.id,
+            )
+        ) == 0
+    elif operation == "remove_member":
+        assert await db_session.get(UserGroupMember, membership_id) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    ["create", "reorder", "update", "delete", "reclone", "env_write"],
+)
+async def test_project_admin_mutations_fence_cached_actor_role(
+    db_session,
+    operation,
+):
+    """A demoted JWT cannot commit Project or workspace side effects."""
+
+    actor = User(
+        email=f"stale-project-mutation-{operation}@example.test",
+        name="Demoted Project administrator",
+        password_hash="unused",
+        role="member",
+        is_active=True,
+    )
+    project = Project(
+        name=f"project-mutation-{operation}",
+        status="ready",
+        has_remote=True,
+        git_url="https://example.test/repository.git",
+        local_path="/does/not/matter",
+        sort_order=1,
+        env_files=[".env"],
+    )
+    db_session.add_all([actor, project])
+    await db_session.commit()
+    actor_id = actor.id
+    project_id = project.id
+    request = _jwt_request(user_id=actor_id, role="admin")
+
+    with pytest.raises(HTTPException) as rejected:
+        if operation == "create":
+            await projects.create_project(
+                request,
+                ProjectCreate(name="must-not-be-created"),
+                db_session,
+            )
+        elif operation == "reorder":
+            await projects.reorder_projects(
+                [ProjectReorderItem(id=project_id, sort_order=99)],
+                request,
+                db_session,
+            )
+        elif operation == "update":
+            await projects.update_project(
+                project_id,
+                ProjectUpdate(name="must-not-change"),
+                request,
+                db_session,
+            )
+        elif operation == "delete":
+            await projects.delete_project(project_id, request, db_session)
+        elif operation == "reclone":
+            await projects.reclone_project(project_id, request, db_session)
+        else:
+            await projects.update_env_file(
+                project_id,
+                ".env",
+                projects.EnvFileContent(content="MUST_NOT_BE_WRITTEN=1"),
+                request,
+                db_session,
+            )
+
+    assert rejected.value.status_code == 409
+    await db_session.rollback()
+    current = await db_session.get(Project, project_id)
+    assert current is not None
+    assert current.name == f"project-mutation-{operation}"
+    assert current.sort_order == 1
+    assert current.status == "ready"
+    assert await db_session.scalar(
+        select(func.count())
+        .select_from(Project)
+        .where(Project.name == "must-not-be-created")
+    ) == 0
 
 
 @pytest.mark.asyncio

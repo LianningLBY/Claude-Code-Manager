@@ -22,6 +22,9 @@ from backend.models.task import Task
 from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 from backend.services import worker_task_termination as termination
 from backend.services.instance_manager import InstanceManager
+from backend.services.test_harness_owner_fence import (
+    TEST_HARNESS_TERMINAL_GATE_KEY,
+)
 
 
 _LEASE_SECONDS = 0.45
@@ -320,6 +323,7 @@ async def test_final_success_waiting_on_task_lock_cannot_write_after_lease_expir
         assert task.status == "completed"
         assert task.retry_count == 2
         assert task.turn_generation == 4
+        assert TEST_HARNESS_TERMINAL_GATE_KEY not in (task.metadata_ or {})
 
 
 @pytest.mark.asyncio

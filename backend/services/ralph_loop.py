@@ -229,6 +229,10 @@ class RalphLoop:
             provider=task.provider,
             config_dir=config_dir,
             source_log_id=source_log_id,
+            initiating_user_id=task.execution_user_id,
+            initiating_user_role=task.execution_user_role,
+            execution_mode=task.execution_mode,
+            execution_principal_kind=task.execution_principal_kind,
         )
 
     async def _bind_claimed_turn_source(

@@ -1328,6 +1328,10 @@ async def test_codex_task_launch_resolves_home_and_resumes_native_thread():
         thinking_budget=1234,
         codex_service_tier="priority",
         turn_source_log_id=701,
+        execution_user_id=None,
+        execution_user_role="super_admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="deployment_token",
     )
 
     with patch("backend.main.dispatcher", dispatcher):
@@ -1354,6 +1358,10 @@ async def test_codex_task_launch_resolves_home_and_resumes_native_thread():
     assert launch_kwargs["model"] == "gpt-5.6-sol"
     assert launch_kwargs["codex_service_tier"] == "priority"
     assert launch_kwargs["source_log_id"] == 701
+    assert launch_kwargs["initiating_user_id"] is None
+    assert launch_kwargs["initiating_user_role"] == "super_admin"
+    assert launch_kwargs["execution_mode"] == "unrestricted"
+    assert launch_kwargs["execution_principal_kind"] == "deployment_token"
 
 
 @pytest.mark.asyncio
@@ -1372,6 +1380,10 @@ async def test_claude_task_launch_uses_resolved_home_without_forcing_resume():
         thinking_budget=None,
         codex_service_tier="default",
         turn_source_log_id=702,
+        execution_user_id=51,
+        execution_user_role="admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="user",
     )
 
     with patch("backend.main.dispatcher", dispatcher):
@@ -1395,6 +1407,10 @@ async def test_claude_task_launch_uses_resolved_home_without_forcing_resume():
     assert launch_kwargs["resume_session_id"] is None
     assert launch_kwargs["model"] == "claude-opus-4-8"
     assert launch_kwargs["source_log_id"] == 702
+    assert launch_kwargs["initiating_user_id"] == 51
+    assert launch_kwargs["initiating_user_role"] == "admin"
+    assert launch_kwargs["execution_mode"] == "unrestricted"
+    assert launch_kwargs["execution_principal_kind"] == "user"
 
 
 @pytest.mark.asyncio

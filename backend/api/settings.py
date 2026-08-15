@@ -25,9 +25,6 @@ from backend.services.instance_capacity import (
     occupied_slot_predicate,
 )
 from backend.services.plan_pipeline_settings import effective_plan_pipeline_config
-from backend.services.runtime_settings import (
-    effective_agent_sandbox_unrestricted_enabled,
-)
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -215,9 +212,6 @@ async def get_runtime_settings(db: AsyncSession = Depends(get_db)):
         codex_app_server_enabled=settings.codex_app_server_enabled,
         codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
         codex_monitor_enabled=settings.codex_main_mcp_enabled,
-        agent_sandbox_unrestricted_enabled=(
-            instance_manager.agent_sandbox_unrestricted_enabled
-        ),
         auto_sort_on_access=(
             row.auto_sort_on_access
             if row.auto_sort_on_access is not None
@@ -239,7 +233,20 @@ async def update_runtime_settings(
 
     async def persist_apply_and_respond() -> RuntimeSettingsResponse:
         async with _runtime_settings_lock:
+            # ``_get_or_create`` may commit when a fresh database has no
+            # singleton yet. Ensure that bootstrap commit happens before the
+            # Worker drain fence; after the fence is acquired this request
+            # must keep one transaction open through the settings commit.
             row = await _get_or_create(db)
+            # On a headless Worker this row lock is held through the settings
+            # commit. It serializes the remote PUT with node drain admission:
+            # the update either commits before the drain claim or is rejected
+            # after the claim, never after a clean drain proof.
+            from backend.services.worker_node_control import (
+                fence_worker_node_mutation,
+            )
+
+            await fence_worker_node_mutation(db)
 
             if body.use_pty_mode is not None:
                 effective = instance_manager.set_pty_mode(body.use_pty_mode)
@@ -253,11 +260,6 @@ async def update_runtime_settings(
                         )
                 row.use_pty_mode = effective
 
-            if body.agent_sandbox_unrestricted_enabled is not None:
-                row.agent_sandbox_unrestricted_enabled = (
-                    body.agent_sandbox_unrestricted_enabled
-                )
-
             if body.auto_sort_on_access is not None:
                 row.auto_sort_on_access = body.auto_sort_on_access
 
@@ -265,14 +267,6 @@ async def update_runtime_settings(
                 row.context_compact_threshold = body.context_compact_threshold
 
             await db.commit()
-            # There is no await between the durable commit and this runtime
-            # assignment. Cancellation therefore cannot expose a committed
-            # toggle while new turns continue using the previous policy.
-            if body.agent_sandbox_unrestricted_enabled is not None:
-                instance_manager.set_agent_sandbox_unrestricted_enabled(
-                    effective_agent_sandbox_unrestricted_enabled(row)
-                )
-
             auto_sort = (
                 row.auto_sort_on_access
                 if row.auto_sort_on_access is not None
@@ -285,9 +279,6 @@ async def update_runtime_settings(
                 codex_app_server_enabled=settings.codex_app_server_enabled,
                 codex_main_mcp_enabled=settings.codex_main_mcp_enabled,
                 codex_monitor_enabled=settings.codex_main_mcp_enabled,
-                agent_sandbox_unrestricted_enabled=(
-                    instance_manager.agent_sandbox_unrestricted_enabled
-                ),
                 auto_sort_on_access=auto_sort,
                 context_compact_threshold=compact_threshold,
             )

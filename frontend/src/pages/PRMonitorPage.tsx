@@ -1,12 +1,24 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { api } from '../api/client';
 import type { MonitoredRepo, PRFinding, PRMonitorRun, PRReview, RequiredCheckPolicy } from '../api/client';
 import { Plus, ArrowLeft, X, Copy, RefreshCw, ToggleLeft, ToggleRight, Trash2, GitPullRequest, Check } from '../components/icons';
 import { FindingActions } from '../components/PRReview/FindingActions';
 import { useDialogA11y } from '../hooks/useDialogA11y';
+import { useWebSocket } from '../hooks/useWebSocket';
 
 const DEFAULT_WEBHOOK_URL = `${window.location.origin}/api/github/webhook`;
 const FINDING_SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+
+function currentUserIsAdmin(): boolean {
+  const stored = localStorage.getItem('cc_user');
+  if (stored === null) return true;
+  try {
+    const user = JSON.parse(stored) as { id?: unknown; role?: unknown };
+    return user.role === 'admin' || user.role === 'super_admin' || !user.id;
+  } catch {
+    return false;
+  }
+}
 
 function parseRequiredChecks(value: string): RequiredCheckPolicy[] {
   return value.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
@@ -153,6 +165,52 @@ const STARTED_REPAIR_STATUSES = new Set(['delivering', 'accepted', 'awaiting_pus
 const STARTED_MERGE_STATUSES = new Set(['enqueuing', 'queued', 'checking']);
 const ACTIVE_ADJUDICATION_STATUSES = new Set(['pending', 'adjudicating', 'accepted']);
 
+const REVIEW_STATUS_LABELS: Record<string, string> = {
+  pending: 'Queued',
+  waiting_ci: 'Waiting for CI',
+  reviewing: 'Reviewing',
+  publishing: 'Publishing result',
+  superseding: 'Updating to a newer head',
+  passed: 'Passed',
+  approved: 'Approved',
+  changes_required: 'Changes required',
+  commented: 'Comments published',
+  error: 'Review failed',
+  superseded: 'Superseded by a newer head',
+  merged: 'Merged',
+  closed: 'Closed',
+};
+
+function statusText(status: string): string {
+  return REVIEW_STATUS_LABELS[status]
+    || status.split('_').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+}
+
+function reviewStatusText(review: PRReview): string {
+  return review.display_status?.trim() || statusText(review.status);
+}
+
+function reviewTaskIds(review: PRReview): number[] {
+  if (review.task_ids?.length) return [...new Set(review.task_ids)];
+  return review.task_id == null ? [] : [review.task_id];
+}
+
+function shortSha(sha: string | null): string {
+  return sha ? sha.slice(0, 8) : 'not captured';
+}
+
+function countSummary(counts: Record<string, number> | undefined): string | null {
+  if (!counts) return null;
+  const entries = Object.entries(counts).filter(([, count]) => count > 0);
+  return entries.length
+    ? entries.map(([status, count]) => `${count} ${statusText(status).toLowerCase()}`).join(' · ')
+    : null;
+}
+
+function isActiveReview(review: PRReview): boolean {
+  return review.outcome_kind === 'in_progress' || ACTIVE_REVIEW_STATUSES.has(review.status);
+}
+
 function copyToClipboard(text: string) {
   navigator.clipboard.writeText(text);
 }
@@ -184,13 +242,21 @@ function FindingRebuttalForm({ finding, onSubmitted }: { finding: PRFinding; onS
   );
 }
 
-function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
+function AddRepoModal({
+  isAdmin,
+  onClose,
+  onSaved,
+}: {
+  isAdmin: boolean;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
   const [repoName, setRepoName] = useState('');
   const [autoMerge, setAutoMerge] = useState(false);
   const [autoRepair, setAutoRepair] = useState(false);
   const [mergeQueueMode, setMergeQueueMode] = useState<'manual' | 'shadow' | 'auto'>('manual');
-  const [reviewMode, setReviewMode] = useState<'single' | 'panel'>('panel');
-  const [waitForCi, setWaitForCi] = useState(true);
+  const [reviewMode, setReviewMode] = useState<'single' | 'panel'>('single');
+  const [waitForCi, setWaitForCi] = useState(false);
   const [requiredChecks, setRequiredChecks] = useState('');
   const [provider, setProvider] = useState('codex');
   const [reviewModel, setReviewModel] = useState('');
@@ -211,8 +277,6 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [createdSecret, setCreatedSecret] = useState<string | null>(null);
-  const ccUser = JSON.parse(localStorage.getItem('cc_user') || '{}');
-  const isAdmin = ccUser.role === 'admin' || ccUser.role === 'super_admin' || !ccUser.id;
   const dialogRef = useDialogA11y(true, onClose);
 
   useEffect(() => {
@@ -225,6 +289,10 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isAdmin || !currentUserIsAdmin()) {
+      setError('Only administrators can add a PR Monitor repository.');
+      return;
+    }
     setSubmitting(true);
     setError(null);
     try {
@@ -355,10 +423,18 @@ function AddRepoModal({ onClose, onSaved }: { onClose: () => void; onSaved: () =
                 const value = e.target.value as 'single' | 'panel';
                 setReviewMode(value);
                 if (value === 'single') { setAutoRepair(false); setWaitForCi(false); setMergeQueueMode('manual'); }
+                else setWaitForCi(true);
               }}>
-              <option value="panel">Independent Principal / Senior / QA panel</option>
-              <option value="single">Single reviewer</option>
+              <option value="single">Single reviewer (recommended)</option>
+              <option value="panel">3-reviewer panel: Principal / Senior / QA</option>
             </select>
+            {reviewMode === 'panel' ? (
+              <p className="mt-1 text-xs text-amber-300">
+                Panel runs three independent review Tasks and uses roughly 3× the model work. Choose it only when you need separate role coverage.
+              </p>
+            ) : (
+              <p className="mt-1 text-xs text-gray-500">One review Task with a bounded PR context.</p>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <input type="checkbox" id="newWaitForCi" checked={waitForCi}
@@ -461,6 +537,8 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
   const [requiredChecks, setRequiredChecks] = useState(renderRequiredChecks(repo));
   const [selectedReview, setSelectedReview] = useState<PRReview | null>(null);
   const [monitorRun, setMonitorRun] = useState<PRMonitorRun | null>(null);
+  const selectedReviewIdRef = useRef<number | null>(null);
+  selectedReviewIdRef.current = selectedReview?.id ?? null;
   const [developerTaskId, setDeveloperTaskId] = useState('');
   const { providers, providerConfigLoaded, modelsFor, effortsFor } = useProviderModels();
   const modelOptions = modelsFor(provider);
@@ -504,6 +582,52 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
   }, [repo.id, page]);
 
   useEffect(() => { loadDetail(); loadReviews(); }, [loadDetail, loadReviews]);
+
+  const refreshSelectedReview = useCallback(async () => {
+    const reviewId = selectedReviewIdRef.current;
+    if (reviewId == null) return;
+    try {
+      const reviewDetail = await api.getReviewDetail(reviewId);
+      if (selectedReviewIdRef.current !== reviewId) return;
+      setSelectedReview(reviewDetail);
+      if (reviewDetail.monitor_run_id) {
+        const run = await api.getPRMonitorRun(reviewDetail.monitor_run_id);
+        if (selectedReviewIdRef.current === reviewId) setMonitorRun(run);
+      } else {
+        setMonitorRun(null);
+      }
+      setRunActionError(null);
+    } catch (error) {
+      if (selectedReviewIdRef.current === reviewId) setRunActionError(String(error));
+    }
+  }, []);
+
+  const refreshReviewData = useCallback(() => {
+    void loadReviews();
+    void refreshSelectedReview();
+  }, [loadReviews, refreshSelectedReview]);
+
+  useWebSocket(
+    ['pr-monitor'],
+    refreshReviewData,
+    refreshReviewData,
+    refreshReviewData,
+  );
+
+  const shouldPollReviews = reviews.some(isActiveReview) || Boolean(selectedReview && isActiveReview(selectedReview));
+  useEffect(() => {
+    if (!shouldPollReviews) return;
+    const timer = window.setInterval(refreshReviewData, 5000);
+    return () => window.clearInterval(timer);
+  }, [refreshReviewData, shouldPollReviews]);
+
+  const latestReviewIdByPr = useMemo(() => {
+    const latest = new Map<number, number>();
+    reviews.forEach((review) => {
+      if (!latest.has(review.pr_number)) latest.set(review.pr_number, review.id);
+    });
+    return latest;
+  }, [reviews]);
 
   const handleSave = async () => {
     setSaving(true);
@@ -569,6 +693,15 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
   };
 
   const reviewerRuns = selectedReview?.reviewer_runs ?? [];
+  const selectedReviewTaskIds = selectedReview ? reviewTaskIds(selectedReview) : [];
+  const selectedReviewSummary = selectedReview?.display_summary?.trim()
+    || selectedReview?.review_summary?.trim()
+    || (selectedReview && isActiveReview(selectedReview)
+      ? 'The review is still running. This page will refresh automatically.'
+      : 'No review summary was recorded.');
+  const reviewerStatusSummary = countSummary(selectedReview?.reviewer_status_counts);
+  const reviewerVerdictSummary = countSummary(selectedReview?.reviewer_verdict_counts);
+  const reviewerCount = selectedReview?.reviewer_count ?? reviewerRuns.length;
   const terminalRun = monitorRun ? TERMINAL_RUN_STATUSES.has(monitorRun.status) : false;
   const readyRun = monitorRun ? READY_RUN_STATUSES.has(monitorRun.status) : false;
   const busyRun = monitorRun ? BUSY_RUN_STATUSES.has(monitorRun.status) : false;
@@ -710,10 +843,18 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                 const value = e.target.value as 'single' | 'panel';
                 setReviewMode(value);
                 if (value === 'single') { setAutoRepair(false); setWaitForCi(false); setMergeQueueMode('manual'); }
+                else setWaitForCi(true);
               }}>
-              <option value="panel">Independent Principal / Senior / QA panel</option>
-              <option value="single">Single reviewer</option>
+              <option value="single">Single reviewer (recommended)</option>
+              <option value="panel">3-reviewer panel: Principal / Senior / QA</option>
             </select>
+            {reviewMode === 'panel' ? (
+              <p className="mt-1 text-xs text-amber-300">
+                Panel runs three independent review Tasks and uses roughly 3× the model work.
+              </p>
+            ) : (
+              <p className="mt-1 text-xs text-gray-500">One review Task with a bounded PR context.</p>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <input type="checkbox" id="waitForCi" checked={reviewMode === 'panel' && waitForCi}
@@ -774,7 +915,13 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
       </div>
 
       <div className="bg-gray-800 rounded-lg p-5 space-y-3">
-        <h4 className="text-foreground font-semibold">Review History</h4>
+        <div className="flex items-center justify-between gap-3">
+          <h4 className="text-foreground font-semibold">Review History</h4>
+          <button type="button" title="Refresh review history" onClick={refreshReviewData}
+            className="rounded p-2 text-gray-400 hover:bg-gray-700 hover:text-foreground">
+            <RefreshCw size={15} />
+          </button>
+        </div>
         {runActionError && <p className="text-sm text-red-400" role="alert">{runActionError}</p>}
         {reviews.length === 0 ? (
           <p className="text-gray-500 text-sm">No reviews yet</p>
@@ -785,17 +932,31 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                 <thead>
                   <tr className="text-gray-400 text-left border-b border-gray-700">
                     <th className="pb-2 pr-4">PR</th>
+                    <th className="pb-2 pr-4">Head</th>
                     <th className="pb-2 pr-4">Title</th>
                     <th className="pb-2 pr-4">Author</th>
                     <th className="pb-2 pr-4">Status</th>
                     <th className="pb-2 pr-4">Action</th>
-                    <th className="pb-2 pr-4">Task</th>
+                    <th className="pb-2 pr-4">Tasks</th>
                     <th className="pb-2">Time</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {reviews.map(r => (
-                    <tr key={r.id} className="border-b border-gray-700/50 text-gray-300 cursor-pointer hover:bg-gray-700/30"
+                  {reviews.map((r) => {
+                    const taskIds = reviewTaskIds(r);
+                    const snapshotState = r.is_current_snapshot
+                      ?? (selectedReview?.id === r.id ? selectedReview.is_current_snapshot : undefined);
+                    const headLabel = snapshotState === true
+                      ? 'Current head'
+                      : snapshotState === false
+                        ? 'Historical head'
+                        : latestReviewIdByPr.get(r.pr_number) === r.id
+                          ? 'Latest review'
+                          : 'Previous review';
+                    return (
+                    <tr key={r.id} className={`border-b border-gray-700/50 text-gray-300 cursor-pointer hover:bg-gray-700/30 ${
+                      selectedReview?.id === r.id ? 'bg-indigo-500/10' : ''
+                    }`}
                       onClick={async () => {
                         setRunActionError(null);
                         setDeveloperTaskId('');
@@ -820,20 +981,33 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                         <a href={r.pr_url} target="_blank" rel="noopener noreferrer"
                           className="text-indigo-400 hover:text-indigo-300">#{r.pr_number}</a>
                       </td>
+                      <td className="py-2 pr-4">
+                        <code className="text-xs text-gray-300" title={r.head_sha || undefined}>{shortSha(r.head_sha)}</code>
+                        <span className={`mt-1 block w-fit rounded px-1.5 py-0.5 text-[10px] ${
+                          snapshotState === true
+                            ? 'bg-green-500/15 text-green-300'
+                            : snapshotState === false
+                              ? 'bg-gray-600/50 text-gray-400'
+                              : 'bg-blue-500/10 text-blue-300'
+                        }`}>{headLabel}</span>
+                      </td>
                       <td className="py-2 pr-4 max-w-xs truncate">{r.pr_title}</td>
                       <td className="py-2 pr-4">{r.pr_author}</td>
                       <td className="py-2 pr-4">
                         <span className={`px-2 py-0.5 rounded text-xs ${STATUS_COLORS[r.status] || 'bg-gray-600 text-gray-300'}`}>
-                          {r.status}
+                          {reviewStatusText(r)}
                         </span>
                       </td>
-                      <td className="py-2 pr-4 text-xs">{r.action_taken || '-'}</td>
+                      <td className="py-2 pr-4 text-xs">{r.action_taken ? statusText(r.action_taken) : '-'}</td>
                       <td className="py-2 pr-4">
-                        {r.task_id ? <span className="text-indigo-400">#{r.task_id}</span> : '-'}
+                        {taskIds.length ? taskIds.map((taskId) => (
+                          <span key={taskId} className="mr-1 text-indigo-400">#{taskId}</span>
+                        )) : '-'}
                       </td>
                       <td className="py-2 text-xs text-gray-500">{new Date(r.created_at).toLocaleString()}</td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -848,16 +1022,66 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                     setRunActionError(null);
                   }}>Close</button>
                 </div>
-                <p className="text-xs text-gray-400">Review: {selectedReview.status}</p>
-                <div className="rounded bg-gray-900/40 p-3">
-                  <h6 className="mb-2 text-sm font-medium text-foreground">1. 总体评价</h6>
-                  <p className="text-xs text-gray-300">{selectedReview.review_summary || '评审仍在执行，暂无总体结论。'}</p>
+                <div className="flex flex-wrap items-center gap-2 text-xs">
+                  <span className={`rounded px-2 py-0.5 ${STATUS_COLORS[selectedReview.status] || 'bg-gray-600 text-gray-300'}`}>
+                    {reviewStatusText(selectedReview)}
+                  </span>
+                  {selectedReview.aggregate_verdict && (
+                    <span className="rounded bg-indigo-500/15 px-2 py-0.5 text-indigo-200">
+                      Verdict: {statusText(selectedReview.aggregate_verdict)}
+                    </span>
+                  )}
+                  {selectedReview.is_current_snapshot === true && (
+                    <span className="rounded bg-green-500/15 px-2 py-0.5 text-green-300">Current head</span>
+                  )}
+                  {selectedReview.is_current_snapshot === false && (
+                    <span className="rounded bg-gray-600/50 px-2 py-0.5 text-gray-400">Historical head</span>
+                  )}
+                  <code className="text-gray-400" title={selectedReview.head_sha || undefined}>
+                    head {shortSha(selectedReview.head_sha)}
+                  </code>
                 </div>
+                <div role={selectedReview.outcome_kind === 'infrastructure_error' ? 'alert' : undefined}
+                  className={`rounded border p-3 ${
+                    selectedReview.outcome_kind === 'infrastructure_error'
+                      ? 'border-red-500/30 bg-red-500/10'
+                      : 'border-gray-700 bg-gray-900/40'
+                  }`}>
+                  <h6 className="mb-2 text-sm font-medium text-foreground">
+                    {selectedReview.outcome_kind === 'infrastructure_error' ? 'Review system failure' : 'Review summary'}
+                  </h6>
+                  <p className="whitespace-pre-wrap text-xs text-gray-300">{selectedReviewSummary}</p>
+                  {selectedReview.outcome_kind === 'infrastructure_error' && (
+                    <p className="mt-2 text-xs text-red-300">No code verdict was produced by this failed review run.</p>
+                  )}
+                </div>
+                {(reviewerCount > 0 || selectedReviewTaskIds.length > 0) && (
+                  <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-400">
+                    {reviewerCount > 0 && <span>{reviewerCount} reviewer{reviewerCount === 1 ? '' : 's'}</span>}
+                    {reviewerStatusSummary && <span>Progress: {reviewerStatusSummary}</span>}
+                    {reviewerVerdictSummary && <span>Results: {reviewerVerdictSummary}</span>}
+                    {selectedReviewTaskIds.length > 0 && (
+                      <span>Review Task{selectedReviewTaskIds.length === 1 ? '' : 's'}: {' '}
+                        {selectedReviewTaskIds.map((taskId) => <span key={taskId} className="text-indigo-300">#{taskId}{' '}</span>)}
+                      </span>
+                    )}
+                  </div>
+                )}
                 {selectedReview.ci_summary && <p className="text-xs text-gray-400">CI: {selectedReview.ci_summary}</p>}
                 {monitorRun && (
-                  <div className="rounded bg-gray-900/50 p-3 text-xs space-y-2">
-                    <p>Loop: {monitorRun.status} · repair {monitorRun.repair_attempts}/{monitorRun.max_repair_attempts}</p>
-                    <p>Developer Task: {monitorRun.developer_task_id ? `#${monitorRun.developer_task_id}` : 'not bound'}</p>
+                  <div className="space-y-2 text-xs">
+                    <details className="rounded bg-gray-900/50">
+                      <summary className="cursor-pointer px-3 py-2 text-gray-400 hover:text-gray-200">
+                        Advanced diagnostics
+                      </summary>
+                      <div className="space-y-2 border-t border-gray-700 px-3 py-3">
+                        <p>Loop: {statusText(monitorRun.status)} · repair {monitorRun.repair_attempts}/{monitorRun.max_repair_attempts}</p>
+                        <p>Developer Task: {monitorRun.developer_task_id ? `#${monitorRun.developer_task_id}` : 'not bound'}</p>
+                        {monitorRun.pause_reason && <p className="text-yellow-500">Paused: {monitorRun.pause_reason}</p>}
+                        {monitorRun.wakes.map(wake => <p key={wake.id}>Wake #{wake.id}: {statusText(wake.status)} · {statusText(wake.reason_kind)}{wake.last_error ? ` · ${wake.last_error}` : ''}</p>)}
+                        {monitorRun.merge_actions?.map(action => <p key={action.id}>Merge #{action.id}: {statusText(action.status)}{action.ci_status ? ` · CI ${statusText(action.ci_status)}` : ''}{action.last_error ? ` · ${action.last_error}` : ''}</p>)}
+                      </div>
+                    </details>
                     {canBindDeveloper && !monitorRun.developer_task_id && (
                       <div className="flex gap-2">
                         <input value={developerTaskId} onChange={(e) => setDeveloperTaskId(e.target.value)}
@@ -870,10 +1094,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                           ))}>{runActionPending === 'bind' ? 'Binding…' : 'Bind'}</button>
                       </div>
                     )}
-                    {monitorRun.pause_reason && <p className="text-yellow-500">Paused: {monitorRun.pause_reason}</p>}
-                    {monitorRun.wakes.map(wake => <p key={wake.id}>Wake #{wake.id}: {wake.status} · {wake.reason_kind}{wake.last_error ? ` · ${wake.last_error}` : ''}</p>)}
-                    {monitorRun.merge_actions?.map(action => <p key={action.id}>Merge #{action.id}: {action.status}{action.ci_status ? ` · CI ${action.ci_status}` : ''}{action.last_error ? ` · ${action.last_error}` : ''}</p>)}
-                    <div className="flex gap-2">
+                    <div className="flex flex-wrap gap-2">
                       {canResume && (
                         <button className="bg-indigo-600 text-white rounded px-2 py-1 disabled:opacity-50"
                           disabled={runActionPending !== null}
@@ -910,17 +1131,24 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                     {item.state} · {item.name} · {item.app_slug}
                   </p>
                 ))}
-                {reviewerRuns.length === 0 && (
+                {reviewerRuns.length === 0 && selectedReview.status === 'waiting_ci' && (
                   <p className="text-xs text-gray-500">Reviewer panel has not started yet.</p>
                 )}
                 </div>
-                {reviewerRuns.length > 0 && <h6 className="text-sm font-medium text-foreground">2. 问题清单（按风险等级排序）</h6>}
+                {reviewerRuns.length > 0 && <h6 className="text-sm font-medium text-foreground">Reviewer results</h6>}
                 {[...reviewerRuns].map(run => (
                   <div key={run.id} className="rounded bg-gray-900/40 p-3">
-                    <div className="flex justify-between text-sm">
-                      <span className="font-medium text-gray-200">{run.role}</span>
-                      <span className={STATUS_COLORS[run.status] || 'text-gray-400'}>{run.status}</span>
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+                      <span className="font-medium text-gray-200">
+                        {statusText(run.role)}
+                        {run.task_id != null && <span className="ml-2 text-xs font-normal text-indigo-300">Task #{run.task_id}</span>}
+                      </span>
+                      <span className={STATUS_COLORS[run.status] || 'text-gray-400'}>{statusText(run.status)}</span>
                     </div>
+                    {run.result_body && <p className="mt-2 whitespace-pre-wrap text-xs text-gray-300">{run.result_body}</p>}
+                    {run.outcome_kind === 'infrastructure_error' && !run.result_body && (
+                      <p className="mt-2 text-xs text-red-300">This reviewer did not produce a code verdict.</p>
+                    )}
                     {run.error_message && <p className="text-xs text-red-400 mt-1">{run.error_message}</p>}
                     {[...run.findings].sort((a, b) => (
                       (FINDING_SEVERITY_ORDER[a.severity] ?? 9) - (FINDING_SEVERITY_ORDER[b.severity] ?? 9)
@@ -953,18 +1181,6 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                     ))}
                   </div>
                 ))}
-                {reviewerRuns.length > 0 && (
-                  <div className="grid gap-3 md:grid-cols-2">
-                    <div className="rounded bg-gray-900/40 p-3">
-                      <h6 className="mb-2 text-sm font-medium text-foreground">3. 优化总结</h6>
-                      <p className="text-xs text-gray-300">优先处理高风险和中风险问题，并按每条 Finding 的 Required fix 验证修复。</p>
-                    </div>
-                    <div className="rounded bg-gray-900/40 p-3">
-                      <h6 className="mb-2 text-sm font-medium text-foreground">4. 额外建议</h6>
-                      <p className="text-xs text-gray-300">应用修复前下载并检查 Diff；推送后继续以 exact-head CI 和 Finding Gate 为准。</p>
-                    </div>
-                  </div>
-                )}
               </>
             )}
             <div className="flex gap-2 pt-2">
@@ -986,6 +1202,7 @@ export function PRMonitorPage() {
   const [error, setError] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [selectedRepo, setSelectedRepo] = useState<MonitoredRepo | null>(null);
+  const isAdmin = currentUserIsAdmin();
 
   const refresh = useCallback(async () => {
     try {
@@ -1041,10 +1258,12 @@ export function PRMonitorPage() {
           <GitPullRequest size={22} className="text-indigo-400" />
           <h2 className="text-xl font-bold text-foreground">PR Monitor</h2>
         </div>
-        <button onClick={() => setShowModal(true)}
-          className="flex items-center gap-1 px-4 py-2 text-sm bg-indigo-600 text-white rounded hover:bg-indigo-500">
-          <Plus size={16} /> Add Repository
-        </button>
+        {isAdmin && (
+          <button onClick={() => setShowModal(true)}
+            className="flex items-center gap-1 px-4 py-2 text-sm bg-indigo-600 text-white rounded hover:bg-indigo-500">
+            <Plus size={16} /> Add Repository
+          </button>
+        )}
       </div>
 
       {error && <p className="text-red-400 text-sm mb-4">{error}</p>}
@@ -1104,7 +1323,9 @@ export function PRMonitorPage() {
         </div>
       )}
 
-      {showModal && <AddRepoModal onClose={() => setShowModal(false)} onSaved={refresh} />}
+      {showModal && (
+        <AddRepoModal isAdmin={isAdmin} onClose={() => setShowModal(false)} onSaved={refresh} />
+      )}
     </div>
   );
 }

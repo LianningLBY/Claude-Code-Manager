@@ -21,7 +21,7 @@ from backend.api.deps import (
     require_admin,
     require_internal_service,
     require_internal_task_incarnation,
-    require_task_access,
+    require_task_control,
 )
 from backend.config import settings
 from backend.database import get_db
@@ -509,9 +509,9 @@ async def list_task_browser_reviews(
     manager: BrowserReviewJobManager = Depends(get_browser_review_job_manager),
 ) -> list[dict[str, Any]]:
     task = await _task_or_404(task_id, db)
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     jobs = await manager.list_for_task(task_id)
-    return [job.as_dict() for job in jobs]
+    return [job.public_dict() for job in jobs]
 
 
 @task_router.post("/{task_id}/browser-reviews/internal/start", status_code=201)
@@ -625,7 +625,7 @@ async def get_task_browser_review_artifact(
     manager: BrowserReviewJobManager = Depends(get_browser_review_job_manager),
 ) -> FileResponse:
     task = await _task_or_404(task_id, db)
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     job = await manager.get(job_id)
     if job is None or (job.owner_task_id or job.task_id) != task_id:
         raise HTTPException(status_code=404, detail="Task Browser Review not found")
@@ -782,7 +782,7 @@ async def create_browser_review(
             await manager.fail_start(job.id, exc)
         raise
     assert job is not None
-    return job.as_dict()
+    return job.public_dict()
 
 
 @router.get("")
@@ -790,7 +790,7 @@ async def list_browser_reviews(
     manager: BrowserReviewJobManager = Depends(get_browser_review_job_manager),
 ) -> list[dict[str, Any]]:
     jobs = await manager.list()
-    return [job.as_dict() for job in jobs if not job.inline_tool][:20]
+    return [job.public_dict() for job in jobs if not job.inline_tool][:20]
 
 
 @router.get("/{job_id}")
@@ -801,7 +801,7 @@ async def get_browser_review(
     job = await manager.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Browser review not found")
-    return job.as_dict()
+    return job.public_dict()
 
 
 async def _fence_browser_cancel_target(
@@ -922,7 +922,7 @@ async def cancel_browser_review(
     if job.task_id is None:
         cancelled = await manager.cancel(job_id)
         assert cancelled is not None
-        return cancelled.as_dict()
+        return cancelled.public_dict()
     run_id, owner_identity = await _fence_browser_cancel_target(
         db,
         job_id=job_id,
@@ -959,7 +959,7 @@ async def cancel_browser_review(
     projected = await manager.cancel(job_id)
     if projected is None:
         raise HTTPException(409, "Browser Review state disappeared after cleanup")
-    return projected.as_dict()
+    return projected.public_dict()
 
 
 @router.get("/{job_id}/internal/context")

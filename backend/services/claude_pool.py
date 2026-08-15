@@ -22,6 +22,7 @@ from pathlib import Path
 from backend.services.cloudrouter_accounts import (
     is_api_auth_kind as _is_api_auth_kind,
 )
+from backend.services.cancellation import await_task_completion
 
 logger = logging.getLogger(__name__)
 _SAFE_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -1857,15 +1858,7 @@ async def migrate_session_async(
             session_id=session_id,
         )
     )
-    cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            if cancellation is None:
-                cancellation = exc
-        except BaseException:
-            break
+    cancellation = await await_task_completion(operation)
     try:
         migrated = operation.result()
     except BaseException as exc:

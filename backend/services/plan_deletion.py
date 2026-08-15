@@ -814,6 +814,16 @@ async def lock_target_plan_delete_graph(
                 plan=plans_by_id[run.plan_id],
                 run=run,
                 steps=run_steps,
+                input_requests=[
+                    input_request
+                    for input_request in inputs
+                    if input_request.run_id == run.id
+                ],
+                versions=[
+                    version
+                    for version in versions
+                    if version.produced_by_run_id == run.id
+                ],
                 runtime_receipts=run_runtime_receipts,
                 dispatch_receipts=run_dispatch_receipts,
             )

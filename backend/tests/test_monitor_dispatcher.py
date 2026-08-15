@@ -186,7 +186,7 @@ async def _seed_project_auxiliary(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["claude", "codex"])
-async def test_shared_project_monitor_claim_terminalizes_without_provider_effect(
+async def test_team_project_share_does_not_block_monitor_claim(
     dispatcher,
     provider,
 ):
@@ -198,21 +198,93 @@ async def test_shared_project_monitor_claim_terminalizes_without_provider_effect
     )
     dispatcher._launch_scheduled_monitor_turn = AsyncMock()
 
-    assert await dispatcher._claim_due_monitor_turn(session_id) is None
+    snapshot = await dispatcher._claim_due_monitor_turn(session_id)
+    assert snapshot is not None
+    assert snapshot["generation"] == 1
     dispatcher._launch_scheduled_monitor_turn.assert_not_awaited()
     async with dispatcher.db_factory() as db:
         session = await db.get(MonitorSession, session_id)
-    assert session.status == "failed"
-    assert session.active_turn_generation is None
+    assert session.status == "running"
+    assert session.active_turn_generation == 1
     assert session.next_check_at is None
-    assert "Project admission failed" in session.last_error
+    assert session.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_worker_drain_refuses_late_monitor_generation_claim(
+    dispatcher,
+    monkeypatch,
+):
+    """NodeControl is the first writer for each scheduled generation."""
+
+    from backend.services.worker_node_control import begin_worker_node_drain
+
+    _project_id, _task_id, session_id = await _seed_project_auxiliary(
+        dispatcher.db_factory,
+        provider="claude",
+        agent_type="monitor",
+        shared=False,
+    )
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    async with dispatcher.db_factory() as db:
+        await begin_worker_node_drain(db, claim="a" * 64)
+        await db.commit()
+
+    assert await dispatcher._claim_due_monitor_turn(session_id) is None
+    async with dispatcher.db_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+    assert session.status == "running"
+    assert session.turn_generation == 0
+    assert session.active_turn_generation is None
+
+
+@pytest.mark.asyncio
+async def test_worker_drain_refuses_claude_monitor_final_launch(
+    dispatcher,
+    monkeypatch,
+    tmp_path,
+):
+    """A claim won after scheduling must still veto the provider boundary."""
+
+    from backend.services.worker_node_control import (
+        WorkerNodeDrainingConflict,
+        begin_worker_node_drain,
+    )
+
+    _project_id, _task_id, session_id = await _seed_project_auxiliary(
+        dispatcher.db_factory,
+        provider="claude",
+        agent_type="monitor",
+        shared=False,
+    )
+    snapshot = await dispatcher._claim_due_monitor_turn(session_id)
+    assert snapshot is not None
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    async with dispatcher.db_factory() as db:
+        await begin_worker_node_drain(db, claim="b" * 64)
+        await db.commit()
+
+    dispatcher._launch_monitor_agent = AsyncMock(return_value=_fake_proc())
+    with patch(
+        "backend.services.mcp_config.generate_monitor_agent_mcp_config",
+        return_value=tmp_path / "late-monitor.json",
+    ):
+        with pytest.raises(WorkerNodeDrainingConflict):
+            await dispatcher._launch_scheduled_monitor_turn(
+                session_id,
+                snapshot,
+            )
+
+    dispatcher._launch_monitor_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["claude", "codex"])
-async def test_monitor_provider_effect_rechecks_project_share_after_claim(
+async def test_team_project_share_does_not_block_monitor_provider_effect(
     dispatcher,
     provider,
+    tmp_path,
 ):
     project_id, task_id, session_id = await _seed_project_auxiliary(
         dispatcher.db_factory,
@@ -231,21 +303,29 @@ async def test_monitor_provider_effect_rechecks_project_share_after_claim(
         ))
         await db.commit()
 
-    dispatcher._launch_codex_monitor_turn = AsyncMock()
-    dispatcher._launch_monitor_agent = AsyncMock()
-    from backend.services.project_share_admission import (
-        ProjectShareAdmissionError,
+    dispatcher._launch_codex_monitor_turn = AsyncMock(
+        return_value=MagicMock(),
+    )
+    dispatcher._launch_monitor_agent = AsyncMock(
+        return_value=_fake_proc(),
     )
 
-    with pytest.raises(ProjectShareAdmissionError, match="is shared"):
+    with patch(
+        "backend.services.mcp_config.generate_monitor_agent_mcp_config",
+        return_value=tmp_path / "team-share-monitor.json",
+    ):
         await dispatcher._launch_scheduled_monitor_turn(session_id, snapshot)
-    dispatcher._launch_codex_monitor_turn.assert_not_awaited()
-    dispatcher._launch_monitor_agent.assert_not_awaited()
+    if provider == "codex":
+        dispatcher._launch_codex_monitor_turn.assert_awaited_once()
+        dispatcher._launch_monitor_agent.assert_not_awaited()
+    else:
+        dispatcher._launch_monitor_agent.assert_awaited_once()
+        dispatcher._launch_codex_monitor_turn.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", ["claude", "codex"])
-async def test_shared_project_sub_agent_has_zero_provider_effect(
+async def test_team_project_share_does_not_block_sub_agent_provider_effect(
     dispatcher,
     provider,
 ):
@@ -255,15 +335,60 @@ async def test_shared_project_sub_agent_has_zero_provider_effect(
         agent_type="sub_agent",
         shared=True,
     )
-    dispatcher._launch_sub_agent = AsyncMock()
-    dispatcher._launch_codex_sub_agent = AsyncMock()
+    dispatcher._launch_sub_agent = AsyncMock(return_value=_fake_proc())
+    dispatcher._launch_codex_sub_agent = AsyncMock(return_value=_fake_proc())
     dispatcher._finalize_aux_lifecycle_process = AsyncMock(return_value=None)
     dispatcher._finalize_codex_sub_agent_turn = AsyncMock()
+    dispatcher.enqueue_message = AsyncMock()
 
     await dispatcher._sub_agent_session_lifecycle(session_id)
 
+    if provider == "codex":
+        dispatcher._launch_codex_sub_agent.assert_awaited_once()
+        dispatcher._launch_sub_agent.assert_not_awaited()
+    else:
+        dispatcher._launch_sub_agent.assert_awaited_once()
+        dispatcher._launch_codex_sub_agent.assert_not_awaited()
+    async with dispatcher.db_factory() as db:
+        session = await db.get(MonitorSession, session_id)
+    # The fake process intentionally exits without reporting a result. The
+    # lifecycle failure is unrelated to the local TeamProjectShare ACL.
+    assert session.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_worker_drain_refuses_claude_sub_agent_final_launch(
+    dispatcher,
+    monkeypatch,
+    tmp_path,
+):
+    """A durable Sub-Agent row cannot spawn after the node claim wins."""
+
+    from backend.services.worker_node_control import begin_worker_node_drain
+
+    _project_id, _task_id, session_id = await _seed_project_auxiliary(
+        dispatcher.db_factory,
+        provider="claude",
+        agent_type="sub_agent",
+        shared=False,
+    )
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    async with dispatcher.db_factory() as db:
+        await begin_worker_node_drain(db, claim="c" * 64)
+        await db.commit()
+
+    dispatcher._launch_sub_agent = AsyncMock(return_value=_fake_proc())
+    dispatcher._finalize_aux_lifecycle_process = AsyncMock(return_value=None)
+    with (
+        patch(
+            "backend.services.mcp_config.generate_sub_agent_mcp_config",
+            return_value=tmp_path / "late-sub-agent.json",
+        ),
+        patch("backend.services.mcp_config.cleanup_sub_agent_mcp_config"),
+    ):
+        await dispatcher._sub_agent_session_lifecycle(session_id)
+
     dispatcher._launch_sub_agent.assert_not_awaited()
-    dispatcher._launch_codex_sub_agent.assert_not_awaited()
     async with dispatcher.db_factory() as db:
         session = await db.get(MonitorSession, session_id)
     assert session.status == "failed"

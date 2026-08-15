@@ -3,16 +3,30 @@
 from copy import deepcopy
 from contextlib import AsyncExitStack
 from datetime import datetime
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.api.deps import get_current_user_id, require_task_access, require_task_control
+from backend.api.deps import (
+    get_current_user_id,
+    lock_task_effect_access,
+    lock_task_effect_accesses,
+    require_task_access,
+    require_task_control,
+    task_execution_principal_from_request,
+)
 from backend.api.uploads import (
     UploadAttachmentValidationError,
     validate_upload_attachments,
+)
+from backend.api.task_projection import (
+    task_list_response,
+    task_response,
+    task_response_model,
 )
 from backend.config import settings
 from backend.database import get_db
@@ -200,7 +214,6 @@ async def _create_related_plan(
     target: Task,
     body: RelatedPlanCreate,
 ) -> Task:
-    await _fence_plan_task_admission(db, target.id)
     active_count = await db.scalar(
         select(func.count(Task.id)).where(
             Task.plan_target_task_id == target.id,
@@ -279,6 +292,42 @@ async def _create_related_plan(
         else await capture_repo_revision(target.last_cwd or target.target_repo)
     )
     target_id = target.id
+    target_snapshot = (
+        target.incarnation_id,
+        target.session_id,
+        target.shared_from_id,
+        target.status,
+        target.title,
+        target.priority,
+        target.project_id,
+        target.target_repo,
+        target.last_cwd,
+        target.target_branch,
+        target.worker_id,
+        target.max_retries,
+        target.timeout_hours,
+    )
+    target_probe = SimpleNamespace(
+        id=target.id,
+        project_id=target.project_id,
+    )
+
+    def target_changed(current: Task) -> bool:
+        return target_snapshot != (
+            current.incarnation_id,
+            current.session_id,
+            current.shared_from_id,
+            current.status,
+            current.title,
+            current.priority,
+            current.project_id,
+            current.target_repo,
+            current.last_cwd,
+            current.target_branch,
+            current.worker_id,
+            current.max_retries,
+            current.timeout_hours,
+        )
 
     async def stage_plan(
         current_target: Task,
@@ -304,6 +353,10 @@ async def _create_related_plan(
             merge_status="pending",
             worker_id=current_target.worker_id,
             created_by=get_current_user_id(request),
+            **task_execution_principal_from_request(
+                request,
+                force_sandbox=True,
+            ),
             max_retries=current_target.max_retries,
             mode="plan",
             provider=provider,
@@ -350,20 +403,101 @@ async def _create_related_plan(
         )
 
     if supersedes is None:
-        plan = await stage_plan(target, None)
+        current_target = await lock_task_effect_access(
+            request,
+            target_probe,
+            db,
+            allow_chat_share=False,
+            fence_worker_node=True,
+            fence_worker_assignment=True,
+        )
+        if target_changed(current_target):
+            raise HTTPException(
+                409,
+                "Plan target changed while creating the Plan",
+            )
+        await _fence_plan_task_admission(db, current_target.id)
+        exact_active_count = await db.scalar(
+            select(func.count(Task.id)).where(
+                Task.plan_target_task_id == current_target.id,
+                Task.mode == "plan",
+                Task.status.in_(ACTIVE_PLAN_STATUSES),
+            )
+        )
+        if int(exact_active_count or 0) >= MAX_ACTIVE_PLANS_PER_TASK:
+            raise HTTPException(
+                429,
+                f"Task already has {MAX_ACTIVE_PLANS_PER_TASK} active Plans",
+            )
+        plan = await stage_plan(current_target, None)
         await db.commit()
     else:
+        supersedes_snapshot = (
+            supersedes.incarnation_id,
+            supersedes.mode,
+            supersedes.status,
+            supersedes.plan_target_task_id,
+            supersedes.project_id,
+            supersedes.worker_id,
+        )
+        supersedes_probe = SimpleNamespace(
+            id=supersedes.id,
+            project_id=supersedes.project_id,
+        )
+        authorized_tasks: dict[int, Task] = {}
+
+        async def authorize_supersede_effect() -> None:
+            locked = await lock_task_effect_accesses(
+                request,
+                [target_probe, supersedes_probe],
+                db,
+                allow_chat_share=False,
+                fence_worker_node=True,
+                fence_worker_assignment=True,
+            )
+            authorized_tasks.update({task.id: task for task in locked})
+            current_target = authorized_tasks.get(target_id)
+            current_supersedes = authorized_tasks.get(superseded_id)
+            if current_target is None or target_changed(current_target):
+                raise HTTPException(
+                    409,
+                    "Plan target changed while creating the revision",
+                )
+            if current_supersedes is None or supersedes_snapshot != (
+                current_supersedes.incarnation_id,
+                current_supersedes.mode,
+                current_supersedes.status,
+                current_supersedes.plan_target_task_id,
+                current_supersedes.project_id,
+                current_supersedes.worker_id,
+            ):
+                raise HTTPException(
+                    409,
+                    "Superseded Plan changed while creating the revision",
+                )
+
         async def commit_supersede() -> Task:
             db.expire_all()
-            current_target = await db.get(Task, target_id)
-            current_supersedes = await db.get(Task, superseded_id)
+            current_target = await db.get(
+                Task,
+                target_id,
+                populate_existing=True,
+            )
+            current_supersedes = await db.get(
+                Task,
+                superseded_id,
+                populate_existing=True,
+            )
             if current_target is None or current_supersedes is None:
                 raise HTTPException(
                     409,
                     "Plan or target disappeared during revision",
                 )
-            await require_task_control(request, current_target, db)
-            await require_task_control(request, current_supersedes, db)
+            if target_changed(current_target):
+                raise HTTPException(
+                    409,
+                    "Plan target changed while creating the revision",
+                )
             if (
                 current_supersedes.mode != "plan"
                 or current_supersedes.plan_target_task_id != current_target.id
@@ -373,6 +507,7 @@ async def _create_related_plan(
                     "Superseded Plan does not belong to this Task",
                 )
             _require_revisable_plan(current_supersedes)
+            await _fence_plan_task_admission(db, current_target.id)
             exact_active_count = await db.scalar(
                 select(func.count(Task.id)).where(
                     Task.plan_target_task_id == current_target.id,
@@ -403,17 +538,11 @@ async def _create_related_plan(
                 superseded_id,
                 "superseded",
                 commit_supersede,
+                authorize_effect_boundary=authorize_supersede_effect,
             )
         except PlanTerminalQuiescenceError as exc:
             raise HTTPException(409, str(exc)) from exc
     await db.refresh(plan)
-    if plan.project_id:
-        try:
-            from backend.services.task_sharing import auto_share_new_task
-
-            await auto_share_new_task(db, plan.id, plan.project_id)
-        except Exception:
-            pass
     await _wake_dispatcher()
     return plan
 
@@ -470,11 +599,17 @@ async def create_related_plan(
             target,
             action="used as a Plan owner",
         )
-        return await _create_related_plan(
+        plan = await _create_related_plan(
             db=db,
             request=request,
             target=target,
             body=body,
+        )
+        return await task_response(
+            request,
+            plan,
+            db,
+            status_code=201,
         )
 
 
@@ -498,10 +633,22 @@ async def list_related_plans(
     )
     plans = list(rows.scalars().all())
     # A related Plan inherits the target's visibility, but do not accidentally
-    # expose a row whose ownership/routing was corrupted independently.
+    # expose a row whose ownership/routing was corrupted independently. A
+    # TeamTaskShare belongs to the target Task and is intentionally not copied
+    # into every Plan row, so re-running require_task_access(plan) here would
+    # turn inherited chat visibility into an unconditional 403.
     for plan in plans:
-        await require_task_access(request, plan, db)
-    return plans
+        if (
+            plan.plan_target_task_id != target.id
+            or plan.project_id != target.project_id
+            or plan.worker_id != target.worker_id
+            or plan.shared_from_id != target.shared_from_id
+        ):
+            raise HTTPException(
+                409,
+                "Related Plan routing does not match its target Task",
+            )
+    return await task_list_response(request, plans, db)
 
 
 @router.get("/{plan_task_id}/plan/staleness")
@@ -665,16 +812,74 @@ async def revise_plan(
             legacy_effort=current_source.effort_level,
         )
         if current_source.plan_target_task_id is None:
+            source_snapshot = (
+                current_source.incarnation_id,
+                current_source.mode,
+                current_source.status,
+                current_source.plan_target_task_id,
+                current_source.project_id,
+                current_source.worker_id,
+                current_source.target_repo,
+                current_source.last_cwd,
+                current_source.target_branch,
+                current_source.priority,
+                current_source.max_retries,
+                current_source.timeout_hours,
+            )
+            source_probe = SimpleNamespace(
+                id=current_source.id,
+                project_id=current_source.project_id,
+            )
+
+            def source_changed(candidate: Task) -> bool:
+                return source_snapshot != (
+                    candidate.incarnation_id,
+                    candidate.mode,
+                    candidate.status,
+                    candidate.plan_target_task_id,
+                    candidate.project_id,
+                    candidate.worker_id,
+                    candidate.target_repo,
+                    candidate.last_cwd,
+                    candidate.target_branch,
+                    candidate.priority,
+                    candidate.max_retries,
+                    candidate.timeout_hours,
+                )
+
             repo_revision = await capture_repo_revision(
                 current_source.last_cwd or current_source.target_repo
             )
 
+            async def authorize_standalone_revision() -> None:
+                admitted = await lock_task_effect_access(
+                    request,
+                    source_probe,
+                    db,
+                    allow_chat_share=False,
+                    fence_worker_node=True,
+                    fence_worker_assignment=True,
+                )
+                if source_changed(admitted):
+                    raise HTTPException(
+                        409,
+                        "Plan changed while its revision was being created",
+                    )
+
             async def commit_standalone_supersede() -> Task:
                 db.expire_all()
-                exact_source = await db.get(Task, plan_task_id)
+                exact_source = await db.get(
+                    Task,
+                    plan_task_id,
+                    populate_existing=True,
+                )
                 if exact_source is None:
                     raise HTTPException(409, "Plan disappeared during revision")
-                await require_task_control(request, exact_source, db)
+                if source_changed(exact_source):
+                    raise HTTPException(
+                        409,
+                        "Plan changed while its revision was being created",
+                    )
                 _require_revisable_plan(exact_source)
                 if exact_source.plan_target_task_id is not None:
                     raise HTTPException(
@@ -704,6 +909,10 @@ async def revise_plan(
                     merge_status="pending",
                     worker_id=exact_source.worker_id,
                     created_by=get_current_user_id(request),
+                    **task_execution_principal_from_request(
+                        request,
+                        force_sandbox=True,
+                    ),
                     max_retries=exact_source.max_retries,
                     mode="plan",
                     provider=revision_pipeline.planner.primary.provider,
@@ -742,28 +951,23 @@ async def revise_plan(
                     plan_task_id,
                     "superseded",
                     commit_standalone_supersede,
+                    authorize_effect_boundary=authorize_standalone_revision,
                 )
             except PlanTerminalQuiescenceError as exc:
                 raise HTTPException(409, str(exc)) from exc
             await db.refresh(revision)
-            if revision.project_id:
-                try:
-                    from backend.services.task_sharing import auto_share_new_task
-
-                    await auto_share_new_task(
-                        db,
-                        revision.id,
-                        revision.project_id,
-                    )
-                except Exception:
-                    pass
             await _wake_dispatcher()
-            return revision
+            return await task_response(
+                request,
+                revision,
+                db,
+                status_code=201,
+            )
 
         revision_files, revision_images, revision_attachments = (
             _plan_upload_fields(current_source)
         )
-        return await _create_related_plan(
+        revision = await _create_related_plan(
             db=db,
             request=request,
             target=current_target,
@@ -779,6 +983,12 @@ async def revise_plan(
                 pipeline_config=revision_pipeline,
                 supersedes_plan_task_id=current_source.id,
             ),
+        )
+        return await task_response(
+            request,
+            revision,
+            db,
+            status_code=201,
         )
 
 
@@ -811,8 +1021,62 @@ async def create_plan_execution_task(
             existing = await db.get(Task, plan.plan_execution_task_id)
             if existing is None:
                 raise HTTPException(409, "Recorded execution Task no longer exists")
-            return PlanExecutionResponse(plan_task=plan, execution_task=existing)
+            projected_plan = await task_response_model(request, plan, db)
+            projected_execution = await task_response_model(
+                request,
+                existing,
+                db,
+            )
+            return JSONResponse(
+                status_code=201,
+                content={
+                    "plan_task": projected_plan.model_dump(mode="json"),
+                    "execution_task": projected_execution.model_dump(
+                        mode="json"
+                    ),
+                },
+            )
 
+        plan_snapshot = (
+            plan.incarnation_id,
+            plan.mode,
+            plan.status,
+            plan.plan_target_task_id,
+            plan.canonical_plan_id,
+            plan.plan_approved,
+            plan.plan_content,
+            plan.plan_execution_task_id,
+            plan.project_id,
+            plan.worker_id,
+            plan.target_repo,
+            plan.target_branch,
+        )
+        plan = await lock_task_effect_access(
+            request,
+            SimpleNamespace(id=plan.id, project_id=plan.project_id),
+            db,
+            allow_chat_share=False,
+            fence_worker_node=True,
+            fence_worker_assignment=True,
+        )
+        if plan_snapshot != (
+            plan.incarnation_id,
+            plan.mode,
+            plan.status,
+            plan.plan_target_task_id,
+            plan.canonical_plan_id,
+            plan.plan_approved,
+            plan.plan_content,
+            plan.plan_execution_task_id,
+            plan.project_id,
+            plan.worker_id,
+            plan.target_repo,
+            plan.target_branch,
+        ):
+            raise HTTPException(
+                409,
+                "Plan changed while creating its execution Task",
+            )
         await _fence_plan_task_admission(db, plan.id)
 
         metadata = deepcopy(plan.metadata_ or {})
@@ -837,6 +1101,10 @@ async def create_plan_execution_task(
             merge_status="pending",
             worker_id=plan.worker_id,
             created_by=get_current_user_id(request),
+            # This is the ordinary implementation Task selected by the user.
+            # Worker is only its execution location; forwarding converts this
+            # native Manager principal to the authenticated delegated form.
+            **task_execution_principal_from_request(request),
             max_retries=plan.max_retries,
             mode="auto",
             provider=plan.provider,
@@ -868,16 +1136,13 @@ async def create_plan_execution_task(
         await db.commit()
         await db.refresh(plan)
         await db.refresh(execution)
-        if execution.project_id:
-            try:
-                from backend.services.task_sharing import auto_share_new_task
-
-                await auto_share_new_task(
-                    db,
-                    execution.id,
-                    execution.project_id,
-                )
-            except Exception:
-                pass
     await _wake_dispatcher()
-    return PlanExecutionResponse(plan_task=plan, execution_task=execution)
+    projected_plan = await task_response_model(request, plan, db)
+    projected_execution = await task_response_model(request, execution, db)
+    return JSONResponse(
+        status_code=201,
+        content={
+            "plan_task": projected_plan.model_dump(mode="json"),
+            "execution_task": projected_execution.model_dump(mode="json"),
+        },
+    )

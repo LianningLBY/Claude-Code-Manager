@@ -2,6 +2,7 @@ import asyncio
 import fnmatch
 import os
 import pathlib
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
@@ -16,6 +17,8 @@ from backend.models.project import Project
 from backend.api.deps import (
     get_current_user_id,
     get_current_user_role,
+    lock_request_user_authority,
+    require_admin,
     require_project_access,
     require_worker_target_access,
 )
@@ -25,6 +28,11 @@ from backend.models.global_settings import GlobalSettings
 from backend.schemas.project import ProjectCreate, ProjectUpdate, ProjectResponse, ProjectReorderItem
 from backend.services.git_config import merge_git_config, settings_to_dict
 from backend.services.dispatcher import _build_git_env
+from backend.services.worker_assignment import (
+    WorkerAssignmentConflict,
+    fence_ready_worker_assignment,
+)
+from backend.services.worker_node_control import fence_worker_node_mutation
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -54,6 +62,49 @@ async def _delivery_run_reference(
     return (await db.execute(statement.limit(1).with_for_update())).scalar_one_or_none()
 
 
+async def _project_pr_monitor_ids(
+    db: AsyncSession,
+    *,
+    project_id: int,
+) -> tuple[int, ...]:
+    """Discover PR Monitor identities before taking deletion writer locks."""
+
+    from backend.models.pr_monitor import MonitoredRepo
+
+    return tuple(
+        await db.scalars(
+            select(MonitoredRepo.id)
+            .where(MonitoredRepo.project_id == project_id)
+            .order_by(MonitoredRepo.id)
+        )
+    )
+
+
+async def _project_pr_monitor_reference(
+    db: AsyncSession,
+    *,
+    project_id: int,
+) -> int | None:
+    """Return one PR Monitor attached to a Project deletion fence.
+
+    The caller has already locked every initially observed MonitoredRepo in ID
+    order, then acquired the Project writer fence.  This final plain read must
+    not acquire another Repo lock after the Project lock.  It catches a monitor
+    that was created or moved here before the Project fence was won; once that
+    fence is held, create/rebind cannot write ``project_id`` until this
+    transaction finishes.  Disabled monitors count too.
+    """
+
+    from backend.models.pr_monitor import MonitoredRepo
+
+    return await db.scalar(
+        select(MonitoredRepo.id)
+        .where(MonitoredRepo.project_id == project_id)
+        .order_by(MonitoredRepo.id)
+        .limit(1)
+    )
+
+
 async def _reject_active_delivery_project_mutation(
     db: AsyncSession,
     *,
@@ -75,6 +126,62 @@ async def _require_project_access(request: Request, project_id: int, db: AsyncSe
     await require_project_access(request, project_id, db)
 
 
+def _redact_project_for_member(project: Project) -> dict:
+    """Return the member-visible Project projection without credentials.
+
+    Project membership authorizes repository-scoped Task work, not access to
+    the Manager's credential material.  Keep the public repository metadata
+    useful while stripping both dedicated credential fields and accidental
+    URL userinfo.
+    """
+
+    data = ProjectResponse.model_validate(project).model_dump()
+    data["git_ssh_key_path"] = None
+    data["git_https_token"] = None
+    # Preview profiles are administrator-owned execution configuration. Their
+    # argv and custom environment can contain deployment-specific material;
+    # Project membership grants use of the capability, not read access to its
+    # stored configuration.
+    data["preview_config"] = None
+    git_url = data.get("git_url")
+    if isinstance(git_url, str) and "://" in git_url:
+        try:
+            parsed = urlsplit(git_url)
+            if (
+                parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                if parsed.hostname is None:
+                    data["git_url"] = None
+                    return data
+                host = parsed.hostname
+                # urlsplit() removes IPv6 brackets from ``hostname``;
+                # urlunsplit() requires them in the netloc.
+                if ":" in host and not host.startswith("["):
+                    host = f"[{host}]"
+                if parsed.port is not None:
+                    host = f"{host}:{parsed.port}"
+                # Query parameters and fragments are not required repository
+                # identity. Legacy remotes sometimes carry access tokens in
+                # either component, so never expose them to Project members.
+                data["git_url"] = urlunsplit(
+                    (parsed.scheme, host, parsed.path, "", "")
+                )
+        except ValueError:
+            # A malformed legacy URL is repository configuration, not member
+            # input. Hide it rather than risk returning embedded credentials.
+            data["git_url"] = None
+    return data
+
+
+def _project_response_for_request(request: Request, project: Project) -> dict:
+    if get_current_user_role(request) in ("admin", "super_admin"):
+        return ProjectResponse.model_validate(project).model_dump()
+    return _redact_project_for_member(project)
+
+
 
 @router.get("")
 async def list_projects(request: Request, db: AsyncSession = Depends(get_db)):
@@ -83,20 +190,23 @@ async def list_projects(request: Request, db: AsyncSession = Depends(get_db)):
     stmt = select(Project).order_by(Project.sort_order.asc(), Project.name.asc())
     if user_role not in ("admin", "super_admin") and user_id:
         from backend.models.team_share import TeamProjectShare
-        from backend.models.worker import Worker
         from backend.models.user_group import UserGroupMember
         user_group_ids = select(UserGroupMember.group_id).where(UserGroupMember.user_id == user_id)
         shared_project_ids = select(TeamProjectShare.project_id).where(
             ((TeamProjectShare.target_type == "user") & (TeamProjectShare.target_id == user_id))
             | ((TeamProjectShare.target_type == "group") & TeamProjectShare.target_id.in_(user_group_ids))
         )
-        owned_worker_ids = select(Worker.id).where(Worker.owner_user_id == user_id)
-        stmt = stmt.where(
-            Project.id.in_(shared_project_ids)
-            | Project.worker_id.in_(owned_worker_ids)
-        )
+        stmt = stmt.where(Project.id.in_(shared_project_ids))
+    elif user_role not in ("admin", "super_admin"):
+        stmt = stmt.where(False)
     result = await db.execute(stmt)
     projects = list(result.scalars().all())
+    if user_role not in ("admin", "super_admin"):
+        from backend.models.project import project_is_internal
+
+        # A stale TeamProjectShare from an older deployment is not authority
+        # to enumerate Manager-owned grouping Projects.
+        projects = [project for project in projects if not project_is_internal(project)]
 
     # Annotate each project with its location using project.worker_id
     from backend.models.worker import Worker as WorkerModel
@@ -108,7 +218,7 @@ async def list_projects(request: Request, db: AsyncSession = Depends(get_db)):
 
     out = []
     for p in projects:
-        d = ProjectResponse.model_validate(p).model_dump()
+        d = _project_response_for_request(request, p)
         d["location"] = worker_name_map.get(p.worker_id, "local") if p.worker_id else "local"
         out.append(d)
     return out
@@ -119,26 +229,29 @@ async def list_project_tags(request: Request, db: AsyncSession = Depends(get_db)
     """Return unique tags from projects the user can see."""
     user_id = get_current_user_id(request)
     user_role = get_current_user_role(request)
-    stmt = select(Project.tags)
+    stmt = select(Project)
     if user_role not in ("admin", "super_admin") and user_id:
         from backend.models.team_share import TeamProjectShare
-        from backend.models.worker import Worker
         from backend.models.user_group import UserGroupMember
         user_group_ids = select(UserGroupMember.group_id).where(UserGroupMember.user_id == user_id)
         shared_project_ids = select(TeamProjectShare.project_id).where(
             ((TeamProjectShare.target_type == "user") & (TeamProjectShare.target_id == user_id))
             | ((TeamProjectShare.target_type == "group") & TeamProjectShare.target_id.in_(user_group_ids))
         )
-        owned_worker_ids = select(Worker.id).where(Worker.owner_user_id == user_id)
-        stmt = stmt.where(
-            Project.id.in_(shared_project_ids)
-            | Project.worker_id.in_(owned_worker_ids)
-        )
+        stmt = stmt.where(Project.id.in_(shared_project_ids))
+    elif user_role not in ("admin", "super_admin"):
+        stmt = stmt.where(False)
     result = await db.execute(stmt)
     all_tags: set[str] = set()
-    for (tags,) in result:
-        if tags:
-            all_tags.update(tags)
+    from backend.models.project import project_is_internal
+
+    for project in result.scalars():
+        if user_role not in ("admin", "super_admin") and project_is_internal(project):
+            continue
+        for tag in project.tags or []:
+            # Internal identity markers are not reusable presentation tags.
+            if isinstance(tag, str) and not tag.startswith("ccm:internal:"):
+                all_tags.add(tag)
     return sorted(all_tags)
 
 
@@ -149,13 +262,27 @@ async def reorder_projects(
     db: AsyncSession = Depends(get_db),
 ):
     """Bulk-update sort_order for a list of projects."""
-    for item in body:
-        project = await db.get(Project, item.id)
-        if project is None:
+    require_admin(request)
+    requested = {item.id: item.sort_order for item in body}
+    if len(requested) != len(body):
+        raise HTTPException(400, "Project reorder contains duplicate ids")
+    # Project rows are the resource fence; numeric order prevents reciprocal
+    # reorder requests from taking the same rows in opposite order.
+    for project_id in sorted(requested):
+        locked = await db.execute(
+            update(Project)
+            .where(Project.id == project_id)
+            .values(id=Project.id)
+        )
+        if locked.rowcount != 1:
+            await db.rollback()
             raise HTTPException(404, "Project not found")
-        await require_project_access(request, item.id, db)
+    await lock_request_user_authority(request, db)
+    for project_id, sort_order in requested.items():
         await db.execute(
-            update(Project).where(Project.id == item.id).values(sort_order=item.sort_order)
+            update(Project)
+            .where(Project.id == project_id)
+            .values(sort_order=sort_order)
         )
     await db.commit()
     # Reuse the canonical visibility filter.  Returning the whole Project table
@@ -165,7 +292,12 @@ async def reorder_projects(
 
 @router.post("", response_model=ProjectResponse, status_code=201)
 async def create_project(request: Request, body: ProjectCreate, db: AsyncSession = Depends(get_db)):
+    require_admin(request)
     await require_worker_target_access(request, body.worker_id, db)
+    # Worker Project materialization is a durable local producer.  Hold the
+    # node-control writer through the Project insert so drain-first rejects it
+    # and create-first is visible to the later drain proof.
+    await fence_worker_node_mutation(db)
     # Check duplicate name
     existing = await db.execute(select(Project).where(Project.name == body.name))
     if existing.scalar_one_or_none():
@@ -193,6 +325,12 @@ async def create_project(request: Request, body: ProjectCreate, db: AsyncSession
         git_https_username=body.git_https_username,
         git_https_token=body.git_https_token,
     )
+    try:
+        await fence_ready_worker_assignment(db, body.worker_id)
+    except WorkerAssignmentConflict as exc:
+        await db.rollback()
+        raise HTTPException(409, exc.detail) from exc
+    await lock_request_user_authority(request, db)
     db.add(project)
 
     # Auto-create Tag records for any new tag names
@@ -204,22 +342,24 @@ async def create_project(request: Request, body: ProjectCreate, db: AsyncSession
                 db.add(Tag(name=tag_name))
                 existing_names.add(tag_name)
 
-    await db.commit()
-    await db.refresh(project)
-
-    # Worker projects: skip local clone — worker_proxy handles remote clone when first task runs
-    if not body.worker_id:
+    # Resolve every background argument before commit, then spawn immediately
+    # after it without an intervening await.  Startup recovery handles the
+    # remaining hard-crash boundary between commit and in-process scheduling.
+    git_config = None
+    if body.worker_id is None:
         global_cfg = await db.get(GlobalSettings, 1)
         git_config = merge_git_config(_extract_git_config(project), settings_to_dict(global_cfg))
+    else:
+        # Manager-side records assigned to Workers are only routing metadata;
+        # the Worker creates and materializes its own local Project copy.
+        project.status = "ready"
+
+    await db.commit()
+    if body.worker_id is None:
         if has_remote:
             asyncio.create_task(_clone_repo(project.id, body.git_url, local_path, body.name, body.default_branch, git_config))
         else:
             asyncio.create_task(_init_local_repo(project.id, local_path, body.name, body.default_branch, git_config))
-    else:
-        # Mark as ready immediately — actual clone happens on Worker
-        project.status = "ready"
-        await db.commit()
-        await db.refresh(project)
 
     return project
 
@@ -230,14 +370,14 @@ async def get_project(project_id: int, request: Request, db: AsyncSession = Depe
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
-    return project
+    return _project_response_for_request(request, project)
 
 
 @router.put("/{project_id}", response_model=ProjectResponse)
 async def update_project(
     project_id: int, body: ProjectUpdate, request: Request, db: AsyncSession = Depends(get_db)
 ):
-    await _require_project_access(request, project_id, db)
+    require_admin(request)
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
@@ -249,6 +389,7 @@ async def update_project(
     )
     if locked.rowcount != 1:
         raise HTTPException(404, "Project not found")
+    await lock_request_user_authority(request, db)
     project = await db.get(Project, project_id, populate_existing=True)
     updates = body.model_dump(exclude_unset=True)
     if "preview_config" in updates and updates["preview_config"] is not None:
@@ -317,12 +458,29 @@ async def delete_project(project_id: int, request: Request, db: AsyncSession = D
         ProjectShareAdmissionError,
         lock_project_share_authority,
     )
+    from backend.services.pr_review_actions import (
+        FindingActionConflict,
+        lock_pr_repo_action_boundary,
+    )
 
     require_admin(request)
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
+    monitor_ids = await _project_pr_monitor_ids(
+        db,
+        project_id=project_id,
+    )
     await db.rollback()
+    try:
+        for monitor_id in monitor_ids:
+            await lock_pr_repo_action_boundary(db, monitor_id)
+    except FindingActionConflict as exc:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Could not establish the PR Monitor deletion fence; retry",
+        ) from exc
     try:
         project = await lock_project_share_authority(db, project_id)
     except ProjectShareAdmissionError as exc:
@@ -334,6 +492,7 @@ async def delete_project(project_id: int, request: Request, db: AsyncSession = D
     except ValueError as exc:
         await db.rollback()
         raise HTTPException(404, "Project not found") from exc
+    await lock_request_user_authority(request, db)
 
     discussion = (
         await db.execute(
@@ -369,6 +528,15 @@ async def delete_project(project_id: int, request: Request, db: AsyncSession = D
             409,
             f"Cannot delete a Project referenced by Delivery Run {run_id}",
         )
+    monitor_id = await _project_pr_monitor_reference(
+        db,
+        project_id=project_id,
+    )
+    if monitor_id is not None:
+        raise HTTPException(
+            409,
+            f"Delete PR Monitor {monitor_id} before deleting its Project",
+        )
     # project_todos declares ON DELETE CASCADE, but SQLite does not enforce FKs
     # (no `PRAGMA foreign_keys=ON` in database.py), so the DB won't cascade.
     # Delete the todos explicitly so this works on SQLite too.
@@ -389,11 +557,12 @@ async def delete_project(project_id: int, request: Request, db: AsyncSession = D
 
 @router.post("/{project_id}/reclone")
 async def reclone_project(project_id: int, request: Request, db: AsyncSession = Depends(get_db)):
-    await _require_project_access(request, project_id, db)
+    require_admin(request)
     project = await db.get(Project, project_id)
     if not project:
         raise HTTPException(404, "Project not found")
     await db.rollback()
+    await fence_worker_node_mutation(db)
     project = (
         await db.execute(
             select(Project)
@@ -404,18 +573,38 @@ async def reclone_project(project_id: int, request: Request, db: AsyncSession = 
     ).scalar_one_or_none()
     if project is None:
         raise HTTPException(404, "Project not found")
+    await lock_request_user_authority(request, db)
+    if project.worker_id is not None:
+        # The Manager row is routing metadata only; the authoritative checkout
+        # lives on the Worker.  There is no durable remote reclone protocol, so
+        # running _clone_repo here would mutate the wrong host.
+        raise HTTPException(
+            409,
+            "Worker-assigned Projects cannot be re-cloned from the Manager",
+        )
     if not project.has_remote:
         raise HTTPException(400, "Cannot reclone a local project")
     await _reject_active_delivery_project_mutation(
         db,
         project_id=project_id,
     )
+    global_cfg = await db.get(GlobalSettings, 1)
+    git_config = merge_git_config(
+        _extract_git_config(project),
+        settings_to_dict(global_cfg),
+    )
+    clone_args = (
+        project_id,
+        project.git_url,
+        project.local_path,
+        project.name,
+        project.default_branch,
+        git_config,
+    )
     project.status = "pending"
     project.error_message = None
     await db.commit()
-    global_cfg = await db.get(GlobalSettings, 1)
-    git_config = merge_git_config(_extract_git_config(project), settings_to_dict(global_cfg))
-    asyncio.create_task(_clone_repo(project_id, project.git_url, project.local_path, project.name, project.default_branch, git_config))
+    asyncio.create_task(_clone_repo(*clone_args))
     return {"ok": True}
 
 
@@ -794,15 +983,15 @@ async def _clone_repo(project_id: int, git_url: str, local_path: str, project_na
             )
             await db.commit()
 
-        # Importing a GitHub project should be enough to use the Delivery tab.
-        # This remains best-effort because CI may not have run yet; the
-        # quick-start endpoint performs the same idempotent setup again and
-        # reports a precise error if a declared identity cannot be resolved.
-        from backend.services.delivery_setup import (
-            try_auto_configure_delivery_monitor,
-        )
+        if settings.ccm_node_role == "manager":
+            # PR Monitor is Manager-authoritative state.  Worker Project copies
+            # are compute caches and must not perform GitHub setup or create a
+            # second, invisible MonitoredRepo in the Worker database.
+            from backend.services.delivery_setup import (
+                try_auto_configure_delivery_monitor,
+            )
 
-        await try_auto_configure_delivery_monitor(project_id)
+            await try_auto_configure_delivery_monitor(project_id)
 
     except Exception as e:
         async with async_session() as db:
@@ -935,6 +1124,35 @@ class ScanEnvFilesResponse(BaseModel):
     discovered: list[str] # found in repo but not yet tracked
 
 
+async def _lock_admin_env_file_effect(
+    request: Request,
+    db: AsyncSession,
+    project_id: int,
+) -> Project:
+    """Fence the exact Project and mutable admin role through a file effect."""
+
+    # End any preliminary read snapshot before taking the portable no-op
+    # writer barrier.  The fixed order is Project -> User, matching other
+    # Project effects and preventing a cached admin role from exposing or
+    # scanning secrets after a concurrent demotion.
+    await db.rollback()
+    locked = await db.execute(
+        update(Project)
+        .where(Project.id == project_id)
+        .values(id=Project.id)
+        .execution_options(synchronize_session=False)
+    )
+    if locked.rowcount != 1:
+        await db.rollback()
+        raise HTTPException(404, "Project not found")
+    await lock_request_user_authority(request, db)
+    project = await db.get(Project, project_id, populate_existing=True)
+    if project is None:  # Defensive: the writer fence already proved it exists.
+        await db.rollback()
+        raise HTTPException(404, "Project not found")
+    return project
+
+
 @router.get("/{project_id}/env-files", response_model=EnvFilesListResponse)
 async def list_env_files(
     project_id: int,
@@ -942,10 +1160,8 @@ async def list_env_files(
     db: AsyncSession = Depends(get_db),
 ):
     """List all configured env file paths and whether each exists on disk."""
-    await require_project_access(request, project_id, db)
-    project = await db.get(Project, project_id)
-    if not project:
-        raise HTTPException(404, "Project not found")
+    require_admin(request)
+    project = await _lock_admin_env_file_effect(request, db, project_id)
     if not project.local_path:
         raise HTTPException(400, "Project has no local path")
     files = []
@@ -963,10 +1179,8 @@ async def get_env_file(
     db: AsyncSession = Depends(get_db),
 ):
     """Read content of a configured env file. Returns empty string if not yet created."""
-    await require_project_access(request, project_id, db)
-    project = await db.get(Project, project_id)
-    if not project:
-        raise HTTPException(404, "Project not found")
+    require_admin(request)
+    project = await _lock_admin_env_file_effect(request, db, project_id)
     if not project.local_path:
         raise HTTPException(400, "Project has no local path")
     if filepath not in (project.env_files or []):
@@ -986,10 +1200,8 @@ async def update_env_file(
     db: AsyncSession = Depends(get_db),
 ):
     """Write content to a configured env file. Creates the file (and dirs) if needed."""
-    await require_project_access(request, project_id, db)
-    project = await db.get(Project, project_id)
-    if not project:
-        raise HTTPException(404, "Project not found")
+    require_admin(request)
+    project = await _lock_admin_env_file_effect(request, db, project_id)
     if not project.local_path:
         raise HTTPException(400, "Project has no local path")
     if filepath not in (project.env_files or []):
@@ -1007,10 +1219,8 @@ async def scan_env_files(
     db: AsyncSession = Depends(get_db),
 ):
     """Scan the project repo for .env-style files and return discovered paths."""
-    await require_project_access(request, project_id, db)
-    project = await db.get(Project, project_id)
-    if not project:
-        raise HTTPException(404, "Project not found")
+    require_admin(request)
+    project = await _lock_admin_env_file_effect(request, db, project_id)
     if not project.local_path or not os.path.isdir(project.local_path):
         raise HTTPException(400, "Project has no local path or directory does not exist")
     tracked = list(project.env_files or [])

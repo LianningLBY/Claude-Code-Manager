@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+from contextlib import asynccontextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -28,10 +29,20 @@ from backend.models.pr_monitor import (
     PRReviewerRun,
 )
 from backend.models.task import Task
+from backend.models.team_share import TeamProjectShare
+from backend.models.user import User
 from backend.models.worker import Worker
 from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 from backend.schemas.pr_monitor import MonitoredRepoResponse, MonitoredRepoUpdate
 from backend.services import pr_review_service
+from backend.tests.group_acl_test_helpers import (
+    grant_group_project_access,
+    revoke_group_membership_at_effect_fence,
+)
+from backend.tests.test_auth_ws_security import (
+    _create_user,
+    secured_client as secured_client,
+)
 
 
 # === Helpers ===
@@ -415,6 +426,230 @@ async def test_immediate_finding_action_survives_authorization_rollback(
     assert response.status_code == 200, response.text
     assert response.json()["finding_id"] == finding_id
     assert response.json()["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_immediate_finding_action_reauthorizes_after_project_fence(
+    secured_client,
+    monkeypatch,
+):
+    """A group revocation that wins the final Project fence vetoes the action."""
+
+    from backend.models.project import Project
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="pr-effect-member@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        project = Project(name="pr-effect-authority-race", status="ready")
+        db.add(project)
+        await db.flush()
+        project_id = project.id
+        repo = MonitoredRepo(
+            repo_full_name="owner/immediate-action-authority-race",
+            project_id=project_id,
+            webhook_secret="effect-test-secret",
+            enabled=True,
+        )
+        db.add(repo)
+        await db.commit()
+        repo_id = repo.id
+    await grant_group_project_access(
+        session_factory,
+        project_id=project_id,
+        user_id=member_id,
+    )
+    _, finding_id = await _seed_actionable_finding(
+        session_factory,
+        repo_id=repo_id,
+    )
+    fence = revoke_group_membership_at_effect_fence(monkeypatch)
+    response = await client.post(
+        f"/api/pr-monitor/findings/{finding_id}/ignore",
+        headers={"Authorization": f"Bearer {member_token}"},
+        json={"idempotency_key": "api-ignore-after-project-revoke"},
+    )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "revoked": True}
+    async with session_factory() as db:
+        assert (
+            await db.scalar(
+                select(PRFindingAction.id).where(
+                    PRFindingAction.finding_id == finding_id
+                )
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "user_change",
+    ({"role": "member"}, {"is_active": False}),
+    ids=("demoted", "disabled"),
+)
+async def test_immediate_finding_action_rejects_cached_jwt_authority_change(
+    secured_client,
+    monkeypatch,
+    user_change,
+):
+    """A projectless admin effect must revalidate its durable User row."""
+
+    import backend.api.deps as deps
+    import backend.api.pr_monitor as pr_monitor_api
+    from backend.models.user import User
+
+    client, session_factory = secured_client
+    admin_id, admin_token = await _create_user(
+        session_factory,
+        email=(
+            "pr-effect-admin-demoted@example.com"
+            if "role" in user_change
+            else "pr-effect-admin-disabled@example.com"
+        ),
+        role="admin",
+    )
+    async with session_factory() as db:
+        repo = MonitoredRepo(
+            repo_full_name=(
+                "owner/immediate-action-admin-demoted"
+                if "role" in user_change
+                else "owner/immediate-action-admin-disabled"
+            ),
+            project_id=None,
+            webhook_secret="effect-test-secret",
+            enabled=True,
+        )
+        db.add(repo)
+        await db.commit()
+        repo_id = repo.id
+    _, finding_id = await _seed_actionable_finding(
+        session_factory,
+        repo_id=repo_id,
+    )
+
+    original = deps.lock_request_user_authority
+    fence = {"calls": 0, "updated": 0}
+
+    async def mutate_then_lock(request, db):
+        fence["calls"] += 1
+        changed = await db.execute(
+            update(User)
+            .where(User.id == admin_id)
+            .values(**user_change)
+        )
+        fence["updated"] += changed.rowcount
+        await original(request, db)
+
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "lock_request_user_authority",
+        mutate_then_lock,
+    )
+    response = await client.post(
+        f"/api/pr-monitor/findings/{finding_id}/ignore",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"idempotency_key": "api-ignore-after-admin-change"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "disabled or changed role" in response.json()["detail"]
+    assert fence == {"calls": 1, "updated": 1}
+    async with session_factory() as db:
+        assert (
+            await db.scalar(
+                select(PRFindingAction.id).where(
+                    PRFindingAction.finding_id == finding_id
+                )
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_immediate_finding_action_rejects_direct_project_share_revocation(
+    secured_client,
+    monkeypatch,
+):
+    """A direct Project ACL revoke that wins the fence vetoes the effect."""
+
+    import backend.api.deps as deps
+    from backend.models.project import Project
+    from backend.models.team_share import TeamProjectShare
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="pr-effect-direct-member@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        project = Project(name="pr-effect-direct-share-race", status="ready")
+        db.add(project)
+        await db.flush()
+        project_id = project.id
+        repo = MonitoredRepo(
+            repo_full_name="owner/immediate-action-direct-share-race",
+            project_id=project_id,
+            webhook_secret="effect-test-secret",
+            enabled=True,
+        )
+        db.add(repo)
+        share = TeamProjectShare(
+            project_id=project_id,
+            target_type="user",
+            target_id=member_id,
+            shared_by=999,
+        )
+        db.add(share)
+        await db.commit()
+        repo_id = repo.id
+        share_id = share.id
+    _, finding_id = await _seed_actionable_finding(
+        session_factory,
+        repo_id=repo_id,
+    )
+
+    original = deps._lock_project_effect_fence
+    fence = {"calls": 0, "deleted": 0}
+
+    async def revoke_then_lock(locked_project_id, db):
+        fence["calls"] += 1
+        revoked = await db.execute(
+            delete(TeamProjectShare).where(
+                TeamProjectShare.id == share_id,
+                TeamProjectShare.project_id == locked_project_id,
+            )
+        )
+        fence["deleted"] += revoked.rowcount
+        return await original(locked_project_id, db)
+
+    monkeypatch.setattr(
+        deps,
+        "_lock_project_effect_fence",
+        revoke_then_lock,
+    )
+    response = await client.post(
+        f"/api/pr-monitor/findings/{finding_id}/ignore",
+        headers={"Authorization": f"Bearer {member_token}"},
+        json={"idempotency_key": "api-ignore-after-direct-share-revoke"},
+    )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "deleted": 1}
+    async with session_factory() as db:
+        assert (
+            await db.scalar(
+                select(PRFindingAction.id).where(
+                    PRFindingAction.finding_id == finding_id
+                )
+            )
+            is None
+        )
 
 
 @pytest.mark.asyncio
@@ -863,6 +1098,277 @@ async def test_panel_webhook_creates_roles_and_detail_api(client, session_factor
         "senior_engineer",
         "qa_engineer",
     ]
+    assert detail.json()["reviewer_count"] == 3
+    assert detail.json()["reviewer_status_counts"] == {"pending": 3}
+    assert detail.json()["reviewer_verdict_counts"] == {}
+    assert detail.json()["aggregate_verdict"] is None
+    assert detail.json()["outcome_kind"] == "in_progress"
+    assert detail.json()["display_status"] == "Reviewing"
+    assert detail.json()["task_ids"] == [run.task_id for run in runs]
+    assert all(
+        reviewer["outcome_kind"] == "in_progress"
+        for reviewer in detail.json()["reviewer_runs"]
+    )
+    assert all(
+        "result_json" not in reviewer
+        for reviewer in detail.json()["reviewer_runs"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_projection_separates_human_results_from_infrastructure_errors(
+    client,
+    session_factory,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(
+        client,
+        "owner/panel-projection",
+        review_mode="panel",
+        wait_for_ci=False,
+    )
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/panel-projection"),
+    )
+    assert opened.status_code == 200, opened.text
+    review_id = opened.json()["review_id"]
+    long_error = (
+        "provider context limit exceeded: "
+        + "上游拒绝了本次审查输入。" * 100
+        + " ERROR_DETAIL_SENTINEL"
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        runs = list((await db.execute(
+            select(PRReviewerRun)
+            .where(PRReviewerRun.pr_review_id == review_id)
+            .order_by(PRReviewerRun.id)
+        )).scalars())
+        assert review is not None
+        assert len(runs) == 3
+        task_ids = [run.task_id for run in runs]
+        legacy_task_id = review.task_id
+        terminal_results = (
+            ("passed", "pass", "Architecture and concurrency look sound."),
+            (
+                "changes_required",
+                "changes_required",
+                "One authorization regression must be fixed.",
+            ),
+            ("passed", "pass", "Targeted regression coverage is sufficient."),
+        )
+        for run, (status, verdict, summary) in zip(runs, terminal_results):
+            run.status = status
+            run.verdict = verdict
+            run.result_body = summary
+            run.result_json = {
+                "schema_version": 1,
+                "summary": summary,
+                "machine_only": "must-not-leak",
+            }
+        review.status = "commented"
+        review.review_summary = "The panel requires one authorization fix."
+        await db.commit()
+
+    listed = await client.get(f"/api/pr-monitor/repos/{repo['id']}/reviews")
+    assert listed.status_code == 200, listed.text
+    row = next(item for item in listed.json() if item["id"] == review_id)
+    assert row["task_id"] == legacy_task_id
+    assert row["task_ids"] == task_ids
+    assert row["reviewer_count"] == 3
+    assert row["reviewer_status_counts"] == {
+        "changes_required": 1,
+        "passed": 2,
+    }
+    assert row["reviewer_verdict_counts"] == {
+        "changes_required": 1,
+        "pass": 2,
+    }
+    assert row["aggregate_verdict"] == "changes_required"
+    assert row["outcome_kind"] == "review_result"
+    assert row["display_status"] == "Changes required"
+    assert row["display_summary"] == (
+        "The panel requires one authorization fix."
+    )
+    assert "reviewer_runs" not in row
+    assert "result_json" not in row
+
+    detail = await client.get(f"/api/pr-monitor/reviews/{review_id}")
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert [run["result_body"] for run in body["reviewer_runs"]] == [
+        item[2] for item in terminal_results
+    ]
+    assert [run["outcome_kind"] for run in body["reviewer_runs"]] == [
+        "review_result",
+        "review_result",
+        "review_result",
+    ]
+    assert all("result_json" not in run for run in body["reviewer_runs"])
+
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        failed = await db.scalar(
+            select(PRReviewerRun)
+            .where(
+                PRReviewerRun.pr_review_id == review_id,
+                PRReviewerRun.role == "qa_engineer",
+            )
+        )
+        assert review is not None
+        assert failed is not None
+        failed.status = "error"
+        failed.verdict = None
+        failed.result_body = None
+        failed.error_message = long_error
+        review.status = "error"
+        review.review_summary = "A required reviewer failed closed"
+        await db.commit()
+
+    failed_detail = await client.get(f"/api/pr-monitor/reviews/{review_id}")
+    assert failed_detail.status_code == 200, failed_detail.text
+    failed_body = failed_detail.json()
+    assert failed_body["outcome_kind"] == "infrastructure_error"
+    assert failed_body["aggregate_verdict"] is None
+    assert failed_body["display_status"] == "Infrastructure error"
+    assert "qa_engineer" in failed_body["display_summary"]
+    assert "provider context limit exceeded" in failed_body["display_summary"]
+    assert failed_body["reviewer_status_counts"] == {
+        "changes_required": 1,
+        "error": 1,
+        "passed": 1,
+    }
+    failed_run = next(
+        run
+        for run in failed_body["reviewer_runs"]
+        if run["role"] == "qa_engineer"
+    )
+    assert failed_run["outcome_kind"] == "infrastructure_error"
+    assert failed_run["result_body"] is None
+    assert failed_run["error_message"] == long_error
+    assert "result_json" not in failed_run
+
+    failed_list = await client.get(
+        f"/api/pr-monitor/repos/{repo['id']}/reviews"
+    )
+    assert failed_list.status_code == 200, failed_list.text
+    failed_row = next(
+        item for item in failed_list.json() if item["id"] == review_id
+    )
+    assert len(failed_row["display_summary"].encode("utf-8")) <= (
+        pr_monitor_api._PR_REVIEW_LIST_SUMMARY_MAX_BYTES
+    )
+    assert failed_row["display_summary"].endswith("…")
+    assert "ERROR_DETAIL_SENTINEL" not in failed_row["display_summary"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_single_review_technical_summary_is_humanized(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(
+        client,
+        "owner/legacy-single-summary",
+        review_mode="single",
+        wait_for_ci=False,
+    )
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/legacy-single-summary"),
+    )
+    assert opened.status_code == 200, opened.text
+    review_id = opened.json()["review_id"]
+    technical_summary = (
+        "Agent recommendation: lgtm_comment; backend action: "
+        "lgtm_comment; durable nonce evidence verified"
+    )
+    human_summary = "Review passed with no blocking findings."
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        assert review is not None
+        review.status = "approved"
+        review.action_taken = "lgtm_comment"
+        review.review_summary = technical_summary
+        review.completed_at = datetime.utcnow()
+        await db.commit()
+
+    listed = await client.get(f"/api/pr-monitor/repos/{repo['id']}/reviews")
+    assert listed.status_code == 200, listed.text
+    row = next(item for item in listed.json() if item["id"] == review_id)
+    assert row["review_summary"] == human_summary
+    assert row["display_summary"] == human_summary
+
+    detail = await client.get(f"/api/pr-monitor/reviews/{review_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["review_summary"] == human_summary
+    assert detail.json()["display_summary"] == human_summary
+    assert technical_summary not in detail.text
+
+
+@pytest.mark.asyncio
+async def test_single_review_list_bounds_summary_but_detail_returns_full_body(
+    client,
+    session_factory,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(
+        client,
+        "owner/single-summary-projection",
+        review_mode="single",
+        wait_for_ci=False,
+    )
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/single-summary-projection"),
+    )
+    assert opened.status_code == 200, opened.text
+    review_id = opened.json()["review_id"]
+    full_body = (
+        "权限边界需要调整。\n\n"
+        + "任务分发前必须保留真实调用者身份。" * 100
+        + "\nDETAIL_SENTINEL"
+    )
+    assert len(full_body.encode("utf-8")) > (
+        pr_monitor_api._PR_REVIEW_LIST_SUMMARY_MAX_BYTES
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        assert review is not None
+        review.status = "commented"
+        review.action_taken = "review_comments"
+        review.review_summary = full_body
+        review.pending_action = None
+        review.pending_review_body = None
+        review.completed_at = datetime.utcnow()
+        await db.commit()
+
+    listed = await client.get(f"/api/pr-monitor/repos/{repo['id']}/reviews")
+    assert listed.status_code == 200, listed.text
+    row = next(item for item in listed.json() if item["id"] == review_id)
+    assert row["review_summary"].endswith("…")
+    assert row["display_summary"].endswith("…")
+    assert len(row["review_summary"].encode("utf-8")) <= (
+        pr_monitor_api._PR_REVIEW_LIST_SUMMARY_MAX_BYTES
+    )
+    assert len(row["display_summary"].encode("utf-8")) <= (
+        pr_monitor_api._PR_REVIEW_LIST_SUMMARY_MAX_BYTES
+    )
+    assert "DETAIL_SENTINEL" not in row["review_summary"]
+    assert "DETAIL_SENTINEL" not in row["display_summary"]
+    assert row["review_summary"] != full_body
+    assert row["display_summary"] != full_body
+
+    detail = await client.get(f"/api/pr-monitor/reviews/{review_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["review_summary"] == full_body
+    assert detail.json()["display_summary"] == full_body
 
 
 @pytest.mark.asyncio
@@ -927,6 +1433,214 @@ async def test_create_repo_success(client):
     assert data["review_effort"] == "high"
     # Detail response: full (unmasked) webhook secret
     assert len(data["webhook_secret"]) == 64
+
+
+@pytest.mark.asyncio
+async def test_create_projectless_repo_revalidates_cached_jwt_authority(
+    secured_client,
+    monkeypatch,
+):
+    """A committed admin disablement must win before the final insert."""
+
+    import backend.api.deps as api_deps
+
+    client, session_factory = secured_client
+    admin_id, admin_token = await _create_user(
+        session_factory,
+        email="pr-create-disabled-admin@example.com",
+        role="admin",
+    )
+    original = api_deps.lock_request_user_authority
+    fence = {"calls": 0, "updated": 0}
+
+    async def disable_then_lock(request, db):
+        fence["calls"] += 1
+        async with session_factory() as competing_db:
+            changed = await competing_db.execute(
+                update(User)
+                .where(User.id == admin_id)
+                .values(is_active=False)
+            )
+            fence["updated"] += changed.rowcount
+            await competing_db.commit()
+        await original(request, db)
+
+    monkeypatch.setattr(
+        api_deps,
+        "lock_request_user_authority",
+        disable_then_lock,
+    )
+    response = await client.post(
+        "/api/pr-monitor/repos",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={"repo_full_name": "owner/create-after-admin-disable"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "disabled or changed role" in response.json()["detail"]
+    assert fence == {"calls": 1, "updated": 1}
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(MonitoredRepo.id).where(
+                MonitoredRepo.repo_full_name
+                == "owner/create-after-admin-disable"
+            )
+        ) is None
+        user = await db.get(User, admin_id)
+        assert user is not None
+        assert user.is_active is False
+
+
+@pytest.mark.asyncio
+async def test_create_project_repo_revalidates_committed_share_revocation(
+    secured_client,
+    monkeypatch,
+):
+    """A Project unshare after optimistic ACL must veto repository creation."""
+
+    import backend.api.pr_monitor as pr_monitor_api
+    from backend.models.project import Project
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="pr-create-unshared-member@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        project = Project(name="pr-create-share-race", status="ready")
+        db.add(project)
+        await db.flush()
+        share = TeamProjectShare(
+            project_id=project.id,
+            target_type="user",
+            target_id=member_id,
+            shared_by=999,
+        )
+        db.add(share)
+        await db.commit()
+        project_id = project.id
+        share_id = share.id
+
+    original = pr_monitor_api.lock_project_worker_effect_access
+    fence = {"calls": 0, "deleted": 0}
+
+    async def revoke_then_lock(request, locked_project_id, db):
+        fence["calls"] += 1
+        async with session_factory() as competing_db:
+            revoked = await competing_db.execute(
+                delete(TeamProjectShare).where(
+                    TeamProjectShare.id == share_id,
+                    TeamProjectShare.project_id == locked_project_id,
+                )
+            )
+            fence["deleted"] += revoked.rowcount
+            await competing_db.commit()
+        return await original(request, locked_project_id, db)
+
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "lock_project_worker_effect_access",
+        revoke_then_lock,
+    )
+    response = await client.post(
+        "/api/pr-monitor/repos",
+        headers={"Authorization": f"Bearer {member_token}"},
+        json={
+            "repo_full_name": "owner/create-after-project-unshare",
+            "project_id": project_id,
+        },
+    )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "deleted": 1}
+    async with session_factory() as db:
+        assert await db.get(TeamProjectShare, share_id) is None
+        assert await db.scalar(
+            select(MonitoredRepo.id).where(
+                MonitoredRepo.repo_full_name
+                == "owner/create-after-project-unshare"
+            )
+        ) is None
+
+
+@pytest.mark.asyncio
+async def test_create_project_repo_fences_project_before_worker_authority(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """Durable monitor creation shares Project -> Worker creation order."""
+
+    import backend.api.pr_monitor as pr_monitor_api
+    from backend.models.project import Project
+
+    async with session_factory() as db:
+        worker = Worker(name="pr-create-lock-order-worker", status="ready")
+        db.add(worker)
+        await db.flush()
+        project = Project(
+            name="pr-create-lock-order-project",
+            status="ready",
+            worker_id=worker.id,
+        )
+        db.add(project)
+        await db.commit()
+        worker_id = worker.id
+        project_id = project.id
+
+    original_project_worker_fence = (
+        pr_monitor_api.lock_project_worker_effect_access
+    )
+    order = []
+
+    async def record_project_worker_fence(request, locked_project_id, db):
+        order.append(("project_worker", locked_project_id))
+        return await original_project_worker_fence(
+            request,
+            locked_project_id,
+            db,
+        )
+
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "lock_project_worker_effect_access",
+        record_project_worker_fence,
+    )
+    response = await client.post(
+        "/api/pr-monitor/repos",
+        json={
+            "repo_full_name": "owner/create-lock-order",
+            "worker_id": worker_id,
+            "project_id": project_id,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert order == [("project_worker", project_id)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "query",
+    ("page=0", "page=-1", "size=0", "size=-1", "size=101"),
+)
+async def test_list_reviews_rejects_unbounded_pagination(client, query):
+    response = await client.get(f"/api/pr-monitor/repos/1/reviews?{query}")
+
+    assert response.status_code == 422, response.text
+
+
+@pytest.mark.asyncio
+async def test_list_reviews_accepts_maximum_page_size(client):
+    repo = await _create_repo(client, "owner/review-page-size-boundary")
+
+    response = await client.get(
+        f"/api/pr-monitor/repos/{repo['id']}/reviews?page=1&size=100"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json() == []
 
 
 @pytest.mark.asyncio
@@ -1122,6 +1836,96 @@ async def test_update_repo_settings(client):
     assert data["default_branch"] == "develop"
     assert data["allowed_authors"] == ["bob"]
     assert data["review_effort"] == "xhigh"
+
+
+@pytest.mark.asyncio
+async def test_update_repo_recomputes_project_move_after_repo_fence(
+    secured_client,
+    monkeypatch,
+):
+    """A stale no-op snapshot cannot turn into a member topology move."""
+
+    import backend.api.pr_monitor as pr_monitor_api
+    from backend.models.project import Project
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="pr-stale-project-move-member@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        old_project = Project(name="pr-stale-move-old", status="ready")
+        new_project = Project(name="pr-stale-move-new", status="ready")
+        db.add_all([old_project, new_project])
+        await db.flush()
+        repo = MonitoredRepo(
+            repo_full_name="owner/stale-project-noop",
+            project_id=old_project.id,
+            webhook_secret="effect-test-secret",
+            enabled=True,
+        )
+        db.add(repo)
+        db.add_all(
+            [
+                TeamProjectShare(
+                    project_id=old_project.id,
+                    target_type="user",
+                    target_id=member_id,
+                    shared_by=999,
+                ),
+                TeamProjectShare(
+                    project_id=new_project.id,
+                    target_type="user",
+                    target_id=member_id,
+                    shared_by=999,
+                ),
+            ]
+        )
+        await db.commit()
+        repo_id = repo.id
+        old_project_id = old_project.id
+        new_project_id = new_project.id
+
+    original_lock = pr_monitor_api._pr_repo_write_lock
+    race = {"calls": 0, "moved": False}
+
+    @asynccontextmanager
+    async def move_before_repo_lock(locked_repo_id):
+        race["calls"] += 1
+        if not race["moved"]:
+            async with session_factory() as competing_db:
+                competing_repo = await competing_db.get(
+                    MonitoredRepo,
+                    locked_repo_id,
+                )
+                assert competing_repo is not None
+                competing_repo.project_id = new_project_id
+                await competing_db.commit()
+            race["moved"] = True
+        async with original_lock(locked_repo_id):
+            yield
+
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_pr_repo_write_lock",
+        move_before_repo_lock,
+    )
+    response = await client.put(
+        f"/api/pr-monitor/repos/{repo_id}",
+        headers={"Authorization": f"Bearer {member_token}"},
+        # This is a no-op against the optimistic row.  It becomes a move back
+        # to the old Project only after the competing transaction commits.
+        json={"project_id": old_project_id},
+    )
+
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Admin only"
+    assert race == {"calls": 1, "moved": True}
+    async with session_factory() as db:
+        current_repo = await db.get(MonitoredRepo, repo_id)
+        assert current_repo is not None
+        assert current_repo.project_id == new_project_id
 
 
 @pytest.mark.asyncio
@@ -1463,6 +2267,339 @@ async def test_webhook_info_unconfigured(client):
 
 
 # === Webhook tests ===
+
+
+def test_webhook_body_limit_matches_github_documented_maximum():
+    import backend.api.pr_monitor as pr_monitor_api
+
+    assert pr_monitor_api._MAX_GITHUB_WEBHOOK_BODY_BYTES == 25 * 1024 * 1024
+
+
+@pytest.mark.asyncio
+async def test_webhook_declared_over_limit_short_circuits_unauthenticated_work(
+    client,
+    monkeypatch,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    json_loads = MagicMock(
+        side_effect=AssertionError("oversized body reached JSON parsing")
+    )
+    signature_check = MagicMock(
+        side_effect=AssertionError("oversized body reached HMAC verification")
+    )
+    db_execute = AsyncMock(
+        side_effect=AssertionError("oversized body reached a database query")
+    )
+    monkeypatch.setattr(pr_monitor_api, "_MAX_GITHUB_WEBHOOK_BODY_BYTES", 8)
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "json",
+        SimpleNamespace(
+            loads=json_loads,
+            JSONDecodeError=json.JSONDecodeError,
+        ),
+    )
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_require_current_webhook_signature",
+        signature_check,
+    )
+    monkeypatch.setattr(AsyncSession, "execute", db_execute)
+
+    resp = await client.post(
+        "/api/github/webhook",
+        content=b"{}",
+        headers={"Content-Length": "9"},
+    )
+
+    assert resp.status_code == 413
+    assert resp.json() == {"detail": "GitHub webhook payload is too large"}
+    json_loads.assert_not_called()
+    signature_check.assert_not_called()
+    db_execute.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_webhook_without_content_length_rejects_streamed_body_over_limit(
+    client,
+    monkeypatch,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    monkeypatch.setattr(pr_monitor_api, "_MAX_GITHUB_WEBHOOK_BODY_BYTES", 4)
+
+    async def chunks():
+        yield b"123"
+        yield b"45"
+
+    resp = await client.post(
+        "/api/github/webhook",
+        content=chunks(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 413
+    assert resp.json() == {"detail": "GitHub webhook payload is too large"}
+
+
+@pytest.mark.asyncio
+async def test_webhook_single_oversized_chunk_stops_receiving_before_copy(
+    monkeypatch,
+):
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    import backend.api.pr_monitor as pr_monitor_api
+
+    monkeypatch.setattr(pr_monitor_api, "_MAX_GITHUB_WEBHOOK_BODY_BYTES", 4)
+    messages = [
+        {"type": "http.request", "body": b"12345", "more_body": True},
+        {"type": "http.request", "body": b"ignored", "more_body": False},
+    ]
+    receive_count = 0
+
+    async def receive():
+        nonlocal receive_count
+        message = messages[receive_count]
+        receive_count += 1
+        return message
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/github/webhook",
+            "headers": [],
+        },
+        receive,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await pr_monitor_api._read_github_webhook_body(request)
+
+    assert exc_info.value.status_code == 413
+    assert receive_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "declared_length"),
+    [
+        pytest.param(b"{}", "1", id="actual-longer-than-declared"),
+        pytest.param(b"{}", "3", id="declared-longer-than-actual"),
+    ],
+)
+async def test_webhook_rejects_content_length_mismatch(
+    client,
+    monkeypatch,
+    body,
+    declared_length,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    monkeypatch.setattr(pr_monitor_api, "_MAX_GITHUB_WEBHOOK_BODY_BYTES", 16)
+
+    resp = await client.post(
+        "/api/github/webhook",
+        content=body,
+        headers={"Content-Length": declared_length},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "detail": "GitHub webhook body length does not match Content-Length"
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_length", ["-1", "not-a-number", "2.0"])
+async def test_webhook_rejects_invalid_content_length(client, content_length):
+    resp = await client.post(
+        "/api/github/webhook",
+        content=b"{}",
+        headers={"Content-Length": content_length},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": "Invalid Content-Length header"}
+
+
+@pytest.mark.asyncio
+async def test_webhook_rejects_repeated_content_length(client):
+    resp = await client.post(
+        "/api/github/webhook",
+        content=b"{}",
+        headers=[
+            ("Content-Length", "2"),
+            ("Content-Length", "2"),
+        ],
+    )
+
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "detail": "Multiple Content-Length headers are invalid"
+    }
+
+
+@pytest.mark.asyncio
+async def test_webhook_rejects_ambiguous_content_length_and_transfer_encoding(client):
+    resp = await client.post(
+        "/api/github/webhook",
+        content=b"{}",
+        headers={
+            "Content-Length": "2",
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "detail": "Content-Length and Transfer-Encoding cannot both be supplied"
+    }
+
+
+def test_webhook_repo_full_name_limit_matches_database_column():
+    import backend.api.pr_monitor as pr_monitor_api
+
+    column_length = MonitoredRepo.__table__.c.repo_full_name.type.length
+    assert pr_monitor_api._MAX_GITHUB_REPO_FULL_NAME_CHARS == column_length == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("repository", [None, [], "owner/repo"])
+async def test_webhook_rejects_non_object_repository_before_db_or_hmac(
+    client,
+    monkeypatch,
+    repository,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    db_execute = AsyncMock(
+        side_effect=AssertionError("invalid repository reached a database query")
+    )
+    signature_check = MagicMock(
+        side_effect=AssertionError("invalid repository reached HMAC verification")
+    )
+    monkeypatch.setattr(AsyncSession, "execute", db_execute)
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_require_current_webhook_signature",
+        signature_check,
+    )
+
+    resp = await client.post(
+        "/api/github/webhook",
+        content=json.dumps({"repository": repository}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": "repository must be an object"}
+    db_execute.assert_not_awaited()
+    signature_check.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("full_name", "detail"),
+    [
+        pytest.param(
+            None,
+            "repository.full_name must be a string",
+            id="null",
+        ),
+        pytest.param(
+            42,
+            "repository.full_name must be a string",
+            id="integer",
+        ),
+        pytest.param(
+            ["owner/repo"],
+            "repository.full_name must be a string",
+            id="list",
+        ),
+        pytest.param(
+            "x" * 201,
+            "repository.full_name is too long",
+            id="over-database-column-limit",
+        ),
+    ],
+)
+async def test_webhook_rejects_invalid_repo_full_name_before_db_or_hmac(
+    client,
+    monkeypatch,
+    full_name,
+    detail,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    db_execute = AsyncMock(
+        side_effect=AssertionError("invalid full_name reached a database query")
+    )
+    signature_check = MagicMock(
+        side_effect=AssertionError("invalid full_name reached HMAC verification")
+    )
+    monkeypatch.setattr(AsyncSession, "execute", db_execute)
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_require_current_webhook_signature",
+        signature_check,
+    )
+
+    resp = await client.post(
+        "/api/github/webhook",
+        content=json.dumps(
+            {"repository": {"full_name": full_name}}
+        ).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 400
+    assert resp.json() == {"detail": detail}
+    db_execute.assert_not_awaited()
+    signature_check.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"repository": {}},
+        {"repository": {"full_name": ""}},
+    ],
+)
+async def test_webhook_missing_repository_identity_remains_ignored(
+    client,
+    monkeypatch,
+    payload,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    db_execute = AsyncMock(
+        side_effect=AssertionError("missing repository reached a database query")
+    )
+    signature_check = MagicMock(
+        side_effect=AssertionError("missing repository reached HMAC verification")
+    )
+    monkeypatch.setattr(AsyncSession, "execute", db_execute)
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_require_current_webhook_signature",
+        signature_check,
+    )
+
+    resp = await client.post(
+        "/api/github/webhook",
+        content=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "ignored", "reason": "no repository info"}
+    db_execute.assert_not_awaited()
+    signature_check.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -2119,9 +3256,14 @@ async def test_terminal_pr_review_task_allows_follow_up_chat(
         )).scalars().all())
     assert stored_review.status == terminal_status
     assert len(messages) == 1
-    assert json.loads(messages[0].raw_json)["raw_content"] == (
-        "explain the review"
-    )
+    log_metadata = json.loads(messages[0].raw_json)
+    assert log_metadata["raw_content"] == "explain the review"
+    assert log_metadata["execution_principal"] == {
+        "user_id": None,
+        "role": "member",
+        "mode": "sandbox",
+        "kind": "system",
+    }
 
 
 @pytest.mark.asyncio
@@ -2210,7 +3352,7 @@ async def test_nonterminal_or_superseded_pr_review_blocks_follow_up_chat(
 
 
 @pytest.mark.asyncio
-async def test_terminal_pr_review_task_allows_live_injection(
+async def test_terminal_pr_review_task_rejects_mismatched_live_injection_principal(
     client,
     session_factory,
 ):
@@ -2244,11 +3386,12 @@ async def test_terminal_pr_review_task_allows_live_injection(
             json={"message": "clarify this finding"},
         )
 
-    assert response.status_code == 200, response.text
-    instance_manager.inject_pty_message.assert_awaited_once_with(
-        "terminal-review-live-session",
-        "clarify this finding",
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == (
+        "Live injection requires the exact principal that started the active "
+        "turn; send a normal next-turn message instead"
     )
+    instance_manager.inject_pty_message.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2465,7 +3608,9 @@ async def test_worker_tag_only_pr_review_chat_requires_internal_terminal_header(
         )
 
     assert response.status_code == 200, response.text
-    internal_auth.assert_called_once()
+    # Terminal Worker chat authenticates once at the public admission and
+    # again at the final durable effect boundary.
+    assert internal_auth.call_count == 2
     dispatcher.enqueue_message.assert_awaited_once()
 
 
@@ -2551,6 +3696,8 @@ async def test_manager_rejects_old_worker_terminal_chat_before_local_log(
 
     worker_proxy = MagicMock()
     worker_proxy.require_ready_worker = AsyncMock(return_value=worker)
+    worker_proxy.require_worker_delegated_principal_support = AsyncMock()
+    worker_proxy.require_worker_task_incarnation_support = AsyncMock()
     worker_proxy.proxy_to_worker = AsyncMock()
     worker_proxy.require_terminal_pr_review_chat_support = AsyncMock(
         side_effect=HTTPException(409, "Worker version is too old"),
@@ -2773,6 +3920,144 @@ async def test_webhook_canonicalizes_uppercase_commit_shas(
         review = await db.get(PRReview, resp.json()["review_id"])
         assert review.base_sha == "a" * 40
         assert review.head_sha == "b" * 40
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["opened", "synchronize"])
+@pytest.mark.parametrize("failure_boundary", ["prepare", "create"])
+async def test_webhook_maps_oversized_review_input_to_422(
+    client,
+    session_factory,
+    monkeypatch,
+    action,
+    failure_boundary,
+):
+    repo = await _create_repo(
+        client,
+        f"owner/oversized-{action}-{failure_boundary}",
+    )
+    detail = (
+        "unsupported_input_size: reviewer prompt exceeds the safe model input "
+        "limit; no reviewer Task was created."
+    )
+
+    async def reject_oversized_input(*args, **kwargs):
+        del args, kwargs
+        raise pr_review_service.PRReviewInputTooLarge(detail)
+
+    monkeypatch.setattr(
+        pr_review_service,
+        (
+            "prepare_pr_review_context"
+            if failure_boundary == "prepare"
+            else "create_pr_review_task"
+        ),
+        reject_oversized_input,
+    )
+
+    response = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(
+            repo["repo_full_name"],
+            action=action,
+            head_sha=HEAD_SHA_2,
+        ),
+    )
+
+    assert response.status_code == 422, response.text
+    assert response.json() == {"detail": detail}
+    async with session_factory() as db:
+        assert list((await db.execute(
+            select(PRReview).where(PRReview.repo_id == repo["id"])
+        )).scalars()) == []
+
+
+@pytest.mark.asyncio
+async def test_webhook_synchronize_rechecks_locked_policy_prompt_budget_before_supersede(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    repo = await _create_repo(client, "owner/locked-prompt-budget")
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(repo["repo_full_name"], action="opened"),
+    )
+    assert opened.status_code == 200, opened.text
+    old_review_id = opened.json()["review_id"]
+    async with session_factory() as db:
+        old_review = await db.get(PRReview, old_review_id)
+        assert old_review is not None
+        old_task_id = old_review.task_id
+
+    prepare = pr_review_service.prepare_pr_review_context
+
+    async def prepare_then_change_provider(repo_row, pr_data):
+        context = await prepare(repo_row, pr_data)
+        async with session_factory() as db:
+            current = await db.get(MonitoredRepo, repo["id"])
+            assert current is not None
+            current.provider = "codex"
+            await db.commit()
+        return context
+
+    detail = (
+        "unsupported_input_size: locked codex review policy cannot accept this "
+        "prompt; no reviewer Task was created."
+    )
+    observed_providers = []
+
+    def reject_locked_codex_policy(
+        repo_row,
+        pr_data,
+        *,
+        prepared_context,
+        base_ref=None,
+    ):
+        del pr_data, prepared_context, base_ref
+        observed_providers.append(repo_row.provider)
+        if repo_row.provider == "codex":
+            raise pr_review_service.PRReviewInputTooLarge(detail)
+        return ("prompt", None)
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "prepare_pr_review_context",
+        prepare_then_change_provider,
+    )
+    monkeypatch.setattr(
+        pr_review_service,
+        "preflight_pr_review_prompts",
+        reject_locked_codex_policy,
+    )
+
+    synchronized = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(
+            repo["repo_full_name"],
+            action="synchronize",
+            head_sha=HEAD_SHA_2,
+        ),
+    )
+
+    assert synchronized.status_code == 422, synchronized.text
+    assert synchronized.json() == {"detail": detail}
+    assert observed_providers == ["codex"]
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview)
+            .where(PRReview.repo_id == repo["id"])
+            .order_by(PRReview.id)
+        )).scalars())
+        assert [review.id for review in reviews] == [old_review_id]
+        assert reviews[0].status == "reviewing"
+        assert reviews[0].superseding_snapshot is None
+        old_task = await db.get(Task, old_task_id)
+        assert old_task is not None
+        assert old_task.status == "pending"
 
 
 @pytest.mark.asyncio
@@ -3558,6 +4843,10 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
         old_review = await db.get(PRReview, old_review_id)
         old_task = await db.get(Task, old_review.task_id)
         old_task.status = remote_initial_status
+        old_task.metadata_ = {
+            **(old_task.metadata_ or {}),
+            "ccm_worker_remote_materialized_v1": True,
+        }
         if remote_initial_status == "completed":
             old_task.completed_at = datetime.utcnow()
         await db.commit()
@@ -3715,6 +5004,7 @@ async def test_webhook_synchronize_worker_review_stops_authoritative_generation(
             "pr_required_checks": [],
             "pr_action_nonce": action_nonce,
             "pr_review_superseded": True,
+            "ccm_worker_remote_materialized_v1": True,
         }
         assert new_review.status == "reviewing"
         assert new_task.worker_id == 77
@@ -3746,6 +5036,10 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
         old_review = await db.get(PRReview, old_review_id)
         old_task = await db.get(Task, old_review.task_id)
         old_task.status = "executing"
+        old_task.metadata_ = {
+            **(old_task.metadata_ or {}),
+            "ccm_worker_remote_materialized_v1": True,
+        }
         await db.commit()
         old_task_id = old_task.id
 
@@ -3962,6 +5256,7 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
             "pr_required_checks": [],
             "pr_action_nonce": action_nonce,
             "pr_review_superseded": True,
+            "ccm_worker_remote_materialized_v1": True,
         }
 
 

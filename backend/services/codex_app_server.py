@@ -36,6 +36,10 @@ from backend.services.codex_tier_proxy import (
     CodexTierProofError,
     CodexTierProxyRoute,
 )
+from backend.services.cancellation import (
+    await_task_completion,
+    finish_awaitable,
+)
 from backend.services.mcp_config import McpServerSpec, render_codex_mcp_config
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.task_runtime_secrets import PrivateTaskTempDir
@@ -421,22 +425,7 @@ _TOOL_FREE_FORBIDDEN_NOTIFICATION_PREFIXES = (
 async def _settle_registry_cleanup(awaitable):
     """Complete registry bookkeeping before propagating caller cancellation."""
 
-    cleanup = asyncio.create_task(awaitable)
-    delayed_cancellation: asyncio.CancelledError | None = None
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError as exc:
-            if delayed_cancellation is None:
-                delayed_cancellation = exc
-        except BaseException:
-            if cleanup.done():
-                break
-            raise
-    result = cleanup.result()
-    if delayed_cancellation is not None:
-        raise delayed_cancellation
-    return result
+    return await finish_awaitable(awaitable)
 
 
 class CodexAppServerError(RuntimeError):
@@ -2095,19 +2084,9 @@ class CodexTurnProcess:
         task = self._runtime_cleanup_task
         if task is None:
             return
-        cancellation: asyncio.CancelledError | None = None
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError as exc:
-                # Cleanup belongs to the exact native generation. Delay
-                # caller cancellation until its executor job has settled.
-                cancellation = exc
-            except Exception:
-                # The completion callback records the failure. A private
-                # retained directory is safer than borrowing another turn's
-                # cleanup or reclassifying native process termination.
-                break
+        # Cleanup belongs to the exact native generation. Delay caller
+        # cancellation until its executor job has settled.
+        cancellation = await await_task_completion(task)
         if task.done() and not task.cancelled():
             try:
                 task.result()
@@ -4483,7 +4462,6 @@ class CodexAppServer:
         output_schema: dict[str, Any] | None = None,
         tools_disabled: bool = False,
         mcp_only: bool = False,
-        sandbox_unrestricted_enabled: bool = False,
         on_thread_started: (
             Callable[[str], Awaitable[None]] | None
         ) = None,
@@ -4501,50 +4479,11 @@ class CodexAppServer:
             "read-only",
         }:
             raise ValueError(f"Unsupported Codex sandbox mode: {sandbox_mode!r}")
-        if sandbox_unrestricted_enabled:
-            # The operator-owned global switch deliberately expands fixed
-            # Reviewer and Browser capability turns as well as ordinary coding
-            # turns. Required MCP servers remain attached, but they are no
-            # longer the exclusive tool surface while the switch is on.
-            tools_disabled = False
-            mcp_only = False
         if tools_disabled and mcp_only:
             raise CodexRequiredMcpPreTurnError(
                 "Codex turn cannot be both tool-free and MCP-only"
             )
         restricted_tools = tools_disabled or mcp_only
-        if sandbox_unrestricted_enabled and not restricted_tools:
-            requested_sandbox_mode = sandbox_mode
-            requested_filesystem_isolation = bool(task_ssh_protected_paths)
-            requested_network_isolation = bool(
-                network_isolated
-                or task_ssh_disable_network
-                or task_managed_network_proxy
-            )
-            # This is deliberately normalized before any managed-network
-            # version proof or permission-profile construction.  Leaving even
-            # one of the old boundary inputs populated would either rebuild a
-            # named profile later or make the supposedly unrestricted request
-            # fail its isolated admission checks.
-            sandbox_mode = "danger-full-access"
-            task_ssh_protected_paths = ()
-            task_ssh_allowed_read_paths = ()
-            task_git_read_paths = ()
-            task_git_boundary_fingerprint = ()
-            task_private_tmpdir = None
-            task_ssh_disable_network = False
-            task_managed_network_proxy = False
-            network_isolated = False
-            disable_autonomous_features = False
-            logger.critical(
-                "AGENT_SANDBOX_UNRESTRICTED_ENABLED admitted an unrestricted "
-                "Codex turn task=%s requested_mode=%s filesystem_isolated=%s "
-                "network_isolated=%s",
-                task_id,
-                requested_sandbox_mode,
-                requested_filesystem_isolation,
-                requested_network_isolation,
-            )
         if task_managed_network_proxy:
             # ``initialize`` is the version proof for this exact transport
             # generation. Complete it before constructing the network profile;
@@ -4942,12 +4881,9 @@ class CodexAppServer:
                     {"threadId": thread_id},
                     expected_process=isolated_process,
                 ))
-                while not delete_request.done():
-                    try:
-                        await asyncio.shield(delete_request)
-                    except asyncio.CancelledError:
-                        cancelled = True
-                        continue
+                cancelled = (
+                    await await_task_completion(delete_request)
+                ) is not None
                 try:
                     delete_request.result()
                 except Exception as cleanup_error:
@@ -4990,7 +4926,6 @@ class CodexAppServer:
                 output_schema=output_schema,
                 tools_disabled=tools_disabled,
                 mcp_only=mcp_only,
-                sandbox_unrestricted_enabled=sandbox_unrestricted_enabled,
                 on_thread_started=on_thread_started,
                 on_turn_prepared=on_turn_prepared,
                 _isolated_admission_retry_count=(
@@ -6523,17 +6458,12 @@ class CodexAppServer:
                     list(turn_params["input"]),
                 ),
             )
-            adoption_cancelled = False
-            while not adoption.done():
-                try:
-                    await asyncio.shield(adoption)
-                except asyncio.CancelledError:
-                    # User input may already have reached the older native
-                    # turn. Resolve its exact identity, then pause/interrupt
-                    # before propagating cancellation.
-                    adoption_cancelled = True
-                except BaseException:
-                    break
+            # User input may already have reached the older native turn.
+            # Resolve its exact identity, then pause/interrupt before
+            # propagating cancellation.
+            adoption_cancelled = (
+                await await_task_completion(adoption)
+            ) is not None
             try:
                 adopted_turn_id = adoption.result()
             except BaseException:
@@ -6559,11 +6489,7 @@ class CodexAppServer:
                     turn_process,
                     "Codex native Goal adoption was cancelled",
                 ))
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        continue
+                await await_task_completion(cleanup)
                 if not cleanup.result():
                     raise _UnconfirmedTurnCancellation(
                         turn_process,
@@ -6586,20 +6512,12 @@ class CodexAppServer:
             turn_params,
             expected_process=isolated_process,
         ))
-        turn_cancelled = False
-        while not turn_request.done():
-            try:
-                await asyncio.shield(turn_request)
-            except asyncio.CancelledError:
-                # Once turn/start is on the wire, abandoning the response can
-                # leave real model work with no process adapter/consumer. Wait
-                # for the bounded RPC to resolve, then interrupt it explicitly.
-                turn_cancelled = True
-            except BaseException:
-                # Retrieve and classify the completed request below. In
-                # particular, a timeout is an indeterminate server-side turn,
-                # not an ordinary rejected admission.
-                break
+        # Once turn/start is on the wire, abandoning the response can leave
+        # real model work with no process adapter/consumer. Wait for the
+        # bounded RPC to resolve, then interrupt it explicitly.
+        turn_cancelled = (
+            await await_task_completion(turn_request)
+        ) is not None
         try:
             turn_response = turn_request.result()
         except asyncio.TimeoutError as exc:
@@ -6684,11 +6602,7 @@ class CodexAppServer:
                 turn_process,
                 "Codex turn admission was cancelled",
             ))
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    continue
+            await await_task_completion(cleanup)
             interrupt_confirmed = cleanup.result()
             if not interrupt_confirmed:
                 raise _UnconfirmedTurnCancellation(
@@ -6710,16 +6624,12 @@ class CodexAppServer:
                     timeout=max(self.request_timeout, 60.0),
                 )
             )
-            while not proof_wait.done():
-                try:
-                    await asyncio.shield(proof_wait)
-                except asyncio.CancelledError:
-                    # The native turn exists and its upstream request may
-                    # already be in flight. Obtain or reject the exact proof,
-                    # then interrupt before propagating cancellation.
-                    turn_cancelled = True
-                except BaseException:
-                    break
+            proof_cancelled = await await_task_completion(proof_wait)
+            if proof_cancelled is not None:
+                # The native turn exists and its upstream request may already
+                # be in flight. Obtain or reject the exact proof, then
+                # interrupt before propagating cancellation.
+                turn_cancelled = True
             try:
                 request_proof = proof_wait.result()
             except CodexTierProofError as exc:
@@ -6742,11 +6652,7 @@ class CodexAppServer:
                     turn_process,
                     "Codex service-tier request proof wait was cancelled",
                 ))
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        continue
+                await await_task_completion(cleanup)
                 interrupt_confirmed = cleanup.result()
                 if not interrupt_confirmed:
                     raise _UnconfirmedTurnCancellation(
@@ -6762,16 +6668,14 @@ class CodexAppServer:
                 asyncio.shield(observed_future),
                 timeout=self.request_timeout,
             ))
-            while not observation_wait.done():
-                try:
-                    await asyncio.shield(observation_wait)
-                except asyncio.CancelledError:
-                    # The turn is already live.  Finish identity
-                    # reconciliation, then interrupt the exact native
-                    # generation before propagating cancellation.
-                    turn_cancelled = True
-                except BaseException:
-                    break
+            observation_cancelled = await await_task_completion(
+                observation_wait
+            )
+            if observation_cancelled is not None:
+                # The turn is already live. Finish identity reconciliation,
+                # then interrupt the exact native generation before
+                # propagating cancellation.
+                turn_cancelled = True
             try:
                 observation_wait.result()
             except asyncio.TimeoutError as exc:
@@ -6795,11 +6699,7 @@ class CodexAppServer:
                     turn_process,
                     "Codex Fast turn admission was cancelled",
                 ))
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        continue
+                await await_task_completion(cleanup)
                 interrupt_confirmed = cleanup.result()
                 if not interrupt_confirmed:
                     raise _UnconfirmedTurnCancellation(
@@ -7219,11 +7119,7 @@ class CodexAppServer:
         if disable_project_config:
             params["config"] = codex_untrusted_project_config(cwd)
         request = asyncio.create_task(self._request("thread/start", params))
-        while not request.done():
-            try:
-                await asyncio.shield(request)
-            except asyncio.CancelledError:
-                continue
+        await await_task_completion(request)
         response = request.result()
         thread = response.get("thread") if isinstance(response, dict) else None
         thread_id = thread.get("id") if isinstance(thread, dict) else None
@@ -7257,11 +7153,7 @@ class CodexAppServer:
                 "sandbox": "danger-full-access",
             },
         ))
-        while not request.done():
-            try:
-                await asyncio.shield(request)
-            except asyncio.CancelledError:
-                continue
+        await await_task_completion(request)
         response = request.result()
         thread = response.get("thread")
         fork_id = thread.get("id") if isinstance(thread, dict) else None
@@ -8726,22 +8618,12 @@ class CodexAppServerRegistry:
             Callable[[str], CodexTierProxyRoute | None] | None
         ) = None,
         require_actual_tier_proof: bool = False,
-        sandbox_unrestricted_enabled: bool = False,
     ) -> None:
         self.binary = binary
         self.request_timeout = request_timeout
         self._env_remove_resolver = env_remove_resolver
         self._actual_tier_route_resolver = actual_tier_route_resolver
         self._require_actual_tier_proof = bool(require_actual_tier_proof)
-        self._sandbox_unrestricted_enabled = bool(
-            sandbox_unrestricted_enabled
-        )
-        if self._sandbox_unrestricted_enabled:
-            logger.critical(
-                "AGENT_SANDBOX_UNRESTRICTED_ENABLED is active for this "
-                "app-server registry; executable Codex turns can access the "
-                "host filesystem and network without CCM permission profiles"
-            )
         self._servers: dict[str, CodexAppServer] = {}
         self._thread_owners: dict[str, str] = {}
         self._draining: set[str] = set()
@@ -8773,28 +8655,6 @@ class CodexAppServerRegistry:
         # conclude that shutting down the same server generation is safe.
         self._abort_locks: dict[str, asyncio.Lock] = {}
 
-    @property
-    def sandbox_unrestricted_enabled(self) -> bool:
-        return self._sandbox_unrestricted_enabled
-
-    def set_sandbox_unrestricted_enabled(self, enabled: bool) -> bool:
-        """Change the operator-owned policy used by subsequent turn starts."""
-
-        effective = bool(enabled)
-        previous = self._sandbox_unrestricted_enabled
-        self._sandbox_unrestricted_enabled = effective
-        if effective and not previous:
-            logger.critical(
-                "Codex app-server sandbox override enabled at runtime; "
-                "subsequent executable turns use danger-full-access"
-            )
-        elif previous and not effective:
-            logger.warning(
-                "Codex app-server sandbox override disabled at runtime; "
-                "subsequent turns use their CCM permission profiles"
-            )
-        return effective
-
     def _new_server(self, home: str) -> CodexAppServer:
         server_kwargs: dict[str, Any] = {}
         if self._env_remove_resolver is not None:
@@ -8819,11 +8679,6 @@ class CodexAppServerRegistry:
         **kwargs: Any,
     ) -> tuple[CodexTurnProcess, str]:
         home = normalize_codex_home(codex_home)
-        # Registry configuration is deployment-owned. Individual Tasks and
-        # callers cannot weaken or re-enable the sandbox independently.
-        kwargs["sandbox_unrestricted_enabled"] = (
-            self._sandbox_unrestricted_enabled
-        )
         resume_session_id = kwargs.get("resume_session_id")
         isolated_turn_lock: asyncio.Lock | None = None
         isolated_turn_lock_transferred = False
@@ -8949,11 +8804,7 @@ class CodexAppServerRegistry:
                     )
 
                 cleanup = asyncio.create_task(_abort_cancelled_admission())
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        continue
+                await await_task_completion(cleanup)
                 cleanup.result()
             raise
         finally:
@@ -8978,11 +8829,7 @@ class CodexAppServerRegistry:
                         self._thread_owners.pop(resume_session_id, None)
 
             cleanup = asyncio.create_task(_release_start_reservations())
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    continue
+            await await_task_completion(cleanup)
             cleanup.result()
             if (
                 isolated_turn_lock is not None
@@ -9869,11 +9716,7 @@ class CodexAppServerRegistry:
                     self._decrement_starting_locked(home)
 
             cleanup = asyncio.create_task(_release_read_reservation())
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    continue
+            await await_task_completion(cleanup)
             cleanup.result()
 
     async def rebind_thread(
@@ -10067,13 +9910,9 @@ class CodexAppServerRegistry:
                         self._draining.discard(home)
 
                 cleanup = asyncio.create_task(_detach_and_reopen())
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        # Repeated caller cancellation must not reopen the home
-                        # before the closed server has been removed.
-                        continue
+                # Repeated caller cancellation must not reopen the home before
+                # the closed server has been removed.
+                await await_task_completion(cleanup)
                 cleanup.result()
             # If shutdown itself was cancelled, retain _draining fail-closed;
             # the server may be only partially terminated and must not be reused.

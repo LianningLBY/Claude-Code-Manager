@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import stat
 import shlex
 import subprocess
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from backend.config import settings
+from backend.services import task_agent_isolation as task_agent_isolation_module
 from backend.services.task_agent_isolation import (
     CLAUDE_DELIVERY_BUILTIN_TOOLS,
     CLAUDE_MONITOR_BUILTIN_TOOLS,
@@ -55,6 +57,22 @@ from backend.services.mcp_config import (
     CCM_SUB_AGENT_TOOLS,
     CCM_WORKSPACE_REVIEW_TOOLS,
 )
+
+
+# Capture the production entrypoint during collection.  The InstanceManager
+# suite intentionally stubs it, but must restore the module attribute before
+# another test module runs; otherwise exact filesystem validation is silently
+# bypassed and negative sandbox tests can produce false passes.
+_COLLECTED_CLAUDE_TASK_ISOLATION_VALIDATOR = (
+    task_agent_isolation_module.validate_claude_task_isolation_settings
+)
+
+
+def test_claude_task_isolation_validator_does_not_leak_between_modules():
+    assert (
+        task_agent_isolation_module.validate_claude_task_isolation_settings
+        is _COLLECTED_CLAUDE_TASK_ISOLATION_VALIDATOR
+    )
 
 
 def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -829,6 +847,148 @@ def test_claude_task_isolation_denies_credentials_and_direct_ssh_network(
     )
     assert all("AUTH_TOKEN" not in command for command in commands)
     assert all("--auth-token" not in command for command in commands)
+
+
+@pytest.mark.parametrize("stale_leaf_kind", ["missing", "directory"])
+def test_claude_isolation_collapses_stale_key_below_denied_managed_root(
+    tmp_path,
+    monkeypatch,
+    stale_leaf_kind,
+):
+    """A stale SSH Profile must not prevent the Bash sandbox from starting."""
+
+    runtime_root = tmp_path / "runtime"
+    managed_root = tmp_path / ".ccm" / "ssh-keys" / "managed"
+    managed_root.mkdir(parents=True)
+    missing_key = managed_root / "165ded4541cf2299dedaaa094a90d9de"
+    if stale_leaf_kind == "directory":
+        missing_key.mkdir()
+    git_parent = tmp_path / ".ssh"
+    git_parent.mkdir()
+    allowed_git_key = git_parent / "project-git-key"
+    allowed_git_key.write_text("private", encoding="utf-8")
+    allowed_git_key.chmod(0o600)
+    sibling_prefix = tmp_path / ".ccm" / "ssh-keys" / "managed-backup"
+    assert missing_key.exists() is (stale_leaf_kind == "directory")
+    monkeypatch.setattr(settings, "task_runtime_secret_dir", str(runtime_root))
+
+    path = generate_claude_task_isolation_settings(
+        32,
+        [
+            str(managed_root),
+            str(missing_key),
+            str(git_parent),
+            str(allowed_git_key),
+            str(sibling_prefix),
+        ],
+        allowed_read_paths=[str(allowed_git_key)],
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    filesystem = payload["sandbox"]["filesystem"]
+    credentials = {
+        entry["path"]
+        for entry in payload["sandbox"]["credentials"]["files"]
+    }
+
+    assert str(managed_root) in filesystem["denyRead"]
+    assert str(managed_root) in filesystem["denyWrite"]
+    assert str(managed_root) in credentials
+    assert str(missing_key) not in filesystem["denyRead"]
+    assert str(missing_key) not in filesystem["denyWrite"]
+    assert str(missing_key) not in credentials
+    assert str(allowed_git_key) not in filesystem["denyRead"]
+    assert str(allowed_git_key) in filesystem["allowRead"]
+    assert str(sibling_prefix) in filesystem["denyRead"]
+    assert payload["sandbox"]["autoAllowBashIfSandboxed"] is True
+
+
+def test_claude_isolation_keeps_required_runtime_root_under_denied_parent(
+    tmp_path,
+    monkeypatch,
+):
+    """The default ~/.ccm layout must still satisfy the exact preflight."""
+
+    ccm_root = tmp_path / ".ccm"
+    runtime_root = ccm_root / "task-runtime-secrets"
+    managed_root = ccm_root / "ssh-keys" / "managed"
+    managed_root.mkdir(parents=True)
+    missing_key = managed_root / "stale-profile-key"
+    monkeypatch.setattr(
+        settings,
+        "task_runtime_secret_dir",
+        str(runtime_root),
+    )
+
+    path = generate_claude_task_isolation_settings(
+        33,
+        [str(ccm_root), str(managed_root), str(missing_key)],
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    filesystem = payload["sandbox"]["filesystem"]
+
+    assert str(ccm_root) in filesystem["denyRead"]
+    assert str(runtime_root) in filesystem["denyRead"]
+    assert str(managed_root) not in filesystem["denyRead"]
+    assert str(missing_key) not in filesystem["denyRead"]
+
+
+@pytest.mark.parametrize("stale_leaf_kind", ["missing", "directory"])
+def test_claude_isolation_stale_key_projection_starts_bubblewrap(
+    tmp_path,
+    monkeypatch,
+    stale_leaf_kind,
+):
+    """Exercise the Linux mount ordering that previously broke every Bash."""
+
+    bwrap = shutil.which("bwrap")
+    bash_binary = shutil.which("bash")
+    if bwrap is None or bash_binary is None:
+        pytest.skip("bubblewrap integration probe is unavailable")
+
+    bash_exit = [bash_binary, "--noprofile", "--norc", "-c", "exit 0"]
+
+    preflight = subprocess.run(
+        [bwrap, "--ro-bind", "/", "/", "--", *bash_exit],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if preflight.returncode != 0:
+        pytest.skip(f"bubblewrap namespaces are unavailable: {preflight.stderr}")
+
+    runtime_root = tmp_path / "runtime"
+    managed_root = tmp_path / ".ccm" / "ssh-keys" / "managed"
+    managed_root.mkdir(parents=True)
+    missing_key = managed_root / "stale-profile-key"
+    if stale_leaf_kind == "directory":
+        missing_key.mkdir()
+    monkeypatch.setattr(settings, "task_runtime_secret_dir", str(runtime_root))
+
+    settings_path = generate_claude_task_isolation_settings(
+        34,
+        [str(managed_root), str(missing_key)],
+    )
+    filesystem = json.loads(
+        settings_path.read_text(encoding="utf-8")
+    )["sandbox"]["filesystem"]
+
+    command = [bwrap, "--ro-bind", "/", "/"]
+    for raw_path in filesystem["denyRead"]:
+        path = Path(raw_path)
+        try:
+            path.relative_to(tmp_path)
+        except ValueError:
+            continue
+        command.extend(("--ro-bind", str(path), str(path)))
+    command.extend(("--", *bash_exit))
+
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_claude_task_isolation_allows_every_injected_task_mcp_tool(

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 
 from backend.api import delivery_runs as delivery_api
 from backend.config import settings
@@ -16,6 +18,7 @@ from backend.models.delivery import (
     DeliveryCycle,
     DeliveryRun,
     DeliveryTransition,
+    DeliveryTurn,
 )
 from backend.models.pr_monitor import MonitoredRepo
 from backend.models.project import Project
@@ -23,8 +26,10 @@ from backend.models.project_todo import ProjectTodo
 from backend.models.plan import Plan, PlanInputRequest, PlanVersion
 from backend.models.plan_agent import PlanAgentRun
 from backend.models.task import Task
-from backend.models.team_share import TeamProjectShare
+from backend.models.team_share import TeamProjectShare, TeamTaskShare
+from backend.models.user import User
 from backend.services import delivery_service
+from backend.services import delivery_setup
 from backend.services.delivery_service import (
     DeliveryCreateSpec,
     DeliveryValidationError,
@@ -35,6 +40,10 @@ from backend.schemas.plan import default_plan_pipeline_config
 from backend.tests.test_auth_ws_security import (
     _create_user,
     secured_client as secured_client,
+)
+from backend.tests.group_acl_test_helpers import (
+    grant_group_project_access,
+    revoke_group_membership_at_effect_fence,
 )
 
 
@@ -97,6 +106,63 @@ async def _scope(
         return project, repo
 
 
+@pytest.mark.asyncio
+async def test_delivery_api_topology_helper_locks_repo_before_project(
+    monkeypatch,
+):
+    calls: list[str] = []
+    repo = SimpleNamespace(project_id=11)
+
+    class FakeSession:
+        async def get(self, _model, _identity):
+            calls.append("optimistic_repo")
+            return repo
+
+        async def rollback(self):
+            calls.append("rollback")
+
+    async def authorize_project(_request, _project_id, _db):
+        calls.append("optimistic_project_acl")
+
+    async def lock_repo(_db, _repo_id):
+        calls.append("repo")
+        return repo
+
+    async def lock_project(_request, _project_id, _db):
+        calls.append("project")
+
+    monkeypatch.setattr(
+        delivery_api,
+        "require_project_access",
+        authorize_project,
+    )
+    monkeypatch.setattr(
+        delivery_api,
+        "lock_pr_repo_action_boundary",
+        lock_repo,
+    )
+    monkeypatch.setattr(
+        delivery_api,
+        "lock_project_effect_access",
+        lock_project,
+    )
+
+    await delivery_api._lock_delivery_admission_topology(
+        object(),
+        FakeSession(),
+        project_id=11,
+        monitored_repo_id=22,
+    )
+
+    assert calls == [
+        "optimistic_project_acl",
+        "optimistic_repo",
+        "rollback",
+        "repo",
+        "project",
+    ]
+
+
 @pytest.fixture
 def delivery_enabled(monkeypatch):
     monkeypatch.setattr(settings, "delivery_loop_enabled", True)
@@ -140,12 +206,255 @@ async def test_create_is_fail_closed_by_both_feature_flags(
 
 
 @pytest.mark.asyncio
+async def test_quick_start_monitor_create_revalidates_cached_admin_authority(
+    secured_client,
+    delivery_enabled,
+    monkeypatch,
+):
+    """Admin revocation during GitHub discovery must veto Monitor creation."""
+
+    client, session_factory = secured_client
+    admin_id, admin_token = await _create_user(
+        session_factory,
+        email="delivery-quick-start-disabled-admin@example.com",
+        role="admin",
+    )
+    async with session_factory() as db:
+        project = Project(
+            name="delivery-quick-start-admin-race",
+            local_path="/srv/repos/delivery-quick-start-admin-race",
+            git_url="git@github.com:acme/delivery-quick-start-admin-race.git",
+            has_remote=True,
+            default_branch="main",
+            status="ready",
+        )
+        db.add(project)
+        await db.commit()
+        project_id = project.id
+
+    async def no_required_checks(_repo_full_name, _default_branch):
+        return [], "no_declared_required_checks"
+
+    monkeypatch.setattr(
+        delivery_setup,
+        "discover_delivery_required_checks",
+        no_required_checks,
+    )
+    original = delivery_api.lock_request_user_authority
+    fence = {"calls": 0, "disabled": 0}
+
+    async def disable_then_lock(request, db):
+        fence["calls"] += 1
+        async with session_factory() as competing_db:
+            changed = await competing_db.execute(
+                update(User)
+                .where(User.id == admin_id)
+                .values(is_active=False)
+            )
+            fence["disabled"] += changed.rowcount
+            await competing_db.commit()
+        await original(request, db)
+
+    monkeypatch.setattr(
+        delivery_api,
+        "lock_request_user_authority",
+        disable_then_lock,
+    )
+
+    response = await client.post(
+        "/api/delivery-runs/quick-start",
+        headers={"Authorization": f"Bearer {admin_token}"},
+        json={
+            "idempotency_key": "quick-start-admin-revoked",
+            "project_id": project_id,
+            "requirements": "must not create a Monitor after revocation",
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert "disabled or changed role" in response.json()["detail"]
+    assert fence == {"calls": 1, "disabled": 1}
+    async with session_factory() as db:
+        assert await db.scalar(select(func.count(MonitoredRepo.id))) == 0
+        assert await db.scalar(select(func.count(DeliveryRun.id))) == 0
+        assert await db.scalar(select(func.count(Task.id))) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "effect",
+    ["create", "quick_start", "resume", "retry"],
+)
+async def test_delivery_effect_rejects_group_revoked_at_final_project_fence(
+    secured_client,
+    delivery_enabled,
+    monkeypatch,
+    effect,
+):
+    """All Delivery admissions and restarts share one Project ACL boundary."""
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email=f"delivery-{effect}-effect@example.com",
+        role="member",
+    )
+    project, repo = await _scope(
+        session_factory,
+        suffix=f"{effect}-effect",
+    )
+    await grant_group_project_access(
+        session_factory,
+        project_id=project.id,
+        user_id=member_id,
+    )
+    admin_headers = {"Authorization": "Bearer security-service-token"}
+    member_headers = {"Authorization": f"Bearer {member_token}"}
+    run_id = None
+    before_state_version = None
+    before_cycle_count = None
+
+    if effect in {"resume", "retry"}:
+        created = await client.post(
+            "/api/delivery-runs",
+            headers=admin_headers,
+            json=_payload(
+                project,
+                repo,
+                idempotency_key=f"seed-{effect}-effect",
+            ),
+        )
+        assert created.status_code == 201, created.text
+        run_id = created.json()["id"]
+        if effect == "resume":
+            paused = await client.post(
+                f"/api/delivery-runs/{run_id}/pause",
+                headers=admin_headers,
+                json={"reason": "seed paused state"},
+            )
+            assert paused.status_code == 200, paused.text
+            before_state_version = paused.json()["state_version"]
+            before_cycle_count = paused.json()["cycle_count"]
+        else:
+            async with session_factory() as db:
+                run = await db.get(DeliveryRun, run_id)
+                cycle = await db.get(DeliveryCycle, run.current_cycle_id)
+                task = await db.get(Task, run.developer_task_id)
+                delivery_service.complete_cycle(cycle, status="failed")
+                await delivery_service.apply_run_event(
+                    db,
+                    run=run,
+                    event=DeliveryReducerEvent(
+                        "fail",
+                        {
+                            "error_code": "plan_run_failed",
+                            "error_message": "seed retry state",
+                        },
+                    ),
+                    actor_kind="controller",
+                )
+                task.status = "failed"
+                task.completed_at = datetime.utcnow()
+                task.error_message = run.error_message
+                await db.commit()
+                before_state_version = run.state_version
+                before_cycle_count = run.cycle_count
+
+    fence = revoke_group_membership_at_effect_fence(monkeypatch)
+    if effect == "create":
+        response = await client.post(
+            "/api/delivery-runs",
+            headers=member_headers,
+            json=_payload(
+                project,
+                repo,
+                idempotency_key="denied-create-effect",
+            ),
+        )
+    elif effect == "quick_start":
+        response = await client.post(
+            "/api/delivery-runs/quick-start",
+            headers=member_headers,
+            json={
+                "idempotency_key": "denied-quick-start-effect",
+                "project_id": project.id,
+                "requirements": "must not start Delivery",
+            },
+        )
+    elif effect == "resume":
+        response = await client.post(
+            f"/api/delivery-runs/{run_id}/resume",
+            headers=member_headers,
+            json={"reason": "must stay paused"},
+        )
+    else:
+        response = await client.post(
+            f"/api/delivery-runs/{run_id}/retry",
+            headers=member_headers,
+            json={
+                "expected_state_version": before_state_version,
+                "reason": "must stay failed",
+            },
+        )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "revoked": True}
+    async with session_factory() as db:
+        runs = list((await db.execute(select(DeliveryRun))).scalars())
+        tasks = list((await db.execute(select(Task))).scalars())
+        if effect in {"create", "quick_start"}:
+            assert runs == []
+            assert tasks == []
+        else:
+            assert len(runs) == 1
+            run = runs[0]
+            task = await db.get(Task, run.developer_task_id)
+            assert run.state_version == before_state_version
+            assert run.cycle_count == before_cycle_count
+            if effect == "resume":
+                assert run.activity == "paused"
+                assert await db.scalar(
+                    select(func.count(DeliveryTransition.id)).where(
+                        DeliveryTransition.run_id == run.id,
+                        DeliveryTransition.cause == "resume",
+                    )
+                ) == 0
+            else:
+                assert (run.activity, run.outcome) == ("terminal", "failed")
+                assert task.status == "failed"
+                assert await db.scalar(
+                    select(func.count(DeliveryTransition.id)).where(
+                        DeliveryTransition.run_id == run.id,
+                        DeliveryTransition.cause == "retry",
+                    )
+                ) == 0
+
+
+@pytest.mark.asyncio
 async def test_delivery_admission_contract_accepts_claude_provider(
     client,
     session_factory,
     delivery_enabled,
+    monkeypatch,
 ):
     project, repo = await _scope(session_factory, suffix="runtime-validation")
+    topology_calls: list[tuple[int, int]] = []
+    real_topology_lock = delivery_api._lock_delivery_admission_topology
+
+    async def observed_topology_lock(request, db, *, project_id, monitored_repo_id):
+        topology_calls.append((project_id, monitored_repo_id))
+        await real_topology_lock(
+            request,
+            db,
+            project_id=project_id,
+            monitored_repo_id=monitored_repo_id,
+        )
+
+    monkeypatch.setattr(
+        delivery_api,
+        "_lock_delivery_admission_topology",
+        observed_topology_lock,
+    )
 
     response = await client.post(
         "/api/delivery-runs",
@@ -158,6 +467,7 @@ async def test_delivery_admission_contract_accepts_claude_provider(
     )
 
     assert response.status_code == 201, response.text
+    assert topology_calls == [(project.id, repo.id)]
     body = response.json()
     async with session_factory() as db:
         run = await db.get(DeliveryRun, body["id"])
@@ -293,7 +603,7 @@ async def test_feature_flags_stop_admission_but_keep_existing_run_controls(
 
 
 @pytest.mark.asyncio
-async def test_create_is_atomic_and_detail_exposes_durable_evidence(
+async def test_create_is_atomic_and_detail_exposes_public_evidence(
     client,
     session_factory,
     delivery_enabled,
@@ -318,8 +628,8 @@ async def test_create_is_atomic_and_detail_exposes_durable_evidence(
     detail = await client.get(f"/api/delivery-runs/{body['id']}")
     assert detail.status_code == 200, detail.text
     detail_body = detail.json()
-    assert detail_body["policy_snapshot"]["terminal"] == "ready_to_merge"
-    assert detail_body["policy_snapshot"]["auto_merge"] is False
+    assert "policy_snapshot" not in detail_body
+    assert detail_body["terminal"] == "ready_to_merge"
     assert len(detail_body["cycles"]) == 1
     assert detail_body["cycles"][0]["trigger_kind"] == "initial_request"
     assert detail_body["turns"] == []
@@ -678,7 +988,13 @@ async def test_progress_projects_open_plan_input_into_the_delivery_run(
     assert body["plan_id"] == plan.id
     assert body["plan_input"]["plan_id"] == plan.id
     assert body["plan_input"]["request"]["questions"][0]["id"] == "scope"
-    assert body["plan_input"]["run"]["steps"] == []
+    assert body["plan_input"]["run"] == {
+        "id": plan_run.id,
+        "generation": 1,
+        "status": "waiting_user",
+        "current_stage": "planner",
+    }
+    assert "answered_by" not in body["plan_input"]["request"]
     assert plan_response.status_code == 200, plan_response.text
     assert plan_response.json()["delivery_run_id"] == run_id
     assert attention.json() == {"total": 1}
@@ -1189,11 +1505,8 @@ async def test_pause_resume_cancel_state_contract(
         "resume",
         "cancel",
     ]
-    assert [item["metadata"] for item in transitions[1:]] == [
-        {"reason": "operator maintenance"},
-        {"reason": "maintenance complete"},
-        {"reason": "request withdrawn"},
-    ]
+    assert all("metadata" not in item for item in transitions)
+    assert all("actor_id" not in item for item in transitions)
     async with session_factory() as db:
         run = await db.get(DeliveryRun, run_id)
         cycle = await db.get(DeliveryCycle, run.current_cycle_id)
@@ -1625,4 +1938,292 @@ async def test_delivery_acl_and_deep_filtered_pagination(
     assert forbidden_project_list.status_code == 403
     assert forbidden_detail.status_code == 403
     assert allowed_detail.status_code == 200
-    assert allowed_detail.json()["created_by"] == alice_id
+    assert "created_by" not in allowed_detail.json()
+
+
+@pytest.mark.asyncio
+async def test_delivery_human_projection_omits_machine_identity_and_host_paths(
+    client,
+    session_factory,
+    delivery_enabled,
+):
+    project, repo = await _scope(session_factory, suffix="public-projection")
+    created = await client.post(
+        "/api/delivery-runs",
+        json=_payload(project, repo),
+    )
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+    private_root = "/srv/private/delivery-public-projection"
+    private_workspace = (
+        f"{private_root}/.claude-manager/worktrees/delivery-{run_id}"
+    )
+
+    async with session_factory() as db:
+        run = await db.get(DeliveryRun, run_id)
+        cycle = await db.get(DeliveryCycle, run.current_cycle_id)
+        transition = await db.scalar(
+            select(DeliveryTransition).where(
+                DeliveryTransition.run_id == run_id
+            )
+        )
+        run.workspace_path = private_workspace
+        run.head_tree_sha = "1" * 40
+        run.patch_sha256 = "2" * 64
+        run.wait_reason = f"waiting under {private_workspace}/controller.sock"
+        run.error_message = f"failed under {private_workspace}/secret.txt"
+        run.policy_snapshot = {
+            **run.policy_snapshot,
+            "internal_controller_config": "must-not-cross-human-api",
+        }
+        cycle.trigger_payload = {
+            "summary": f"reviewed {private_workspace}/src/app.py",
+            "review_result_id": 771,
+            "test_harness_run_id": "f" * 32,
+            "turn_id": 772,
+            "findings": [{
+                "title": "Visible finding",
+                "path": f"{private_workspace}/src/app.py",
+                "severity": "high",
+                "internal_receipt": "must-not-cross-human-api",
+            }],
+        }
+        cycle.result_head_tree_sha = "3" * 40
+        cycle.result_patch_sha256 = "4" * 64
+        cycle.error_message = f"cycle error at {private_root}/internal.log"
+        transition.actor_id = "controller-owner-secret"
+        transition.metadata_ = {
+            "reason": f"controller inspected {private_workspace}/internal.log",
+            "capability_invocation_id": 776,
+        }
+        transition.before_state = {
+            **transition.before_state,
+            "machine_path": private_workspace,
+        }
+        db.add(
+            DeliveryTurn(
+                run_id=run.id,
+                cycle_id=cycle.id,
+                generation=1,
+                correlation_id="internal-correlation-secret",
+                active_run_id=None,
+                purpose="code",
+                trigger_kind="plan_ready",
+                trigger_payload={"capability_invocation_id": 777},
+                prompt_payload={"private_path": private_workspace},
+                prompt_hash="5" * 64,
+                status="completed",
+                task_id=run.developer_task_id,
+                task_retry_count=7,
+                task_instance_id=778,
+                task_started_at=datetime.utcnow(),
+                task_session_id="internal-session-secret",
+                source_log_id=779,
+                checkpoint={
+                    "previous_session_id": "previous-session-secret",
+                    "workspace": private_workspace,
+                },
+                checkpoint_status="admitted",
+                attempts=1,
+                last_error=f"turn failed at {private_workspace}/turn.log",
+                completed_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+
+    detail = await client.get(f"/api/delivery-runs/{run_id}")
+    progress = await client.get(f"/api/delivery-runs/{run_id}/progress")
+
+    assert detail.status_code == 200, detail.text
+    assert progress.status_code == 200, progress.text
+    body = detail.json()
+    for field in (
+        "created_by",
+        "worktree_id",
+        "workspace_path",
+        "requirements_hash",
+        "policy_hash",
+        "policy_snapshot",
+        "head_tree_sha",
+        "patch_sha256",
+        "head_generation",
+        "next_reconcile_at",
+    ):
+        assert field not in body
+    assert body["wait_reason"] == (
+        "waiting under [delivery-workspace]/controller.sock"
+    )
+    assert body["error_message"] == "failed under [delivery-workspace]/secret.txt"
+
+    cycle_body = body["cycles"][0]
+    for field in (
+        "plan_invocation_id",
+        "review_invocation_id",
+        "review_result_id",
+        "result_head_tree_sha",
+        "result_patch_sha256",
+    ):
+        assert field not in cycle_body
+    assert cycle_body["trigger_payload"] == {
+        "summary": "reviewed [delivery-workspace]/src/app.py",
+        "findings": [{
+            "severity": "high",
+            "title": "Visible finding",
+            "path": "[delivery-workspace]/src/app.py",
+        }],
+    }
+
+    turn_body = body["turns"][0]
+    for field in (
+        "correlation_id",
+        "trigger_payload",
+        "task_retry_count",
+        "task_instance_id",
+        "task_session_id",
+        "checkpoint",
+        "checkpoint_status",
+    ):
+        assert field not in turn_body
+    assert turn_body["last_error"].startswith(
+        "turn failed at [delivery-workspace]/"
+    )
+
+    transition_body = body["transitions"][0]
+    for field in ("actor_id", "before_state", "after_state", "metadata"):
+        assert field not in transition_body
+
+    serialized = json.dumps(
+        {"detail": body, "progress": progress.json()},
+        sort_keys=True,
+    )
+    for secret in (
+        private_root,
+        "controller-owner-secret",
+        "internal-correlation-secret",
+        "internal-session-secret",
+        "previous-session-secret",
+        "must-not-cross-human-api",
+    ):
+        assert secret not in serialized
+    assert progress.json()["events"][0]["id"] == "event:1"
+
+
+@pytest.mark.asyncio
+async def test_chat_only_task_share_cannot_read_or_control_delivery_run(
+    secured_client,
+    delivery_enabled,
+):
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="delivery-chat-only@example.com",
+        role="member",
+    )
+    sharer_id, _ = await _create_user(
+        session_factory,
+        email="delivery-chat-sharer@example.com",
+        role="admin",
+    )
+    project, repo = await _scope(session_factory, suffix="chat-only")
+    admin_headers = {"Authorization": "Bearer security-service-token"}
+    member_headers = {"Authorization": f"Bearer {member_token}"}
+    created = await client.post(
+        "/api/delivery-runs",
+        headers=admin_headers,
+        json=_payload(project, repo),
+    )
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+    task_id = created.json()["developer_task_id"]
+    state_version = created.json()["state_version"]
+    async with session_factory() as db:
+        db.add(
+            TeamTaskShare(
+                task_id=task_id,
+                target_type="user",
+                target_id=member_id,
+                permission="chat",
+                shared_by=sharer_id,
+            )
+        )
+        await db.commit()
+
+    shared_task = await client.get(
+        f"/api/tasks/{task_id}",
+        headers=member_headers,
+    )
+    assert shared_task.status_code == 200, shared_task.text
+    assert shared_task.json()["access_scope"] == "chat"
+    assert shared_task.json()["delivery_run_id"] == run_id
+
+    listing = await client.get("/api/delivery-runs", headers=member_headers)
+    detail = await client.get(
+        f"/api/delivery-runs/{run_id}",
+        headers=member_headers,
+    )
+    progress = await client.get(
+        f"/api/delivery-runs/{run_id}/progress",
+        headers=member_headers,
+    )
+    denied_create = await client.post(
+        "/api/delivery-runs",
+        headers=member_headers,
+        json=_payload(
+            project,
+            repo,
+            idempotency_key="chat-share-must-not-create",
+        ),
+    )
+    denied_quick_start = await client.post(
+        "/api/delivery-runs/quick-start",
+        headers=member_headers,
+        json={
+            "idempotency_key": "chat-share-must-not-quick-start",
+            "project_id": project.id,
+            "requirements": "must not start",
+        },
+    )
+    command_responses = [
+        await client.post(
+            f"/api/delivery-runs/{run_id}/pause",
+            headers=member_headers,
+            json={"reason": "must not pause"},
+        ),
+        await client.post(
+            f"/api/delivery-runs/{run_id}/resume",
+            headers=member_headers,
+            json={},
+        ),
+        await client.post(
+            f"/api/delivery-runs/{run_id}/cancel",
+            headers=member_headers,
+            json={"reason": "must not cancel"},
+        ),
+        await client.post(
+            f"/api/delivery-runs/{run_id}/retry",
+            headers=member_headers,
+            json={"expected_state_version": state_version},
+        ),
+    ]
+
+    assert listing.status_code == 200
+    assert listing.json() == []
+    assert detail.status_code == 403
+    assert progress.status_code == 403
+    assert denied_create.status_code == 403
+    assert denied_quick_start.status_code == 403
+    assert [response.status_code for response in command_responses] == [
+        403,
+        403,
+        403,
+        403,
+    ]
+    async with session_factory() as db:
+        run = await db.get(DeliveryRun, run_id)
+        assert run.state_version == state_version
+        assert (run.phase, run.activity) == ("planning", "ready")
+        assert await db.scalar(
+            select(func.count(DeliveryTransition.id)).where(
+                DeliveryTransition.run_id == run_id
+            )
+        ) == 1

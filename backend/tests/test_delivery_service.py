@@ -3,7 +3,7 @@
 import asyncio
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from backend.config import settings
@@ -61,6 +61,63 @@ async def _scope(db_session, *, worker_id=None, auto_merge=False):
     db_session.add(repo)
     await db_session.commit()
     return project, repo
+
+
+@pytest.mark.asyncio
+async def test_delivery_admission_locks_repo_before_project(
+    db_session,
+    db_engine,
+):
+    """Keep Delivery and PR Monitor topology writers in one lock order."""
+
+    project, repo = await _scope(db_session)
+    statements: list[str] = []
+
+    def record_statement(
+        _connection,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        statements.append(" ".join(statement.lower().split()))
+
+    event.listen(
+        db_engine.sync_engine,
+        "before_cursor_execute",
+        record_statement,
+    )
+    try:
+        await create_delivery_run(
+            db_session,
+            DeliveryCreateSpec(
+                idempotency_key="topology-lock-order",
+                project_id=project.id,
+                monitored_repo_id=repo.id,
+                title="Preserve topology lock order",
+                requirements="Lock the PR Monitor before its Project.",
+                provider="codex",
+            ),
+        )
+    finally:
+        event.remove(
+            db_engine.sync_engine,
+            "before_cursor_execute",
+            record_statement,
+        )
+
+    repo_update = next(
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("update monitored_repos ")
+    )
+    project_update = next(
+        index
+        for index, statement in enumerate(statements)
+        if statement.startswith("update projects ")
+    )
+    assert repo_update < project_update
 
 
 @pytest.mark.asyncio
@@ -144,6 +201,10 @@ async def test_create_delivery_run_is_atomic_and_developer_task_rests(db_session
     assert task.delivery_role == "developer"
     assert task.result_branch == run.delivery_branch
     assert task.provider == "codex"
+    assert task.execution_user_id is None
+    assert task.execution_user_role == "member"
+    assert task.execution_mode == "sandbox"
+    assert task.execution_principal_kind == "system"
     assert run.policy_snapshot["provider"] == "codex"
     assert run.policy_snapshot["model"] == "gpt-5.6-sol"
     assert run.policy_snapshot["effort_level"] == "high"

@@ -1319,7 +1319,11 @@ class ContainerManager:
 
 
 async def is_shared_project(project_id: int | None, db_factory) -> bool:
-    """Check unified Team/Feishu visibility behind a Project writer fence."""
+    """Check legacy cross-CCM Project sharing behind its writer fence.
+
+    TeamProjectShare is an in-process ACL and deliberately does not select the
+    legacy container/shadow trust boundary.
+    """
     if not project_id:
         return False
     from backend.services.project_share_admission import (

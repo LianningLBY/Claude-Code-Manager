@@ -14,13 +14,14 @@ import logging
 from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Awaitable, TypeVar
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.instance import Instance
 from backend.models.task import Task
+from backend.services.cancellation import finish_awaitable
 from backend.services.task_queue import (
     PR_REVIEW_SUPERSEDED_METADATA_KEY,
     task_retry_not_superseded_predicate,
@@ -124,25 +125,14 @@ class LocalTaskGeneration:
     pty_background_generation: str | None
 
 
-_T = TypeVar("_T")
 _MAX_LATE_AUXILIARY_REAP_SWEEPS = 8
 _AUXILIARY_TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped"})
 
 
-async def _finish_despite_cancellation(awaitable: Awaitable[_T]) -> _T:
+async def _finish_despite_cancellation(awaitable):
     """Finish safety-critical cleanup before propagating caller cancellation."""
 
-    operation = asyncio.create_task(awaitable)
-    cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-    result = operation.result()
-    if cancellation is not None:
-        raise cancellation
-    return result
+    return await finish_awaitable(awaitable)
 
 
 def _utc_naive(value: datetime | None) -> datetime | None:
@@ -1434,6 +1424,11 @@ async def _terminate_worker_task_generation_impl(
     observed = WorkerTaskGeneration(
         task_id=receipt.task_id,
         worker_id=receipt.worker_id,
+        incarnation_id=current_task.incarnation_id,
+        execution_user_id=current_task.execution_user_id,
+        execution_user_role=current_task.execution_user_role,
+        execution_mode=current_task.execution_mode,
+        execution_principal_kind=current_task.execution_principal_kind,
         status=receipt.source_task_status,
         retry_count=receipt.source_task_retry_count,
         turn_generation=receipt.source_task_turn_generation,

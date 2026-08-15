@@ -32,8 +32,13 @@ from backend.models.pr_monitor import (
 )
 from backend.models.task import Task
 from backend.services.delivery_pr_policy import legacy_pr_effect_is_forbidden
+from backend.services.task_creation import (
+    stage_task_record,
+    system_task_execution_principal_values,
+)
 from backend.services.pr_review_actions import (
     FindingActionConflict,
+    PREffectAuthorizer,
     is_current_review_snapshot,
     lock_pr_repo_action_boundary,
 )
@@ -812,6 +817,7 @@ async def create_fix_task(
     repo_id: int,
     idempotency_key: str,
     actor_user_id: int | None,
+    effect_authorizer: PREffectAuthorizer | None = None,
 ) -> PRFindingAction:
     """Capture exact-head input and enqueue one isolated patch-generation Task."""
 
@@ -829,7 +835,9 @@ async def create_fix_task(
         # repo fence in a fresh transaction first so SQLite cannot attempt to
         # upgrade the idempotency read snapshot after a concurrent writer.
         await db.rollback()
-        await lock_pr_repo_action_boundary(db, repo_id)
+        locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
+        if effect_authorizer is not None:
+            await effect_authorizer(db, locked_repo)
         existing = (
             await db.execute(
                 select(PRFindingAction)
@@ -888,6 +896,8 @@ async def create_fix_task(
     # fails to upgrade.
     await db.rollback()
     repo = await lock_pr_repo_action_boundary(db, repo_id)
+    if effect_authorizer is not None:
+        await effect_authorizer(db, repo)
     # A concurrent request may have committed this idempotency key between
     # the optimistic probe and our writer fence.  Resolve that winner before
     # interpreting its active slot as an unrelated repair conflict.
@@ -984,6 +994,8 @@ async def create_fix_task(
         # CAS must not let this creator continue after its fence was released.
         await db.rollback()
         repo = await lock_pr_repo_action_boundary(db, repo_id)
+        if effect_authorizer is not None:
+            await effect_authorizer(db, repo)
         review = (
             await db.execute(
                 select(PRReview)
@@ -1158,6 +1170,27 @@ async def create_fix_task(
     # before creating the Task.
     await db.rollback()
     locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
+    if effect_authorizer is not None:
+        try:
+            await effect_authorizer(db, locked_repo)
+        except BaseException as exc:
+            cleanup = asyncio.create_task(_abort_creation_reservation(
+                db,
+                repo_id=repo_id,
+                action_id=reserved_action_id,
+                finding_id=finding_id,
+                reservation_token=reservation_token,
+                error=(
+                    "PR fix authorization was revoked before Task creation: "
+                    f"{exc}"
+                ),
+            ))
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                await asyncio.shield(cleanup)
+                raise
+            raise
     locked_review = (
         await db.execute(
             select(PRReview)
@@ -1239,8 +1272,6 @@ async def create_fix_task(
 
         model = app_settings.default_codex_model
     try:
-        from backend.services.task_creation import stage_task_record
-
         task = await stage_task_record(
             db,
             title=(
@@ -1260,6 +1291,7 @@ async def create_fix_task(
             effort_level=repo.review_effort,
             project_id=await _get_or_create_pr_monitor_project(db),
             worker_id=repo.worker_id,
+            **system_task_execution_principal_values(),
         )
         action_result = dict(action.result or {})
         action_result.update({
@@ -1531,12 +1563,14 @@ async def _read_patch_terminal_output(
     task: Task,
     retry_count: int,
     allowed_files: set[str],
+    expected_background_generation: str | None = None,
 ) -> str:
     if (
         task.status != "completed"
         or task.retry_count != retry_count
         or task.started_at is None
-        or task.pty_background_generation is not None
+        or task.pty_background_generation
+        != expected_background_generation
     ):
         raise PatchProtocolError("PR fix Task generation is not terminal")
     result = await db.execute(
@@ -2011,6 +2045,7 @@ async def _commit_task_transition(
     task: Task,
     action_values: dict,
     finding_status: str,
+    expected_background_generation: str | None = None,
 ) -> bool:
     """Commit a model-Task terminal state only while no push owner exists."""
 
@@ -2042,6 +2077,11 @@ async def _commit_task_transition(
     # a concurrently committed receipt becomes a clean CAS miss, never a
     # SQLITE_BUSY_SNAPSHOT upgrade failure.
     await db.rollback()
+    from backend.services.worker_node_control import (
+        fence_worker_node_mutation,
+    )
+
+    await fence_worker_node_mutation(db)
     task_guard = await db.execute(
         update(Task)
         .where(
@@ -2085,7 +2125,12 @@ async def _commit_task_transition(
                 if task_identity["completed_at"] is None
                 else Task.completed_at == task_identity["completed_at"]
             ),
-            Task.pty_background_generation.is_(None),
+            (
+                Task.pty_background_generation.is_(None)
+                if expected_background_generation is None
+                else Task.pty_background_generation
+                == expected_background_generation
+            ),
             no_active_worker_task_termination_predicate(),
         )
         .values(status=Task.status)
@@ -2119,6 +2164,7 @@ async def handle_fix_task_completion(
     action_id: int,
     task_id: int,
     retry_count: int,
+    expected_background_generation: str | None = None,
 ) -> None:
     """Validate one exact fix Task generation and stage its canonical diff."""
 
@@ -2174,6 +2220,9 @@ async def handle_fix_task_completion(
                 "completed_at": datetime.utcnow(),
             },
             finding_status="failed",
+            expected_background_generation=(
+                expected_background_generation
+            ),
         )
         return
     try:
@@ -2182,6 +2231,9 @@ async def handle_fix_task_completion(
             task=task,
             retry_count=retry_count,
             allowed_files=set(allowed),
+            expected_background_generation=(
+                expected_background_generation
+            ),
         )
         await _verify_current_snapshot(repo, review)
         await _validate_patch_applies(
@@ -2204,6 +2256,9 @@ async def handle_fix_task_completion(
                 )[:2000],
             },
             finding_status="open",
+            expected_background_generation=(
+                expected_background_generation
+            ),
         )
         return
     except PRHeadDriftError as exc:
@@ -2218,6 +2273,9 @@ async def handle_fix_task_completion(
                 "completed_at": datetime.utcnow(),
             },
             finding_status="stale",
+            expected_background_generation=(
+                expected_background_generation
+            ),
         )
         return
     except PatchProtocolError as exc:
@@ -2232,6 +2290,9 @@ async def handle_fix_task_completion(
                 "completed_at": datetime.utcnow(),
             },
             finding_status="failed",
+            expected_background_generation=(
+                expected_background_generation
+            ),
         )
         return
     patch_sha256 = hashlib.sha256(patch.encode("utf-8")).hexdigest()
@@ -2260,6 +2321,7 @@ async def handle_fix_task_completion(
             "error_message": None,
         },
         finding_status="diff_ready",
+        expected_background_generation=expected_background_generation,
     )
 
 
@@ -2319,6 +2381,7 @@ async def confirm_fix(
     patch_sha256: str,
     download_receipt: str,
     confirmed_by_user_id: int | None,
+    effect_authorizer: PREffectAuthorizer | None = None,
 ) -> PRFindingAction:
     """Confirm, exact-head CAS push, and verify one SHA/patch-bound repair."""
 
@@ -2350,6 +2413,8 @@ async def confirm_fix(
         repo_id = repo.id
         await db.rollback()
         repo = await lock_pr_repo_action_boundary(db, repo_id)
+        if effect_authorizer is not None:
+            await effect_authorizer(db, repo)
         action = await db.get(PRFindingAction, action_id, populate_existing=True)
         finding = (
             await db.get(PRFinding, action.finding_id, populate_existing=True)
@@ -2858,6 +2923,7 @@ async def cancel_fix_action(
     *,
     action_id: int,
     cancelled_by_user_id: int | None,
+    effect_authorizer: PREffectAuthorizer | None = None,
 ) -> PRFindingAction:
     """Durably cancel an unconfirmed AI-fix action and its exact Task."""
 
@@ -2875,7 +2941,9 @@ async def cancel_fix_action(
             raise FixConfirmationError("PR fix action is not available")
         repo_id = review.repo_id
         await db.rollback()
-        await lock_pr_repo_action_boundary(db, repo_id)
+        locked_repo = await lock_pr_repo_action_boundary(db, repo_id)
+        if effect_authorizer is not None:
+            await effect_authorizer(db, locked_repo)
         action = await db.get(PRFindingAction, action_id, populate_existing=True)
         if action is None or action.action_type != "ai_fix":
             raise FixConfirmationError("PR fix action is not available")

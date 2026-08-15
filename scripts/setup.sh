@@ -145,6 +145,7 @@ if [ ! -f .env ]; then
 AUTH_TOKEN=${TOKEN}
 DATABASE_URL=sqlite+aiosqlite:///./claude_manager.db
 WORKSPACE_DIR=~/Projects
+CCM_NODE_ROLE=manager
 AUTO_START_DISPATCHER=true
 PORT=8002
 POOL_ENABLED=true
@@ -157,6 +158,10 @@ else
     if ! grep -q "WORKER_SSH_KEY_PATH" .env; then
         echo "WORKER_SSH_KEY_PATH=${CCM_KEY}" >> .env
         echo "  已追加 WORKER_SSH_KEY_PATH 到 .env"
+    fi
+    if ! grep -q "^CCM_NODE_ROLE=" .env; then
+        echo "CCM_NODE_ROLE=manager" >> .env
+        echo "  已追加 CCM_NODE_ROLE=manager 到 .env"
     fi
     echo "  .env 已存在，跳过生成"
 fi

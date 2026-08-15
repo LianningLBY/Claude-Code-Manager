@@ -12,6 +12,7 @@ from backend.api import test_harness as test_harness_api
 from backend.config import settings
 from backend.database import get_db
 from backend.models.task import Task
+from backend.models.user import User
 from backend.models.test_harness import (
     TestHarnessEvidence as EvidenceModel,
     TestHarnessRun as RunModel,
@@ -25,6 +26,22 @@ from backend.services.test_harness_contracts import (
     compile_test_plan,
 )
 from backend.services.internal_service_auth import InternalServiceClaims
+
+
+def _request_state(
+    *,
+    auth_type: str,
+    role: str,
+    user_id: int | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type=auth_type,
+            user_role=role,
+            user_id=user_id,
+        ),
+        headers={},
+    )
 
 
 @pytest.mark.asyncio
@@ -217,6 +234,139 @@ async def test_public_test_run_waits_for_parent_task_terminal(db_factory):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["start", "repeat"])
+async def test_public_test_run_effect_rejects_cached_jwt_role_change(
+    monkeypatch,
+    db_factory,
+    operation,
+):
+    async with db_factory() as db:
+        user = User(
+            email=f"harness-role-{operation}@example.invalid",
+            name="Harness role race",
+            password_hash="not-used",
+            role="member",
+            is_active=True,
+        )
+        db.add(user)
+        await db.flush()
+        task = Task(
+            title="Harness cached role admission",
+            status="completed",
+            created_by=user.id,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+        user_id = user.id
+
+    service = SimpleNamespace(
+        start_task_run=AsyncMock(),
+        start_fixed_url_browser=AsyncMock(),
+        get_run=AsyncMock(return_value={"task_id": task_id}),
+        repeat=AsyncMock(),
+    )
+    monkeypatch.setattr(test_harness_api, "test_harness_service", service)
+    # Simulate an HTTP request authenticated while the User was still admin;
+    # the durable row has already been demoted before effect admission.
+    request = _request_state(
+        auth_type="jwt",
+        role="admin",
+        user_id=user_id,
+    )
+
+    async with db_factory() as db:
+        with pytest.raises(HTTPException) as caught:
+            if operation == "start":
+                await test_harness_api.start_test_harness_run(
+                    task_id,
+                    test_harness_api.TestHarnessRunStart(
+                        target_kind="fixed_url",
+                        target={"url": "https://example.com"},
+                        goal="Do not use stale admin authority",
+                    ),
+                    request,
+                    db,
+                )
+            else:
+                await test_harness_api.repeat_test_harness_run(
+                    task_id,
+                    "a" * 32,
+                    request,
+                    db,
+                )
+
+    assert caught.value.status_code == 409
+    assert "changed role" in caught.value.detail
+    service.start_task_run.assert_not_awaited()
+    service.get_run.assert_not_awaited()
+    service.repeat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner_fields", "message"),
+    [
+        ({"worker_id": 71}, "Worker-authoritative"),
+        ({"shared_from_id": 72}, "Shared shadow"),
+    ],
+)
+@pytest.mark.parametrize("operation", ["start", "repeat"])
+async def test_public_test_run_never_materializes_manager_mirror(
+    monkeypatch,
+    db_factory,
+    owner_fields,
+    message,
+    operation,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="Remote Harness mirror",
+            status="completed",
+            **owner_fields,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    service = SimpleNamespace(
+        start_task_run=AsyncMock(),
+        start_fixed_url_browser=AsyncMock(),
+        get_run=AsyncMock(return_value={"task_id": task_id}),
+        repeat=AsyncMock(),
+    )
+    monkeypatch.setattr(test_harness_api, "test_harness_service", service)
+    request = _request_state(auth_type="token", role="super_admin")
+
+    async with db_factory() as db:
+        with pytest.raises(HTTPException) as caught:
+            if operation == "start":
+                await test_harness_api.start_test_harness_run(
+                    task_id,
+                    test_harness_api.TestHarnessRunStart(
+                        target_kind="fixed_url",
+                        target={"url": "https://example.com"},
+                        goal="Do not materialize on the Manager mirror",
+                    ),
+                    request,
+                    db,
+                )
+            else:
+                await test_harness_api.repeat_test_harness_run(
+                    task_id,
+                    "b" * 32,
+                    request,
+                    db,
+                )
+
+    assert caught.value.status_code == 409
+    assert message in caught.value.detail
+    service.start_task_run.assert_not_awaited()
+    service.get_run.assert_not_awaited()
+    service.repeat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("owner_fields", "message"),
     [
@@ -253,7 +403,7 @@ async def test_capabilities_disable_manager_targets_for_remote_authority(
             sandbox=SimpleNamespace(as_dict=lambda: {"available": True}),
         )
 
-    monkeypatch.setattr(test_harness_api, "require_task_access", allow_access)
+    monkeypatch.setattr(test_harness_api, "require_task_control", allow_access)
     monkeypatch.setattr(
         test_harness_api,
         "untrusted_git_target_capability",

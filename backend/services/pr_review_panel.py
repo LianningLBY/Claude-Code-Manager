@@ -7,11 +7,12 @@ import json
 import logging
 import re
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.pr_monitor import (
     MonitoredRepo,
@@ -21,6 +22,7 @@ from backend.models.pr_monitor import (
     PRReviewerRun,
 )
 from backend.models.task import Task
+from backend.services.task_creation import system_task_execution_principal_values
 from backend.services.worker_task_termination import (
     no_active_worker_task_termination_predicate,
 )
@@ -55,7 +57,10 @@ _PANEL_OUTPUT_RE = re.compile(
 )
 _MAX_PANEL_OUTPUT_BYTES = 60 * 1024
 _MAX_FINDINGS = 50
-_POLICY_VERSION = "ccm-pr-review-panel-v3"
+_POLICY_VERSION = "ccm-pr-review-panel-v4"
+_OPEN_REVIEWER_RUN_STATUSES = ("pending", "reviewing", "finalizing")
+_ACTIVE_REVIEWER_TASK_STATUSES = ("in_progress", "executing", "merging")
+_WORKER_TERMINAL_HISTORY_GRACE = timedelta(hours=1)
 
 
 class _PanelTerminalError(ValueError):
@@ -80,6 +85,153 @@ async def _commit_review_error(db: AsyncSession, review: PRReview) -> None:
     from backend.services.pr_monitor_loop import record_review_error
 
     await record_review_error(db, review_id=review.id)
+
+
+async def _cancel_open_reviewer_siblings(
+    db: AsyncSession,
+    *,
+    review_id: int,
+    failed_run_id: int | None,
+    reason: str,
+) -> int:
+    """Close every unfinished role when one required reviewer fails.
+
+    ReviewerRun is the durable panel lifecycle shown by the PR Monitor.  It
+    must never remain ``pending`` after the parent Review has failed, even if
+    the sibling Task completes later or the Manager restarts before its
+    callback. Queue admission independently refuses cancelled role rows. The
+    periodic cancelled-reviewer reconciler stops any process that had already
+    crossed the launch boundary, after this parent transition has committed.
+    """
+
+    predicates = [
+        PRReviewerRun.pr_review_id == review_id,
+        PRReviewerRun.status.in_(_OPEN_REVIEWER_RUN_STATUSES),
+    ]
+    if failed_run_id is not None:
+        predicates.append(PRReviewerRun.id != failed_run_id)
+    changed = await db.execute(
+        update(PRReviewerRun)
+        .where(*predicates)
+        .values(
+            status="cancelled",
+            error_message=reason[:1000],
+            completed_at=datetime.utcnow(),
+        )
+    )
+    return int(changed.rowcount or 0)
+
+
+def _cancelled_reviewer_runtime_predicate():
+    """Return durable evidence that a cancelled reviewer may still be live."""
+
+    reverse_instance_owner = (
+        select(Instance.id)
+        .where(Instance.current_task_id == Task.id)
+        .correlate(Task)
+        .exists()
+    )
+    return or_(
+        Task.status.in_(_ACTIVE_REVIEWER_TASK_STATUSES),
+        Task.pty_background_generation.is_not(None),
+        Task.worker_turn_handoff_id.is_not(None),
+        reverse_instance_owner,
+    )
+
+
+async def reconcile_cancelled_reviewer_tasks(
+    db_factory,
+    review_id: int | None = None,
+) -> int:
+    """Stop durable cancelled siblings without holding Review lifecycle locks.
+
+    The parent Review error and sibling cancellation are committed before this
+    recovery path can discover them. Each Task is then independently rechecked
+    while holding the same migration/operation locks used by retry, Worker
+    proxy mutations, and authoritative termination. A conflict leaves the
+    durable cancelled row untouched so the next periodic pass can retry.
+    """
+
+    from backend.services.task_termination import (
+        TaskTerminationConflict,
+        local_task_generation,
+        task_termination_operation_locks,
+        terminate_authoritative_task_generation,
+    )
+
+    def candidate_statement(*, task_id: int | None = None):
+        statement = (
+            select(Task)
+            .join(PRReviewerRun, PRReviewerRun.task_id == Task.id)
+            .join(PRReview, PRReview.id == PRReviewerRun.pr_review_id)
+            .where(
+                PRReviewerRun.status == "cancelled",
+                PRReview.status == "error",
+                Task.shared_from_id.is_(None),
+                _cancelled_reviewer_runtime_predicate(),
+            )
+        )
+        if review_id is not None:
+            statement = statement.where(PRReview.id == review_id)
+        if task_id is not None:
+            statement = statement.where(Task.id == task_id)
+        return statement
+
+    async with db_factory() as db:
+        task_ids = list(
+            (
+                await db.execute(
+                    candidate_statement()
+                    .with_only_columns(Task.id)
+                    .distinct()
+                    .order_by(Task.id)
+                )
+            ).scalars()
+        )
+
+    reconciled = 0
+    for task_id in task_ids:
+        try:
+            async with task_termination_operation_locks((task_id,)):
+                async with db_factory() as db:
+                    task = (
+                        await db.execute(
+                            candidate_statement(task_id=task_id)
+                            .execution_options(populate_existing=True)
+                        )
+                    ).scalar_one_or_none()
+                    if task is None:
+                        await db.rollback()
+                        continue
+                    expected_local_generation = (
+                        local_task_generation(task)
+                        if task.worker_id is None
+                        else None
+                    )
+                    # End the classification snapshot before the termination
+                    # core begins its own Task writer/receipt transaction.
+                    await db.rollback()
+                    await terminate_authoritative_task_generation(
+                        task_id,
+                        db,
+                        reason="Cancelled because another required PR reviewer failed",
+                        operation_locks_held=True,
+                        expected_local_generation=expected_local_generation,
+                        allow_delivery_effect_stop=True,
+                    )
+                    reconciled += 1
+        except TaskTerminationConflict as exc:
+            logger.warning(
+                "Deferred cancelled PR reviewer Task %s cleanup: %s",
+                task_id,
+                exc,
+            )
+        except Exception:
+            logger.exception(
+                "Cancelled PR reviewer Task %s cleanup failed; will retry",
+                task_id,
+            )
+    return reconciled
 
 
 ENGINEERING_DESIGN_STANDARD = """Every reviewer must apply the same repository-wide engineering standard.
@@ -174,10 +326,7 @@ def build_panel_review_prompt(
     if role not in REVIEWER_ROLES:
         raise ValueError("unknown PR reviewer role")
     rendered_guidance = _render_guidance_documents(guidance, role=role)
-    rendered_material = _render_pr_material(
-        material,
-        include_full_files=(role == "senior_engineer"),
-    )
+    rendered_material = _render_pr_material(material)
     policy_hash = _canonical_hash({
         "version": _POLICY_VERSION,
         "engineering_design_standard": ENGINEERING_DESIGN_STANDARD,
@@ -209,8 +358,10 @@ comment, approve, merge, or claim that the overall Gate passed.
 {rendered_guidance}
 </ccm_verified_base_guidance>
 
-The fixed contract outranks the guides. Base `CLAUDE.md` is normative and
-`PROGRESS.md` is supporting history. Head changes to guides are ordinary diff.
+The fixed contract outranks the guides. Base `CLAUDE.md` is normative.
+`PROGRESS.md` or any other repository document is included only when the exact
+base manifest explicitly assigns it to this role. Head changes to guides are
+ordinary diff.
 
 ## Shared engineering design standard
 
@@ -222,9 +373,9 @@ The fixed contract outranks the guides. Base `CLAUDE.md` is normative and
 {rendered_material}
 </ccm_verified_pr_material>
 
-Review the complete injected patch. The Senior Engineer also receives bounded
-exact-base/head full content for every changed path; an unavailable entry states
-why its content could not be injected. Do not invent files, lines or behavior.
+Review the complete injected patch and file metadata. Full base/head file copies
+are intentionally not duplicated into the prompt. Do not invent files, lines,
+or behavior outside the supplied immutable material.
 
 ## Role contract
 
@@ -252,6 +403,40 @@ Use an empty findings list only after completing the role contract. Verdict
 must be `changes_required` iff any blocking finding exists.
 """
     return prompt, policy_hash, guide_pack_hash
+
+
+def _build_panel_prompt_set(
+    *,
+    repo_name: str,
+    pr_number: int,
+    base_sha: str,
+    head_sha: str,
+    provider: str,
+    guidance: dict[str, object],
+    material: dict,
+) -> dict[str, tuple[str, str, str]]:
+    """Render and budget every required role before staging any Task."""
+
+    from backend.services.pr_review_service import validate_review_prompt_budget
+
+    prompts: dict[str, tuple[str, str, str]] = {}
+    for role in REVIEWER_ROLES:
+        rendered = build_panel_review_prompt(
+            repo_name=repo_name,
+            pr_number=pr_number,
+            base_sha=base_sha,
+            head_sha=head_sha,
+            role=role,
+            guidance=guidance,
+            material=material,
+        )
+        validate_review_prompt_budget(
+            rendered[0],
+            provider=provider,
+            label=f"{role} reviewer",
+        )
+        prompts[role] = rendered
+    return prompts
 
 
 def _bounded_string(value: object, field: str, maximum: int, *, empty: bool = False) -> str:
@@ -338,24 +523,22 @@ async def create_pr_review_panel(
         _valid_base_ref,
         _validate_review_identifiers,
         prepare_pr_review_context,
+        preflight_pr_review_prompts,
     )
 
     pr_number, repo_name, base_sha, head_sha = _validate_review_identifiers(repo, pr_data)
     context = prepared_context or await prepare_pr_review_context(repo, pr_data)
     base_ref = _frozen_pr_base_ref(repo, pr_data)
-    if (
-        context.get("repo_name") != repo_name
-        or context.get("pr_number") != pr_number
-        or context.get("base_ref") != base_ref
-        or context.get("base_sha") != base_sha
-        or context.get("head_sha") != head_sha
-        or not isinstance(context.get("guidance"), dict)
-        or not isinstance(context.get("material"), dict)
-        or context["material"].get("base_ref") != context.get("base_ref")
-    ):
-        raise ValueError("prepared PR review context does not match the panel snapshot")
     if not _valid_base_ref(base_ref):
         raise ValueError("prepared PR review context has an invalid base ref")
+    single_prompt, prompt_set = preflight_pr_review_prompts(
+        repo,
+        pr_data,
+        prepared_context=context,
+        base_ref=base_ref,
+    )
+    if single_prompt is not None or prompt_set is None:
+        raise ValueError("panel PR review preflight returned a single prompt")
     nonce = secrets.token_hex(24)
     review = PRReview(
         repo_id=repo.id,
@@ -372,7 +555,13 @@ async def create_pr_review_panel(
     )
     db.add(review)
     await db.flush()
-    await _add_panel_tasks(db, repo=repo, review=review, context=context)
+    await _add_panel_tasks(
+        db,
+        repo=repo,
+        review=review,
+        context=context,
+        prompt_set=prompt_set,
+    )
     return review
 
 
@@ -423,6 +612,7 @@ async def _add_panel_tasks(
     repo: MonitoredRepo,
     review: PRReview,
     context: dict,
+    prompt_set: dict[str, tuple[str, str, str]] | None = None,
 ) -> None:
     from backend.config import settings
     from backend.services.delivery_pr_policy import frozen_delivery_pr_policy
@@ -462,18 +652,19 @@ async def _add_panel_tasks(
     ))
     provider = (repo.provider or "claude").lower()
     model = repo.review_model or (settings.default_codex_model if provider == "codex" else None)
+    prompts = prompt_set or _build_panel_prompt_set(
+        repo_name=repo_name,
+        pr_number=pr_number,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        provider=provider,
+        guidance=context["guidance"],
+        material=context["material"],
+    )
     project_id = await _get_or_create_pr_monitor_project(db)
     first_task_id = None
     for role in REVIEWER_ROLES:
-        prompt, policy_hash, guide_hash = build_panel_review_prompt(
-            repo_name=repo_name,
-            pr_number=pr_number,
-            base_sha=base_sha,
-            head_sha=head_sha,
-            role=role,
-            guidance=context["guidance"],
-            material=context["material"],
-        )
+        prompt, policy_hash, guide_hash = prompts[role]
         run = PRReviewerRun(
             pr_review_id=review.id,
             role=role,
@@ -511,6 +702,8 @@ async def _add_panel_tasks(
             effort_level=repo.review_effort,
             project_id=project_id,
             worker_id=repo.worker_id,
+            archived=True,
+            **system_task_execution_principal_values(),
         )
         run.task_id = task.id
         first_task_id = first_task_id or task.id
@@ -697,10 +890,71 @@ async def fetch_exact_head_ci(
     return "passed", f"{len(normalized)} required exact-head CI checks passed", details
 
 
+async def _fail_waiting_ci_input(
+    db_factory,
+    *,
+    review_id: int,
+    error: Exception,
+) -> bool:
+    """Terminalize one deterministic post-CI reviewer admission failure."""
+
+    async with db_factory() as db:
+        # Preserve the global PRMonitorRun -> PRReview lock order.  A newer
+        # synchronize may already own the Monitor; in that case the old Review
+        # is still closed locally but cannot pause the replacement subject.
+        monitor_run_id = await db.scalar(
+            select(PRReview.monitor_run_id).where(
+                PRReview.id == review_id,
+                PRReview.status == "waiting_ci",
+            )
+        )
+        monitor_run = (
+            (
+                await db.execute(
+                    select(PRMonitorRun)
+                    .where(PRMonitorRun.id == monitor_run_id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if monitor_run_id is not None
+            else None
+        )
+        review = (
+            await db.execute(
+                select(PRReview)
+                .where(
+                    PRReview.id == review_id,
+                    PRReview.status == "waiting_ci",
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if review is None:
+            await db.rollback()
+            return False
+
+        review.status = "error"
+        review.action_taken = "error"
+        review.ci_status = "passed"
+        review.review_summary = str(error)[:2000]
+        review.completed_at = datetime.utcnow()
+        if monitor_run is not None:
+            from backend.services.pr_monitor_loop import (
+                _apply_current_review_error,
+            )
+
+            _apply_current_review_error(monitor_run, review)
+        await db.commit()
+        return True
+
+
 async def reconcile_waiting_ci_reviews(db_factory) -> int:
     """Start reviewer panels whose immutable head has reached CI PASS."""
 
     from backend.services.pr_review_service import (
+        PRReviewInputTooLarge,
         prepare_pr_review_context,
         verify_pr_review_snapshot_current,
     )
@@ -857,6 +1111,24 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
                 await db.commit()
                 started += 1
                 _wake_dispatcher()
+        except PRReviewInputTooLarge as exc:
+            changed = await _fail_waiting_ci_input(
+                db_factory,
+                review_id=review_id,
+                error=exc,
+            )
+            if changed:
+                from backend.services.pr_review_service import (
+                    _broadcast_review_update,
+                )
+
+                await _broadcast_review_update(review_id, "error", "error")
+                logger.warning(
+                    "PR review %s cannot start after CI: %s",
+                    review_id,
+                    exc,
+                )
+            continue
         except Exception:
             # Durable waiting row remains available for the next bounded pass.
             logger.exception(
@@ -950,10 +1222,15 @@ async def _guard_exact_terminal_task(
     task: Task,
     *,
     statuses: set[str],
+    expected_background_generation: str | None = None,
 ) -> bool:
     """Acquire a SQLite-safe proof that no termination receipt owns Task."""
 
-    if task.status not in statuses or task.pty_background_generation is not None:
+    if (
+        task.status not in statuses
+        or task.pty_background_generation
+        != expected_background_generation
+    ):
         return False
     identity = {
         "id": task.id,
@@ -973,6 +1250,11 @@ async def _guard_exact_terminal_task(
     # a fresh writer transaction; otherwise a receipt that committed meanwhile
     # can surface as SQLITE_BUSY_SNAPSHOT instead of a deterministic CAS miss.
     await db.rollback()
+    from backend.services.worker_node_control import (
+        fence_worker_node_mutation,
+    )
+
+    await fence_worker_node_mutation(db)
     guarded = await db.execute(
         update(Task)
         .where(
@@ -1015,7 +1297,12 @@ async def _guard_exact_terminal_task(
                 if identity["completed_at"] is None
                 else Task.completed_at == identity["completed_at"]
             ),
-            Task.pty_background_generation.is_(None),
+            (
+                Task.pty_background_generation.is_(None)
+                if expected_background_generation is None
+                else Task.pty_background_generation
+                == expected_background_generation
+            ),
             no_active_worker_task_termination_predicate(),
         )
         .values(status=Task.status)
@@ -1032,6 +1319,7 @@ async def check_and_update_reviewer_run(
     retry_count: int,
     db_factory=None,
     defer_missing_terminal: bool = False,
+    expected_background_generation: str | None = None,
 ) -> bool:
     from backend.services import pr_review_service
 
@@ -1058,13 +1346,15 @@ async def check_and_update_reviewer_run(
         or task.status != "completed"
         or task.retry_count != retry_count
         or task.started_at is None
-        or task.pty_background_generation is not None
+        or task.pty_background_generation
+        != expected_background_generation
     ):
         return False
     if not await _guard_exact_terminal_task(
         db,
         task,
         statuses={"completed"},
+        expected_background_generation=expected_background_generation,
     ):
         await db.rollback()
         return False
@@ -1119,7 +1409,8 @@ async def check_and_update_reviewer_run(
         or task.status != "completed"
         or task.retry_count != retry_count
         or task.started_at is None
-        or task.pty_background_generation is not None
+        or task.pty_background_generation
+        != expected_background_generation
         or review.base_sha is None
         or review.head_sha is None
     ):
@@ -1176,6 +1467,12 @@ async def check_and_update_reviewer_run(
         run.status = "error"
         run.error_message = str(terminal_error)
         run.completed_at = datetime.utcnow()
+        await _cancel_open_reviewer_siblings(
+            db,
+            review_id=review.id,
+            failed_run_id=run.id,
+            reason=f"Cancelled because {run.role} failed closed",
+        )
         review.status = "error"
         review.action_taken = "error"
         review.review_summary = (
@@ -1204,6 +1501,13 @@ async def check_and_update_reviewer_run(
     await db.flush()
     runs = list((await db.execute(select(PRReviewerRun).where(PRReviewerRun.pr_review_id == review.id))).scalars())
     if any(item.status == "error" for item in runs):
+        failed_role = next(item.role for item in runs if item.status == "error")
+        await _cancel_open_reviewer_siblings(
+            db,
+            review_id=review.id,
+            failed_run_id=None,
+            reason=f"Cancelled because {failed_role} failed closed",
+        )
         review.status = "error"
         review.action_taken = "error"
         review.review_summary = "A required reviewer failed closed"
@@ -1402,6 +1706,12 @@ async def check_and_update_reviewer_run(
         # stage back to its original publication action.  In particular, do not
         # acquire a publication lease or probe/write GitHub here.
         return True
+    if expected_background_generation is not None:
+        # The exact PTY marker remains the Worker drain blocker until the
+        # terminal callback returns. Publication is already durable; the
+        # normal marker-free recovery pass resumes the GitHub effect after the
+        # marker-last transaction commits.
+        return True
     await pr_review_service._resume_publishing_review(
         db,
         review.id,
@@ -1513,6 +1823,12 @@ async def fail_reviewer_run(
     run.error_message = error[:1000]
     run.completed_at = datetime.utcnow()
     if review.status == "reviewing":
+        await _cancel_open_reviewer_siblings(
+            db,
+            review_id=review.id,
+            failed_run_id=run.id,
+            reason=f"Cancelled because {run.role} reviewer failed",
+        )
         review.status = "error"
         review.action_taken = "error"
         review.review_summary = f"{run.role} task failed: {error[:500]}"
@@ -1532,7 +1848,10 @@ async def recover_panel_reviews(db_factory) -> int:
     from backend.services.pr_review_service import pr_review_action_lock
     from backend.services.worker_proxy import get_task_operation_lock
 
+    from backend.services.pr_review_service import _database_now
+
     async with db_factory() as db:
+        database_now = await _database_now(db)
         rows = list((await db.execute(
             select(
                 PRReviewerRun.id,
@@ -1572,13 +1891,20 @@ async def recover_panel_reviews(db_factory) -> int:
             async with pr_review_action_lock(review_id):
                 async with db_factory() as db:
                     if status == "completed":
+                        terminal_at = completed_at or started_at
+                        defer_missing_terminal = bool(
+                            worker_id is not None
+                            and terminal_at is not None
+                            and terminal_at
+                            > database_now - _WORKER_TERMINAL_HISTORY_GRACE
+                        )
                         processed = await check_and_update_reviewer_run(
                             db,
                             reviewer_run_id=run_id,
                             task_id=task_id,
                             retry_count=retry_count,
                             db_factory=db_factory,
-                            defer_missing_terminal=worker_id is not None,
+                            defer_missing_terminal=defer_missing_terminal,
                         )
                         if not processed:
                             continue

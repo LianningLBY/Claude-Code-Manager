@@ -19,12 +19,6 @@ class GlobalSettings(Base):
     git_https_token: Mapped[str | None] = mapped_column(String(500), nullable=True)
     # Runtime mode switches (None = follow env default)
     use_pty_mode: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    # High-risk Agent sandbox override (None = follow env default). This is
-    # operator-owned runtime state; individual Tasks can never set it.
-    agent_sandbox_unrestricted_enabled: Mapped[bool | None] = mapped_column(
-        Boolean,
-        nullable=True,
-    )
     # Task sort: auto-move accessed task to top of its group (None = True)
     auto_sort_on_access: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     # Context compaction threshold (0-1); None = follow env default

@@ -803,7 +803,6 @@ export function ProjectsPage() {
   const [teamSharingProject, setTeamSharingProject] = useState<Project | null>(null);
   const ccUser = JSON.parse(localStorage.getItem('cc_user') || '{}');
   const isAdmin = ccUser.role === 'admin' || ccUser.role === 'super_admin' || !ccUser.id;
-  const [hasWorker, setHasWorker] = useState(isAdmin);
   const [showGlobalGit, setShowGlobalGit] = useState(false);
   const [showTagManager, setShowTagManager] = useState(false);
   const [tagItems, setTagItems] = useState<TagItem[]>([]);
@@ -842,7 +841,6 @@ export function ProjectsPage() {
       setAllTags(Array.from(merged).sort());
       setTagItems(tagList);
       setError(null);
-      if (!isAdmin) api.listWorkers().then(w => setHasWorker(w.length > 0)).catch(() => {});
     } catch (e) {
       setError(String(e));
     }
@@ -1051,7 +1049,7 @@ export function ProjectsPage() {
               <Tag size={14} /> Tags
             </button>
           )}
-          {hasWorker && (
+          {isAdmin && (
             <button
               onClick={() => setShowCreate(true)}
               className="flex items-center gap-1.5 px-3 py-1.5 text-sm bg-indigo-600 text-white rounded hover:bg-indigo-500"
@@ -1125,11 +1123,11 @@ export function ProjectsPage() {
             <div
               key={p.id}
               ref={setCardRef(p.id)}
-              draggable
-              onDragStart={handleDragStart(p.id)}
-              onDragOver={handleDragOver(p.id)}
-              onDrop={handleDrop(p.id)}
-              onDragEnd={handleDragEnd}
+              draggable={isAdmin}
+              onDragStart={isAdmin ? handleDragStart(p.id) : undefined}
+              onDragOver={isAdmin ? handleDragOver(p.id) : undefined}
+              onDrop={isAdmin ? handleDrop(p.id) : undefined}
+              onDragEnd={isAdmin ? handleDragEnd : undefined}
               className={`bg-gray-800 rounded-lg p-3 sm:p-4 space-y-2 transition-opacity ${
                 draggingId === p.id ? 'opacity-40' : 'opacity-100'
               } ${
@@ -1140,7 +1138,7 @@ export function ProjectsPage() {
             >
               <div className="flex items-start gap-3">
                 {/* Drag handle */}
-                <div
+                {isAdmin && <div
                   className="mt-1 text-gray-600 hover:text-gray-400 cursor-grab active:cursor-grabbing select-none touch-none"
                   title="Drag to reorder"
                   onTouchStart={handleTouchStart(p.id)}
@@ -1148,7 +1146,7 @@ export function ProjectsPage() {
                   onTouchEnd={handleTouchEnd}
                 >
                   <GripVertical size={18} />
-                </div>
+                </div>}
 
                 {/* Icon */}
                 <div className="mt-1 text-gray-400">
@@ -1159,7 +1157,7 @@ export function ProjectsPage() {
                 <div className="flex-1 min-w-0 space-y-1">
                   <div className="flex items-center gap-2 flex-wrap">
                     <span className="text-foreground font-medium">{p.name}</span>
-                    <BadgeColorPicker value={p.badge_color} onChange={(c) => handleBadgeColor(p, c)} />
+                    {isAdmin && <BadgeColorPicker value={p.badge_color} onChange={(c) => handleBadgeColor(p, c)} />}
                     <span className={`inline-block w-2 h-2 rounded-full ${statusColor[p.status] || 'bg-gray-500'}`} title={p.status} />
                     <span className="text-xs text-gray-500 capitalize">{p.status}</span>
                     {p.has_remote ? (
@@ -1196,14 +1194,23 @@ export function ProjectsPage() {
                   </div>
 
                   {/* Tags row */}
-                  <div className="pt-0.5">
-                    <TagEditor
-                      tags={p.tags}
-                      allTags={allTags}
-                      onSave={(tags) => handleTagSave(p, tags)}
-                      tagColorMap={tagColorMap}
-                    />
-                  </div>
+                  {isAdmin ? (
+                    <div className="pt-0.5">
+                      <TagEditor
+                        tags={p.tags}
+                        allTags={allTags}
+                        onSave={(tags) => handleTagSave(p, tags)}
+                        tagColorMap={tagColorMap}
+                      />
+                    </div>
+                  ) : p.tags.length > 0 ? (
+                    <div className="flex flex-wrap gap-1.5 pt-0.5">
+                      {p.tags.map((tag) => {
+                        const color = resolveTagColor(tag, tagColorMap[tag]);
+                        return <span key={tag} className={`rounded border px-1.5 py-0.5 text-xs ${color.bg} ${color.text} ${color.border}`}>{tag}</span>;
+                      })}
+                    </div>
+                  ) : null}
 
                   <ProjectTodoList projectId={p.id} project={p} />
                 </div>
@@ -1212,7 +1219,7 @@ export function ProjectsPage() {
               {/* Actions */}
               <div className="flex items-center gap-3 pl-10 sm:pl-0 sm:justify-end">
                 {/* Show in selector toggle */}
-                <label className="flex items-center gap-2 cursor-pointer select-none" title="Show in task project dropdown">
+                {isAdmin && <label className="flex items-center gap-2 cursor-pointer select-none" title="Show in task project dropdown">
                   <span className="text-xs text-gray-400">Selector</span>
                   <button
                     onClick={() => toggleSelector(p)}
@@ -1227,10 +1234,10 @@ export function ProjectsPage() {
                       }`}
                     />
                   </button>
-                </label>
+                </label>}
 
-                {/* Project management: admin or Worker owner */}
-                {(isAdmin || hasWorker) && (
+                {/* Project configuration and sharing are administrator-only. */}
+                {isAdmin && (
                   <>
                     <button
                       onClick={() => setEditingPreviewProfiles(p)}
@@ -1253,7 +1260,7 @@ export function ProjectsPage() {
                     >
                       <FileKey size={16} />
                     </button>
-                    {p.has_remote && (
+                    {p.has_remote && p.worker_id == null && (
                       <button
                         onClick={async () => {
                           try {

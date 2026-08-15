@@ -393,32 +393,6 @@ async def get_project_shares(db: AsyncSession, project_id: int) -> list[dict]:
     ]
 
 
-async def auto_share_new_task(db: AsyncSession, task_id: int, project_id: int):
-    """Called when a new task is created under a shared project — auto-share to all project recipients."""
-    task = await db.get(Task, task_id)
-    if task is None or _writable_share_block_reason(task) is not None:
-        return
-    result = await db.execute(
-        select(ProjectShare).where(
-            ProjectShare.project_id == project_id,
-            ProjectShare.status == "active",
-        )
-    )
-    shares = result.scalars().all()
-    if not shares:
-        return
-
-    targets = [
-        {
-            "open_id": s.shared_to_open_id,
-            "name": s.shared_to_name,
-            "ccm_url": s.shared_to_ccm_url,
-        }
-        for s in shares
-    ]
-    await share_task(db, task_id, targets)
-
-
 # ---------- Push helpers ----------
 
 async def _push_share_to_recipient(ccm_url: str, payload: dict) -> bool:

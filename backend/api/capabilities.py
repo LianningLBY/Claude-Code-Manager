@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import (
     get_current_user_id,
-    require_task_access,
+    lock_task_effect_access,
     require_task_control,
 )
 from backend.database import get_db
@@ -89,8 +89,25 @@ async def create_capability_invocation(
         action="given ad-hoc capability invocations",
     )
 
-    async def authorize_locked_task(locked_db: AsyncSession, locked_task: Task):
+    async def lock_effect_task(
+        locked_db: AsyncSession,
+        observed_task: Task,
+        worker_node_fence_held: bool,
+    ) -> Task:
+        locked_task = await lock_task_effect_access(
+            request,
+            observed_task,
+            locked_db,
+            allow_chat_share=False,
+            fence_worker_node=worker_node_fence_held,
+            worker_node_fence_held=worker_node_fence_held,
+        )
         await require_task_control(request, locked_task, locked_db)
+        _require_not_delivery_owned_task(
+            locked_task,
+            action="given ad-hoc capability invocations",
+        )
+        return locked_task
 
     try:
         invocation, created = await create_human_invocation(
@@ -100,7 +117,7 @@ async def create_capability_invocation(
             request_payload=body.request,
             idempotency_key=body.idempotency_key,
             requested_by_user_id=get_current_user_id(request),
-            authorize_locked_task=authorize_locked_task,
+            lock_effect_task=lock_effect_task,
         )
     except CapabilityError as exc:
         raise _http_error(exc) from exc
@@ -123,7 +140,10 @@ async def list_capability_invocations(
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, task, db)
+    # Invocation records include the raw capability input, frozen native
+    # session/instance generation and executor audit.  They are control-plane
+    # resources, not part of a chat-only Task share.
+    await require_task_control(request, task, db)
     invocations = await list_task_invocations(db, task_id)
     return [await _resource(db, invocation) for invocation in invocations]
 
@@ -144,7 +164,7 @@ async def read_capability_invocation(
     task = await db.get(Task, invocation.task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     return await _resource(db, invocation)
 
 
@@ -164,7 +184,7 @@ async def read_capability_result(
     task = await db.get(Task, invocation.task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     try:
         resolved = await resolve_capability_result(db, invocation)
         return CapabilityResultResource.model_validate(resolved.as_payload())
@@ -197,15 +217,30 @@ async def consume_capability_invocation(
         action="had capability results consumed outside its Delivery Run",
     )
 
-    async def authorize_locked_task(locked_db: AsyncSession, locked_task: Task):
+    async def lock_effect_task(
+        locked_db: AsyncSession,
+        observed_task: Task,
+        _worker_node_fence_held: bool,
+    ) -> Task:
+        locked_task = await lock_task_effect_access(
+            request,
+            observed_task,
+            locked_db,
+            allow_chat_share=False,
+        )
         await require_task_control(request, locked_task, locked_db)
+        _require_not_delivery_owned_task(
+            locked_task,
+            action="had capability results consumed outside its Delivery Run",
+        )
+        return locked_task
 
     try:
         invocation = await consume_ready_invocation(
             db,
             invocation_id=invocation_id,
             expected_state_version=body.expected_state_version,
-            authorize_locked_task=authorize_locked_task,
+            lock_effect_task=lock_effect_task,
         )
     except CapabilityError as exc:
         raise _http_error(exc) from exc
@@ -237,15 +272,30 @@ async def cancel_capability_invocation(
         action="had capabilities cancelled outside its Delivery Run",
     )
 
-    async def authorize_locked_task(locked_db: AsyncSession, locked_task: Task):
+    async def lock_effect_task(
+        locked_db: AsyncSession,
+        observed_task: Task,
+        _worker_node_fence_held: bool,
+    ) -> Task:
+        locked_task = await lock_task_effect_access(
+            request,
+            observed_task,
+            locked_db,
+            allow_chat_share=False,
+        )
         await require_task_control(request, locked_task, locked_db)
+        _require_not_delivery_owned_task(
+            locked_task,
+            action="had capabilities cancelled outside its Delivery Run",
+        )
+        return locked_task
 
     try:
         invocation = await cancel_invocation(
             db,
             invocation_id=invocation_id,
             expected_state_version=body.expected_state_version,
-            authorize_locked_task=authorize_locked_task,
+            lock_effect_task=lock_effect_task,
         )
     except CapabilityError as exc:
         raise _http_error(exc) from exc

@@ -4,6 +4,7 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -15,6 +16,7 @@ from backend.config import settings
 from backend.database import get_db
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.user import User
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.workspace_review import workspace_review_run_dict
 from backend.services.internal_service_auth import InternalServiceClaims
@@ -107,6 +109,7 @@ async def test_workspace_review_api_confirms_preview_then_starts_one_shot(
     )
     assert capability.status_code == 200, capability.text
     assert capability.json()["available"] is False
+    assert capability.json()["repo_path"] is None
     suggestion = capability.json()["suggested_config"]
     assert suggestion["name"] == "Vite development preview"
 
@@ -162,6 +165,8 @@ async def test_workspace_review_api_confirms_preview_then_starts_one_shot(
     assert started.status_code == 202, started.text
     assert started.json()["id"] == "api-workspace-review"
     assert started.json()["mode"] == "review_only"
+    assert started.json()["workspace_path"] is None
+    assert started.json()["preview_url"] is None
     assert captured["task_id"] == task_id
     assert captured["spec"].goal == "Verify the settings flow without modifying code"
     assert captured["spec"].browser_channel == "chromium"
@@ -200,6 +205,121 @@ async def test_workspace_review_public_start_waits_for_idle_task(
     )
     assert response.status_code == 409
     assert "执行中的 Agent 可直接调用测试工具" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_workspace_review_start_rejects_cached_jwt_role_change(
+    monkeypatch,
+    db_factory,
+):
+    async with db_factory() as db:
+        user = User(
+            email="workspace-role-race@example.invalid",
+            name="Workspace role race",
+            password_hash="not-used",
+            role="member",
+            is_active=True,
+        )
+        db.add(user)
+        await db.flush()
+        task = Task(
+            title="Workspace cached role admission",
+            status="completed",
+            created_by=user.id,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+        user_id = user.id
+
+    start_task_run = AsyncMock()
+    monkeypatch.setattr(
+        workspace_reviews,
+        "test_harness_service",
+        SimpleNamespace(
+            start_task_run=start_task_run,
+            get_run=AsyncMock(),
+        ),
+    )
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="jwt",
+            user_role="admin",
+            user_id=user_id,
+        ),
+        headers={},
+    )
+    async with db_factory() as db:
+        with pytest.raises(HTTPException) as caught:
+            await workspace_reviews.start_workspace_review(
+                task_id,
+                workspace_reviews.WorkspaceReviewStart(
+                    goal="Do not use stale admin authority",
+                ),
+                request,
+                db,
+            )
+
+    assert caught.value.status_code == 409
+    assert "changed role" in caught.value.detail
+    start_task_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner_fields", "message"),
+    [
+        ({"worker_id": 81}, "Worker-authoritative"),
+        ({"shared_from_id": 82}, "Shared shadow"),
+    ],
+)
+async def test_workspace_review_start_never_materializes_manager_mirror(
+    monkeypatch,
+    db_factory,
+    owner_fields,
+    message,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="Remote Workspace mirror",
+            status="completed",
+            **owner_fields,
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+
+    start_task_run = AsyncMock()
+    monkeypatch.setattr(
+        workspace_reviews,
+        "test_harness_service",
+        SimpleNamespace(
+            start_task_run=start_task_run,
+            get_run=AsyncMock(),
+        ),
+    )
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            auth_type="token",
+            user_role="super_admin",
+            user_id=None,
+        ),
+        headers={},
+    )
+    async with db_factory() as db:
+        with pytest.raises(HTTPException) as caught:
+            await workspace_reviews.start_workspace_review(
+                task_id,
+                workspace_reviews.WorkspaceReviewStart(
+                    goal="Do not materialize on the Manager mirror",
+                ),
+                request,
+                db,
+            )
+
+    assert caught.value.status_code == 409
+    assert message in caught.value.detail
+    start_task_run.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -579,7 +579,6 @@ async def _start_tool_free_test_turn(
     thread_id: str = "thread-tool-free-test",
     turn_id: str = "turn-tool-free-test",
     resume_session_id: str | None = None,
-    sandbox_unrestricted_enabled: bool = False,
 ) -> tuple[CodexTurnProcess, str]:
     server._process = SimpleNamespace(pid=4321, returncode=None)
     server.ensure_started = AsyncMock()
@@ -589,17 +588,6 @@ async def _start_tool_free_test_turn(
         if method == "skills/list":
             return _empty_skills_response("/tmp")
         if method == "thread/start":
-            if sandbox_unrestricted_enabled:
-                return {
-                    "thread": {
-                        "id": thread_id,
-                        "status": {"type": "idle"},
-                    },
-                    "sandbox": {
-                        "type": "dangerFullAccess",
-                        "networkAccess": True,
-                    },
-                }
             return _tool_free_thread_response(
                 thread_id,
                 permission_profile=params["config"]["default_permissions"],
@@ -620,7 +608,6 @@ async def _start_tool_free_test_turn(
         sandbox_mode="read-only",
         disable_autonomous_features=True,
         tools_disabled=True,
-        sandbox_unrestricted_enabled=sandbox_unrestricted_enabled,
     )
 
 
@@ -3761,101 +3748,6 @@ async def test_monitor_profile_is_read_only_and_disables_autonomous_features():
         ("thread", "thread-read-only-monitor"),
         ("turn", process, "thread-read-only-monitor"),
     ]
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("requested_profile", ["plan", "delivery"])
-async def test_unrestricted_switch_replaces_executable_permission_profiles(
-    isolated_task_boundary,
-    requested_profile,
-    caplog,
-):
-    boundary = isolated_task_boundary(908)
-    server = CodexAppServer("codex")
-    server._process = SimpleNamespace(pid=4321, returncode=None)
-    server.ensure_started = AsyncMock()
-    server._request = AsyncMock(side_effect=[
-        {
-            "thread": {
-                "id": f"thread-unrestricted-{requested_profile}",
-                "status": {"type": "idle"},
-            },
-            "sandbox": {
-                "type": "dangerFullAccess",
-                "networkAccess": True,
-            },
-        },
-        {"turn": {"id": f"turn-unrestricted-{requested_profile}"}},
-    ])
-    isolation_kwargs = (
-        {
-            "sandbox_mode": "read-only",
-            "task_ssh_protected_paths": ("/Users/operator/.ssh",),
-            "task_ssh_disable_network": True,
-        }
-        if requested_profile == "plan"
-        else {
-            "sandbox_mode": "workspace-write",
-            "network_isolated": True,
-        }
-    )
-
-    with caplog.at_level(logging.CRITICAL):
-        await server.start_turn(
-            prompt="exercise the configured sandbox override",
-            cwd=boundary.cwd,
-            model="gpt-5.6-terra",
-            effort="medium",
-            resume_session_id=None,
-            git_env=None,
-            task_id=908,
-            disable_project_config=True,
-            disable_user_mcp=True,
-            disable_autonomous_features=True,
-            task_git_read_paths=boundary.git_read_paths,
-            task_git_boundary_fingerprint=boundary.git_fingerprint,
-            task_private_tmpdir=boundary.scratch,
-            sandbox_unrestricted_enabled=True,
-            **isolation_kwargs,
-        )
-
-    assert [call.args[0] for call in server._request.await_args_list] == [
-        "thread/start",
-        "turn/start",
-    ]
-    thread_params = server._request.await_args_list[0].args[1]
-    assert thread_params["sandbox"] == "danger-full-access"
-    assert "default_permissions" not in thread_params.get("config", {})
-    assert "permissions" not in thread_params["config"]
-    assert "agents" not in thread_params["config"]
-    assert "features" not in thread_params["config"]
-    turn_params = server._request.await_args_list[1].args[1]
-    assert "sandboxPolicy" not in turn_params
-    assert "AGENT_SANDBOX_UNRESTRICTED_ENABLED admitted" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_unrestricted_switch_expands_tool_free_review():
-    server = CodexAppServer("codex")
-
-    await _start_tool_free_test_turn(
-        server,
-        sandbox_unrestricted_enabled=True,
-    )
-
-    thread_call = next(
-        call for call in server._request.await_args_list
-        if call.args[0] == "thread/start"
-    )
-    thread_params = thread_call.args[1]
-    assert thread_params["sandbox"] == "danger-full-access"
-    assert "default_permissions" not in thread_params.get("config", {})
-    turn_call = next(
-        call for call in server._request.await_args_list
-        if call.args[0] == "turn/start"
-    )
-    assert "sandboxPolicy" not in turn_call.args[1]
-
 
 @pytest.mark.asyncio
 async def test_network_isolated_delivery_profile_has_no_remote_or_git_authority(
@@ -12619,38 +12511,6 @@ async def test_registry_routes_each_canonical_home_to_one_server(
     )
     assert server_a.steered == [(thread_a, "a-only")]
     assert server_b.steered == []
-
-
-@pytest.mark.asyncio
-async def test_registry_owns_unrestricted_sandbox_switch(
-    tmp_path,
-    reset_registry_fake_servers,
-):
-    registry = CodexAppServerRegistry("codex")
-    assert registry.sandbox_unrestricted_enabled is False
-    assert registry.set_sandbox_unrestricted_enabled(True) is True
-    home = tmp_path / "unrestricted-account"
-
-    with patch(
-        "backend.services.codex_app_server.CodexAppServer",
-        _RegistryFakeServer,
-    ):
-        await registry.start_turn(
-            codex_home=home,
-            resume_session_id=None,
-            task_id=71,
-            # A Task-level caller cannot turn the deployment override off.
-            sandbox_unrestricted_enabled=False,
-        )
-
-    server = _RegistryFakeServer.instances[0]
-    assert server.start_turn_calls == [{
-        "resume_session_id": None,
-        "task_id": 71,
-        "sandbox_unrestricted_enabled": True,
-    }]
-    assert registry.set_sandbox_unrestricted_enabled(False) is False
-    assert registry.sandbox_unrestricted_enabled is False
 
 
 @pytest.mark.asyncio

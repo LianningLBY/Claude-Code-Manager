@@ -68,7 +68,7 @@ def _apply_current_review_error(
     reason = _review_error_pause_reason(review)
     if run.status == "paused" and run.pause_reason == reason:
         return False
-    if run.status != "reviewing":
+    if run.status not in {"waiting_ci", "reviewing"}:
         return False
     run.status = "paused"
     run.pause_reason = reason

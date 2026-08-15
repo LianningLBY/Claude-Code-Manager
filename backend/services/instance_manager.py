@@ -1,12 +1,15 @@
 import asyncio
+import concurrent.futures
 import hashlib
 import inspect
 import json
 import logging
 import os
+import stat
 import re
 import secrets
 import signal
+import threading
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -29,6 +32,11 @@ from backend.services.context_compaction import (
     build_compacted_resume_prompt,
     read_codex_rollout_last_usage,
 )
+from backend.services.cancellation import (
+    await_task_completion,
+    consume_current_task_cancellation,
+    finish_awaitable,
+)
 from backend.services.codex_models import clamp_codex_effort
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.stream_parser import StreamParser
@@ -40,6 +48,7 @@ from backend.services.worker_routing_config import (
 from backend.services.worker_task_termination import (
     active_worker_task_termination_receipt,
     no_active_worker_task_termination_predicate,
+    worker_task_runtime_persistence_predicate,
     worker_task_termination_authority_predicate,
     worker_task_termination_authority_matches,
 )
@@ -54,6 +63,121 @@ if TYPE_CHECKING:
     from backend.services.task_runtime_secrets import PrivateTaskTempDir
 
 logger = logging.getLogger(__name__)
+
+
+async def _fence_worker_runtime_mutation(
+    db: AsyncSession,
+    *,
+    producer: str,
+) -> bool:
+    """Serialize exact-generation persistence with the final runtime seal.
+
+    PTY callbacks can outlive the foreground Task consumer and are not reached
+    by the ordinary Task/Instance lifecycle locks. During phase-one drain this
+    fence remains open only so callers can finish a *full* durable
+    incarnation/retry/turn/runtime-generation CAS in the same transaction.
+    Taking the node-control row first makes that write visible to backfill or
+    rejects it after the exact phase-two seal. Manager databases retain the
+    existing no-op behavior.
+    """
+
+    from backend.services.worker_node_control import (
+        WorkerNodeDrainingConflict,
+        fence_worker_node_runtime_persistence,
+    )
+
+    try:
+        await fence_worker_node_runtime_persistence(db)
+    except WorkerNodeDrainingConflict:
+        await db.rollback()
+        logger.info(
+            "Dropping %s because the Worker runtime seal has committed",
+            producer,
+        )
+        return False
+    return True
+
+
+async def _fence_worker_runtime_admission(
+    db: AsyncSession,
+    *,
+    producer: str,
+) -> bool:
+    """Reject new PTY ownership as soon as phase-one drain commits."""
+
+    from backend.services.worker_node_control import (
+        WorkerNodeDrainingConflict,
+        fence_worker_node_mutation,
+    )
+
+    try:
+        await fence_worker_node_mutation(db)
+    except WorkerNodeDrainingConflict:
+        await db.rollback()
+        logger.info(
+            "Dropping %s because Worker node ownership admission is closed",
+            producer,
+        )
+        return False
+    return True
+
+
+@dataclass(frozen=True, slots=True)
+class _SshAgentSocketSnapshot:
+    path: str | None
+    device: int | None
+    inode: int | None
+    owner_uid: int | None
+
+    @property
+    def identity(
+        self,
+    ) -> tuple[str | None, int | None, int | None, int | None]:
+        """Return the immutable identity retained across one logical turn."""
+
+        return (self.path, self.device, self.inode, self.owner_uid)
+
+    @classmethod
+    def capture(cls, raw_path: object) -> "_SshAgentSocketSnapshot":
+        if raw_path is None or raw_path == "":
+            # Freeze the absence as well. A retry of this logical turn must
+            # not pick up an agent that appeared after initial admission.
+            return cls(None, None, None, None)
+        if not isinstance(raw_path, str) or "\x00" in raw_path:
+            raise LaunchSupersededError(
+                "Host SSH agent socket path is invalid"
+            )
+        path = os.path.abspath(raw_path)
+        if path != raw_path:
+            raise LaunchSupersededError(
+                "Host SSH agent socket path must be absolute"
+            )
+        try:
+            info = os.lstat(path)
+        except OSError as exc:
+            raise LaunchSupersededError(
+                "Host SSH agent socket is unavailable"
+            ) from exc
+        if (
+            not stat.S_ISSOCK(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.geteuid()
+        ):
+            raise LaunchSupersededError(
+                "Host SSH agent socket is not a safe owned Unix socket"
+            )
+        return cls(path, info.st_dev, info.st_ino, info.st_uid)
+
+    def assert_current(self) -> None:
+        if self.path is None:
+            return
+        current = self.capture(self.path)
+        if current != self:
+            raise LaunchSupersededError(
+                "Host SSH agent socket changed before provider admission"
+            )
+
+
 _EXPECTED_GENERATION_UNSET = object()
 DEFAULT_TERMINAL_CONSUMER_TIMEOUT = 30.0
 DEFAULT_CONSUMER_CANCEL_TIMEOUT = 5.0
@@ -249,22 +373,7 @@ _CLOUDROUTER_AUTH_RE = re.compile(
 async def _settle_instance_cleanup(awaitable):
     """Finish a lifecycle release before delivering caller cancellation."""
 
-    cleanup = asyncio.create_task(awaitable)
-    delayed_cancellation: asyncio.CancelledError | None = None
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError as exc:
-            if delayed_cancellation is None:
-                delayed_cancellation = exc
-        except BaseException:
-            if cleanup.done():
-                break
-            raise
-    result = cleanup.result()
-    if delayed_cancellation is not None:
-        raise delayed_cancellation
-    return result
+    return await finish_awaitable(awaitable)
 
 
 class InstanceAlreadyRunningError(RuntimeError):
@@ -299,7 +408,11 @@ async def _require_unshared_project_agent_launch(
     project_id: int | None,
     db_factory,
 ) -> None:
-    """Fail closed unless a Task's Project is proven to be unshared."""
+    """Fail closed while a Project has an active legacy cross-CCM share.
+
+    Local TeamProjectShare ACLs do not alter the Task's execution principal or
+    provider boundary and therefore are intentionally ignored here.
+    """
 
     if project_id is None:
         return
@@ -897,15 +1010,18 @@ class InstanceManager:
         # PTY 权限透传：request_id -> {session_id, task_id, tool_name, expires_at}
         # bridge HTTP 线程收到 CC 的权限请求后经 _loop 调度进事件循环
         self._pty_permissions: dict[str, dict] = {}
+        # BridgeHub invokes the callback from an HTTP thread.  Track the exact
+        # cross-thread Futures so an irreversible Worker drain can atomically
+        # close admission, cancel queued callbacks, and await their retirement.
+        self._pty_permission_callback_lock = threading.Lock()
+        self._pty_permission_callback_futures: set[
+            concurrent.futures.Future
+        ] = set()
+        self._pty_permission_callbacks_draining = False
         self._loop = None  # 主事件循环，lifespan 启动时注入
         # Codex persistent JSON-RPC backend.  Created lazily so Claude-only
         # deployments never start an extra process.
         self._codex_app_server = None
-        # Operator-owned effective value. The DB runtime override is applied
-        # during lifespan startup before Dispatcher admission begins.
-        self._agent_sandbox_unrestricted_enabled = bool(
-            settings.agent_sandbox_unrestricted_enabled
-        )
         # Relogin/delete reserves a canonical CODEX_HOME here as well as in
         # the app-server registry.  The manager-level gate also covers the
         # `codex exec` path when app-server is disabled or falls back.
@@ -988,32 +1104,6 @@ class InstanceManager:
     @property
     def pty_mode_enabled(self) -> bool:
         return self._pty_enabled and self._pty_backend is not None
-
-    @property
-    def agent_sandbox_unrestricted_enabled(self) -> bool:
-        return self._agent_sandbox_unrestricted_enabled
-
-    def set_agent_sandbox_unrestricted_enabled(self, enabled: bool) -> bool:
-        """Apply the operator policy to subsequent executable Agent turns."""
-
-        effective = bool(enabled)
-        previous = self._agent_sandbox_unrestricted_enabled
-        self._agent_sandbox_unrestricted_enabled = effective
-        registry = self._codex_app_server
-        if registry is not None:
-            registry.set_sandbox_unrestricted_enabled(effective)
-        if effective and not previous:
-            logger.critical(
-                "Agent sandbox unrestricted mode enabled; subsequent Delivery "
-                "Plan, Coding, Reviewer, Browser, and executable Codex turns "
-                "can bypass host isolation and capability-only tool limits"
-            )
-        elif previous and not effective:
-            logger.warning(
-                "Agent sandbox unrestricted mode disabled; subsequent turns "
-                "return to CCM permission profiles"
-            )
-        return effective
 
     def is_pty_managed_turn(
         self,
@@ -1170,14 +1260,9 @@ class InstanceManager:
                 steering = asyncio.create_task(
                     steer(content, expected_process=native_process)
                 )
-                caller_cancelled = False
-                while not steering.done():
-                    try:
-                        await asyncio.shield(steering)
-                    except asyncio.CancelledError:
-                        caller_cancelled = True
+                caller_cancellation = await await_task_completion(steering)
                 result = bool(steering.result())
-                if caller_cancelled:
+                if caller_cancellation is not None:
                     logger.info(
                         "Finished PTY steer acknowledgement for session %s "
                         "after caller cancellation",
@@ -1507,7 +1592,11 @@ class InstanceManager:
         initiating_user_id: int | None = None,
         initiating_user_role: str = "member",
         execution_mode: str = "sandbox",
+        execution_principal_kind: str = "system",
         attachment_paths: tuple[str, ...] = (),
+        ssh_agent_socket_snapshot: _SshAgentSocketSnapshot | None = None,
+        context_retry_permit: object | None = None,
+        context_retry_claimed_source_log_id: int | None = None,
     ) -> int:
         """Admit one turn and spend continuation authority on every attempt.
 
@@ -1548,7 +1637,13 @@ class InstanceManager:
                 initiating_user_id=initiating_user_id,
                 initiating_user_role=initiating_user_role,
                 execution_mode=execution_mode,
+                execution_principal_kind=execution_principal_kind,
                 attachment_paths=attachment_paths,
+                ssh_agent_socket_snapshot=ssh_agent_socket_snapshot,
+                context_retry_permit=context_retry_permit,
+                context_retry_claimed_source_log_id=(
+                    context_retry_claimed_source_log_id
+                ),
             )
         finally:
             self.revoke_sequential_turn_continuation(
@@ -1578,12 +1673,16 @@ class InstanceManager:
         initiating_user_id: int | None = None,
         initiating_user_role: str = "member",
         execution_mode: str = "sandbox",
+        execution_principal_kind: str = "system",
         attachment_paths: tuple[str, ...] = (),
+        ssh_agent_socket_snapshot: _SshAgentSocketSnapshot | None = None,
         current_message: str | None = None,
         queue_timestamp: float | None = None,
         codex_service_tier: str = "default",
         on_launch_admitted: Callable[[], Awaitable[None]] | None = None,
         sequential_turn_token: object | None = None,
+        context_retry_permit: object | None = None,
+        context_retry_claimed_source_log_id: int | None = None,
     ) -> int:
         """Atomically admit one turn into a reusable instance slot."""
 
@@ -1686,7 +1785,19 @@ class InstanceManager:
                                 initiating_user_id=initiating_user_id,
                                 initiating_user_role=initiating_user_role,
                                 execution_mode=execution_mode,
+                                execution_principal_kind=(
+                                    execution_principal_kind
+                                ),
                                 attachment_paths=attachment_paths,
+                                ssh_agent_socket_snapshot=(
+                                    ssh_agent_socket_snapshot
+                                ),
+                                context_retry_permit=(
+                                    context_retry_permit
+                                ),
+                                context_retry_claimed_source_log_id=(
+                                    context_retry_claimed_source_log_id
+                                ),
                             )
                     except BaseException:
                         # A token which did not reach the durable provider
@@ -2011,6 +2122,10 @@ class InstanceManager:
         actual_transport: str,
         sequential_turn_token: object | None = None,
         browser_child_admission: _BrowserChildLaunchAdmission | None = None,
+        initiating_user_id: int | None = None,
+        initiating_user_role: str = "member",
+        execution_mode: str = "sandbox",
+        execution_principal_kind: str = "system",
     ) -> bool:
         """Persist the final runtime route before its first provider effect.
 
@@ -2073,6 +2188,19 @@ class InstanceManager:
             )
 
         async with self.db_factory() as db:
+            from backend.services.worker_node_control import (
+                WorkerNodeDrainingConflict,
+                fence_worker_node_mutation,
+            )
+
+            try:
+                # This is the final common provider boundary for Claude/Codex
+                # and Browser children. Keep the node-control lock through the
+                # exact Task/source/Instance commit below so an already begun
+                # drain can never be followed by a provider process launch.
+                await fence_worker_node_mutation(db)
+            except WorkerNodeDrainingConflict as exc:
+                raise LaunchSupersededError(str(exc.detail)) from exc
             browser_binding = None
             browser_owner = None
             if browser_child_admission is not None:
@@ -2304,6 +2432,67 @@ class InstanceManager:
                     f"Task {task_id} lost its exact launch generation"
                 )
 
+            frozen_principal = (
+                initiating_user_id,
+                initiating_user_role,
+                execution_mode,
+                execution_principal_kind,
+            )
+            if frozen_principal != (
+                task.execution_user_id,
+                task.execution_user_role,
+                task.execution_mode,
+                task.execution_principal_kind,
+            ):
+                raise LaunchSupersededError(
+                    "Task execution principal changed at the provider boundary"
+                )
+
+            # A local user's active state and role are mutable authority, not
+            # facts that a queued/retried turn may cache indefinitely.  Keep
+            # this conditional writer in the same transaction as the exact
+            # Task fence and actual_transport CAS.  A concurrent demotion or
+            # deactivation therefore either commits first and makes this gate
+            # miss, or waits until this already-admitted provider boundary is
+            # durable.  Delegated users belong to the authoritative Manager
+            # database and are instead covered by the generation-bound launch
+            # permit obtained immediately before this transaction.
+            if execution_principal_kind == "user":
+                if (
+                    isinstance(initiating_user_id, bool)
+                    or not isinstance(initiating_user_id, int)
+                    or initiating_user_id <= 0
+                    or initiating_user_role
+                    not in {"member", "admin", "super_admin"}
+                    or execution_mode
+                    != (
+                        "unrestricted"
+                        if initiating_user_role in {"admin", "super_admin"}
+                        else "sandbox"
+                    )
+                ):
+                    raise LaunchSupersededError(
+                        "Task turn initiator identity is invalid at the "
+                        "provider boundary"
+                    )
+                from backend.models.user import User
+
+                principal_fence = await db.execute(
+                    update(User)
+                    .where(
+                        User.id == initiating_user_id,
+                        User.is_active.is_(True),
+                        User.role == initiating_user_role,
+                    )
+                    .values(role=User.role)
+                    .execution_options(synchronize_session=False)
+                )
+                if principal_fence.rowcount != 1:
+                    raise LaunchSupersededError(
+                        "Task turn initiator role or active state changed at "
+                        "the provider boundary"
+                    )
+
             if browser_binding is not None:
                 try:
                     require_browser_child_binding(browser_binding, task)
@@ -2510,7 +2699,11 @@ class InstanceManager:
         initiating_user_id: int | None = None,
         initiating_user_role: str = "member",
         execution_mode: str = "sandbox",
+        execution_principal_kind: str = "system",
         attachment_paths: tuple[str, ...] = (),
+        ssh_agent_socket_snapshot: _SshAgentSocketSnapshot | None = None,
+        context_retry_permit: object | None = None,
+        context_retry_claimed_source_log_id: int | None = None,
     ) -> int:
         """Launch a Claude Code subprocess for the given instance.
 
@@ -2524,19 +2717,164 @@ class InstanceManager:
 
         selected_actual_transport: str | None = None
 
-        async def require_current_initiating_principal() -> None:
+        def context_retry_wire_authority() -> dict[str, object] | None:
+            """Render only the narrow fields understood by Manager admission."""
+
+            if context_retry_permit is None:
+                return None
+            authority_id = getattr(
+                context_retry_permit, "authority_id", None
+            )
+            permit_task_id = getattr(context_retry_permit, "task_id", None)
+            permit_retry_count = getattr(
+                context_retry_permit, "retry_count", None
+            )
+            from_generation = getattr(
+                context_retry_permit, "turn_generation", None
+            )
+            source_log_id = getattr(
+                context_retry_permit, "turn_source_log_id", None
+            )
+            if (
+                not isinstance(authority_id, str)
+                or len(authority_id) != 32
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in authority_id
+                )
+                or permit_task_id != task_id
+                or type(permit_retry_count) is not int
+                or type(from_generation) is not int
+                or type(source_log_id) is not int
+                or source_log_id <= 0
+                or type(context_retry_claimed_source_log_id) is not int
+                or context_retry_claimed_source_log_id <= 0
+                or permit_retry_count != task_retry_count
+                or task_turn_generation != from_generation + 1
+            ):
+                raise LaunchSupersededError(
+                    "Context retry launch authority is malformed or stale"
+                )
+            return {
+                "authority_id": authority_id,
+                "retry_count": permit_retry_count,
+                "from_generation": from_generation,
+                "source_log_id": source_log_id,
+                "claimed_source_log_id": (
+                    context_retry_claimed_source_log_id
+                ),
+            }
+
+        async def require_current_initiating_principal(
+            actual_transport: str,
+        ) -> None:
             """Revalidate a frozen user principal at the provider boundary.
 
             The Dispatcher performs the same check when it first consumes a
             queued message.  Automatic transient retries and account rotation
             can wait and relaunch without returning through that queue, so the
             final common launch boundary must not trust their cached role.
-            System/Worker turns intentionally have no local user id and retain
-            their separately authenticated envelope semantics.
+            System turns intentionally have no local user id. Worker-managed
+            mirrors still require an exact-generation Manager permit; only
+            genuinely Worker-local derived tasks retain local system authority.
             """
 
+            if execution_principal_kind not in {
+                "user",
+                "deployment_token",
+                "system",
+                "delegated_user",
+                "delegated_deployment_token",
+            }:
+                raise LaunchSupersededError(
+                    "Task turn principal kind is invalid"
+                )
             if initiating_user_id is None:
+                if execution_principal_kind in {
+                    "deployment_token",
+                    "delegated_deployment_token",
+                }:
+                    if (
+                        initiating_user_role != "super_admin"
+                        or execution_mode != "unrestricted"
+                        or task_id is None
+                    ):
+                        raise LaunchSupersededError(
+                            "Deployment-token Task principal is invalid"
+                        )
+                    if execution_principal_kind == "delegated_deployment_token":
+                        from backend.services.worker_launch_admission import (
+                            WorkerLaunchAdmissionError,
+                            request_worker_launch_admission,
+                        )
+
+                        try:
+                            await request_worker_launch_admission(
+                                broadcaster=self.broadcaster,
+                                task_id=task_id,
+                                incarnation_id=task_incarnation_id or "",
+                                retry_count=task_retry_count,
+                                turn_generation=task_turn_generation,
+                                actual_transport=actual_transport,
+                                execution_principal={
+                                    "execution_user_id": initiating_user_id,
+                                    "execution_user_role": initiating_user_role,
+                                    "execution_mode": execution_mode,
+                                    "execution_principal_kind": (
+                                        execution_principal_kind
+                                    ),
+                                },
+                                context_retry=(
+                                    context_retry_wire_authority()
+                                ),
+                            )
+                        except WorkerLaunchAdmissionError as exc:
+                            raise LaunchSupersededError(str(exc)) from exc
+                    return
+                if (
+                    execution_principal_kind != "system"
+                    or initiating_user_role != "member"
+                    or execution_mode != "sandbox"
+                ):
+                    raise LaunchSupersededError(
+                        "Source-less unrestricted Task principal is invalid"
+                    )
+                if settings.ccm_node_role == "worker" and worker_managed_task:
+                    from backend.services.worker_launch_admission import (
+                        WorkerLaunchAdmissionError,
+                        request_worker_launch_admission,
+                    )
+
+                    try:
+                        await request_worker_launch_admission(
+                            broadcaster=self.broadcaster,
+                            task_id=task_id,
+                            incarnation_id=task_incarnation_id or "",
+                            retry_count=task_retry_count,
+                            turn_generation=task_turn_generation,
+                            actual_transport=actual_transport,
+                            execution_principal={
+                                "execution_user_id": initiating_user_id,
+                                "execution_user_role": initiating_user_role,
+                                "execution_mode": execution_mode,
+                                "execution_principal_kind": (
+                                    execution_principal_kind
+                                ),
+                            },
+                            context_retry=(
+                                context_retry_wire_authority()
+                            ),
+                        )
+                    except WorkerLaunchAdmissionError as exc:
+                        raise LaunchSupersededError(str(exc)) from exc
                 return
+            if execution_principal_kind not in {
+                "user",
+                "delegated_user",
+            }:
+                raise LaunchSupersededError(
+                    "Only a user Task principal may carry a user id"
+                )
             if (
                 isinstance(initiating_user_id, bool)
                 or not isinstance(initiating_user_id, int)
@@ -2545,6 +2883,46 @@ class InstanceManager:
                 raise LaunchSupersededError(
                     "Task turn initiator identity is invalid"
                 )
+
+            # A delegated user belongs to the authoritative Manager database,
+            # not the Worker. Its shape and immutable envelope were verified
+            # at the authenticated control-plane boundary. The Worker cannot
+            # query that foreign User row; fresh messages are re-authorized by
+            # the Manager before a new envelope is issued.
+            if execution_principal_kind == "delegated_user":
+                expected_execution_mode = (
+                    "unrestricted"
+                    if initiating_user_role in {"admin", "super_admin"}
+                    else "sandbox"
+                )
+                if expected_execution_mode != execution_mode:
+                    raise LaunchSupersededError(
+                        "Delegated Task principal role/mode mismatch"
+                    )
+                from backend.services.worker_launch_admission import (
+                    WorkerLaunchAdmissionError,
+                    request_worker_launch_admission,
+                )
+
+                try:
+                    await request_worker_launch_admission(
+                        broadcaster=self.broadcaster,
+                        task_id=task_id,
+                        incarnation_id=task_incarnation_id or "",
+                        retry_count=task_retry_count,
+                        turn_generation=task_turn_generation,
+                        actual_transport=actual_transport,
+                        execution_principal={
+                            "execution_user_id": initiating_user_id,
+                            "execution_user_role": initiating_user_role,
+                            "execution_mode": execution_mode,
+                            "execution_principal_kind": execution_principal_kind,
+                        },
+                        context_retry=context_retry_wire_authority(),
+                    )
+                except WorkerLaunchAdmissionError as exc:
+                    raise LaunchSupersededError(str(exc)) from exc
+                return
 
             from backend.models.user import User
 
@@ -2587,7 +2965,6 @@ class InstanceManager:
             if (
                 provider == "claude"
                 and delivery_task
-                and not agent_unrestricted_delivery_turn
             ):
                 from backend.services.task_agent_isolation import (
                     discover_linked_worktree_git_read_boundary,
@@ -2611,7 +2988,9 @@ class InstanceManager:
             # Retry/backoff and account migration may have taken long enough
             # for an administrator to be disabled or demoted.  Revalidate as
             # late as possible before any provider process/turn is admitted.
-            await require_current_initiating_principal()
+            await require_current_initiating_principal(actual_transport)
+            if ssh_agent_socket_snapshot is not None:
+                ssh_agent_socket_snapshot.assert_current()
             # Sharing may be enabled after the initial Task snapshot. Recheck
             # at the last common boundary for Claude PTY/direct and Codex
             # app-server/direct routes; an unavailable check is also a veto.
@@ -2628,6 +3007,10 @@ class InstanceManager:
                 actual_transport=actual_transport,
                 sequential_turn_token=sequential_turn_token,
                 browser_child_admission=browser_child_admission,
+                initiating_user_id=initiating_user_id,
+                initiating_user_role=initiating_user_role,
+                execution_mode=execution_mode,
+                execution_principal_kind=execution_principal_kind,
             )
             if on_launch_admitted is not None:
                 await on_launch_admitted()
@@ -2655,6 +3038,7 @@ class InstanceManager:
         pr_review_task = False
         browser_review_task = False
         browser_child_admission: _BrowserChildLaunchAdmission | None = None
+        worker_managed_task = False
         task_ssh_capabilities: set[str] = set()
         task_ssh_broker_only = False
         task_ssh_protected_path_values: tuple[str, ...] = ()
@@ -2666,38 +3050,53 @@ class InstanceManager:
         ] = ()
         task_private_tmpdir = None
         delivery_task = False
-        agent_unrestricted_delivery_turn = False
-        unrestricted_capability_turn = False
         if execution_mode not in {"sandbox", "unrestricted"}:
             raise LaunchSupersededError("Invalid Task execution mode")
         unrestricted_admin_turn = bool(
             execution_mode == "unrestricted"
             and initiating_user_role in {"admin", "super_admin"}
         )
+        # An unrestricted administrator turn may inherit the service node's
+        # exact ssh-agent socket. For delegated principals this is the Worker
+        # node's own operator socket (never a path transported from Manager).
+        # The inode/owner snapshot is captured locally and revalidated at the
+        # final provider boundary. Member/system and special workflows are
+        # vetoed below.
+        host_ssh_agent_allowed = bool(
+            unrestricted_admin_turn
+            and (
+                (
+                    execution_principal_kind in {"user", "delegated_user"}
+                    and initiating_user_id is not None
+                )
+                or execution_principal_kind in {
+                    "deployment_token",
+                    "delegated_deployment_token",
+                }
+            )
+        )
         validated_attachment_paths: tuple[str, ...] = ()
         if attachment_paths:
-            from backend.api.uploads import UPLOAD_DIR
+            from backend.api.uploads import (
+                UploadAttachmentValidationError,
+                validate_upload_attachments,
+            )
 
-            upload_root = UPLOAD_DIR.resolve(strict=True)
-            validated: list[str] = []
-            for raw_path in attachment_paths:
-                candidate = Path(raw_path)
-                if candidate.is_symlink():
-                    raise LaunchSupersededError("Task attachment is a symlink")
-                try:
-                    resolved = candidate.resolve(strict=True)
-                    resolved.relative_to(upload_root)
-                except (FileNotFoundError, ValueError) as exc:
-                    raise LaunchSupersededError(
-                        "Task attachment is no longer a managed upload"
-                    ) from exc
-                if not resolved.is_file():
-                    raise LaunchSupersededError(
-                        "Task attachment is not a regular file"
-                    )
-                validated.append(str(resolved))
-            validated_attachment_paths = tuple(validated)
-        if execution_mode == "unrestricted" and not unrestricted_admin_turn:
+            try:
+                validated = validate_upload_attachments(
+                    file_paths=list(attachment_paths),
+                )
+            except UploadAttachmentValidationError as exc:
+                raise LaunchSupersededError(
+                    "Task attachment is no longer a managed upload"
+                ) from exc
+            validated_attachment_paths = tuple(
+                upload.path for upload in validated
+            )
+        if (
+            execution_mode == "unrestricted"
+            and initiating_user_role not in {"admin", "super_admin"}
+        ):
             raise LaunchSupersededError(
                 "Only an administrator may launch an unrestricted Task turn"
             )
@@ -2739,6 +3138,45 @@ class InstanceManager:
                     )
                 task_incarnation_id = task.incarnation_id
                 task_project_id = task.project_id
+                task_principal_snapshot = (
+                    task.execution_user_id,
+                    task.execution_user_role,
+                    task.execution_mode,
+                    task.execution_principal_kind,
+                )
+                if task_principal_snapshot != (
+                    initiating_user_id,
+                    initiating_user_role,
+                    execution_mode,
+                    execution_principal_kind,
+                ):
+                    raise LaunchSupersededError(
+                        "Task execution principal changed before launch"
+                    )
+                from backend.services.skill_context import (
+                    is_worker_managed_task_metadata,
+                )
+
+                worker_managed_task = is_worker_managed_task_metadata(
+                    task.metadata_
+                )
+                if worker_managed_task:
+                    if execution_principal_kind not in {
+                        "delegated_user",
+                        "delegated_deployment_token",
+                        "system",
+                    }:
+                        raise LaunchSupersededError(
+                            "Worker-managed Task has a non-delegated principal"
+                        )
+                elif execution_principal_kind in {
+                    "delegated_user",
+                    "delegated_deployment_token",
+                }:
+                    raise LaunchSupersededError(
+                        "Delegated principal is valid only for a Worker-managed "
+                        "Task"
+                    )
                 await _require_unshared_project_agent_launch(
                     task_project_id,
                     self.db_factory,
@@ -2760,11 +3198,15 @@ class InstanceManager:
                     task,
                     cwd=cwd,
                 )
-                agent_unrestricted_delivery_turn = bool(
-                    delivery_task
-                    and self._agent_sandbox_unrestricted_enabled
-                    and provider in {"claude", "codex"}
-                )
+                # Role-based unrestricted execution applies to ordinary local
+                # Tasks and to Worker-local mirrors carrying a Manager-
+                # delegated administrator principal.  A Manager mirror with a
+                # non-null ``worker_id`` never launches locally; legacy
+                # cross-CCM shares and purpose-built workflows retain their
+                # independent isolation contracts.
+                if task.worker_id is not None or task.shared_from_id is not None:
+                    unrestricted_admin_turn = False
+                    host_ssh_agent_allowed = False
                 if delivery_task:
                     if (
                         provider not in {"claude", "codex"}
@@ -2798,6 +3240,9 @@ class InstanceManager:
                 )
 
                 pr_review_task = is_pr_sandbox_task(task)
+                if pr_review_task or delivery_task:
+                    unrestricted_admin_turn = False
+                    host_ssh_agent_allowed = False
                 from backend.models.test_harness import TestHarnessChildBinding
                 from backend.services.test_harness_children import (
                     CHILD_RUNNING,
@@ -2860,6 +3305,9 @@ class InstanceManager:
                     else None
                 )
                 browser_review_task = bool(browser_binding is not None)
+                if browser_review_task:
+                    unrestricted_admin_turn = False
+                    host_ssh_agent_allowed = False
                 if isolated_browser_marker and browser_binding is None:
                     raise LaunchSupersededError(
                         "Browser Agent launch has no durable isolation binding"
@@ -2897,10 +3345,14 @@ class InstanceManager:
                 if browser_review_task and (
                     not isinstance(settings.auth_token, str)
                     or not settings.auth_token.strip()
-                ):
+                    ):
                     raise LaunchSupersededError(
                         "Browser Agent launch requires AUTH_TOKEN-backed "
                         "scoped authentication"
+                    )
+                if execution_mode == "unrestricted" and not unrestricted_admin_turn:
+                    raise LaunchSupersededError(
+                        "This Task execution channel cannot run unrestricted"
                     )
                 if browser_review_task:
                     if (
@@ -2960,11 +3412,6 @@ class InstanceManager:
                         child_task_turn_generation=task.turn_generation,
                         claimed_instance_id=instance_id,
                     )
-                unrestricted_capability_turn = bool(
-                    self._agent_sandbox_unrestricted_enabled
-                    and (pr_review_task or browser_review_task)
-                    and provider in {"claude", "codex"}
-                )
                 if not pr_review_task:
                     from backend.services.task_agent_isolation import (
                         explicit_git_credential_paths,
@@ -2995,8 +3442,14 @@ class InstanceManager:
                     task_ssh_broker_only = bool(
                         task_ssh_runtime.broker_only
                         and not unrestricted_admin_turn
-                        and not agent_unrestricted_delivery_turn
                     )
+                    if task_ssh_broker_only:
+                        # Member/system turns with a durable grant use only
+                        # the audited broker route.  For an unrestricted
+                        # administrator turn the same grant is an additional
+                        # managed capability; it must not silently revoke the
+                        # execution node's ordinary SSH agent authority.
+                        host_ssh_agent_allowed = False
                     explicit_git_paths = (
                         ()
                         if task_ssh_broker_only or browser_review_task
@@ -3006,10 +3459,7 @@ class InstanceManager:
                     # provider-account, and scoped runtime credentials. A Task
                     # with grants additionally loses direct network access and
                     # reaches SSH only through the broker MCP.
-                    if not (
-                        unrestricted_admin_turn
-                        or agent_unrestricted_delivery_turn
-                    ):
+                    if not unrestricted_admin_turn:
                         task_ssh_protected_path_values = (
                             await task_ssh_protected_paths(
                                 db,
@@ -3153,7 +3603,6 @@ class InstanceManager:
             task_id is not None
             and config_dir
             and not unrestricted_admin_turn
-            and not agent_unrestricted_delivery_turn
         ):
             from backend.services.task_ssh_access import (
                 _protected_path_variants,
@@ -3179,17 +3628,10 @@ class InstanceManager:
         claude_unrestricted_allowed_rules: tuple[str, ...] | None = None
         claude_delivery_git_boundary = None
         claude_task_runtime_scope_reserved = False
-        if provider == "claude" and agent_unrestricted_delivery_turn:
-            from backend.services.task_agent_isolation import (
-                CLAUDE_DELIVERY_BUILTIN_TOOLS,
-            )
-
-            claude_unrestricted_tools = CLAUDE_DELIVERY_BUILTIN_TOOLS
         if (
             provider == "claude"
             and task_id
             and not pr_review_task
-            and not agent_unrestricted_delivery_turn
         ):
             self._reserve_task_runtime_scope(task_id)
             claude_task_runtime_scope_reserved = True
@@ -3213,14 +3655,9 @@ class InstanceManager:
         if (
             provider == "claude"
             and task_id
-            and (
-                (
-                    not pr_review_task
-                    and not delivery_task
-                    and unrestricted_admin_turn
-                )
-                or unrestricted_capability_turn
-            )
+            and not pr_review_task
+            and not delivery_task
+            and unrestricted_admin_turn
         ):
             from backend.services.task_agent_isolation import (
                 CLAUDE_UNRESTRICTED_BUILTIN_TOOLS,
@@ -3257,8 +3694,6 @@ class InstanceManager:
             and task_id
             and not pr_review_task
             and not unrestricted_admin_turn
-            and not agent_unrestricted_delivery_turn
-            and not unrestricted_capability_turn
         ):
             from backend.services.task_agent_isolation import (
                 CLAUDE_TASK_BUILTIN_TOOLS,
@@ -3405,17 +3840,33 @@ class InstanceManager:
             and not browser_review_task
             and not delivery_task
         ):
-            # These variables are inherited by Claude PTY, Claude direct, and
-            # Codex shell environments. Empty agent coordinates prevent any
-            # Task (granted or not) from reaching a service-level SSH agent.
-            # A Browser child is MCP-only and receives no shell environment at
-            # all, including otherwise-safe empty SSH variables.
+            # An ordinary local administrator turn receives this node's exact
+            # ssh-agent coordinates.  That includes a Worker-local mirror with
+            # a Manager-delegated administrator principal, but never a socket
+            # path transported by the Manager.  Project config and caller
+            # ``git_env`` remain mutable inputs; every other Task explicitly
+            # shadows ambient SSH state. A Browser child is MCP-only and
+            # receives no shell environment at all, including otherwise-safe
+            # empty SSH variables.
             git_env = dict(git_env or {})
-            git_env.update({
-                "SSH_AUTH_SOCK": "",
-                "SSH_AGENT_PID": "",
-                "SSH_ASKPASS": "",
-            })
+            if host_ssh_agent_allowed:
+                if ssh_agent_socket_snapshot is None:
+                    ssh_agent_socket_snapshot = (
+                        _SshAgentSocketSnapshot.capture(
+                            os.environ.get("SSH_AUTH_SOCK")
+                        )
+                    )
+                ssh_agent_socket_snapshot.assert_current()
+                git_env["SSH_AUTH_SOCK"] = (
+                    ssh_agent_socket_snapshot.path or ""
+                )
+            else:
+                ssh_agent_socket_snapshot = None
+                git_env["SSH_AUTH_SOCK"] = ""
+            # PID is unused by ssh clients and ASKPASS could execute arbitrary
+            # Manager-side code. They are never inherited by any Task role.
+            git_env["SSH_AGENT_PID"] = ""
+            git_env["SSH_ASKPASS"] = ""
             if task_ssh_broker_only:
                 git_env["CCM_TASK_SSH_GUARD"] = "1"
 
@@ -3472,6 +3923,7 @@ class InstanceManager:
             and task_id is not None
             and not pr_review_task
             and not delivery_task
+            and not unrestricted_admin_turn
             and task_ssh_protected_path_values
         )
         codex_mcp_required = (
@@ -3695,7 +4147,9 @@ class InstanceManager:
                         initiating_user_id=initiating_user_id,
                         initiating_user_role=initiating_user_role,
                         execution_mode=execution_mode,
+                        execution_principal_kind=execution_principal_kind,
                         attachment_paths=attachment_paths,
+                        ssh_agent_socket_snapshot=ssh_agent_socket_snapshot,
                         disable_project_config=(
                             cloudrouter_account is not None
                             or pr_review_task
@@ -3735,7 +4189,8 @@ class InstanceManager:
                             else ()
                         ),
                         task_private_tmpdir=task_private_tmpdir,
-                        # Durable SSH grants remain broker-only/network-off.
+                        # Member/system durable SSH grants remain
+                        # broker-only/network-off.
                         # Ordinary local Tasks get public egress only through
                         # Codex's managed proxy, whose thread response is
                         # audited before model input.
@@ -3936,7 +4391,6 @@ class InstanceManager:
         if (
             provider == "claude"
             and delivery_task
-            and not agent_unrestricted_delivery_turn
         ):
             from backend.services.task_agent_isolation import (
                 discover_linked_worktree_git_read_boundary,
@@ -3959,7 +4413,6 @@ class InstanceManager:
             and self.pty_mode_enabled
             and not pr_review_task
             and not browser_review_task
-            and not agent_unrestricted_delivery_turn
         ):
             return await self._launch_pty(
                 instance_id=instance_id,
@@ -3989,7 +4442,9 @@ class InstanceManager:
                 initiating_user_id=initiating_user_id,
                 initiating_user_role=initiating_user_role,
                 execution_mode=execution_mode,
+                execution_principal_kind=execution_principal_kind,
                 attachment_paths=attachment_paths,
+                ssh_agent_socket_snapshot=ssh_agent_socket_snapshot,
                 claude_isolation_settings_path=(
                     claude_isolation_settings_path
                 ),
@@ -4037,11 +4492,8 @@ class InstanceManager:
             codex_api_account=cloudrouter_account is not None,
             codex_service_tier=codex_service_tier,
             tools_disabled=(
-                not unrestricted_capability_turn
-                and (
-                    pr_review_task
-                    or (provider == "claude" and browser_review_task)
-                )
+                pr_review_task
+                or (provider == "claude" and browser_review_task)
             ),
             claude_isolation_settings_path=claude_isolation_settings_path,
             claude_isolation_tools=claude_isolation_tools,
@@ -4268,7 +4720,9 @@ class InstanceManager:
                 "initiating_user_id": initiating_user_id,
                 "initiating_user_role": initiating_user_role,
                 "execution_mode": execution_mode,
+                "execution_principal_kind": execution_principal_kind,
                 "attachment_paths": tuple(attachment_paths),
+                "ssh_agent_socket_snapshot": ssh_agent_socket_snapshot,
             }
 
         return await self._persist_and_track_launch(
@@ -4297,9 +4751,6 @@ class InstanceManager:
                     self._codex_actual_tier_route_for_home
                 ),
                 require_actual_tier_proof=True,
-                sandbox_unrestricted_enabled=(
-                    self._agent_sandbox_unrestricted_enabled
-                ),
             )
         return self._codex_app_server
 
@@ -4762,7 +5213,9 @@ class InstanceManager:
         initiating_user_id: int | None = None,
         initiating_user_role: str = "member",
         execution_mode: str = "sandbox",
+        execution_principal_kind: str = "system",
         attachment_paths: Sequence[str] = (),
+        ssh_agent_socket_snapshot: _SshAgentSocketSnapshot | None = None,
         disable_project_config: bool = False,
         disable_user_mcp: bool = False,
         codex_service_tier: str = "default",
@@ -4855,7 +5308,9 @@ class InstanceManager:
                 "initiating_user_id": initiating_user_id,
                 "initiating_user_role": initiating_user_role,
                 "execution_mode": execution_mode,
+                "execution_principal_kind": execution_principal_kind,
                 "attachment_paths": tuple(attachment_paths),
+                "ssh_agent_socket_snapshot": ssh_agent_socket_snapshot,
             }
 
         try:
@@ -5088,11 +5543,7 @@ class InstanceManager:
                     )
 
             cleanup = asyncio.create_task(_cleanup_failed_launch())
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    continue
+            await await_task_completion(cleanup)
             cleanup.result()
             raise
 
@@ -5617,6 +6068,7 @@ class InstanceManager:
         *,
         mcp_config_path: str | Path | None,
         git_env: dict | None,
+        ssh_agent_socket_identity: tuple[object, ...] | None = None,
     ) -> str:
         """Fingerprint every launch input retained by a hot Claude process."""
 
@@ -5640,6 +6092,14 @@ class InstanceManager:
             add_component(f"trusted-hook:{asset_name}", asset_bytes)
         if mcp_config_path is not None:
             add_component("mcp", Path(mcp_config_path).read_bytes())
+        add_component(
+            "ssh-agent-socket-identity",
+            json.dumps(
+                ssh_agent_socket_identity,
+                ensure_ascii=True,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+        )
         environment_items = sorted(
             (
                 str(key),
@@ -5939,7 +6399,9 @@ class InstanceManager:
         initiating_user_id: int | None = None,
         initiating_user_role: str = "member",
         execution_mode: str = "sandbox",
+        execution_principal_kind: str = "system",
         attachment_paths: Sequence[str] = (),
+        ssh_agent_socket_snapshot: _SshAgentSocketSnapshot | None = None,
         claude_isolation_settings_path: Path | None = None,
         claude_isolation_tools: Sequence[str] | None = None,
         claude_isolation_allowed_rules: Sequence[str] | None = None,
@@ -5968,6 +6430,11 @@ class InstanceManager:
                     runtime_settings_path,
                     mcp_config_path=mcp_config_path,
                     git_env=git_env,
+                    ssh_agent_socket_identity=(
+                        ssh_agent_socket_snapshot.identity
+                        if ssh_agent_socket_snapshot is not None
+                        else None
+                    ),
                 )
             )
         elif claude_unrestricted_tools is not None:
@@ -6046,7 +6513,9 @@ class InstanceManager:
                 "initiating_user_id": initiating_user_id,
                 "initiating_user_role": initiating_user_role,
                 "execution_mode": execution_mode,
+                "execution_principal_kind": execution_principal_kind,
                 "attachment_paths": tuple(attachment_paths),
+                "ssh_agent_socket_snapshot": ssh_agent_socket_snapshot,
             }
             self._launch_params[instance_id] = pty_launch_params
         try:
@@ -6126,6 +6595,7 @@ class InstanceManager:
                             in {
                                 "CCM_ASK_USER_TOKEN",
                                 "CCM_TASK_SSH_GUARD",
+                                "SSH_AUTH_SOCK",
                             }
                         ):
                             overrides[key] = value
@@ -6613,11 +7083,7 @@ class InstanceManager:
                     )
 
             cleanup = asyncio.create_task(_cleanup_failed_pty_launch())
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    continue
+            await await_task_completion(cleanup)
             cleanup.result()
             raise
 
@@ -7291,6 +7757,11 @@ class InstanceManager:
             else Task.pty_background_generation.is_(None)
         )
         async with self.db_factory() as db:
+            if not await _fence_worker_runtime_admission(
+                db,
+                producer="PTY background-generation admission",
+            ):
+                return False
             armed = await db.execute(
                 update(Task)
                 .where(
@@ -8030,6 +8501,13 @@ class InstanceManager:
                 )
 
         async with self.db_factory() as db:
+            fence = (
+                _fence_worker_runtime_mutation
+                if state is not None
+                else _fence_worker_runtime_admission
+            )
+            if not await fence(db, producer="PTY autonomous-activity admission"):
+                return None
             # Dispatcher-owned initial/goal/loop turns pre-arm the exact epoch
             # while their Task is still executing.  Reuse that durable token
             # before applying the completed-only late-autonomous admission rule.
@@ -8194,6 +8672,38 @@ class InstanceManager:
             )
         ):
             return False
+        # This preflight is deliberately before Harness cleanup.  On a
+        # Worker, NodeControl must be the first writer and the exact Task CAS
+        # keeps a drain that starts afterwards from overlooking this live
+        # marker.  If the irreversible drain already won, retain both the
+        # durable marker and the in-memory Session for its termination receipt.
+        async with self.db_factory() as db:
+            if not await _fence_worker_runtime_mutation(
+                db,
+                producer="PTY background terminal admission",
+            ):
+                return False
+            admitted = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == state.task_id,
+                    Task.session_id == state.session_id,
+                    Task.status.in_(
+                        ("in_progress", "executing", "completed")
+                    ),
+                    Task.retry_count == state.task_retry_count,
+                    Task.turn_generation == state.task_turn_generation,
+                    Task.pty_background_generation == state.generation,
+                    task_retry_not_superseded_predicate(),
+                    no_active_worker_task_termination_predicate(),
+                )
+                .values(status=Task.status)
+                .execution_options(synchronize_session=False)
+            )
+            if admitted.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.commit()
         async with self._test_harness_owner_terminal_context(
             state.task_id,
             reason="PTY background activity reached terminal completion",
@@ -8211,6 +8721,235 @@ class InstanceManager:
                     state
                 )
 
+    @staticmethod
+    def _pty_terminal_publication_matches_task(task: Task, publication) -> bool:
+        """Match the committed post-marker Task snapshot exactly."""
+
+        return bool(
+            task.id == publication.task_id
+            and task.incarnation_id == publication.incarnation_id
+            and task.retry_count == publication.retry_count
+            and task.turn_generation == publication.turn_generation
+            and task.session_id == publication.session_id
+            and task.status == publication.status
+            and task.instance_id == publication.instance_id
+            and task.started_at == publication.started_at
+            and task.completed_at == publication.completed_at
+            and task.pty_background_generation is None
+        )
+
+    @staticmethod
+    def _pty_terminal_publication_is_superseded(task: Task, publication) -> bool:
+        """Prove that an old batch must be discarded rather than emitted.
+
+        A same-generation shape mismatch is deliberately not enough.  It may
+        be corruption or an ABA transition whose ordering is unknown.  A new
+        incarnation, a strictly newer retry/turn, or a different committed
+        terminal status is durable supersession evidence.
+        """
+
+        if task.incarnation_id != publication.incarnation_id:
+            return True
+        current_generation = (task.retry_count, task.turn_generation)
+        published_generation = (
+            publication.retry_count,
+            publication.turn_generation,
+        )
+        if current_generation > published_generation:
+            return True
+        return bool(
+            current_generation == published_generation
+            and task.status in {"completed", "failed", "cancelled", "conflict"}
+            and task.status != publication.status
+        )
+
+    async def _publish_pty_terminal_publication(self, outbox_id: int) -> bool:
+        """Publish one committed PTY terminal batch and delete its marker last.
+
+        The first read is only routing information.  Publication authority is
+        reacquired in the canonical NodeControl -> Task -> LogEntry order, and
+        the raw envelope is parsed and compared again under those locks.
+        """
+
+        from backend.services.task_events import (
+            PTY_TERMINAL_PUBLICATION_EVENT_TYPE,
+            parse_pty_terminal_publication_payload,
+        )
+        from backend.services.worker_node_control import (
+            fence_worker_node_receipt_resolution,
+        )
+
+        try:
+            async with self.db_factory() as snapshot_db:
+                snapshot = (
+                    await snapshot_db.execute(
+                        select(
+                            LogEntry.id,
+                            LogEntry.task_id,
+                            LogEntry.task_retry_count,
+                            LogEntry.task_turn_generation,
+                            LogEntry.native_turn_id,
+                            LogEntry.role,
+                            LogEntry.content,
+                            LogEntry.raw_json,
+                        ).where(
+                            LogEntry.id == outbox_id,
+                            LogEntry.event_type
+                            == PTY_TERMINAL_PUBLICATION_EVENT_TYPE,
+                        )
+                    )
+                ).one_or_none()
+            if snapshot is None:
+                return True
+            publication = parse_pty_terminal_publication_payload(
+                snapshot.raw_json
+            )
+            if (
+                snapshot.task_id != publication.task_id
+                or snapshot.task_retry_count != publication.retry_count
+                or snapshot.task_turn_generation
+                != publication.turn_generation
+                or snapshot.native_turn_id
+                != publication.source_background_generation
+                or snapshot.role is not None
+                or snapshot.content is not None
+            ):
+                raise ValueError(
+                    "PTY terminal publication LogEntry identity is invalid"
+                )
+
+            async with self.db_factory() as db:
+                # A drain may resolve ownership admitted before its irreversible
+                # claim, but it may not create a new publication row.  This
+                # writer is therefore intentionally the receipt-resolution
+                # fence rather than the ordinary mutation fence.
+                await fence_worker_node_receipt_resolution(db)
+                task_guard = await db.execute(
+                    update(Task)
+                    .where(Task.id == publication.task_id)
+                    .values(status=Task.status)
+                    .execution_options(synchronize_session=False)
+                )
+                task = None
+                if task_guard.rowcount:
+                    task = await db.get(
+                        Task,
+                        publication.task_id,
+                        populate_existing=True,
+                    )
+
+                # Task is locked first.  Deletion/retry writers either committed
+                # before this point (and are observed below) or must wait until
+                # the exact old batch is fully emitted and ACK-deleted.
+                entry = (
+                    await db.execute(
+                        select(LogEntry)
+                        .where(
+                            LogEntry.id == outbox_id,
+                            LogEntry.event_type
+                            == PTY_TERMINAL_PUBLICATION_EVENT_TYPE,
+                        )
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).scalar_one_or_none()
+                if entry is None:
+                    await db.rollback()
+                    return True
+                locked_publication = parse_pty_terminal_publication_payload(
+                    entry.raw_json
+                )
+                if (
+                    locked_publication != publication
+                    or entry.task_id != publication.task_id
+                    or entry.task_retry_count != publication.retry_count
+                    or entry.task_turn_generation
+                    != publication.turn_generation
+                    or entry.native_turn_id
+                    != publication.source_background_generation
+                    or entry.role is not None
+                    or entry.content is not None
+                ):
+                    await db.rollback()
+                    logger.error(
+                        "Refusing malformed PTY terminal publication %s",
+                        outbox_id,
+                    )
+                    return False
+
+                if task is None:
+                    # Task deletion is a committed, irreversible supersession.
+                    # There is no channel owner left to receive the old batch.
+                    await db.delete(entry)
+                    await db.commit()
+                    return True
+                if not self._pty_terminal_publication_matches_task(
+                    task, publication
+                ):
+                    if self._pty_terminal_publication_is_superseded(
+                        task, publication
+                    ):
+                        await db.delete(entry)
+                        await db.commit()
+                        logger.info(
+                            "Discarded superseded PTY terminal publication %s "
+                            "for task %s",
+                            outbox_id,
+                            publication.task_id,
+                        )
+                        return True
+                    await db.rollback()
+                    logger.error(
+                        "Retaining ambiguous PTY terminal publication %s for "
+                        "task %s after an exact-generation mismatch",
+                        outbox_id,
+                        publication.task_id,
+                    )
+                    return False
+
+                for channel, data in publication.events:
+                    await self.broadcaster.broadcast(channel, data)
+                # Delete-on-ACK is the marker-last step.  A broadcaster error
+                # or cancellation rolls this transaction back, leaving the
+                # exact immutable batch available for startup/drain recovery.
+                await db.delete(entry)
+                await db.commit()
+                return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "PTY terminal publication %s failed; durable outbox retained",
+                outbox_id,
+            )
+            return False
+
+    async def recover_pty_terminal_publications(self) -> tuple[int, int]:
+        """Replay every crash-left terminal batch in stable row order."""
+
+        from backend.services.task_events import (
+            PTY_TERMINAL_PUBLICATION_EVENT_TYPE,
+        )
+
+        async with self.db_factory() as db:
+            outbox_ids = list(
+                (
+                    await db.execute(
+                        select(LogEntry.id)
+                        .where(
+                            LogEntry.event_type
+                            == PTY_TERMINAL_PUBLICATION_EVENT_TYPE
+                        )
+                        .order_by(LogEntry.id)
+                    )
+                ).scalars()
+            )
+        resolved = 0
+        for outbox_id in outbox_ids:
+            if await self._publish_pty_terminal_publication(outbox_id):
+                resolved += 1
+        return resolved, len(outbox_ids) - resolved
+
     async def _try_complete_pty_background_generation_locked(
         self,
         state: _PtyBackgroundState,
@@ -8227,9 +8966,9 @@ class InstanceManager:
         if not state.terminal_seen:
             return False
 
-        completed_at = datetime.utcnow()
         completed_task = False
         original_status: str | None = None
+        original_completed_at: datetime | None = None
         async with self.db_factory() as db:
             guarded = await db.execute(
                 select(Task.status, Task.completed_at).where(
@@ -8266,28 +9005,61 @@ class InstanceManager:
                 )
                 return False
             original_status = row.status
+            original_completed_at = row.completed_at
             completed_task = original_status == "completed"
-            values: dict[str, Any] = {
-                "error_message": None,
-                "pty_background_generation": None,
-            }
+            await db.rollback()
+
+        # PR terminal consumers may persist their own exact-generation
+        # outcome.  Keep the durable PTY marker throughout that work: a Worker
+        # drain proof must continue to see this Task as live until every
+        # terminal consumer has returned.
+        if completed_task:
+            handler = self.pty_background_completion_handler
+            if handler is not None:
+                try:
+                    result = handler(state.task_id, state.generation)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    logger.exception(
+                        "PTY background terminal handler failed for task %s",
+                        state.task_id,
+                    )
+
+        # Stage a delete-on-ACK LogEntry together with the post-terminal Task
+        # state.  The Task marker is now allowed to clear before publication:
+        # the committed LogEntry becomes the Worker drain blocker until every
+        # event has returned and the publisher deletes it last.
+        outbox_id: int | None = None
+        async with self.db_factory() as db:
+            if not await _fence_worker_runtime_mutation(
+                db,
+                producer="PTY background terminal staging",
+            ):
+                return False
+            publish_predicates = [
+                Task.id == state.task_id,
+                Task.session_id == state.session_id,
+                Task.status == original_status,
+                Task.retry_count == state.task_retry_count,
+                Task.turn_generation == state.task_turn_generation,
+                Task.pty_background_generation == state.generation,
+                task_retry_not_superseded_predicate(),
+                no_active_worker_task_termination_predicate(),
+            ]
             if completed_task:
-                values["completed_at"] = completed_at
-            completed = await db.execute(
-                update(Task)
-                .where(
-                    Task.id == state.task_id,
-                    Task.session_id == state.session_id,
-                    Task.status == original_status,
-                    Task.retry_count == state.task_retry_count,
-                    Task.turn_generation == state.task_turn_generation,
-                    Task.pty_background_generation == state.generation,
-                    task_retry_not_superseded_predicate(),
-                    no_active_worker_task_termination_predicate(),
+                publish_predicates.append(
+                    Task.completed_at.is_(None)
+                    if original_completed_at is None
+                    else Task.completed_at == original_completed_at
                 )
-                .values(**values)
+            publication_guard = await db.execute(
+                update(Task)
+                .where(*publish_predicates)
+                .values(status=Task.status)
+                .execution_options(synchronize_session=False)
             )
-            if not completed.rowcount:
+            if publication_guard.rowcount != 1:
                 active_termination = (
                     await active_worker_task_termination_receipt(
                         db,
@@ -8298,96 +9070,84 @@ class InstanceManager:
                 if active_termination is not None:
                     return False
                 state.outcome = "superseded"
-                self._discard_pty_background_state(
-                    key, state.generation
-                )
+                self._discard_pty_background_state(key, state.generation)
                 return False
-            if completed_task:
-                completed_at = (
-                    await db.execute(
-                        select(Task.completed_at).where(
-                            Task.id == state.task_id
-                        )
-                    )
-                ).scalar_one()
-            await db.commit()
+            locked_task = await db.get(
+                Task,
+                state.task_id,
+                populate_existing=True,
+            )
+            if locked_task is None:
+                await db.rollback()
+                return False
+            completed_at = (
+                datetime.utcnow().replace(microsecond=0)
+                if completed_task
+                else original_completed_at
+            )
+            from backend.services.task_events import (
+                PTY_TERMINAL_PUBLICATION_EVENT_TYPE,
+                build_pty_terminal_publication_payload,
+            )
 
-        # Fence publication against a new chat/retry generation.
-        async with self.db_factory() as db:
-            publish_predicates = [
-                Task.id == state.task_id,
-                Task.session_id == state.session_id,
-                Task.status == original_status,
-                Task.retry_count == state.task_retry_count,
-                Task.turn_generation == state.task_turn_generation,
-                Task.pty_background_generation.is_(None),
-                task_retry_not_superseded_predicate(),
-                no_active_worker_task_termination_predicate(),
-            ]
+            outbox = LogEntry(
+                instance_id=None,
+                task_id=state.task_id,
+                task_retry_count=state.task_retry_count,
+                task_turn_generation=state.task_turn_generation,
+                native_turn_id=state.generation,
+                turn_scope=None,
+                event_type=PTY_TERMINAL_PUBLICATION_EVENT_TYPE,
+                role=None,
+                content=None,
+                raw_json=build_pty_terminal_publication_payload(
+                    task_id=state.task_id,
+                    incarnation_id=locked_task.incarnation_id,
+                    retry_count=state.task_retry_count,
+                    turn_generation=state.task_turn_generation,
+                    session_id=state.session_id,
+                    source_background_generation=state.generation,
+                    status=original_status,
+                    instance_id=locked_task.instance_id,
+                    started_at=locked_task.started_at,
+                    completed_at=completed_at,
+                ),
+                is_error=False,
+            )
+            db.add(outbox)
+            await db.flush()
+            # AsyncSession expires ORM attributes on commit in production.
+            # Capture the generated key while it is still synchronously loaded
+            # so publication never performs an implicit post-commit refresh.
+            outbox_id = outbox.id
+            values: dict[str, Any] = {
+                "error_message": None,
+                "pty_background_generation": None,
+            }
             if completed_task:
-                publish_predicates.append(
-                    Task.completed_at == completed_at
-                )
-            publish = await db.execute(
+                values["completed_at"] = completed_at
+            cleared = await db.execute(
                 update(Task)
                 .where(*publish_predicates)
-                .values(status=original_status)
+                .values(**values)
+                .execution_options(synchronize_session=False)
             )
-            if publish.rowcount:
-                payload = {
-                    "event": "background_activity",
-                    "event_type": "background_activity",
-                    "task_id": state.task_id,
-                    "task_retry_count": state.task_retry_count,
-                    "task_turn_generation": state.task_turn_generation,
-                    "background_active": False,
-                }
-                await self.broadcaster.broadcast("tasks", payload)
-                await self.broadcaster.broadcast(
-                    f"task:{state.task_id}", payload
-                )
-                if completed_task:
-                    # This is the real terminal notification point. Foreground
-                    # completion carried background_active=true and is
-                    # suppressed by WebSocketBroadcaster's shared notifier.
-                    await self.broadcaster.broadcast(
-                        "tasks",
-                        {
-                            "event": "status_change",
-                            "task_id": state.task_id,
-                            "task_retry_count": state.task_retry_count,
-                            "task_turn_generation": state.task_turn_generation,
-                            "new_status": "completed",
-                            "background_active": False,
-                        },
-                    )
-                    await self.broadcaster.broadcast(
-                        f"task:{state.task_id}",
-                        {
-                            "event_type": "process_exit",
-                            "task_retry_count": state.task_retry_count,
-                            "task_turn_generation": state.task_turn_generation,
-                            "exit_code": 0,
-                            "stderr": None,
-                            "background": True,
-                        },
-                    )
+            if cleared.rowcount != 1:
+                await db.rollback()
+                return False
             await db.commit()
-        if publish.rowcount and completed_task:
-            handler = self.pty_background_completion_handler
-            if handler is not None:
-                try:
-                    result = handler(state.task_id)
-                    if inspect.isawaitable(result):
-                        await result
-                except Exception:
-                    logger.exception(
-                        "PTY background terminal handler failed for task %s",
-                        state.task_id,
-                    )
-        state.outcome = (
-            "completed" if publish.rowcount else "superseded"
-        )
+
+        if outbox_id is None:
+            return False
+        published = await self._publish_pty_terminal_publication(outbox_id)
+        if not published:
+            logger.warning(
+                "PTY terminal state for task %s committed before publication; "
+                "durable outbox %s will be recovered",
+                state.task_id,
+                outbox_id,
+            )
+        state.outcome = "completed"
         self._discard_pty_background_state(key, state.generation)
         return True
 
@@ -8426,6 +9186,49 @@ class InstanceManager:
             state.accepting_events = False
 
             async with self.db_factory() as db:
+                if not await _fence_worker_runtime_mutation(
+                    db,
+                    producer="PTY background watchdog admission",
+                ):
+                    state.watchdog_stopping = False
+                    return False
+                task_lock = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == state.task_id,
+                        Task.session_id == state.session_id,
+                        Task.status.in_(
+                            ("in_progress", "executing", "completed")
+                        ),
+                        Task.retry_count == state.task_retry_count,
+                        Task.turn_generation
+                        == state.task_turn_generation,
+                        Task.pty_background_generation
+                        == state.generation,
+                        task_retry_not_superseded_predicate(),
+                        no_active_worker_task_termination_predicate(),
+                    )
+                    .values(status=Task.status)
+                    .execution_options(synchronize_session=False)
+                )
+                if task_lock.rowcount != 1:
+                    active_termination = (
+                        await active_worker_task_termination_receipt(
+                            db,
+                            state.task_id,
+                        )
+                    )
+                    await db.rollback()
+                    if active_termination is not None:
+                        # Freeze this natural watchdog owner but retain its
+                        # exact state for the receipt executor's stop path.
+                        state.watchdog_stopping = False
+                        return False
+                    state.outcome = "superseded"
+                    self._discard_pty_background_state(
+                        key, state.generation
+                    )
+                    return True
                 task_row = (
                     await db.execute(
                         select(
@@ -8451,18 +9254,7 @@ class InstanceManager:
                     )
                 ).one_or_none()
                 if task_row is None:
-                    active_termination = (
-                        await active_worker_task_termination_receipt(
-                            db,
-                            state.task_id,
-                        )
-                    )
                     await db.rollback()
-                    if active_termination is not None:
-                        # Freeze this natural watchdog owner but retain its
-                        # exact state for the receipt executor's stop path.
-                        state.watchdog_stopping = False
-                        return False
                     state.outcome = "superseded"
                     self._discard_pty_background_state(
                         key, state.generation
@@ -8477,8 +9269,10 @@ class InstanceManager:
                 ).scalars().all()
                 if len(owner_rows) > 1:
                     state.watchdog_stopping = False
+                    await db.rollback()
                     return False
                 owner = owner_rows[0] if owner_rows else None
+                await db.commit()
 
         detached = owner is None
 
@@ -8558,6 +9352,11 @@ class InstanceManager:
             # wins before this guard (suppressing publication) or waits until
             # all exact events have been emitted.
             async with self.db_factory() as publication_db:
+                if not await _fence_worker_runtime_mutation(
+                    publication_db,
+                    producer="PTY background watchdog publication",
+                ):
+                    return True
                 publication_guard = await publication_db.execute(
                     update(Task)
                     .where(
@@ -10775,8 +11574,14 @@ class InstanceManager:
                         "execution_mode": params.get(
                             "execution_mode", "sandbox"
                         ),
+                        "execution_principal_kind": params.get(
+                            "execution_principal_kind", "system"
+                        ),
                         "attachment_paths": tuple(
                             params.get("attachment_paths") or ()
+                        ),
+                        "ssh_agent_socket_snapshot": params.get(
+                            "ssh_agent_socket_snapshot"
                         ),
                     })
                     admitted = await enqueuer(**retry_kwargs)
@@ -10834,10 +11639,7 @@ class InstanceManager:
                 structured_preflight_rejection = True
                 try:
                     from backend.main import dispatcher
-                    from backend.services.dispatcher import (
-                        ContextRetryPermit,
-                        PRIORITY_USER,
-                    )
+                    from backend.services.dispatcher import PRIORITY_USER
 
                     async with self.db_factory() as db:
                         permit = context_preflight_permit
@@ -10900,17 +11702,8 @@ class InstanceManager:
                                     or params.get("prompt")
                                     or "continue"
                                 )
-                                retry_kwargs = dict(
-                                    task_id=task_id,
-                                    prompt=build_compacted_resume_prompt(
-                                        summary,
-                                        current_message,
-                                        interrupted=True,
-                                    ),
-                                    priority=PRIORITY_USER,
-                                    source="compact_retry",
-                                    current_message=current_message,
-                                    context_retry_permit=ContextRetryPermit(
+                                context_retry_permit = (
+                                    dispatcher.issue_context_retry_permit(
                                         task_id=permit.task_id,
                                         instance_id=permit.instance_id,
                                         retry_count=permit.retry_count,
@@ -10921,6 +11714,20 @@ class InstanceManager:
                                         session_id=None,
                                         started_at=permit.started_at,
                                         completed_at=permit.completed_at,
+                                    )
+                                )
+                                retry_kwargs = dict(
+                                    task_id=task_id,
+                                    prompt=build_compacted_resume_prompt(
+                                        summary,
+                                        current_message,
+                                        interrupted=True,
+                                    ),
+                                    priority=PRIORITY_USER,
+                                    source="compact_retry",
+                                    current_message=current_message,
+                                    context_retry_permit=(
+                                        context_retry_permit
                                     ),
                                 )
                                 if isinstance(
@@ -10952,11 +11759,29 @@ class InstanceManager:
                                     "execution_mode": params.get(
                                         "execution_mode", "sandbox"
                                     ),
+                                    "execution_principal_kind": params.get(
+                                        "execution_principal_kind", "system"
+                                    ),
                                     "attachment_paths": tuple(
                                         params.get("attachment_paths") or ()
                                     ),
+                                    "ssh_agent_socket_snapshot": params.get(
+                                        "ssh_agent_socket_snapshot"
+                                    ),
                                 })
-                                await dispatcher.enqueue_message(**retry_kwargs)
+                                try:
+                                    admitted = await dispatcher.enqueue_message(
+                                        **retry_kwargs
+                                    )
+                                except BaseException:
+                                    dispatcher.revoke_context_retry_permit(
+                                        context_retry_permit
+                                    )
+                                    raise
+                                if admitted is False:
+                                    dispatcher.revoke_context_retry_permit(
+                                        context_retry_permit
+                                    )
                 except Exception:
                     logger.exception(
                         "Context-window compaction failed for task %d",
@@ -11944,8 +12769,14 @@ class InstanceManager:
                     "initiating_user_role", "member"
                 ),
                 execution_mode=params.get("execution_mode", "sandbox"),
+                execution_principal_kind=params.get(
+                    "execution_principal_kind", "system"
+                ),
                 attachment_paths=tuple(
                     params.get("attachment_paths") or ()
+                ),
+                ssh_agent_socket_snapshot=params.get(
+                    "ssh_agent_socket_snapshot"
                 ),
             )
             return True
@@ -12059,8 +12890,14 @@ class InstanceManager:
                     "initiating_user_role", "member"
                 ),
                 "execution_mode": params.get("execution_mode", "sandbox"),
+                "execution_principal_kind": params.get(
+                    "execution_principal_kind", "system"
+                ),
                 "attachment_paths": tuple(
                     params.get("attachment_paths") or ()
+                ),
+                "ssh_agent_socket_snapshot": params.get(
+                    "ssh_agent_socket_snapshot"
                 ),
             })
             admitted = await dispatcher.enqueue_message(**requeue_kwargs)
@@ -12182,8 +13019,14 @@ class InstanceManager:
                         "initiating_user_role", "member"
                     ),
                     execution_mode=params.get("execution_mode", "sandbox"),
+                    execution_principal_kind=params.get(
+                        "execution_principal_kind", "system"
+                    ),
                     attachment_paths=tuple(
                         params.get("attachment_paths") or ()
+                    ),
+                    ssh_agent_socket_snapshot=params.get(
+                        "ssh_agent_socket_snapshot"
                     ),
                 )
                 return True
@@ -12328,8 +13171,14 @@ class InstanceManager:
                     "initiating_user_role", "member"
                 ),
                 execution_mode=params.get("execution_mode", "sandbox"),
+                execution_principal_kind=params.get(
+                    "execution_principal_kind", "system"
+                ),
                 attachment_paths=tuple(
                     params.get("attachment_paths") or ()
+                ),
+                ssh_agent_socket_snapshot=params.get(
+                    "ssh_agent_socket_snapshot"
                 ),
             )
             return True
@@ -12712,16 +13561,9 @@ class InstanceManager:
                 # compensates; repeated cancellations are deliberately ignored
                 # while the shielded child is still settling.
                 switch_operation = asyncio.create_task(finish_codex_switch())
-                delayed_cancellation: asyncio.CancelledError | None = None
-                while not switch_operation.done():
-                    try:
-                        await asyncio.shield(switch_operation)
-                    except asyncio.CancelledError as exc:
-                        delayed_cancellation = (
-                            delayed_cancellation or exc
-                        )
-                    except BaseException:
-                        break
+                delayed_cancellation = await await_task_completion(
+                    switch_operation
+                )
                 switched = switch_operation.result()
                 if delayed_cancellation is not None:
                     raise delayed_cancellation
@@ -13440,7 +14282,6 @@ class InstanceManager:
             predicates = [
                 Task.id == task_id,
                 task_retry_not_superseded_predicate(),
-                no_active_worker_task_termination_predicate(),
             ]
             if detached_autonomous:
                 predicates.extend(
@@ -13451,6 +14292,16 @@ class InstanceManager:
                         == expected_task_turn_generation,
                         Task.pty_background_generation
                         == expected_background_generation,
+                        worker_task_runtime_persistence_predicate(
+                            task_retry_count=expected_task_retry_count,
+                            task_turn_generation=(
+                                expected_task_turn_generation
+                            ),
+                            session_id=expected_session_id,
+                            pty_background_generation=(
+                                expected_background_generation
+                            ),
+                        ),
                     ]
                 )
             elif event_record is not None:
@@ -13460,7 +14311,18 @@ class InstanceManager:
                         Task.retry_count == event_record.task_retry_count,
                         Task.turn_generation
                         == event_record.task_turn_generation,
+                        worker_task_runtime_persistence_predicate(
+                            task_retry_count=event_record.task_retry_count,
+                            task_turn_generation=(
+                                event_record.task_turn_generation
+                            ),
+                            instance_id=instance_id,
+                        ),
                     ]
+                )
+            else:
+                predicates.append(
+                    no_active_worker_task_termination_predicate()
                 )
             return predicates
 
@@ -13614,6 +14476,11 @@ class InstanceManager:
             if loop_iteration is not None:
                 broadcast_data["loop_iteration"] = loop_iteration
             async with self.db_factory() as db:
+                if not await _fence_worker_runtime_mutation(
+                    db,
+                    producer="PTY streaming event",
+                ):
+                    return
                 if not await guard_managed_event_generation(db):
                     await db.rollback()
                     logger.info(
@@ -13650,6 +14517,11 @@ class InstanceManager:
         ):
             reactivated_completed_at: datetime | None = None
             async with self.db_factory() as db:
+                if not await _fence_worker_runtime_mutation(
+                    db,
+                    producer="PTY Task reactivation",
+                ):
+                    return
                 # First acquire the exact Task write barrier without changing
                 # status.  A routing stage that wins before this point leaves
                 # a durable marker which late output must never cross.
@@ -13663,7 +14535,13 @@ class InstanceManager:
                         Task.turn_generation
                         == event_record.task_turn_generation,
                         task_retry_not_superseded_predicate(),
-                        no_active_worker_task_termination_predicate(),
+                        worker_task_runtime_persistence_predicate(
+                            task_retry_count=event_record.task_retry_count,
+                            task_turn_generation=(
+                                event_record.task_turn_generation
+                            ),
+                            instance_id=instance_id,
+                        ),
                     )
                     .values(status=Task.status)
                 )
@@ -13720,6 +14598,11 @@ class InstanceManager:
                 # same Task row lock, so an old executing event cannot cross a
                 # newer generation.
                 async with self.db_factory() as db:
+                    if not await _fence_worker_runtime_mutation(
+                        db,
+                        producer="PTY Task reactivation publication",
+                    ):
+                        return
                     publish_task_guard = await db.execute(
                         update(Task)
                         .where(
@@ -13736,7 +14619,15 @@ class InstanceManager:
                                 == reactivated_completed_at
                             ),
                             task_retry_not_superseded_predicate(),
-                            no_active_worker_task_termination_predicate(),
+                            worker_task_runtime_persistence_predicate(
+                                task_retry_count=(
+                                    event_record.task_retry_count
+                                ),
+                                task_turn_generation=(
+                                    event_record.task_turn_generation
+                                ),
+                                instance_id=instance_id,
+                            ),
                         )
                         .values(status="executing")
                     )
@@ -13804,6 +14695,7 @@ class InstanceManager:
             event_record,
             provider,
         )
+        context_preflight_relay_proof: dict[str, object] | None = None
 
         # Store the event and related heartbeat/session/unread updates in one
         # transaction.  The old path committed 2-4 times per Codex event,
@@ -13811,6 +14703,11 @@ class InstanceManager:
         # When both ownership rows are touched, preserve the global
         # Task -> Instance lock order used by lifecycle transactions.
         async with self.db_factory() as db:
+            if not await _fence_worker_runtime_mutation(
+                db,
+                producer="PTY durable event",
+            ):
+                return
             if not await guard_managed_event_generation(db):
                 await db.rollback()
                 logger.info(
@@ -13900,6 +14797,52 @@ class InstanceManager:
                 if task_id is not None
                 else None
             )
+            if (
+                settings.ccm_node_role == "worker"
+                and
+                str(provider or "").strip().lower() == "codex"
+                and task_id is not None
+                and turn_scope == "foreground"
+                and type(persisted_task_retry_count) is int
+                and type(persisted_task_turn_generation) is int
+            ):
+                source_identity = (
+                    await db.execute(
+                        select(
+                            Task.turn_source_log_id,
+                            LogEntry.actual_transport,
+                            Task.metadata_,
+                        )
+                        .join(
+                            LogEntry,
+                            LogEntry.id == Task.turn_source_log_id,
+                        )
+                        .where(*task_event_predicates())
+                    )
+                ).one_or_none()
+                if source_identity is not None:
+                    from backend.services.skill_context import (
+                        is_worker_managed_task_metadata,
+                    )
+                    from backend.services.worker_launch_admission import (
+                        build_codex_context_preflight_relay_proof,
+                    )
+
+                    if is_worker_managed_task_metadata(
+                        source_identity[2]
+                    ):
+                        context_preflight_relay_proof = (
+                            build_codex_context_preflight_relay_proof(
+                                raw_payload,
+                                event,
+                                retry_count=persisted_task_retry_count,
+                                turn_generation=(
+                                    persisted_task_turn_generation
+                                ),
+                                source_log_id=source_identity[0],
+                                actual_transport=source_identity[1],
+                            )
+                        )
             entry = LogEntry(
                 instance_id=instance_id,
                 task_id=task_id,
@@ -14065,6 +15008,11 @@ class InstanceManager:
                 try:
                     from backend.services.skill_evolution import evolve_on_failure
                     async with self.db_factory() as db:
+                        if not await _fence_worker_runtime_admission(
+                            db,
+                            producer="PTY skill-evolution event",
+                        ):
+                            return
                         await evolve_on_failure(
                             tool_name=failed_tool,
                             error=str(event.get("content") or event.get("tool_output", ""))[:500],
@@ -14101,6 +15049,14 @@ class InstanceManager:
                 f"instance:{instance_id}", broadcast_data
             )
         if task_id:
+            if context_preflight_relay_proof is not None:
+                from backend.services.worker_launch_admission import (
+                    WORKER_CONTEXT_PREFLIGHT_PROOF_KEY,
+                )
+
+                broadcast_data[WORKER_CONTEXT_PREFLIGHT_PROOF_KEY] = (
+                    context_preflight_relay_proof
+                )
             await self.broadcaster.broadcast(f"task:{task_id}", broadcast_data)
 
         # Persist and broadcast context usage
@@ -14204,6 +15160,11 @@ class InstanceManager:
                 context_usage["context_window"] = claude_context_window(model_name)
         if context_usage and task_id:
             async with self.db_factory() as db:
+                if not await _fence_worker_runtime_mutation(
+                    db,
+                    producer="PTY context-usage update",
+                ):
+                    return
                 context_updated = await db.execute(
                     update(Task)
                     .where(*task_event_predicates())
@@ -14260,6 +15221,21 @@ class InstanceManager:
             return
 
         async with self.db_factory() as db:
+            node_fence = (
+                _fence_worker_runtime_admission
+                if event_type == "subagent_spawn"
+                else _fence_worker_runtime_mutation
+            )
+            if not await node_fence(db, producer="PTY native sub-agent event"):
+                return
+            termination_fence = (
+                no_active_worker_task_termination_predicate()
+                if event_type == "subagent_spawn"
+                else worker_task_runtime_persistence_predicate(
+                    task_retry_count=task_retry_count,
+                    task_turn_generation=task_turn_generation,
+                )
+            )
             generation_guard = await db.execute(
                 update(Task)
                 .where(
@@ -14267,7 +15243,7 @@ class InstanceManager:
                     Task.retry_count == task_retry_count,
                     Task.turn_generation == task_turn_generation,
                     task_retry_not_superseded_predicate(),
-                    no_active_worker_task_termination_predicate(),
+                    termination_fence,
                 )
                 .values(status=Task.status)
             )
@@ -14316,16 +15292,6 @@ class InstanceManager:
                 existing.checks_done = (existing.checks_done or 0) + 1
                 if info.get("summary"):
                     existing.last_summary = info["summary"][:2000]
-                await db.commit()
-                await self.broadcaster.broadcast(f"task:{task_id}", {
-                    "event_type": "sub_agent_report",
-                    "sub_agent_session_id": existing.id,
-                    "agent_type": existing.agent_type,
-                    "check_number": existing.checks_done,
-                    "summary": existing.last_summary,
-                    "task_retry_count": task_retry_count,
-                    "task_turn_generation": task_turn_generation,
-                })
                 # Write progress as system_event in chat (like monitor checks)
                 summary_text = (existing.last_summary or "working...")[:300]
                 log_content = f"[Agent #{existing.id}] {existing.description}: {summary_text}"
@@ -14338,7 +15304,19 @@ class InstanceManager:
                     content=log_content,
                     is_error=False,
                 ))
+                # The sub-agent update and its chat audit row are one fenced
+                # durable mutation.  A commit between them would let a node
+                # drain claim win and leave a late post-proof LogEntry writer.
                 await db.commit()
+                await self.broadcaster.broadcast(f"task:{task_id}", {
+                    "event_type": "sub_agent_report",
+                    "sub_agent_session_id": existing.id,
+                    "agent_type": existing.agent_type,
+                    "check_number": existing.checks_done,
+                    "summary": existing.last_summary,
+                    "task_retry_count": task_retry_count,
+                    "task_turn_generation": task_turn_generation,
+                })
                 await self.broadcaster.broadcast(f"task:{task_id}", {
                     "event_type": "system_event",
                     "content": log_content,
@@ -14376,21 +15354,73 @@ class InstanceManager:
     _PTY_PERMISSION_TIMEOUT = 120  # channel server 阻塞上限（秒），超时 deny
 
     def _on_pty_permission_request(self, session_id: str, request: dict) -> None:
-        """BridgeHub HTTP 线程回调——只做线程切换，业务在事件循环里处理。"""
+        """BridgeHub thread callback with drainable cross-thread ownership."""
         loop = self._loop
         if loop is None or loop.is_closed():
             logger.warning(
                 "PTY permission request dropped (no event loop): %s", request
             )
             return
-        asyncio.run_coroutine_threadsafe(
-            self._handle_pty_permission_request(session_id, request), loop
-        )
+        with self._pty_permission_callback_lock:
+            if self._pty_permission_callbacks_draining:
+                logger.info(
+                    "PTY permission request dropped because Worker runtime "
+                    "callbacks are draining"
+                )
+                return
+            callback = self._handle_pty_permission_request(session_id, request)
+            try:
+                future = asyncio.run_coroutine_threadsafe(callback, loop)
+            except RuntimeError:
+                callback.close()
+                logger.info(
+                    "PTY permission request dropped because the event loop "
+                    "closed during scheduling"
+                )
+                return
+            self._pty_permission_callback_futures.add(future)
+        # ``add_done_callback`` invokes synchronously when the Future already
+        # finished; attach it outside the non-reentrant registry lock.
+        future.add_done_callback(self._pty_permission_callback_finished)
+
+    def _pty_permission_callback_finished(
+        self,
+        future: concurrent.futures.Future,
+    ) -> None:
+        with self._pty_permission_callback_lock:
+            self._pty_permission_callback_futures.discard(future)
+        try:
+            future.result()
+        except concurrent.futures.CancelledError:
+            return
+        except Exception:
+            logger.exception("PTY permission request callback failed")
+
+    async def drain_pty_permission_callbacks(self) -> int:
+        """Irreversibly close and reap permission callbacks for node drain."""
+
+        with self._pty_permission_callback_lock:
+            self._pty_permission_callbacks_draining = True
+            pending = tuple(self._pty_permission_callback_futures)
+        # Do not cancel the concurrent Future: run_coroutine_threadsafe marks
+        # that facade cancelled before the loop Task has necessarily unwound.
+        # Admission is already closed and the durable node claim makes each
+        # callback fail closed, so natural Future completion is the exact
+        # settlement acknowledgement required here.
+        if pending:
+            await asyncio.gather(
+                *(asyncio.wrap_future(future) for future in pending),
+                return_exceptions=True,
+            )
+        with self._pty_permission_callback_lock:
+            for future in pending:
+                self._pty_permission_callback_futures.discard(future)
+        return len(pending)
 
     async def _handle_pty_permission_request(
         self, session_id: str, request: dict
     ) -> None:
-        """把 CC 的权限请求落库并广播成前端聊天卡片。"""
+        """Persist one exact PTY permission request before publishing it."""
         import json as _json
         import time as _time
 
@@ -14399,20 +15429,83 @@ class InstanceManager:
             return
 
         task_id = None
+        task_incarnation_id = None
+        task_retry_count = None
+        task_turn_generation = None
+        instance_id = None
         async with self.db_factory() as db:
+            # A permission request can authorize a new tool effect, so it is
+            # admission rather than persistence by an already-admitted runtime.
+            # Lock order is node-control -> Task -> termination receipt.  The
+            # no-op Task writer keeps a new stop receipt from appearing between
+            # the generation check and the permission log commit.
+            if not await _fence_worker_runtime_admission(
+                db,
+                producer="PTY permission request",
+            ):
+                return
             row = (
                 await db.execute(
                     select(Task)
                     .where(Task.session_id == session_id)
                     .order_by(Task.id.desc())
+                    .limit(1)
+                    .with_for_update()
                 )
-            ).scalars().first()
+            ).scalar_one_or_none()
             if row:
+                guarded_task_id = row.id
+                guarded = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == row.id,
+                        Task.session_id == session_id,
+                        Task.retry_count == row.retry_count,
+                        Task.turn_generation == row.turn_generation,
+                        task_retry_not_superseded_predicate(),
+                        no_active_worker_task_termination_predicate(),
+                    )
+                    .values(status=Task.status)
+                )
+                if guarded.rowcount != 1:
+                    await db.rollback()
+                    logger.info(
+                        "Dropping PTY permission request %s because Task %s "
+                        "is terminating or changed generation",
+                        request_id,
+                        guarded_task_id,
+                    )
+                    return
                 task_id = row.id
+                task_incarnation_id = row.incarnation_id
+                task_retry_count = row.retry_count
+                task_turn_generation = row.turn_generation
+                instance_id = row.instance_id or 1
+                db.add(LogEntry(
+                    instance_id=instance_id,
+                    task_id=task_id,
+                    task_retry_count=task_retry_count,
+                    task_turn_generation=task_turn_generation,
+                    event_type="permission_request",
+                    role="system",
+                    content=request.get("description")
+                    or f"权限请求: {request.get('tool_name')}",
+                    tool_name=request.get("tool_name"),
+                    tool_input=request.get("input_preview"),
+                    raw_json=_json.dumps(
+                        {"request_id": request_id, "session_id": session_id},
+                        ensure_ascii=False,
+                    ),
+                ))
+            await db.commit()
 
         self._pty_permissions[request_id] = {
             "session_id": session_id,
             "task_id": task_id,
+            "task_incarnation_id": task_incarnation_id,
+            "task_retry_count": task_retry_count,
+            "task_turn_generation": task_turn_generation,
+            "instance_id": instance_id,
             "tool_name": request.get("tool_name"),
             "expires_at": _time.monotonic() + self._PTY_PERMISSION_TIMEOUT,
         }
@@ -14427,23 +15520,6 @@ class InstanceManager:
         }
 
         if task_id:
-            instance_id = row.instance_id or 1
-            async with self.db_factory() as db:
-                db.add(LogEntry(
-                    instance_id=instance_id,
-                    task_id=task_id,
-                    event_type="permission_request",
-                    role="system",
-                    content=request.get("description")
-                    or f"权限请求: {request.get('tool_name')}",
-                    tool_name=request.get("tool_name"),
-                    tool_input=request.get("input_preview"),
-                    raw_json=_json.dumps(
-                        {"request_id": request_id, "session_id": session_id},
-                        ensure_ascii=False,
-                    ),
-                ))
-                await db.commit()
             await self.broadcaster.broadcast(f"task:{task_id}", payload)
         else:
             logger.warning(
@@ -14451,11 +15527,21 @@ class InstanceManager:
                 session_id, request.get("tool_name"),
             )
 
-    async def resolve_pty_permission(self, request_id: str, behavior: str) -> bool:
-        """前端按钮回包 → BridgeHub → channel server 解除阻塞。
+    async def resolve_pty_permission(
+        self,
+        request_id: str,
+        behavior: str,
+        *,
+        fenced_db: AsyncSession | None = None,
+        authorized_task_id: int | None = None,
+    ) -> bool:
+        """Resolve a Bridge permission under one node/ACL/Task transaction.
 
-        Returns False when the request is unknown/expired（channel server
-        已超时默认 deny）。
+        The HTTP effect path supplies ``fenced_db`` after acquiring the Worker
+        node, Project ACL, and Task ACL writer fences in that order.  Internal
+        callers may omit it and this method acquires the node/Task fences in a
+        fresh transaction.  Returns False when the request is stale or its
+        exact Task generation no longer owns the effect.
         """
         import json as _json
         import time as _time
@@ -14468,33 +15554,97 @@ class InstanceManager:
             self._pty_permissions.pop(rid, None)
 
         if not pending or pending["expires_at"] < now:
+            if fenced_db is not None:
+                await fenced_db.rollback()
             return False
         if self._pty_backend is None:
+            if fenced_db is not None:
+                await fenced_db.rollback()
             return False
 
-        loop = asyncio.get_running_loop()
-        ok = await loop.run_in_executor(
-            None,
-            self._pty_backend._bridge.resolve_permission,
-            pending["session_id"],
-            request_id,
-            behavior,
-        )
-
-        # 只有真正送达 CC（channel server 还挂着这个请求）才记录/广播，
-        # 否则其他在线客户端会把过期请求误标成"已允许/拒绝"
         task_id = pending.get("task_id")
-        if ok and task_id:
-            async with self.db_factory() as db:
+        if fenced_db is not None and (
+            authorized_task_id is None or task_id != authorized_task_id
+        ):
+            await fenced_db.rollback()
+            return False
+
+        async def settle(db: AsyncSession, *, node_fence_held: bool) -> bool:
+            # Keep the node and exact Task generation locked across the Bridge
+            # effect and its audit row.  Resolving a pending prompt can start a
+            # new tool effect, so phase-one drain and any active Task stop both
+            # reject it; it is not late persistence by the old runtime.
+            if not node_fence_held:
+                if not await _fence_worker_runtime_admission(
+                    db,
+                    producer="PTY permission resolution",
+                ):
+                    return False
+            if task_id:
+                incarnation_id = pending.get("task_incarnation_id")
+                incarnation_predicate = (
+                    Task.incarnation_id.is_(None)
+                    if incarnation_id is None
+                    else Task.incarnation_id == incarnation_id
+                )
+                guarded = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task_id,
+                        Task.session_id == pending.get("session_id"),
+                        incarnation_predicate,
+                        Task.retry_count == pending.get("task_retry_count"),
+                        Task.turn_generation
+                        == pending.get("task_turn_generation"),
+                        task_retry_not_superseded_predicate(),
+                        no_active_worker_task_termination_predicate(),
+                    )
+                    .values(status=Task.status)
+                )
+                if guarded.rowcount != 1:
+                    await db.rollback()
+                    return False
+
+            loop = asyncio.get_running_loop()
+            ok = await loop.run_in_executor(
+                None,
+                self._pty_backend._bridge.resolve_permission,
+                pending["session_id"],
+                request_id,
+                behavior,
+            )
+
+            # 只有真正送达 CC（channel server 还挂着这个请求）才记录/广播，
+            # 否则其他在线客户端会把过期请求误标成"已允许/拒绝"
+            if ok and task_id:
                 db.add(LogEntry(
-                    instance_id=1,
+                    instance_id=pending.get("instance_id") or 1,
                     task_id=task_id,
+                    task_retry_count=pending.get("task_retry_count"),
+                    task_turn_generation=pending.get(
+                        "task_turn_generation"
+                    ),
                     event_type="system_event",
                     role="system",
                     content=f"permission_{behavior}: {pending.get('tool_name')}",
                     raw_json=_json.dumps({"request_id": request_id}),
                 ))
+            if ok:
                 await db.commit()
+            else:
+                await db.rollback()
+            return bool(ok)
+
+        if fenced_db is not None:
+            ok = await _settle_instance_cleanup(
+                settle(fenced_db, node_fence_held=True)
+            )
+        else:
+            async with self.db_factory() as db:
+                ok = await _settle_instance_cleanup(
+                    settle(db, node_fence_held=False)
+                )
+        if ok and task_id:
             await self.broadcaster.broadcast(f"task:{task_id}", {
                 "event_type": "permission_resolved",
                 "request_id": request_id,
@@ -14525,14 +15675,25 @@ class InstanceManager:
             asyncio.create_subprocess_exec(*cmd, **spawn_kwargs)
         )
         cancellation: asyncio.CancelledError | None = None
-        first_wait = True
-        while first_wait or not spawn.done():
-            first_wait = False
-            try:
-                await asyncio.shield(spawn)
-            except asyncio.CancelledError as exc:
-                if cancellation is None:
-                    cancellation = exc
+        # Keep one explicit checkpoint: a spawn can finish between task
+        # creation and the first done check, while cancellation of this caller
+        # is already scheduled.  Afterwards the shared helper consumes each
+        # delivered request so Python 3.14 cannot immediately cancel every new
+        # shield and starve the exact process registration below.
+        try:
+            await asyncio.shield(spawn)
+        except asyncio.CancelledError as exc:
+            if consume_current_task_cancellation():
+                cancellation = exc
+            elif not spawn.done():
+                raise
+        except BaseException:
+            if not spawn.done():
+                raise
+        if not spawn.done():
+            later_cancellation = await await_task_completion(spawn)
+            if cancellation is None:
+                cancellation = later_cancellation
 
         process = spawn.result()
         self.processes[instance_id] = process
@@ -14584,20 +15745,9 @@ class InstanceManager:
 
         cleanup = asyncio.create_task(cleanup_cancelled_spawn())
         cleanup_error: BaseException | None = None
-        while not cleanup.done():
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                # Preserve the first cancellation while refusing to abandon
-                # the OS child during repeated application-shutdown cancels.
-                continue
-            except BaseException:
-                # Retrieve and handle the completed cleanup failure below,
-                # where generation evidence is persisted before cancellation
-                # is propagated.
-                if cleanup.done():
-                    break
-                raise
+        # Preserve the first cancellation while refusing to abandon the OS
+        # child during repeated application-shutdown cancels.
+        await await_task_completion(cleanup)
         try:
             cleanup.result()
         except BaseException as exc:
@@ -14886,17 +16036,7 @@ class InstanceManager:
                     ) from exc
                 return True
 
-        operation = asyncio.create_task(kill_exact())
-        cancellation: asyncio.CancelledError | None = None
-        while not operation.done():
-            try:
-                await asyncio.shield(operation)
-            except asyncio.CancelledError as exc:
-                cancellation = exc
-        result = operation.result()
-        if cancellation is not None:
-            raise cancellation
-        return result
+        return await finish_awaitable(kill_exact())
 
     async def stop(
         self,
@@ -14987,7 +16127,7 @@ class InstanceManager:
             # accept the historical anonymous ``False`` escape hatch.
             return False
 
-        operation = asyncio.create_task(
+        return await finish_awaitable(
             self._stop_serialized(
                 instance_id,
                 expected_task_id=expected_task_id,
@@ -15016,19 +16156,6 @@ class InstanceManager:
                 ),
             )
         )
-        cancellation: asyncio.CancelledError | None = None
-        while not operation.done():
-            try:
-                await asyncio.shield(operation)
-            except asyncio.CancelledError as exc:
-                # A disconnected API caller or shutdown cancellation must not
-                # abandon a signalled process while it is still mapped. Delay
-                # propagation until exact process/consumer cleanup completes.
-                cancellation = exc
-        result = operation.result()
-        if cancellation is not None:
-            raise cancellation
-        return result
 
     @staticmethod
     def _pid_is_definitely_gone(pid: int | None) -> bool:

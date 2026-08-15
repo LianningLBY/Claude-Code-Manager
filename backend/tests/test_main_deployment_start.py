@@ -136,6 +136,7 @@ async def test_task_ssh_effect_recovery_fails_before_any_runtime_writer(
     monkeypatch,
 ):
     import backend.main as main
+    from backend.services import task_id_namespace
     from backend.services.tmp_space_manager import tmp_space_manager
 
     recovery_error = RuntimeError("receipt recovery unavailable")
@@ -145,6 +146,8 @@ async def test_task_ssh_effect_recovery_fails_before_any_runtime_writer(
     recover_workers = AsyncMock()
     sync_tags = AsyncMock()
     start_runtimes = AsyncMock()
+    bind_task_namespace = AsyncMock()
+    recover_pty_publications = AsyncMock(return_value=(0, 0))
 
     monkeypatch.setattr(
         main,
@@ -158,9 +161,19 @@ async def test_task_ssh_effect_recovery_fails_before_any_runtime_writer(
     )
     monkeypatch.setattr(main.update_service, "ensure_runtime_snapshot", MagicMock())
     monkeypatch.setattr(
+        task_id_namespace,
+        "bind_task_id_namespace_at_startup",
+        bind_task_namespace,
+    )
+    monkeypatch.setattr(
         main,
         "recover_interrupted_task_ssh_effects",
         recover_effects,
+    )
+    monkeypatch.setattr(
+        main.instance_manager,
+        "recover_pty_terminal_publications",
+        recover_pty_publications,
     )
     monkeypatch.setattr(main, "_reset_stale_discussion_agents", reset_discussions)
     monkeypatch.setattr(main, "_cleanup_stale_sub_agents", cleanup_children)
@@ -174,6 +187,11 @@ async def test_task_ssh_effect_recovery_fails_before_any_runtime_writer(
             pytest.fail("lifespan must not open after receipt recovery fails")
 
     recover_effects.assert_awaited_once_with()
+    bind_task_namespace.assert_awaited_once_with(
+        main.async_session,
+        node_role=main.settings.ccm_node_role,
+    )
+    recover_pty_publications.assert_awaited_once_with()
     reset_discussions.assert_not_awaited()
     cleanup_children.assert_not_awaited()
     recover_workers.assert_not_awaited()

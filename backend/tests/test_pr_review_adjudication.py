@@ -522,6 +522,7 @@ async def test_accepted_rebuttal_resolves_exact_github_thread_and_gate(
     adjudicator = Task(
         title="Adjudicator", description="judge", status="completed",
         retry_count=0, started_at=started,
+        pty_background_generation="adjudication-background-generation",
         metadata_={"pr_review_id": review.id}, tags=["pr-review"],
     )
     db_session.add(adjudicator)
@@ -544,8 +545,14 @@ async def test_accepted_rebuttal_resolves_exact_github_thread_and_gate(
     await complete_adjudication(
         db_session, adjudication_id=rebuttal.id,
         task_id=adjudicator.id, retry_count=0,
+        expected_background_generation=(
+            "adjudication-background-generation"
+        ),
     )
     assert (await db_session.get(PRFinding, finding.id, populate_existing=True)).status == "resolved_rebutted"
+    assert (
+        await db_session.get(Task, adjudicator.id, populate_existing=True)
+    ).pty_background_generation == "adjudication-background-generation"
 
     calls = []
 

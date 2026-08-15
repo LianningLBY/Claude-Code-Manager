@@ -41,6 +41,7 @@ from backend.models.pr_monitor import (
 from backend.models.project import Project
 from backend.models.task import Task
 from backend.services.code_review_subject import verify_commit_range_subject
+from backend.services.cancellation import await_task_completion
 from backend.services.delivery_controller import (
     DeliveryEffectFence,
     DeliveryPublisherNoEffectPreflightError,
@@ -332,14 +333,8 @@ async def _await_cleanup_settled(
     *,
     delayed_cancel: asyncio.CancelledError | None = None,
 ) -> None:
-    cancellation = delayed_cancel
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-        except BaseException:
-            break
+    cancellation = await await_task_completion(cleanup)
+    cancellation = cancellation or delayed_cancel
     cleanup.result()
     if cancellation is not None:
         raise cancellation
@@ -407,13 +402,7 @@ async def _run_git(
     )
     delayed_cancel: asyncio.CancelledError | None = None
     try:
-        while not spawn.done():
-            try:
-                await asyncio.shield(spawn)
-            except asyncio.CancelledError as exc:
-                delayed_cancel = exc
-            except BaseException:
-                break
+        delayed_cancel = await await_task_completion(spawn)
         process = spawn.result()
     except OSError as exc:
         raise DeliveryGitError("Unable to start Git") from exc

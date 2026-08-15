@@ -12,6 +12,7 @@ from backend.services.browser_review_jobs import (
     BrowserReviewBusyError,
     BrowserReviewJobManager,
     _safe_tool_arguments,
+    public_browser_review_payload,
 )
 from backend.services.test_harness_artifacts import TestHarnessArtifactStore as ArtifactStore
 from backend.services.test_harness_artifacts import (
@@ -21,6 +22,16 @@ from backend.services.test_harness_artifacts import (
 
 def _artifact_store(tmp_path: Path) -> ArtifactStore:
     return ArtifactStore(tmp_path / "artifacts")
+
+
+def test_public_browser_projection_preserves_user_supplied_external_url():
+    payload = {
+        "network_policy": "external_public",
+        "url": "https://example.com/review",
+        "trace": [{"detail": "Opened https://example.com/review"}],
+    }
+
+    assert public_browser_review_payload(payload) == payload
 
 
 @pytest.mark.asyncio
@@ -96,6 +107,25 @@ async def test_job_manager_tracks_progress_and_artifacts(monkeypatch, tmp_path):
         "report.md",
         "telemetry.json",
     ]
+    job.telemetry = {
+        "request_failures": [
+            {"url": "http://127.0.0.1:5173/api/private", "error": "closed"}
+        ]
+    }
+    job.trace_events = [
+        {
+            "id": 1,
+            "kind": "decision",
+            "title": "Inspect managed Preview",
+            "detail": "Opened http://127.0.0.1:5173/settings",
+            "timestamp": None,
+        }
+    ]
+    public_payload = job.public_dict()
+    assert public_payload["url"] is None
+    assert "127.0.0.1:5173" not in str(public_payload)
+    assert "[managed-preview]" in str(public_payload)
+    assert job.as_dict()["url"] == "http://127.0.0.1:5173"
     assert await manager.resolve_artifact(job.id, "final.png") is not None
     assert await manager.resolve_artifact(job.id, "../final.png") is None
 

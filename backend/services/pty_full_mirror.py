@@ -832,6 +832,24 @@ class FullMirrorCCMBackend(CCMBackend):
                 retry_kwargs["queue_timestamp"] = params[
                     "queue_timestamp"
                 ]
+            retry_kwargs.update({
+                "initiating_user_id": params.get("initiating_user_id"),
+                "initiating_user_role": params.get(
+                    "initiating_user_role", "member"
+                ),
+                "execution_mode": params.get(
+                    "execution_mode", "sandbox"
+                ),
+                "execution_principal_kind": params.get(
+                    "execution_principal_kind", "system"
+                ),
+                "attachment_paths": tuple(
+                    params.get("attachment_paths") or ()
+                ),
+                "ssh_agent_socket_snapshot": params.get(
+                    "ssh_agent_socket_snapshot"
+                ),
+            })
             admitted = await dispatcher.enqueue_message(**retry_kwargs)
             if admitted is False:
                 logger.info(

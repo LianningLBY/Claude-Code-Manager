@@ -104,6 +104,34 @@ describe('DeliveryRunDialog', () => {
     expect(onOpenPlan).toHaveBeenCalledWith(2);
   });
 
+  it('fails closed when a Plan choice has an unknown requester', async () => {
+    vi.mocked(api.getDeliveryRun).mockResolvedValue({ id: 8, title: 'Choose scope', phase: 'planning', activity: 'waiting', outcome: null, terminal: 'ready_to_merge', developer_task_id: null, pr_monitor_run_id: null, cycles: [{ id: 2, cycle_number: 1, plan_version_id: null }], turns: [], transitions: [], delivery_branch: 'ccm/delivery/8', turn_count: 0, head_sha: null, wait_reason: 'plan_capability' } as never);
+    vi.mocked(api.getDeliveryProgress).mockResolvedValue({
+      run_id: 8, state_version: 4, phase: 'planning', activity: 'waiting', headline: 'Plan needs your decision', detail: null, attention_required: true, attention_kind: 'plan_input', last_activity_at: null,
+      stages: [
+        { key: 'planning', label: 'Plan', state: 'waiting', summary: '', started_at: null, completed_at: null },
+        { key: 'coding', label: 'Development', state: 'pending', summary: '', started_at: null, completed_at: null },
+        { key: 'pre_review', label: 'Code review', state: 'pending', summary: '', started_at: null, completed_at: null },
+        { key: 'frontend_review', label: 'Frontend review', state: 'pending', summary: '', started_at: null, completed_at: null },
+        { key: 'publishing', label: 'Publish PR', state: 'pending', summary: '', started_at: null, completed_at: null },
+        { key: 'monitoring', label: 'CI & PR review', state: 'pending', summary: '', started_at: null, completed_at: null },
+      ],
+      active_agent: null, events: [],
+      plan_input: {
+        plan_id: 44,
+        run: { id: 55, generation: 2 },
+        request: { id: 66, requested_by: 'operator', reason: null, questions: [{ id: 'scope', header: 'Scope', question: 'Which rollout scope?', response_type: 'text', options: [], required: true }] },
+      },
+      frontend_review: { policy: 'auto', run_id: null, status: null, stage: null, verdict: null, report: null, error: null, cleanup_status: null, evidence_archive_state: null, finding_count: 0, evidence_count: 0, skip_reason: null },
+    } as never);
+
+    render(<DeliveryRunDialog runId={8} onClose={() => {}} onOpenTask={() => {}} onOpenPlan={() => {}} onOpenPRMonitor={() => {}} />);
+
+    expect(await screen.findByText(/invalid Plan input requester/)).toBeInTheDocument();
+    expect(screen.queryByText(/Inline plan input:/)).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Open full Plan' })).toBeInTheDocument();
+  });
+
   it('shows Browser Agent findings and archived report in the frontend stage', async () => {
     vi.mocked(api.getDeliveryRun).mockResolvedValue({ id: 9, title: 'Review UI', phase: 'frontend_review', activity: 'waiting', outcome: null, terminal: 'ready_to_merge', developer_task_id: 14, pr_monitor_run_id: null, cycles: [{ id: 3, cycle_number: 1, plan_version_id: null, frontend_review_run_id: 'f'.repeat(32) }], turns: [], transitions: [], delivery_branch: 'ccm/delivery/9', turn_count: 1, head_sha: 'b'.repeat(40), wait_reason: 'frontend_review' } as never);
     vi.mocked(api.getDeliveryProgress).mockResolvedValue({

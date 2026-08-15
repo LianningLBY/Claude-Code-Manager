@@ -20,7 +20,6 @@ from backend.api.deps import (
     require_internal_service,
     require_internal_task_incarnation,
     require_managed_ssh_auth_configured,
-    require_task_access,
     require_task_control,
 )
 from backend.database import get_db
@@ -33,7 +32,6 @@ from backend.models.task_ssh_effect import (
     TaskSSHEffectReceipt,
 )
 from backend.models.task_ssh_grant import TaskSSHGrant
-from backend.models.team_share import TeamProjectShare, TeamTaskShare
 from backend.schemas.task_ssh_grant import (
     TASK_SSH_MAX_EXEC_OUTPUT_BYTES,
     TaskSSHExecuteRequest,
@@ -51,6 +49,7 @@ from backend.services.ssh_executor import (
     SSHHostKeyMismatchError,
     SSHKeyPreflightError,
 )
+from backend.services.cancellation import settle_awaitable
 from backend.services.ssh_profiles import executor_for_profile
 from backend.services.ssh_remote_paths import (
     resolve_existing_remote_path,
@@ -68,6 +67,7 @@ from backend.services.task_ssh_access import (
     resolve_task_ssh_profile,
     task_ssh_grant_snapshots,
 )
+from backend.services.worker_node_control import fence_worker_node_mutation
 from backend.services.worker_proxy import get_task_operation_lock
 
 
@@ -106,16 +106,7 @@ class _EffectAdmission:
 async def _settle_despite_cancellation(awaitable):
     """Finish a finite receipt write before re-delivering cancellation."""
 
-    operation = asyncio.ensure_future(awaitable)
-    delayed: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            if delayed is None:
-                delayed = exc
-        except BaseException:
-            break
+    operation, delayed = await settle_awaitable(awaitable)
     return operation.result(), delayed
 
 
@@ -540,6 +531,12 @@ async def _admit_task_ssh_effect(
         await _verify_sqlite_effect_permit(db, effect_id)
         # End the sqlite_master snapshot before attempting a writer fence.
         await db.rollback()
+    # A remote SSH effect is durable Worker-owned execution.  Take the node
+    # drain fence before the Task generation writer and hold it through the
+    # running-receipt commit.  An effect admitted first is therefore visible to
+    # the drain proof; a drain claim admitted first refuses the effect without
+    # touching the remote host.
+    await fence_worker_node_mutation(db)
     # The short Task writer fence serializes the validation + receipt INSERT.
     # It is released by the admission commit before any network call. SQLite's
     # permit trigger deliberately allows this no-op fence (and benign runtime
@@ -718,6 +715,12 @@ async def _prepare_admitted_effect(
 ) -> SSHProfile:
     if _is_sqlite_session(db):
         await _verify_sqlite_effect_permit(db, effect_id)
+        # Do not upgrade the sqlite_master read snapshot after a concurrent
+        # drain commit.  Start a fresh transaction whose first write is the
+        # node-control fence.
+        await db.rollback()
+    await fence_worker_node_mutation(db)
+    if _is_sqlite_session(db):
         task = await db.scalar(
             select(Task).where(
                 Task.id == admission.generation.task_id,
@@ -825,20 +828,10 @@ async def _prepare_admitted_effect(
             .where(TaskShare.task_id == admission.generation.task_id)
             .with_for_update()
         )
-        await db.execute(
-            select(TeamTaskShare.id)
-            .where(TeamTaskShare.task_id == admission.generation.task_id)
-            .with_for_update()
-        )
         if task.project_id is not None:
             await db.execute(
                 select(ProjectShare.id)
                 .where(ProjectShare.project_id == task.project_id)
-                .with_for_update()
-            )
-            await db.execute(
-                select(TeamProjectShare.id)
-                .where(TeamProjectShare.project_id == task.project_id)
                 .with_for_update()
             )
     profile = await resolve_task_ssh_profile(
@@ -1037,7 +1030,11 @@ async def list_task_ssh_grants(
     db: AsyncSession = Depends(get_db),
 ):
     task = await _task_or_404(db, task_id)
-    await require_task_access(request, task, db)
+    # A chat share permits conversation only.  Grant snapshots expose the SSH
+    # host, username, host-key fingerprint, capability set and allowed remote
+    # roots, so they are Task control-plane configuration rather than chat
+    # history.
+    await require_task_control(request, task, db)
     return await task_ssh_grant_snapshots(db, task)
 
 

@@ -32,9 +32,18 @@ from backend.models.plan_agent import (
     PlanAgentRun,
     PlanAgentWorkerDispatchReceipt,
 )
-from backend.models.pr_monitor import MonitoredRepo
+from backend.models.pr_monitor import (
+    MonitoredRepo,
+    PRFinding,
+    PRFindingAction,
+    PRFindingRebuttal,
+    PRMonitorRun,
+    PRReview,
+    PRReviewerRun,
+)
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.user import User
 from backend.models.test_harness import (
     TestHarnessAttempt,
     TestHarnessChildBinding,
@@ -46,6 +55,8 @@ from backend.models.test_harness import (
 )
 from backend.models.task_share import TaskShare
 from backend.models.team_share import TeamTaskShare
+from backend.models.user_group import UserGroupMember  # noqa: F401
+from backend.models.worker import Worker
 from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.delivery_service import DeliveryCreateSpec, create_delivery_run
@@ -55,6 +66,8 @@ from backend.services.task_queue import (
     TaskQueue,
     TaskWaitingCapabilityConflict,
     _effective_key_expr,
+    _pr_review_dispatch_predicate,
+    ordinary_task_visibility_predicate,
     task_delete_fence,
     task_generation_fence,
 )
@@ -64,6 +77,18 @@ from backend.services.test_harness_children import TestHarnessChildService
 @pytest_asyncio.fixture
 async def queue(db_session):
     return TaskQueue(db_session)
+
+
+async def _seed_ready_worker(queue: TaskQueue, worker_id: int = 91) -> Worker:
+    worker = Worker(
+        id=worker_id,
+        name=f"queue-worker-{worker_id}",
+        status="ready",
+        bootstrap_step=None,
+    )
+    queue.db.add(worker)
+    await queue.db.commit()
+    return worker
 
 
 async def _pending_delivery_task(queue: TaskQueue, *, admitted: bool) -> Task:
@@ -372,8 +397,9 @@ async def test_update_task_loses_cleanly_to_concurrent_wal_receipt(tmp_path):
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,
@@ -420,8 +446,9 @@ async def test_update_task_loses_cleanly_to_concurrent_wal_capability_wait(tmp_p
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,
@@ -513,6 +540,116 @@ async def test_dequeue_clears_previous_turn_source_in_generation_claim(queue):
     assert claimed.id == task.id
     assert claimed.turn_generation == 1
     assert claimed.turn_source_log_id is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    (("is_active", False), ("role", "member")),
+    ids=("disabled", "demoted"),
+)
+async def test_dequeue_rejects_revoked_native_principal_without_claiming(
+    queue,
+    changed_field,
+    changed_value,
+):
+    user = User(
+        email=f"dequeue-{changed_field}@example.com",
+        name="dequeue principal",
+        password_hash="unused",
+        role="admin",
+        is_active=True,
+    )
+    queue.db.add(user)
+    await queue.db.flush()
+    blocked = await queue.create(
+        title="revoked native principal",
+        description="must stay pending",
+        priority=-10,
+        execution_user_id=user.id,
+        execution_user_role="admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="user",
+    )
+    runnable = await queue.create(
+        title="unrelated runnable",
+        description="must still claim",
+        priority=0,
+    )
+    blocked_id = blocked.id
+    runnable_id = runnable.id
+    principal = await queue.db.get(User, user.id)
+    setattr(principal, changed_field, changed_value)
+    await queue.db.commit()
+
+    claimed = await queue.dequeue()
+
+    assert claimed is not None and claimed.id == runnable_id
+    current = await queue.db.get(Task, blocked_id, populate_existing=True)
+    assert current.status == "pending"
+    assert current.turn_generation == 0
+
+
+@pytest.mark.asyncio
+async def test_dequeue_delegated_principal_does_not_require_local_user(queue):
+    task = await queue.create(
+        title="delegated Worker task",
+        description="Manager permit owns authority",
+        execution_user_id=987654321,
+        execution_user_role="admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="delegated_user",
+    )
+
+    claimed = await queue.dequeue()
+
+    assert claimed is not None and claimed.id == task.id
+    assert claimed.status == "in_progress"
+    assert claimed.turn_generation == 1
+
+
+@pytest.mark.asyncio
+async def test_dequeue_native_principal_writer_order_is_task_then_user(
+    queue,
+    monkeypatch,
+):
+    user = User(
+        email="dequeue-lock-order@example.com",
+        name="dequeue lock order",
+        password_hash="unused",
+        role="admin",
+        is_active=True,
+    )
+    queue.db.add(user)
+    await queue.db.flush()
+    await queue.create(
+        title="native lock order",
+        description="Task writer precedes User writer",
+        execution_user_id=user.id,
+        execution_user_role="admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="user",
+    )
+
+    original_execute = AsyncSession.execute
+    writes: list[str] = []
+
+    async def record_writes(session, statement, *args, **kwargs):
+        table = getattr(statement, "table", None)
+        table_name = getattr(table, "name", None)
+        if getattr(statement, "is_update", False) and table_name in {
+            "tasks",
+            "users",
+        }:
+            writes.append(table_name)
+        return await original_execute(session, statement, *args, **kwargs)
+
+    monkeypatch.setattr(AsyncSession, "execute", record_writes)
+
+    claimed = await queue.dequeue()
+
+    assert claimed is not None
+    assert writes[:2] == ["tasks", "users"]
 
 
 @pytest.mark.asyncio
@@ -1415,12 +1552,18 @@ async def test_delete_harness_owner_rejects_reused_task_id_incarnation(queue):
     ).incarnation_id
     await queue.db.execute(delete(Task).where(Task.id == owner_id))
     await queue.db.commit()
-    replacement = await queue.create(
+    # Simulate a pre-namespace/legacy database reusing the integer directly.
+    # Production Manager creation must never weaken its explicit-id gate just
+    # to construct this ABA fixture.
+    replacement = Task(
         id=owner_id,
         title="Reused owner integer",
         description="different security identity",
         status="completed",
     )
+    queue.db.add(replacement)
+    await queue.db.commit()
+    await queue.db.refresh(replacement)
     assert replacement.incarnation_id != old_incarnation
 
     assert await queue.delete(owner_id) is False
@@ -1526,6 +1669,12 @@ async def test_task_creation_purges_pre_upgrade_acl_for_reused_id(queue):
     # Simulate an older SQLite deployment deleting the Task without FK
     # enforcement or explicit ACL cleanup, then reusing its integer id.
     await queue.db.execute(delete(Task).where(Task.id == old_id))
+    # Emulate the legacy allocator state that allowed the deleted highest
+    # integer to be selected again.  Current Manager code still obtains the
+    # value through its native allocator; it never accepts an explicit id.
+    await queue.db.execute(
+        text("UPDATE sqlite_sequence SET seq = 0 WHERE name = 'tasks'")
+    )
     await queue.db.commit()
     assert await queue.db.scalar(
         select(TaskShare.id).where(TaskShare.task_id == old_id)
@@ -1534,11 +1683,14 @@ async def test_task_creation_purges_pre_upgrade_acl_for_reused_id(queue):
         select(TeamTaskShare.id).where(TeamTaskShare.task_id == old_id)
     ) is not None
 
+    # SQLite may naturally reuse the deleted highest ROWID.  Exercise the
+    # canonical Manager allocator without passing an explicit id, then prove
+    # that its creation boundary still purges legacy ACL rows for that value.
     replacement = await queue.create(
-        id=old_id,
         title="new incarnation",
         description="must stay private",
     )
+    assert replacement.id == old_id
 
     assert replacement.id == old_id
     assert await queue.db.scalar(
@@ -1555,7 +1707,9 @@ async def test_share_write_fence_rejects_reused_task_incarnation(queue):
     observed = SimpleNamespace(id=old.id, incarnation_id=old.incarnation_id)
     await queue.db.execute(delete(Task).where(Task.id == old.id))
     await queue.db.commit()
-    replacement = await queue.create(
+    # Build the legacy ABA state below the canonical Manager allocator.  The
+    # production API must continue rejecting caller-selected Manager ids.
+    replacement = Task(
         id=old.id,
         title="new share owner",
         description="different private task",
@@ -1563,6 +1717,9 @@ async def test_share_write_fence_rejects_reused_task_incarnation(queue):
         # DateTime precision.
         created_at=old.created_at,
     )
+    queue.db.add(replacement)
+    await queue.db.commit()
+    await queue.db.refresh(replacement)
 
     assert replacement.created_at == old.created_at
     assert replacement.incarnation_id != observed.incarnation_id
@@ -1649,6 +1806,7 @@ async def test_delete_rejects_completed_task_with_live_pty_background(queue):
 
 @pytest.mark.asyncio
 async def test_delete_worker_mirror_requires_remote_confirmation(queue):
+    await _seed_ready_worker(queue)
     task = await queue.create(
         title="remote",
         description="d",
@@ -1664,6 +1822,7 @@ async def test_delete_worker_mirror_requires_remote_confirmation(queue):
 
 @pytest.mark.asyncio
 async def test_remote_worker_delete_accepts_exact_background_mirror(queue):
+    await _seed_ready_worker(queue)
     task = await queue.create(
         title="remote background",
         description="d",
@@ -1687,6 +1846,7 @@ async def test_remote_worker_delete_accepts_exact_background_mirror(queue):
 
 @pytest.mark.asyncio
 async def test_remote_worker_delete_rejects_changed_background_mirror(queue):
+    await _seed_ready_worker(queue)
     task = await queue.create(
         title="remote background changed",
         description="d",
@@ -1714,6 +1874,7 @@ async def test_remote_worker_delete_rejects_changed_background_mirror(queue):
 async def test_remote_delete_callback_runs_after_plan_preflight_before_local_delete(
     queue,
 ):
+    await _seed_ready_worker(queue)
     task = await queue.create(
         title="remote plan graph",
         description="d",
@@ -1818,6 +1979,7 @@ async def test_local_delete_preflight_includes_plan_added_after_stale_read(queue
 
 @pytest.mark.asyncio
 async def test_remote_delete_callback_rejects_active_worker_plan_dispatch(queue):
+    await _seed_ready_worker(queue)
     task = await queue.create(
         title="active remote Plan dispatch",
         description="d",
@@ -3066,6 +3228,352 @@ async def test_list_tasks_filter_status(queue):
     assert pending[0].title == "pending"
 
 
+@pytest.mark.asyncio
+async def test_ordinary_task_lists_hide_linked_pr_reviewer_tasks(queue):
+    ordinary = await queue.create(
+        title="ordinary",
+        description="user-visible work",
+        target_repo="/tmp",
+    )
+    ordinary_archived = await queue.create(
+        title="ordinary archived",
+        description="user-visible history",
+        target_repo="/tmp",
+        archived=True,
+    )
+    single_task = await queue.create(
+        title="single reviewer",
+        description="internal protocol",
+        target_repo="/tmp",
+    )
+    panel_task = await queue.create(
+        title="panel reviewer",
+        description="internal protocol",
+        target_repo="/tmp",
+        archived=True,
+    )
+    fix_task = await queue.create(
+        title="finding fix",
+        description="internal patch protocol",
+        target_repo="/tmp",
+    )
+    rebuttal_task = await queue.create(
+        title="rebuttal adjudication",
+        description="internal adjudication protocol",
+        target_repo="/tmp",
+        archived=True,
+    )
+    repo = MonitoredRepo(
+        repo_full_name="example/hidden-reviewer-tasks",
+        webhook_secret="queue-secret",
+    )
+    queue.db.add(repo)
+    await queue.db.flush()
+    review = PRReview(
+        repo_id=repo.id,
+        pr_number=17,
+        base_ref="main",
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        pr_title="Internal review",
+        pr_author="alice",
+        pr_url="https://github.com/example/hidden-reviewer-tasks/pull/17",
+        task_id=single_task.id,
+        status="reviewing",
+    )
+    queue.db.add(review)
+    await queue.db.flush()
+    reviewer_run = PRReviewerRun(
+        pr_review_id=review.id,
+        role="principal_engineer",
+        task_id=panel_task.id,
+        provider="claude",
+        status="pending",
+        prompt_policy_hash="c" * 64,
+        guide_pack_hash="d" * 64,
+    )
+    queue.db.add(reviewer_run)
+    await queue.db.flush()
+    monitor_run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=17,
+        current_base_sha="a" * 40,
+        current_head_sha="b" * 40,
+        current_review_id=review.id,
+    )
+    queue.db.add(monitor_run)
+    await queue.db.flush()
+    review.monitor_run_id = monitor_run.id
+    finding = PRFinding(
+        pr_review_id=review.id,
+        reviewer_run_id=reviewer_run.id,
+        fingerprint="e" * 64,
+        role="principal_engineer",
+        severity="high",
+        category="correctness",
+        path="backend/internal.py",
+        line=1,
+        title="Internal finding",
+        evidence="internal evidence",
+        impact="internal impact",
+        required_fix="internal fix",
+        test="internal test",
+        thread_nonce="f" * 48,
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+    )
+    queue.db.add(finding)
+    await queue.db.flush()
+    queue.db.add_all([
+        PRFindingAction(
+            finding_id=finding.id,
+            action_type="ai_fix",
+            status="completed",
+            idempotency_key="queue-hidden-fix",
+            task_id=fix_task.id,
+            expected_head_sha="b" * 40,
+        ),
+        PRFindingRebuttal(
+            finding_id=finding.id,
+            pr_review_id=review.id,
+            monitor_run_id=monitor_run.id,
+            developer_task_id=ordinary.id,
+            task_id=rebuttal_task.id,
+            attempt=1,
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            evidence="bounded evidence",
+            evidence_hash="1" * 64,
+            status="completed",
+            resolution_nonce="2" * 48,
+        ),
+    ])
+    await queue.db.commit()
+
+    from backend.services.pr_monitor_task_access import is_pr_monitor_owned_task
+
+    assert not await is_pr_monitor_owned_task(queue.db, ordinary)
+    for internal_task in (single_task, panel_task, fix_task, rebuttal_task):
+        assert await is_pr_monitor_owned_task(queue.db, internal_task)
+
+    assert {task.id for task in await queue.list_tasks()} == {ordinary.id}
+    assert {
+        task.id for task in await queue.list_tasks(archived_only=True)
+    } == {ordinary_archived.id}
+    assert {
+        task.id for task in await queue.list_tasks(include_archived=True)
+    } == {ordinary.id, ordinary_archived.id}
+    assert await queue.count_tasks() == 1
+    assert await queue.count_tasks(archived_only=True) == 1
+    assert await queue.count_tasks(include_archived=True) == 2
+
+
+@pytest.mark.parametrize(
+    ("link_kind", "review_status", "run_status", "should_claim"),
+    [
+        ("none", None, None, True),
+        ("single", "reviewing", None, True),
+        ("single", "error", None, False),
+        ("panel", "reviewing", "pending", True),
+        ("panel", "reviewing", "reviewing", True),
+        ("panel", "reviewing", "cancelled", False),
+        ("panel", "error", "pending", False),
+    ],
+    ids=(
+        "ordinary",
+        "single-runnable",
+        "single-parent-terminal",
+        "panel-pending",
+        "panel-running",
+        "panel-sibling-cancelled",
+        "panel-parent-terminal",
+    ),
+)
+@pytest.mark.asyncio
+async def test_dequeue_requires_runnable_pr_review_owner(
+    queue,
+    link_kind,
+    review_status,
+    run_status,
+    should_claim,
+):
+    task = await queue.create(
+        title=f"{link_kind} reviewer dispatch",
+        description="internal protocol",
+        target_repo="/tmp",
+    )
+    task_id = task.id
+    if link_kind != "none":
+        repo = MonitoredRepo(
+            repo_full_name=f"example/dispatch-{link_kind}-{task_id}",
+            webhook_secret="queue-secret",
+        )
+        queue.db.add(repo)
+        await queue.db.flush()
+        review = PRReview(
+            repo_id=repo.id,
+            pr_number=task_id,
+            base_ref="main",
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            pr_title="Dispatch ownership",
+            pr_author="alice",
+            pr_url=f"https://github.com/{repo.repo_full_name}/pull/{task_id}",
+            # Panel creation keeps this legacy pointer to its first Task.  It
+            # must not override a terminal PRReviewerRun below.
+            task_id=task_id,
+            status=review_status,
+        )
+        queue.db.add(review)
+        await queue.db.flush()
+        if link_kind == "panel":
+            queue.db.add(PRReviewerRun(
+                pr_review_id=review.id,
+                role="principal_engineer",
+                task_id=task_id,
+                provider="claude",
+                status=run_status,
+                prompt_policy_hash="c" * 64,
+                guide_pack_hash="d" * 64,
+            ))
+        await queue.db.commit()
+
+    claimed = await queue.dequeue()
+
+    if should_claim:
+        assert claimed is not None and claimed.id == task_id
+        assert claimed.status == "in_progress"
+        assert claimed.turn_generation == 1
+    else:
+        assert claimed is None
+        current = await queue.db.get(Task, task_id, populate_existing=True)
+        assert current is not None
+        assert current.status == "pending"
+        assert current.turn_generation == 0
+
+
+@pytest.mark.asyncio
+async def test_dequeue_claim_cas_rechecks_cancelled_panel_reviewer_run(
+    queue,
+    monkeypatch,
+):
+    task = await queue.create(
+        title="panel cancellation race",
+        description="must remain pending",
+        target_repo="/tmp",
+    )
+    repo = MonitoredRepo(
+        repo_full_name="example/panel-cancellation-race",
+        webhook_secret="queue-secret",
+    )
+    queue.db.add(repo)
+    await queue.db.flush()
+    review = PRReview(
+        repo_id=repo.id,
+        pr_number=17,
+        base_ref="main",
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        pr_title="Cancellation race",
+        pr_author="alice",
+        pr_url="https://github.com/example/panel-cancellation-race/pull/17",
+        task_id=task.id,
+        status="reviewing",
+    )
+    queue.db.add(review)
+    await queue.db.flush()
+    reviewer_run = PRReviewerRun(
+        pr_review_id=review.id,
+        role="principal_engineer",
+        task_id=task.id,
+        provider="claude",
+        status="pending",
+        prompt_policy_hash="c" * 64,
+        guide_pack_hash="d" * 64,
+    )
+    queue.db.add(reviewer_run)
+    await queue.db.flush()
+    task_id = task.id
+    reviewer_run_id = reviewer_run.id
+    await queue.db.commit()
+
+    original_execute = queue.db.execute
+    cancelled = False
+
+    async def cancel_immediately_before_task_claim(statement, *args, **kwargs):
+        nonlocal cancelled
+        table = getattr(statement, "table", None)
+        if (
+            not cancelled
+            and getattr(statement, "is_update", False)
+            and getattr(table, "name", None) == "tasks"
+        ):
+            cancelled = True
+            await original_execute(
+                update(PRReviewerRun)
+                .where(PRReviewerRun.id == reviewer_run_id)
+                .values(status="cancelled")
+            )
+            await queue.db.commit()
+        return await original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(
+        queue.db,
+        "execute",
+        AsyncMock(side_effect=cancel_immediately_before_task_claim),
+    )
+
+    claimed = await queue.dequeue()
+
+    assert cancelled
+    assert claimed is None
+    current = await queue.db.get(Task, task_id, populate_existing=True)
+    assert current is not None
+    assert current.status == "pending"
+    assert current.turn_generation == 0
+
+
+@pytest.mark.asyncio
+async def test_member_task_list_and_count_require_chat_share_permission(queue):
+    chat_task = await queue.create(
+        title="chat-shared",
+        description="d",
+        target_repo="/tmp",
+        created_by=7,
+    )
+    unrelated_permission_task = await queue.create(
+        title="not-chat-shared",
+        description="d",
+        target_repo="/tmp",
+        created_by=7,
+    )
+    queue.db.add_all([
+        TeamTaskShare(
+            task_id=chat_task.id,
+            target_type="user",
+            target_id=42,
+            permission="chat",
+            shared_by=7,
+        ),
+        # Keep this deliberately outside the current API Literal.  The query
+        # must remain least-privilege if another permission is introduced or
+        # a legacy/corrupt row exists in the database.
+        TeamTaskShare(
+            task_id=unrelated_permission_task.id,
+            target_type="user",
+            target_id=42,
+            permission="read_metadata",
+            shared_by=7,
+        ),
+    ])
+    await queue.db.commit()
+
+    visible = await queue.list_tasks(user_id=42)
+
+    assert [task.id for task in visible] == [chat_task.id]
+    assert await queue.count_tasks(user_id=42) == 1
+
+
 @pytest.mark.parametrize(
     ("dialect", "expected", "forbidden"),
     [
@@ -3084,6 +3592,36 @@ def test_effective_sort_key_compiles_for_supported_database_dialects(
 
     assert expected in sql
     assert forbidden not in sql
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    [sqlite.dialect(), postgresql.dialect(), mysql.dialect()],
+    ids=("sqlite", "postgresql", "mysql"),
+)
+def test_pr_review_task_predicates_compile_for_supported_database_dialects(
+    dialect,
+):
+    list_statement = select(Task.id).where(
+        ordinary_task_visibility_predicate()
+    )
+    claim_statement = (
+        update(Task)
+        .where(_pr_review_dispatch_predicate())
+        .values(status="in_progress")
+    )
+
+    list_sql = str(list_statement.compile(dialect=dialect))
+    claim_sql = str(claim_statement.compile(dialect=dialect))
+
+    assert "pr_reviews" in list_sql
+    assert "pr_reviewer_runs" in list_sql
+    assert "pr_finding_actions" in list_sql
+    assert "pr_finding_rebuttals" in list_sql
+    assert "NOT ((EXISTS" in list_sql
+    assert "pr_reviews" in claim_sql
+    assert "pr_reviewer_runs" in claim_sql
+    assert "EXISTS" in claim_sql
 
 
 # === Dequeue picks any pending task ===

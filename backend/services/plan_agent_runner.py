@@ -65,6 +65,7 @@ from backend.services.plan_runtime_receipt import (
     runtime_generation_is_clean,
     runtime_token_environment,
 )
+from backend.services.worker_node_control import fence_worker_node_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -981,53 +982,12 @@ def _build_command(
     effort: str | None,
     schema: dict,
     isolation_settings_path: str | None,
-    unrestricted: bool = False,
 ) -> list[str]:
     if provider != "claude":
         raise ValueError(
             "Codex Plan turns use the persistent app-server transport"
         )
     schema_json = json.dumps(schema, separators=(",", ":"))
-    if unrestricted:
-        from backend.services.task_agent_isolation import (
-            CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
-            claude_permission_allow_rules,
-        )
-
-        allowed_rules = claude_permission_allow_rules(
-            CLAUDE_UNRESTRICTED_PERMISSION_TOOLS,
-            include_mcp_tools=False,
-        )
-        command = [
-            settings.claude_binary,
-            "-p",
-            "-",
-            "--output-format",
-            "json",
-            "--dangerously-skip-permissions",
-            "--permission-mode",
-            "bypassPermissions",
-            "--no-session-persistence",
-            "--disable-slash-commands",
-            "--strict-mcp-config",
-            "--mcp-config",
-            '{"mcpServers":{}}',
-            "--setting-sources",
-            "",
-            "--no-chrome",
-            "--tools",
-            "default",
-            "--allowedTools",
-            ",".join(allowed_rules),
-            "--json-schema",
-            schema_json,
-            "--model",
-            model,
-        ]
-        if effort:
-            command.extend(["--effort", effort])
-        return command
-
     command = [
         settings.claude_binary,
         "-p",
@@ -1863,6 +1823,12 @@ class PlanAgentRunner:
         from backend.services.task_ssh_access import task_ssh_protected_paths
 
         async with self.db_factory() as boundary_db:
+            # The Worker drain fence is the outermost runtime-admission lock.
+            # Holding it through the exact graph validation commit makes this
+            # the final durable boundary before either Claude or Codex can be
+            # invoked; a destroy claim that wins first rejects the provider
+            # effect and the caller reconciles the prepared runtime receipt.
+            await fence_worker_node_mutation(boundary_db)
             if probe.project_id is not None:
                 await lock_project_share_authority(boundary_db, probe.project_id)
             parent_task = await lock_and_validate_graph(boundary_db, probe)
@@ -2490,52 +2456,27 @@ class PlanAgentRunner:
 
             from backend.services.task_agent_isolation import (
                 CLAUDE_READ_ONLY_BUILTIN_TOOLS,
-                CLAUDE_SUBPROCESS_ENV_SCRUB,
                 generate_claude_read_only_isolation_settings,
                 validate_claude_task_isolation_settings,
             )
 
-            unrestricted_plan = (
-                getattr(
-                    self.instance_manager,
-                    "agent_sandbox_unrestricted_enabled",
-                    False,
-                )
-                is True
+            isolation_identifier = step_id or task_id
+            isolation_path = generate_claude_read_only_isolation_settings(
+                "plan",
+                isolation_identifier,
+                protected_paths,
             )
-            isolation_path = None
-            if unrestricted_plan:
-                # The deployment-owned switch intentionally gives both the
-                # Planner and structured Reviewer the complete provider tool
-                # inventory. The subprocess scrub would force the effective
-                # permission mode back to default, so omit it for this path.
-                env.pop(CLAUDE_SUBPROCESS_ENV_SCRUB, None)
-                logger.critical(
-                    "AGENT_SANDBOX_UNRESTRICTED_ENABLED admitted Claude Plan "
-                    "pipeline turn task_id=%s step_id=%s; host filesystem, "
-                    "network, and the complete provider tool inventory are "
-                    "enabled",
-                    task_id,
-                    step_id,
+            try:
+                await asyncio.to_thread(
+                    validate_claude_task_isolation_settings,
+                    isolation_path,
+                    claude_binary=settings.claude_binary,
+                    tools=CLAUDE_READ_ONLY_BUILTIN_TOOLS,
+                    include_mcp_tools=False,
                 )
-            else:
-                isolation_identifier = step_id or task_id
-                isolation_path = generate_claude_read_only_isolation_settings(
-                    "plan",
-                    isolation_identifier,
-                    protected_paths,
-                )
-                try:
-                    await asyncio.to_thread(
-                        validate_claude_task_isolation_settings,
-                        isolation_path,
-                        claude_binary=settings.claude_binary,
-                        tools=CLAUDE_READ_ONLY_BUILTIN_TOOLS,
-                        include_mcp_tools=False,
-                    )
-                except BaseException:
-                    await asyncio.to_thread(runtime_temp_dir.cleanup_if_unbound)
-                    raise
+            except BaseException:
+                await asyncio.to_thread(runtime_temp_dir.cleanup_if_unbound)
+                raise
             command = _build_command(
                 provider=provider,
                 model=model,
@@ -2544,7 +2485,6 @@ class PlanAgentRunner:
                 isolation_settings_path=(
                     str(isolation_path) if isolation_path is not None else None
                 ),
-                unrestricted=unrestricted_plan,
             )
             process = None
             token = None
@@ -2932,6 +2872,7 @@ class PlanAgentRunner:
             else None
         )
         async with self.db_factory() as db:
+            await fence_worker_node_mutation(db)
             run = PlanAgentRun(
                 plan_task_id=task.id,
                 status="planning",
@@ -2971,6 +2912,7 @@ class PlanAgentRunner:
         generation: int = 0,
     ) -> int:
         async with self.db_factory() as db:
+            await fence_worker_node_mutation(db)
             step = PlanAgentStep(
                 run_id=run_id,
                 plan_id=plan_id,

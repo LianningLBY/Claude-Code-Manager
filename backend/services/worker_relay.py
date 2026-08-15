@@ -32,10 +32,12 @@ from sqlalchemy import exists, func, or_, select, update
 from backend.config import settings
 from backend.models.log_entry import LogEntry
 from backend.models.monitor_session import MonitorCheck, MonitorSession
+from backend.models.sub_agent import SubAgentSession
 from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.services.chat_event_identity import persisted_chat_event
+from backend.services.cancellation import await_task_completion
 from backend.services.legacy_plan_execution import (
     LegacyPlanExecutionCarrierProof,
     legacy_approved_execution_carrier_proof,
@@ -48,8 +50,28 @@ from backend.services.pr_review_runtime import (
     is_pr_review_task,
 )
 from backend.services.task_queue import PR_REVIEW_SUPERSEDED_METADATA_KEY
+from backend.services.task_creation import (
+    delegated_task_execution_principal_values,
+    task_execution_principal_values,
+)
 from backend.services.test_harness_owner_fence import (
     no_active_test_harness_owner_graph_predicate,
+)
+from backend.services.worker_plan_decision import (
+    worker_plan_decision_gate_receipt,
+    worker_plan_decision_is_prepared,
+)
+from backend.services.worker_launch_admission import (
+    WORKER_CONTEXT_PREFLIGHT_PROOF_KEY,
+    WORKER_CONTEXT_RETRY_MARKER_METADATA_KEY,
+    WORKER_CONTEXT_RETRY_MARKER_VERSION,
+    WORKER_EXACT_LAUNCH_MARKER_METADATA_KEY,
+    WORKER_EXACT_LAUNCH_MARKER_VERSION,
+    WORKER_LAUNCH_ADMISSION_EVENT,
+    WorkerLaunchAdmissionRequest,
+    build_worker_launch_admission_response,
+    parse_codex_context_preflight_relay_proof,
+    parse_worker_launch_admission_request,
 )
 
 _TASK_STATUSES = frozenset(
@@ -70,6 +92,8 @@ _TERMINAL_TASK_STATUSES = frozenset(
     {"completed", "failed", "cancelled", "conflict"}
 )
 _WORKER_BACKGROUND_MIRROR_SENTINEL = "worker-relay:background-active:v1"
+_WORKER_CHILD_MIRROR_META_KEY = "ccm_worker_mirror"
+_SUB_AGENT_TERMINAL_STATUSES = frozenset({"completed", "failed", "stopped"})
 _FP_PREFIX = 20_000  # Match the history endpoint's exact observable prefix.
 WORKER_HANDOFF_RECOVERY_BASE_DELAY = 1.0
 WORKER_HANDOFF_RECOVERY_MAX_DELAY = 60.0
@@ -106,6 +130,13 @@ _ACTUAL_TRANSPORTS = frozenset(
 WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY = (
     "worker_termination_uncertainty_v1"
 )
+WORKER_MANUAL_RETRY_PROTOCOL = 1
+WORKER_MANUAL_RETRY_RECEIPT_METADATA_KEY = (
+    "ccm_worker_manual_retry_receipt_v1"
+)
+WORKER_REMOTE_MATERIALIZED_METADATA_KEY = (
+    "ccm_worker_remote_materialized_v1"
+)
 LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY = (
     "legacy_plan_carrier_conflict_v1"
 )
@@ -124,6 +155,156 @@ def _handoff_payload_digest(payload: dict) -> str:
     ).hexdigest()
 
 
+_WORKER_TURN_HANDOFF_RECEIPT_FIELDS = frozenset({
+    "worker_turn_handoff_id",
+    "worker_turn_handoff_retry_count",
+    "worker_turn_handoff_from_generation",
+})
+_MANAGER_HANDOFF_REQUEST_ENVELOPE_VERSION = 2
+
+
+def worker_turn_handoff_request_identity(
+    replay_payload: dict,
+    admitted_routing: object,
+) -> dict:
+    """Build the provider-neutral identity shared by both handoff receipts.
+
+    The random receipt id and its separately fenced retry/generation baseline
+    are deliberately excluded from the request digest.  The admitted provider
+    route is included because the HTTP ``expected_routing`` object is only the
+    caller's expectation, not the Worker's authoritative admission result.
+    """
+
+    if not isinstance(replay_payload, dict):
+        raise TypeError("Worker handoff replay payload must be an object")
+    if (
+        not isinstance(admitted_routing, (list, tuple))
+        or len(admitted_routing) != 3
+        or not isinstance(admitted_routing[0], str)
+        or (
+            admitted_routing[1] is not None
+            and not isinstance(admitted_routing[1], str)
+        )
+        or not isinstance(admitted_routing[2], str)
+    ):
+        raise ValueError("Worker handoff admitted routing is invalid")
+    identity = {
+        key: value
+        for key, value in replay_payload.items()
+        if key not in _WORKER_TURN_HANDOFF_RECEIPT_FIELDS
+    }
+    identity["admitted_routing"] = list(admitted_routing)
+    return identity
+
+
+def task_execution_principal_payload(task_or_payload) -> dict[str, object]:
+    """Return the canonical four-field execution authority snapshot."""
+
+    if isinstance(task_or_payload, dict):
+        get = task_or_payload.get
+    else:
+        get = lambda name: getattr(task_or_payload, name, None)
+    return {
+        "execution_user_id": get("execution_user_id"),
+        "execution_user_role": get("execution_user_role"),
+        "execution_mode": get("execution_mode"),
+        "execution_principal_kind": get("execution_principal_kind"),
+    }
+
+
+def canonical_delegated_principal_payload(task_or_payload) -> dict[str, object] | None:
+    """Canonicalize a Manager/native or Worker/delegated principal for wire use."""
+
+    principal = task_execution_principal_payload(task_or_payload)
+    try:
+        canonical = task_execution_principal_values(
+            user_id=principal["execution_user_id"],
+            role=principal["execution_user_role"],
+            principal_kind=principal["execution_principal_kind"],
+        )
+        if canonical != principal:
+            return None
+        return delegated_task_execution_principal_values(
+            user_id=canonical["execution_user_id"],
+            role=canonical["execution_user_role"],
+            principal_kind=canonical["execution_principal_kind"],
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def canonical_manager_principal_from_delegated(
+    task_or_payload,
+) -> dict[str, object] | None:
+    """Map a proven Worker wire principal back to Manager-native authority."""
+
+    delegated = canonical_delegated_principal_payload(task_or_payload)
+    if delegated is None:
+        return None
+    kind = delegated["execution_principal_kind"]
+    if kind == "delegated_user":
+        native_kind = "user"
+    elif kind == "delegated_deployment_token":
+        native_kind = "deployment_token"
+    elif kind == "system":
+        native_kind = "system"
+    else:
+        return None
+    try:
+        return task_execution_principal_values(
+            user_id=delegated["execution_user_id"],
+            role=delegated["execution_user_role"],
+            principal_kind=native_kind,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def worker_principal_digest(task_or_payload) -> str | None:
+    principal = canonical_delegated_principal_payload(task_or_payload)
+    if principal is None:
+        return None
+    return _handoff_payload_digest(principal)
+
+
+def worker_manual_retry_request_identity(payload: dict) -> dict:
+    """Return the immutable portion covered by a manual-retry request digest."""
+
+    if not isinstance(payload, dict):
+        raise TypeError("Worker manual retry payload must be an object")
+    identity = dict(payload)
+    identity.pop("request_digest", None)
+    return identity
+
+
+def worker_manual_retry_request_digest(payload: dict) -> str:
+    return _handoff_payload_digest(worker_manual_retry_request_identity(payload))
+
+
+def worker_manual_retry_receipt(metadata: object) -> dict | None:
+    if not isinstance(metadata, dict):
+        return None
+    receipt = metadata.get(WORKER_MANUAL_RETRY_RECEIPT_METADATA_KEY)
+    return receipt if isinstance(receipt, dict) else None
+
+
+def worker_manual_retry_is_prepared(metadata: object) -> bool:
+    receipt = worker_manual_retry_receipt(metadata)
+    return bool(
+        receipt is not None
+        and receipt.get("version") == WORKER_MANUAL_RETRY_PROTOCOL
+        and receipt.get("side") == "manager"
+        and receipt.get("state") == "prepared"
+    )
+
+
+def worker_remote_task_is_materialized(metadata: object) -> bool:
+    return bool(
+        isinstance(metadata, dict)
+        and metadata.get(WORKER_REMOTE_MATERIALIZED_METADATA_KEY) is True
+    )
+
+
 @dataclass(frozen=True)
 class WorkerTaskGeneration:
     """Exact Manager-side mirror generation owned by one Worker.
@@ -135,6 +316,11 @@ class WorkerTaskGeneration:
 
     task_id: int
     worker_id: int
+    incarnation_id: str | None
+    execution_user_id: int | None
+    execution_user_role: str
+    execution_mode: str
+    execution_principal_kind: str
     status: str
     retry_count: int
     turn_generation: int
@@ -174,6 +360,8 @@ def has_worker_execution_quarantine(metadata: object) -> bool:
 
     return bool(
         has_worker_termination_uncertainty(metadata)
+        or worker_manual_retry_is_prepared(metadata)
+        or worker_plan_decision_is_prepared(metadata)
         or (
             isinstance(metadata, dict)
             and LEGACY_PLAN_CARRIER_CONFLICT_METADATA_KEY in metadata
@@ -188,6 +376,13 @@ def _generation_marker_payload(generation: WorkerTaskGeneration) -> dict:
     return {
         "task_id": generation.task_id,
         "worker_id": generation.worker_id,
+        "incarnation_id": generation.incarnation_id,
+        "execution_principal": {
+            "execution_user_id": generation.execution_user_id,
+            "execution_user_role": generation.execution_user_role,
+            "execution_mode": generation.execution_mode,
+            "execution_principal_kind": generation.execution_principal_kind,
+        },
         "status": generation.status,
         "retry_count": generation.retry_count,
         "turn_generation": generation.turn_generation,
@@ -266,6 +461,11 @@ def worker_task_generation(
     return WorkerTaskGeneration(
         task_id=task.id,
         worker_id=worker_id,
+        incarnation_id=task.incarnation_id,
+        execution_user_id=task.execution_user_id,
+        execution_user_role=task.execution_user_role,
+        execution_mode=task.execution_mode,
+        execution_principal_kind=task.execution_principal_kind,
         status=task.status,
         retry_count=task.retry_count,
         turn_generation=task.turn_generation,
@@ -311,6 +511,11 @@ def worker_task_generation_predicates(
         Task.id == generation.task_id,
         Task.worker_id == generation.worker_id,
         Task.shared_from_id.is_(None),
+        _nullable_eq(Task.incarnation_id, generation.incarnation_id),
+        _nullable_eq(Task.execution_user_id, generation.execution_user_id),
+        Task.execution_user_role == generation.execution_user_role,
+        Task.execution_mode == generation.execution_mode,
+        Task.execution_principal_kind == generation.execution_principal_kind,
         Task.status == generation.status,
         Task.retry_count == generation.retry_count,
         Task.turn_generation == generation.turn_generation,
@@ -417,6 +622,12 @@ def _same_worker_turn_handoff_generation(
         and _has_worker_turn_handoff(observed)
         and current.task_id == observed.task_id
         and current.worker_id == observed.worker_id
+        and current.incarnation_id == observed.incarnation_id
+        and current.execution_user_id == observed.execution_user_id
+        and current.execution_user_role == observed.execution_user_role
+        and current.execution_mode == observed.execution_mode
+        and current.execution_principal_kind
+        == observed.execution_principal_kind
         and current.status == observed.status
         and current.retry_count == observed.retry_count
         and current.turn_generation == observed.turn_generation
@@ -487,6 +698,11 @@ async def read_worker_task_generation(
             select(
                 Task.id,
                 Task.worker_id,
+                Task.incarnation_id,
+                Task.execution_user_id,
+                Task.execution_user_role,
+                Task.execution_mode,
+                Task.execution_principal_kind,
                 Task.status,
                 Task.retry_count,
                 Task.turn_generation,
@@ -513,6 +729,11 @@ async def read_worker_task_generation(
     return WorkerTaskGeneration(
         task_id=row.id,
         worker_id=row.worker_id,
+        incarnation_id=row.incarnation_id,
+        execution_user_id=row.execution_user_id,
+        execution_user_role=row.execution_user_role,
+        execution_mode=row.execution_mode,
+        execution_principal_kind=row.execution_principal_kind,
         status=row.status,
         retry_count=row.retry_count,
         turn_generation=row.turn_generation,
@@ -551,6 +772,51 @@ async def read_worker_task_generation(
             else None
         ),
     )
+
+
+async def mark_worker_task_materialized(
+    db,
+    observed: WorkerTaskGeneration,
+) -> bool:
+    """Persist that initial create crossed the remote Task-row boundary."""
+
+    fenced = await db.execute(
+        update(Task)
+        .where(*_worker_task_generation_write_predicates(observed))
+        .values(status=Task.status)
+    )
+    if fenced.rowcount != 1:
+        await db.rollback()
+        current = await db.get(Task, observed.task_id, populate_existing=True)
+        return bool(
+            current is not None
+            and current.worker_id == observed.worker_id
+            and current.incarnation_id == observed.incarnation_id
+            and worker_remote_task_is_materialized(current.metadata_)
+        )
+    current = (
+        await db.execute(
+            select(Task)
+            .where(*_worker_task_generation_write_predicates(observed))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if current is None:
+        await db.rollback()
+        return False
+    metadata = dict(current.metadata_ or {})
+    metadata[WORKER_REMOTE_MATERIALIZED_METADATA_KEY] = True
+    changed = await db.execute(
+        update(Task)
+        .where(*_worker_task_generation_write_predicates(observed))
+        .values(metadata_=metadata)
+    )
+    if changed.rowcount != 1:
+        await db.rollback()
+        return False
+    await db.commit()
+    return True
 
 
 async def quarantine_uncertain_worker_termination(
@@ -732,6 +998,7 @@ async def reserve_worker_turn_handoff(
     source_log_id: int,
     request_payload: dict,
     request_digest: str,
+    replay_payload: dict | None = None,
     terminal_pr_review_chat: bool = False,
 ) -> WorkerTaskGeneration | None:
     """Reserve exactly one Worker G -> G+1 follow-up before network I/O."""
@@ -751,12 +1018,51 @@ async def reserve_worker_turn_handoff(
         or not isinstance(request_payload, dict)
         or not isinstance(request_digest, str)
         or len(request_digest) != 64
+        or (replay_payload is not None and not isinstance(replay_payload, dict))
         or type(terminal_pr_review_chat) is not bool
     ):
         return None
     try:
         if _handoff_payload_digest(request_payload) != request_digest:
             return None
+        stored_request_payload = request_payload
+        if replay_payload is not None:
+            admitted_routing = request_payload.get("admitted_routing")
+            if (
+                worker_turn_handoff_request_identity(
+                    replay_payload,
+                    admitted_routing,
+                )
+                != request_payload
+            ):
+                return None
+            if (
+                replay_payload.get("worker_turn_handoff_id") != handoff_id
+                or replay_payload.get("worker_turn_handoff_retry_count")
+                != observed.retry_count
+                or replay_payload.get("worker_turn_handoff_from_generation")
+                != observed.turn_generation
+                or replay_payload.get("worker_turn_handoff_incarnation_id")
+                != observed.incarnation_id
+            ):
+                return None
+            replay_principal = canonical_delegated_principal_payload(
+                replay_payload
+            )
+            identity_principal = canonical_delegated_principal_payload(
+                request_payload
+            )
+            if (
+                replay_principal is None
+                or identity_principal is None
+                or replay_principal != identity_principal
+            ):
+                return None
+            stored_request_payload = {
+                "version": _MANAGER_HANDOFF_REQUEST_ENVELOPE_VERSION,
+                "identity": request_payload,
+                "replay_payload": replay_payload,
+            }
     except (TypeError, ValueError, UnicodeError):
         return None
     changed = await db.execute(
@@ -787,7 +1093,7 @@ async def reserve_worker_turn_handoff(
             retry_count=observed.retry_count,
             from_generation=observed.turn_generation,
             status="prepared",
-            request_payload=request_payload,
+            request_payload=stored_request_payload,
             request_digest=request_digest,
             terminal_pr_review_chat=terminal_pr_review_chat,
         )
@@ -946,6 +1252,7 @@ def authoritative_worker_task_values(
     remote_task: dict,
     *,
     task_id: int,
+    incarnation_id: str | None,
 ) -> dict | None:
     """Validate a Worker task snapshot and return mirror-safe fields.
 
@@ -959,12 +1266,44 @@ def authoritative_worker_task_values(
         not isinstance(remote_task, dict)
         or type(remote_task.get("id")) is not int
         or remote_task["id"] != task_id
+        or not incarnation_id
+        or remote_task.get("incarnation_id") != incarnation_id
         or remote_task.get("status") not in _TASK_STATUSES
         or type(remote_task.get("retry_count")) is not int
         or remote_task["retry_count"] < 0
         or type(remote_task.get("turn_generation")) is not int
         or remote_task["turn_generation"] < 0
     ):
+        return None
+
+    from backend.services.task_creation import (
+        TASK_EXECUTION_WORKER_PRINCIPAL_KINDS,
+        task_execution_principal_values,
+    )
+
+    principal_fields = {
+        field: remote_task.get(field)
+        for field in (
+            "execution_user_id",
+            "execution_user_role",
+            "execution_mode",
+            "execution_principal_kind",
+        )
+    }
+    if (
+        principal_fields["execution_principal_kind"]
+        not in TASK_EXECUTION_WORKER_PRINCIPAL_KINDS
+    ):
+        return None
+    try:
+        canonical_principal = task_execution_principal_values(
+            user_id=principal_fields["execution_user_id"],
+            role=principal_fields["execution_user_role"],
+            principal_kind=principal_fields["execution_principal_kind"],
+        )
+    except ValueError:
+        return None
+    if canonical_principal != principal_fields:
         return None
 
     status = remote_task["status"]
@@ -1047,6 +1386,7 @@ async def apply_authoritative_worker_task(
     metadata_updates: dict | None = None,
     worker_turn_handoff_id: str | None = None,
     worker_termination_operation_id: str | None = None,
+    worker_plan_decision_operation_id: str | None = None,
     commit: bool = True,
 ) -> WorkerTaskGeneration | None:
     """CAS an authoritative Worker snapshot onto its exact observed mirror."""
@@ -1072,8 +1412,64 @@ async def apply_authoritative_worker_task(
     values = authoritative_worker_task_values(
         remote_task,
         task_id=observed.task_id,
+        incarnation_id=observed.incarnation_id,
     )
     if values is None or not _valid_worker_turn_handoff(observed):
+        return None
+    principal_values = task_execution_principal_payload(remote_task)
+    # Worker rows must always expose an internally delegated (or system)
+    # principal.  Accepting a native ``user``/``deployment_token`` kind here
+    # would let an old/misconfigured Worker blur the control-plane boundary.
+    if canonical_delegated_principal_payload(remote_task) != principal_values:
+        return None
+    manager_task = await db.get(Task, observed.task_id)
+    if manager_task is not None and worker_manual_retry_is_prepared(
+        manager_task.metadata_
+    ):
+        # Only apply_authoritative_worker_retry may cross N -> N+1 while the
+        # exact Manager outbox owns the mutation.  A same-principal snapshot is
+        # not a substitute for the Worker's durable operation receipt.
+        return None
+    prepared_plan_decision = (
+        worker_plan_decision_gate_receipt(manager_task.metadata_)
+        if manager_task is not None
+        else None
+    )
+    if worker_plan_decision_is_prepared(
+        manager_task.metadata_ if manager_task is not None else None
+    ) and not (
+        isinstance(prepared_plan_decision, dict)
+        and worker_plan_decision_operation_id is not None
+        and prepared_plan_decision.get("side") == "manager"
+        and prepared_plan_decision.get("state") == "prepared"
+        and prepared_plan_decision.get("operation_id")
+        == worker_plan_decision_operation_id
+    ):
+        # Relay snapshots cannot prove which non-repeatable terminal decision
+        # committed.  Only the exact decision receipt readback may advance the
+        # Manager mirror while its outbox is prepared.
+        return None
+    manager_principal = (
+        task_execution_principal_payload(manager_task)
+        if manager_task is not None
+        else None
+    )
+    manager_wire_principal = (
+        canonical_delegated_principal_payload(manager_task)
+        if manager_task is not None
+        else None
+    )
+    # The Manager mirror is the control-plane authority and must retain its
+    # native ``user``/``deployment_token``/``system`` kind.  A delegated kind
+    # is valid only on the Worker wire/row; accepting one in the Manager DB
+    # would make a later local retry or migration indistinguishable from a
+    # trusted local principal.
+    if (
+        manager_principal is None
+        or manager_wire_principal is None
+        or canonical_manager_principal_from_delegated(manager_task)
+        != manager_principal
+    ):
         return None
     remote_retry_count = values["retry_count"]
     remote_turn_generation = values["turn_generation"]
@@ -1108,6 +1504,36 @@ async def apply_authoritative_worker_task(
         if adopting_handoff:
             if worker_turn_handoff_id != observed.worker_turn_handoff_id:
                 return None
+            receipt = await db.get(
+                WorkerTurnHandoffReceipt,
+                observed.worker_turn_handoff_id,
+            )
+            if (
+                receipt is None
+                or receipt.side != "manager"
+                or receipt.task_id != observed.task_id
+                or receipt.worker_id != observed.worker_id
+                or receipt.retry_count != observed.retry_count
+                or receipt.from_generation != observed.turn_generation
+                or not isinstance(receipt.request_payload, dict)
+                or _handoff_payload_digest(receipt.request_payload)
+                != receipt.request_digest
+            ):
+                return None
+            handoff_principal = canonical_delegated_principal_payload(
+                receipt.request_payload
+            )
+            if handoff_principal is None:
+                return None
+            handoff_manager_principal = (
+                canonical_manager_principal_from_delegated(
+                    receipt.request_payload
+                )
+            )
+            if handoff_manager_principal is None:
+                return None
+            manager_wire_principal = handoff_principal
+            manager_principal = handoff_manager_principal
         elif not same_turn or remote_retry_count < observed.retry_count:
             return None
         elif _has_worker_turn_handoff(observed):
@@ -1122,6 +1548,12 @@ async def apply_authoritative_worker_task(
                 and not termination_settles_same_turn_handoff
             ):
                 return None
+    if principal_values != manager_wire_principal:
+        return None
+    # Authority changes only when the exact remote generation has been proven.
+    # The Worker delegated envelope is comparison evidence only; persist its
+    # canonical native counterpart on the Manager mirror.
+    values.update(manager_principal)
     if (
         remote_retry_count != observed.retry_count
         or remote_turn_generation != observed.turn_generation
@@ -1133,6 +1565,7 @@ async def apply_authoritative_worker_task(
         # validate a durable row for the newly accepted generation.
         values["turn_source_log_id"] = None
     merged_metadata_updates = dict(metadata_updates or {})
+    merged_metadata_updates[WORKER_REMOTE_MATERIALIZED_METADATA_KEY] = True
     remote_metadata = remote_task.get("metadata_") or {}
     if (
         isinstance(remote_metadata, dict)
@@ -1202,6 +1635,221 @@ async def apply_authoritative_worker_task(
             *adoption_predicates,
         )
         .values(**values)
+    )
+    if changed.rowcount != 1:
+        await db.rollback()
+        return None
+    resulting = await read_worker_task_generation(
+        db,
+        observed.task_id,
+        observed.worker_id,
+    )
+    if resulting is None:
+        await db.rollback()
+        return None
+    if commit:
+        await db.commit()
+    else:
+        await db.flush()
+    return resulting
+
+
+def worker_manual_retry_source_generation(
+    task: Task,
+    observed: WorkerTaskGeneration,
+) -> dict | None:
+    """Freeze the exact source row authorized to advance retry N -> N+1."""
+
+    if worker_task_generation(task, expected_worker_id=observed.worker_id) != observed:
+        return None
+    manager_principal = task_execution_principal_payload(task)
+    principal_digest = worker_principal_digest(task)
+    if (
+        not task.incarnation_id
+        or principal_digest is None
+        or canonical_manager_principal_from_delegated(task)
+        != manager_principal
+    ):
+        return None
+    return {
+        "task_id": task.id,
+        "worker_id": observed.worker_id,
+        "incarnation_id": task.incarnation_id,
+        "status": task.status,
+        "retry_count": task.retry_count,
+        "turn_generation": task.turn_generation,
+        "principal_digest": principal_digest,
+    }
+
+
+def _manual_retry_receipt_matches(
+    receipt: object,
+    *,
+    operation_id: str,
+    request_digest: str,
+    source_generation: dict,
+    target_principal: dict,
+) -> bool:
+    if not isinstance(receipt, dict):
+        return False
+    result = receipt.get("result_generation")
+    return bool(
+        receipt.get("version") == WORKER_MANUAL_RETRY_PROTOCOL
+        and receipt.get("side") == "worker"
+        and receipt.get("state") == "committed"
+        and receipt.get("operation_id") == operation_id
+        and receipt.get("request_digest") == request_digest
+        and receipt.get("source_generation") == source_generation
+        and receipt.get("target_principal") == target_principal
+        and receipt.get("source_principal_digest")
+        == source_generation.get("principal_digest")
+        and receipt.get("target_principal_digest")
+        == _handoff_payload_digest(target_principal)
+        and isinstance(result, dict)
+        and result.get("status") == "pending"
+        and result.get("retry_count") == source_generation.get("retry_count") + 1
+        and result.get("turn_generation")
+        == source_generation.get("turn_generation")
+    )
+
+
+async def apply_authoritative_worker_retry(
+    db,
+    observed: WorkerTaskGeneration,
+    remote_response: dict,
+    *,
+    operation_id: str,
+    request_digest: str,
+    commit: bool = True,
+) -> WorkerTaskGeneration | None:
+    """Adopt only the exact durable Worker retry receipt prepared by Manager.
+
+    Ordinary relay snapshots intentionally require principal equality.  Manual
+    retry is the one legal principal transition, so it has a dedicated CAS that
+    proves Manager outbox + Worker receipt + source incarnation/generation and
+    target delegated authority before changing the mirror.
+    """
+
+    if not isinstance(remote_response, dict):
+        return None
+    remote_task = remote_response.get("task")
+    remote_receipt = remote_response.get("receipt")
+    if not isinstance(remote_task, dict):
+        return None
+
+    # Acquire the portable Task writer fence before reading/merging JSON.  On
+    # SQLite this no-op UPDATE establishes the write transaction; on row-locking
+    # databases the following SELECT FOR UPDATE owns the exact row.
+    fenced = await db.execute(
+        update(Task)
+        .where(
+            *_worker_task_generation_write_predicates(observed),
+            no_active_test_harness_owner_graph_predicate(),
+        )
+        .values(status=Task.status)
+    )
+    if fenced.rowcount != 1:
+        await db.rollback()
+        return None
+    current = (
+        await db.execute(
+            select(Task)
+            .where(*_worker_task_generation_write_predicates(observed))
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if current is None:
+        await db.rollback()
+        return None
+    marker = worker_manual_retry_receipt(current.metadata_)
+    source_generation = worker_manual_retry_source_generation(current, observed)
+    if (
+        marker is None
+        or source_generation is None
+        or marker.get("version") != WORKER_MANUAL_RETRY_PROTOCOL
+        or marker.get("side") != "manager"
+        or marker.get("state") != "prepared"
+        or marker.get("operation_id") != operation_id
+        or marker.get("request_digest") != request_digest
+        or marker.get("source_generation") != source_generation
+    ):
+        await db.rollback()
+        return None
+    target_principal = marker.get("target_principal")
+    target_manager_principal = marker.get("target_manager_principal")
+    if (
+        not isinstance(target_principal, dict)
+        or canonical_delegated_principal_payload(target_principal)
+        != target_principal
+        or not isinstance(target_manager_principal, dict)
+        or canonical_manager_principal_from_delegated(target_principal)
+        != target_manager_principal
+        or not _manual_retry_receipt_matches(
+            remote_receipt,
+            operation_id=operation_id,
+            request_digest=request_digest,
+            source_generation=source_generation,
+            target_principal=target_principal,
+        )
+    ):
+        await db.rollback()
+        return None
+    result_generation = remote_receipt["result_generation"]
+    if (
+        remote_task.get("id") != observed.task_id
+        or remote_task.get("incarnation_id")
+        != source_generation["incarnation_id"]
+        or type(remote_task.get("retry_count")) is not int
+        or remote_task.get("retry_count") < result_generation["retry_count"]
+        or type(remote_task.get("turn_generation")) is not int
+        or remote_task.get("turn_generation")
+        < result_generation["turn_generation"]
+        or task_execution_principal_payload(remote_task) != target_principal
+    ):
+        await db.rollback()
+        return None
+
+    metadata = dict(current.metadata_ or {})
+    metadata[WORKER_MANUAL_RETRY_RECEIPT_METADATA_KEY] = {
+        **marker,
+        "state": "acknowledged",
+        "worker_receipt": remote_receipt,
+    }
+    metadata[WORKER_REMOTE_MATERIALIZED_METADATA_KEY] = True
+    # The Worker may already have dequeued pending N+1 into turn G+1 before a
+    # lost HTTP response is reconciled.  The durable receipt still proves the
+    # exact retry commit; first adopt its inert pending result, then let the
+    # normal relay apply the separately proven dequeue/turn transition.
+    remote_values = {
+        "status": "pending",
+        "retry_count": result_generation["retry_count"],
+        "turn_generation": result_generation["turn_generation"],
+        "instance_id": None,
+        "error_message": None,
+        "started_at": None,
+        "completed_at": None,
+        "pty_background_generation": None,
+        **target_manager_principal,
+    }
+    remote_values["metadata_"] = metadata
+    remote_values["turn_source_log_id"] = None
+    changed = await db.execute(
+        update(Task)
+        .where(
+            *_worker_task_generation_write_predicates(observed),
+            Task.incarnation_id == source_generation["incarnation_id"],
+            Task.execution_user_role == current.execution_user_role,
+            Task.execution_mode == current.execution_mode,
+            Task.execution_principal_kind == current.execution_principal_kind,
+            (
+                Task.execution_user_id.is_(None)
+                if current.execution_user_id is None
+                else Task.execution_user_id == current.execution_user_id
+            ),
+            no_active_test_harness_owner_graph_predicate(),
+        )
+        .values(**remote_values)
     )
     if changed.rowcount != 1:
         await db.rollback()
@@ -1321,9 +1969,14 @@ async def apply_authoritative_legacy_plan_execution_carrier(
     values = authoritative_worker_task_values(
         remote_task,
         task_id=observed.task_id,
+        incarnation_id=observed.incarnation_id,
     )
     if (
         values is None
+        or canonical_manager_principal_from_delegated(observed)
+        != task_execution_principal_payload(observed)
+        or canonical_delegated_principal_payload(observed)
+        != task_execution_principal_payload(remote_task)
         or values["status"] != remote_proof.task_status
         or values["retry_count"] != remote_proof.retry_count
         or values["turn_generation"] != remote_proof.turn_generation
@@ -1491,6 +2144,129 @@ CHAT_EVENT_TYPES = {
     "system_init", "system_event", "thinking", "process_exit",
 }
 
+
+def _validated_sub_agent_relay_payload(
+    data: dict,
+    *,
+    terminal: bool,
+) -> dict[str, object] | None:
+    """Validate one Worker-owned CCM Sub-Agent mirror snapshot."""
+
+    remote_id = data.get("sub_agent_session_id")
+    description = data.get("description")
+    monitor_context = data.get("monitor_context")
+    status = data.get("status")
+    checks_done = data.get("checks_done")
+    last_summary = data.get("last_summary")
+    if (
+        type(remote_id) is not int
+        or remote_id <= 0
+        or data.get("agent_type") != "sub_agent"
+        or data.get("source") != "ccm"
+        or not isinstance(description, str)
+        or len(description) > 500
+        or (monitor_context is not None and not isinstance(monitor_context, str))
+        or type(checks_done) is not int
+        or checks_done < 0
+        or (last_summary is not None and not isinstance(last_summary, str))
+    ):
+        return None
+    if terminal:
+        if status not in _SUB_AGENT_TERMINAL_STATUSES:
+            return None
+    elif status != "running":
+        return None
+    return {
+        "remote_id": remote_id,
+        "description": description,
+        "monitor_context": monitor_context,
+        "status": status,
+        "checks_done": checks_done,
+        "last_summary": last_summary,
+    }
+
+
+def _worker_child_mirror_meta(
+    *,
+    worker_id: int,
+    task_incarnation_id: str,
+    remote_id: int,
+) -> str:
+    return json.dumps(
+        {
+            _WORKER_CHILD_MIRROR_META_KEY: {
+                "worker_id": worker_id,
+                "task_incarnation_id": task_incarnation_id,
+                "remote_id": remote_id,
+            }
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def worker_child_mirror_identity(
+    meta: object,
+) -> tuple[int, str, int] | None:
+    if not isinstance(meta, str):
+        return None
+    try:
+        payload = json.loads(meta)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {_WORKER_CHILD_MIRROR_META_KEY}
+    ):
+        return None
+    identity = payload.get(_WORKER_CHILD_MIRROR_META_KEY)
+    if not isinstance(identity, dict) or set(identity) != {
+        "worker_id",
+        "task_incarnation_id",
+        "remote_id",
+    }:
+        return None
+    worker_id = identity.get("worker_id")
+    incarnation_id = identity.get("task_incarnation_id")
+    remote_id = identity.get("remote_id")
+    if (
+        type(worker_id) is not int
+        or worker_id <= 0
+        or not isinstance(incarnation_id, str)
+        or len(incarnation_id) != 32
+        or any(char not in "0123456789abcdef" for char in incarnation_id)
+        or type(remote_id) is not int
+        or remote_id <= 0
+    ):
+        return None
+    return worker_id, incarnation_id, remote_id
+
+
+def _exact_worker_child_mirror(
+    mirrors: list[SubAgentSession],
+    expected_identity: tuple[int, str, int],
+) -> tuple[SubAgentSession | None, bool]:
+    """Select one exact mirror without aliasing historical Worker rows.
+
+    A Task can move from Worker A to Worker B while both Workers independently
+    allocate the same numeric child id.  Valid mirrors for other Worker/task
+    incarnations are history and may coexist.  A row with missing or malformed
+    identity is ambiguous, however, so the whole mutation must fail closed.
+    """
+
+    exact: list[SubAgentSession] = []
+    for mirror in mirrors:
+        identity = worker_child_mirror_identity(mirror.meta)
+        if identity is None:
+            return None, False
+        if identity == expected_identity:
+            exact.append(mirror)
+    if len(exact) > 1:
+        return None, False
+    return (exact[0] if exact else None), True
+
 # Unlike status/background/plan notifications, these events apply payload
 # fields directly to the Manager mirror.  They therefore cannot use the
 # Manager's current generation at receive time as their identity: every
@@ -1506,6 +2282,8 @@ EXACT_GENERATION_RELAY_EVENT_TYPES = frozenset({
     "monitor_session_created",
     "monitor_check",
     "monitor_session_status",
+    "sub_agent_session_created",
+    "sub_agent_session_status",
 })
 
 _INVALID_NATIVE_TURN_ID = object()
@@ -2046,6 +2824,7 @@ class WorkerRelay:
                             remote_task = await self._fetch_task_snapshot(
                                 worker,
                                 task_id,
+                                observed.incarnation_id,
                                 client=client,
                             )
                             history_response = await client.get(
@@ -2053,7 +2832,12 @@ class WorkerRelay:
                                     worker,
                                     f"/api/tasks/{task_id}/chat/history?compact=false",
                                 ),
-                                headers=self._headers(worker),
+                                headers={
+                                    **self._headers(worker),
+                                    "X-CCM-Task-Incarnation": (
+                                        observed.incarnation_id
+                                    ),
+                                },
                             )
                             remote_history = (
                                 history_response.json()
@@ -2131,6 +2915,7 @@ class WorkerRelay:
                                 closing_task = await self._fetch_task_snapshot(
                                     worker,
                                     task_id,
+                                    observed.incarnation_id,
                                     client=client,
                                 )
                                 closing_history_response = await client.get(
@@ -2138,7 +2923,12 @@ class WorkerRelay:
                                         worker,
                                         f"/api/tasks/{task_id}/chat/history?compact=false",
                                     ),
-                                    headers=self._headers(worker),
+                                    headers={
+                                        **self._headers(worker),
+                                        "X-CCM-Task-Incarnation": (
+                                            observed.incarnation_id
+                                        ),
+                                    },
                                 )
                                 closing_history = (
                                     closing_history_response.json()
@@ -2267,15 +3057,9 @@ class WorkerRelay:
         """断开并停止重连（worker 关机/销毁前必须调，否则重连风暴）。"""
 
         operation = asyncio.create_task(self._stop_worker_impl(worker_id))
-        cancellation: asyncio.CancelledError | None = None
-        while not operation.done():
-            try:
-                await asyncio.shield(operation)
-            except asyncio.CancelledError as exc:
-                # A cancelled API/lifespan caller must not abandon a half-closed
-                # socket with reconnect or handoff producers still running.
-                if cancellation is None:
-                    cancellation = exc
+        # A cancelled API/lifespan caller must not abandon a half-closed
+        # socket with reconnect or handoff producers still running.
+        cancellation = await await_task_completion(operation)
         operation.result()
         if cancellation is not None:
             raise cancellation
@@ -2350,13 +3134,7 @@ class WorkerRelay:
             self._shutting_down = True
             self._shutdown_task = asyncio.create_task(self._shutdown_impl())
         operation = self._shutdown_task
-        cancellation: asyncio.CancelledError | None = None
-        while not operation.done():
-            try:
-                await asyncio.shield(operation)
-            except asyncio.CancelledError as exc:
-                if cancellation is None:
-                    cancellation = exc
+        cancellation = await await_task_completion(operation)
         operation.result()
         if cancellation is not None:
             raise cancellation
@@ -2552,18 +3330,27 @@ class WorkerRelay:
         self,
         worker: Worker,
         task_id: int,
+        incarnation_id: str,
         *,
         client=None,
     ) -> dict | None:
+        headers = self._headers(worker)
+        headers["X-CCM-Task-Incarnation"] = incarnation_id
+
         async def fetch(http_client):
             response = await http_client.get(
                 self._api(worker, f"/api/tasks/{task_id}"),
-                headers=self._headers(worker),
+                headers=headers,
             )
             if response.status_code != 200:
                 return None
             payload = response.json()
-            return payload if isinstance(payload, dict) else None
+            return (
+                payload
+                if isinstance(payload, dict)
+                and payload.get("incarnation_id") == incarnation_id
+                else None
+            )
 
         try:
             if client is not None:
@@ -2583,23 +3370,32 @@ class WorkerRelay:
         worker: Worker,
         task_id: int,
         handoff_id: str,
+        incarnation_id: str,
         *,
         client=None,
     ) -> dict | None:
+        headers = self._headers(worker)
+        headers["X-CCM-Task-Incarnation"] = incarnation_id
+
         async def fetch(http_client):
             response = await http_client.get(
                 self._api(
                     worker,
                     f"/api/tasks/{task_id}/worker-turn-handoffs/{handoff_id}",
                 ),
-                headers=self._headers(worker),
+                headers=headers,
             )
             if response.status_code == 404:
                 return None
             if response.status_code != 200:
                 return None
             payload = response.json()
-            return payload if isinstance(payload, dict) else None
+            return (
+                payload
+                if isinstance(payload, dict)
+                and payload.get("incarnation_id") == incarnation_id
+                else None
+            )
 
         try:
             if client is not None:
@@ -2652,11 +3448,38 @@ class WorkerRelay:
                 or not isinstance(receipt.request_payload, dict)
             ):
                 return None
+            stored_payload = receipt.request_payload
+            if stored_payload.get("version") == (
+                _MANAGER_HANDOFF_REQUEST_ENVELOPE_VERSION
+            ):
+                if set(stored_payload) != {
+                    "version",
+                    "identity",
+                    "replay_payload",
+                }:
+                    return None
+                identity = stored_payload.get("identity")
+                payload = stored_payload.get("replay_payload")
+                if not isinstance(identity, dict) or not isinstance(payload, dict):
+                    return None
+                try:
+                    rebuilt_identity = worker_turn_handoff_request_identity(
+                        payload,
+                        identity.get("admitted_routing"),
+                    )
+                except (TypeError, ValueError):
+                    return None
+                if rebuilt_identity != identity:
+                    return None
+            else:
+                # Compatibility for one in-flight receipt written by a
+                # pre-v2 Manager.  Its digest covered the complete HTTP body.
+                identity = stored_payload
+                payload = stored_payload
             try:
-                actual_digest = _handoff_payload_digest(receipt.request_payload)
+                actual_digest = _handoff_payload_digest(identity)
             except (TypeError, ValueError, UnicodeError):
                 return None
-            payload = receipt.request_payload
             if (
                 actual_digest != receipt.request_digest
                 or payload.get("worker_turn_handoff_id")
@@ -2665,12 +3488,64 @@ class WorkerRelay:
                 != observed.worker_turn_handoff_retry_count
                 or payload.get("worker_turn_handoff_from_generation")
                 != observed.worker_turn_handoff_from_generation
+                or payload.get("worker_turn_handoff_incarnation_id")
+                != observed.incarnation_id
+            ):
+                return None
+            principal = canonical_delegated_principal_payload(payload)
+            if (
+                principal is None
+                or task_execution_principal_payload(payload) != principal
+                or canonical_delegated_principal_payload(identity) != principal
+                or task_execution_principal_payload(identity) != principal
             ):
                 return None
             return {
                 "payload": dict(payload),
+                "request_digest": receipt.request_digest,
+                "principal_digest": _handoff_payload_digest(principal),
                 "terminal_pr_review_chat": receipt.terminal_pr_review_chat,
             }
+
+    async def _require_worker_delegated_principal_protocol(
+        self,
+        worker: Worker,
+        *,
+        client=None,
+    ) -> bool:
+        """Read-only mixed-version gate used before every recovery mutation."""
+
+        from backend.services.worker_proxy import (
+            WORKER_DELEGATED_PRINCIPAL_PROTOCOL,
+        )
+
+        async def check(http_client) -> bool:
+            response = await http_client.get(
+                self._api(worker, "/api/system/config"),
+                headers=self._headers(worker),
+            )
+            if response.status_code != 200:
+                return False
+            try:
+                payload = response.json()
+            except Exception:
+                return False
+            return bool(
+                isinstance(payload, dict)
+                and payload.get("worker_delegated_principal_protocol")
+                == WORKER_DELEGATED_PRINCIPAL_PROTOCOL
+                and payload.get("worker_task_incarnation_proxy_version") == 1
+            )
+
+        try:
+            if client is not None:
+                return await check(client)
+            async with httpx.AsyncClient(timeout=30) as http_client:
+                return await check(http_client)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return False
 
     async def _post_worker_turn_handoff_request(
         self,
@@ -2688,7 +3563,17 @@ class WorkerRelay:
                 )
                 if fenced is None:
                     return False
+                if not await self._require_worker_delegated_principal_protocol(
+                    worker,
+                    client=client,
+                ):
+                    await db.rollback()
+                    return False
                 headers = self._headers(worker)
+                if not observed.incarnation_id:
+                    await db.rollback()
+                    return False
+                headers["X-CCM-Task-Incarnation"] = observed.incarnation_id
                 if replay["terminal_pr_review_chat"]:
                     headers[PR_REVIEW_TERMINAL_CHAT_HEADER] = (
                         PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE
@@ -2728,6 +3613,7 @@ class WorkerRelay:
     def _remote_handoff_matches(
         observed: WorkerTaskGeneration,
         receipt: dict,
+        replay: dict,
     ) -> bool:
         status = receipt.get("status")
         remote_task_id = receipt.get("task_id")
@@ -2749,6 +3635,7 @@ class WorkerRelay:
             receipt.get("handoff_id") == observed.worker_turn_handoff_id
             and type(remote_task_id) is int
             and remote_task_id == observed.task_id
+            and receipt.get("incarnation_id") == observed.incarnation_id
             and type(remote_retry_count) is int
             and remote_retry_count == observed.worker_turn_handoff_retry_count
             and type(remote_from_generation) is int
@@ -2756,6 +3643,8 @@ class WorkerRelay:
             == observed.worker_turn_handoff_from_generation
             and valid_turn
             and isinstance(receipt.get("response"), dict)
+            and receipt.get("request_digest") == replay.get("request_digest")
+            and receipt.get("principal_digest") == replay.get("principal_digest")
         )
 
     async def _acknowledge_recovered_worker_turn_handoff(
@@ -2827,6 +3716,9 @@ class WorkerRelay:
         self,
         worker: Worker,
         observed: WorkerTaskGeneration,
+        replay: dict,
+        *,
+        client=None,
     ) -> bool:
         if (
             observed.termination_uncertainty_present
@@ -2841,19 +3733,35 @@ class WorkerRelay:
                 )
                 if fenced is None:
                     return False
-                async with httpx.AsyncClient(timeout=30) as client:
-                    response = await client.post(
+                if not await self._require_worker_delegated_principal_protocol(
+                    worker,
+                    client=client,
+                ):
+                    await db.rollback()
+                    return False
+                if not observed.incarnation_id:
+                    await db.rollback()
+                    return False
+                headers = self._headers(worker)
+                headers["X-CCM-Task-Incarnation"] = observed.incarnation_id
+                async def send(http_client):
+                    return await http_client.post(
                         self._api(
                             worker,
                             f"/api/tasks/{observed.task_id}/worker-turn-handoffs/"
                             f"{observed.worker_turn_handoff_id}/resume",
                         ),
-                        headers=self._headers(worker),
+                        headers=headers,
                     )
+                if client is not None:
+                    response = await send(client)
+                else:
+                    async with httpx.AsyncClient(timeout=30) as http_client:
+                        response = await send(http_client)
                 payload = response.json() if response.status_code == 200 else None
                 resumed = bool(
                     isinstance(payload, dict)
-                    and self._remote_handoff_matches(observed, payload)
+                    and self._remote_handoff_matches(observed, payload, replay)
                     # Only accepted/claimed callers invoke this endpoint.  The
                     # response may already be post-boundary because the queue
                     # can advance while the resume request is in flight.
@@ -2932,6 +3840,7 @@ class WorkerRelay:
                 worker,
                 observed.task_id,
                 observed.worker_turn_handoff_id,
+                observed.incarnation_id,
                 client=client,
             )
             if receipt is None:
@@ -2948,11 +3857,13 @@ class WorkerRelay:
                     worker,
                     observed.task_id,
                     observed.worker_turn_handoff_id,
+                    observed.incarnation_id,
                     client=client,
                 )
             if not isinstance(receipt, dict) or not self._remote_handoff_matches(
                 observed,
                 receipt,
+                replay,
             ):
                 return False
             if receipt.get("status") == "cancelled":
@@ -2979,6 +3890,8 @@ class WorkerRelay:
             if await self._resume_worker_turn_handoff(
                 worker,
                 observed,
+                replay,
+                client=client,
             ):
                 return True
             if attempt + 1 < attempts:
@@ -3143,6 +4056,8 @@ class WorkerRelay:
         *,
         retry_count: int,
         turn_generation: int,
+        request_digest: str,
+        principal_digest: str,
     ) -> bool:
         return bool(
             _valid_worker_turn_handoff(observed)
@@ -3151,6 +4066,7 @@ class WorkerRelay:
             and receipt.get("handoff_id")
             == observed.worker_turn_handoff_id
             and receipt.get("task_id") == observed.task_id
+            and receipt.get("incarnation_id") == observed.incarnation_id
             # ``launching`` already crossed the durable provider-side-effect
             # boundary.  It therefore proves the same exact G+1 identity as
             # ``launched`` for relay adoption, even though only the latter says
@@ -3162,6 +4078,8 @@ class WorkerRelay:
             and receipt.get("from_generation")
             == observed.worker_turn_handoff_from_generation
             and receipt.get("turn_generation") == turn_generation
+            and receipt.get("request_digest") == request_digest
+            and receipt.get("principal_digest") == principal_digest
             and retry_count
             == observed.worker_turn_handoff_retry_count
             and turn_generation
@@ -3194,13 +4112,19 @@ class WorkerRelay:
             worker,
             observed.task_id,
             observed.worker_turn_handoff_id,
+            observed.incarnation_id,
             client=client,
         )
+        replay = await self._manager_worker_turn_handoff_request(observed)
+        if replay is None:
+            return None
         if self._launched_handoff_proves_generation(
             observed,
             receipt,
             retry_count=retry_count,
             turn_generation=turn_generation,
+            request_digest=replay["request_digest"],
+            principal_digest=replay["principal_digest"],
         ):
             return observed.worker_turn_handoff_id
         return None
@@ -3216,6 +4140,7 @@ class WorkerRelay:
         values = authoritative_worker_task_values(
             remote_task,
             task_id=observed.task_id,
+            incarnation_id=observed.incarnation_id,
         )
         if values is None:
             return None
@@ -3462,6 +4387,814 @@ class WorkerRelay:
             await self._notify_completed_pr_review(generation)
         return True
 
+    @staticmethod
+    def _handoff_launch_principal(
+        receipt: WorkerTurnHandoffReceipt,
+    ) -> dict[str, object] | None:
+        """Recover the exact delegated principal from a Manager handoff."""
+
+        stored = receipt.request_payload
+        if not isinstance(stored, dict):
+            return None
+        if stored.get("version") == _MANAGER_HANDOFF_REQUEST_ENVELOPE_VERSION:
+            identity = stored.get("identity")
+            replay = stored.get("replay_payload")
+            if not isinstance(identity, dict) or not isinstance(replay, dict):
+                return None
+            try:
+                if (
+                    _handoff_payload_digest(identity) != receipt.request_digest
+                    or worker_turn_handoff_request_identity(
+                        replay,
+                        identity.get("admitted_routing"),
+                    )
+                    != identity
+                ):
+                    return None
+            except (TypeError, ValueError, UnicodeError):
+                return None
+            replay_principal = canonical_delegated_principal_payload(replay)
+            identity_principal = canonical_delegated_principal_payload(identity)
+            return (
+                replay_principal
+                if replay_principal is not None
+                and replay_principal == identity_principal
+                else None
+            )
+        try:
+            if _handoff_payload_digest(stored) != receipt.request_digest:
+                return None
+        except (TypeError, ValueError, UnicodeError):
+            return None
+        return canonical_delegated_principal_payload(stored)
+
+    @staticmethod
+    def _manual_retry_launch_authorized(
+        task: Task,
+        observed: WorkerTaskGeneration,
+        request: WorkerLaunchAdmissionRequest,
+        target_manager_principal: dict[str, object],
+    ) -> bool:
+        """Authorize a Worker dequeue which raced Manager retry adoption."""
+
+        marker = worker_manual_retry_receipt(task.metadata_)
+        if (
+            marker is None
+            or marker.get("version") != WORKER_MANUAL_RETRY_PROTOCOL
+            or marker.get("side") != "manager"
+            or marker.get("worker_id") != observed.worker_id
+            or marker.get("target_principal") != request.principal
+            or marker.get("target_manager_principal")
+            != target_manager_principal
+            or marker.get("target_principal_digest")
+            != request.principal_digest
+            or not isinstance(marker.get("request"), dict)
+            or marker.get("request_digest")
+            != worker_manual_retry_request_digest(marker["request"])
+        ):
+            return False
+        source = marker.get("source_generation")
+        if not isinstance(source, dict):
+            return False
+        if marker.get("state") == "prepared":
+            current_source = worker_manual_retry_source_generation(task, observed)
+            return bool(
+                current_source is not None
+                and source == current_source
+                and request.retry_count == source.get("retry_count") + 1
+                and request.turn_generation
+                == source.get("turn_generation") + 1
+            )
+        if marker.get("state") != "acknowledged":
+            return False
+        worker_receipt = marker.get("worker_receipt")
+        operation_id = marker.get("operation_id")
+        request_digest = marker.get("request_digest")
+        if not (
+            isinstance(operation_id, str)
+            and isinstance(request_digest, str)
+            and _manual_retry_receipt_matches(
+                worker_receipt,
+                operation_id=operation_id,
+                request_digest=request_digest,
+                source_generation=source,
+                target_principal=request.principal,
+            )
+        ):
+            return False
+        result = worker_receipt.get("result_generation")
+        return bool(
+            isinstance(result, dict)
+            and task.status == "pending"
+            and task_execution_principal_payload(task)
+            == target_manager_principal
+            and task.retry_count == result.get("retry_count")
+            and task.turn_generation == result.get("turn_generation")
+            and request.retry_count == task.retry_count
+            and request.turn_generation == task.turn_generation + 1
+        )
+
+    @staticmethod
+    def _context_retry_marker_for_request(
+        request: WorkerLaunchAdmissionRequest,
+        *,
+        worker_id: int,
+        rejected_actual_transport: str,
+    ) -> dict[str, object] | None:
+        authority = request.context_retry
+        if authority is None:
+            return None
+        return {
+            "version": WORKER_CONTEXT_RETRY_MARKER_VERSION,
+            "worker_id": worker_id,
+            "incarnation_id": request.incarnation_id,
+            "retry_count": request.retry_count,
+            "from_generation": authority.from_generation,
+            "turn_generation": request.turn_generation,
+            "authority_id": authority.authority_id,
+            "rejected_source_log_id": authority.source_log_id,
+            "claimed_source_log_id": authority.claimed_source_log_id,
+            "rejected_actual_transport": rejected_actual_transport,
+            "actual_transport": request.actual_transport,
+            "principal_digest": request.principal_digest,
+        }
+
+    @staticmethod
+    def _exact_launch_marker_for_request(
+        request: WorkerLaunchAdmissionRequest,
+        *,
+        worker_id: int,
+    ) -> dict[str, object]:
+        """Stable authority for one Manager-admitted Worker generation."""
+
+        return {
+            "version": WORKER_EXACT_LAUNCH_MARKER_VERSION,
+            "worker_id": worker_id,
+            "incarnation_id": request.incarnation_id,
+            "retry_count": request.retry_count,
+            "turn_generation": request.turn_generation,
+            "principal_digest": request.principal_digest,
+            "actual_transport": request.actual_transport,
+        }
+
+    @staticmethod
+    def _exact_launch_marker_matches_request(
+        marker: object,
+        request: WorkerLaunchAdmissionRequest,
+        *,
+        worker_id: int,
+    ) -> bool:
+        expected = WorkerRelay._exact_launch_marker_for_request(
+            request,
+            worker_id=worker_id,
+        )
+        return bool(
+            isinstance(marker, dict)
+            and set(marker) == set(expected)
+            and marker == expected
+        )
+
+    @staticmethod
+    def _exact_launch_marker_is_immediate_predecessor(
+        marker: object,
+        request: WorkerLaunchAdmissionRequest,
+        *,
+        worker_id: int,
+    ) -> bool:
+        """Accept only the immediately preceding admitted generation."""
+
+        expected_keys = set(
+            WorkerRelay._exact_launch_marker_for_request(
+                request,
+                worker_id=worker_id,
+            )
+        )
+        if not isinstance(marker, dict) or set(marker) != expected_keys:
+            return False
+        marker_retry = marker.get("retry_count")
+        marker_generation = marker.get("turn_generation")
+        return bool(
+            marker.get("version") == WORKER_EXACT_LAUNCH_MARKER_VERSION
+            and marker.get("worker_id") == worker_id
+            and marker.get("incarnation_id") == request.incarnation_id
+            and type(marker_retry) is int
+            and type(marker_generation) is int
+            and marker_retry >= 0
+            and marker_generation >= 1
+            and marker_generation + 1 == request.turn_generation
+            and request.retry_count in {marker_retry, marker_retry + 1}
+            and isinstance(marker.get("principal_digest"), str)
+            and len(marker["principal_digest"]) == 64
+            and all(
+                char in "0123456789abcdef"
+                for char in marker["principal_digest"]
+            )
+            and marker.get("actual_transport")
+            in {
+                "claude_pty",
+                "claude_exec",
+                "codex_app_server",
+                "codex_exec",
+            }
+        )
+
+    @staticmethod
+    def _context_retry_marker_matches_request(
+        marker: object,
+        request: WorkerLaunchAdmissionRequest,
+        *,
+        worker_id: int,
+    ) -> bool:
+        authority = request.context_retry
+        if authority is None or not isinstance(marker, dict):
+            return False
+        expected = WorkerRelay._context_retry_marker_for_request(
+            request,
+            worker_id=worker_id,
+            rejected_actual_transport=marker.get(
+                "rejected_actual_transport"
+            ),
+        )
+        return bool(
+            isinstance(expected, dict)
+            and set(marker) == set(expected)
+            and marker == expected
+            and marker.get("rejected_actual_transport")
+            in {"codex_app_server", "codex_exec"}
+        )
+
+    async def _manager_context_retry_preflight_proof(
+        self,
+        db,
+        *,
+        task: Task,
+        observed: WorkerTaskGeneration,
+        request: WorkerLaunchAdmissionRequest,
+        worker: Worker,
+    ) -> str | None:
+        """Re-prove exact structured overflow from Manager-persisted events."""
+
+        authority = request.context_retry
+        if authority is None:
+            return None
+        rows = list(
+            (
+                await db.execute(
+                    select(LogEntry)
+                    .where(
+                        LogEntry.task_id == task.id,
+                        LogEntry.task_retry_count == authority.retry_count,
+                        LogEntry.task_turn_generation
+                        == authority.from_generation,
+                        LogEntry.turn_scope == "foreground",
+                    )
+                    .order_by(LogEntry.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        if not rows:
+            return None
+        proofs = [
+            parse_codex_context_preflight_relay_proof(row.raw_json)
+            for row in rows
+        ]
+        if any(proof is None for proof in proofs):
+            return None
+        typed_proofs = [proof for proof in proofs if proof is not None]
+        common_matches = all(
+            proof["retry_count"] == authority.retry_count
+            and proof["turn_generation"] == authority.from_generation
+            and proof["source_log_id"] == authority.source_log_id
+            for proof in typed_proofs
+        )
+        transports = {
+            proof["actual_transport"] for proof in typed_proofs
+        }
+        if not common_matches or len(transports) != 1:
+            return None
+        proof_transport = next(iter(transports))
+
+        terminal = rows[-1]
+        terminal_proof = typed_proofs[-1]
+        content = terminal.content
+        if not (
+            terminal.event_type == "system_event"
+            and terminal.role is None
+            and terminal.is_error is True
+            and terminal_proof["raw_type"] == "turn.failed"
+            and terminal_proof.get("codex_error_info")
+            == "ContextWindowExceeded"
+            and isinstance(content, str)
+            and terminal_proof.get("message_sha256")
+            == hashlib.sha256(content.encode("utf-8")).hexdigest()
+        ):
+            return None
+        seen_start_types: set[str] = set()
+        for row, proof in zip(
+            rows[:-1], typed_proofs[:-1], strict=True
+        ):
+            raw_type = proof["raw_type"]
+            if not (
+                row.event_type == "system_event"
+                and row.is_error is False
+                and raw_type in {"thread.started", "turn.started"}
+                and raw_type not in seen_start_types
+            ):
+                return None
+            seen_start_types.add(raw_type)
+
+        metadata = task.metadata_ if isinstance(task.metadata_, dict) else {}
+        marker = metadata.get(WORKER_CONTEXT_RETRY_MARKER_METADATA_KEY)
+        current_request_marker = (
+            self._context_retry_marker_matches_request(
+                marker,
+                request,
+                worker_id=worker.id,
+            )
+            and marker.get("rejected_actual_transport")
+            == proof_transport
+        )
+        predecessor_marker = bool(
+            isinstance(marker, dict)
+            and marker.get("version")
+            == WORKER_CONTEXT_RETRY_MARKER_VERSION
+            and marker.get("worker_id") == worker.id
+            and marker.get("incarnation_id") == request.incarnation_id
+            and marker.get("retry_count") == authority.retry_count
+            and marker.get("turn_generation")
+            == authority.from_generation
+            and marker.get("claimed_source_log_id")
+            == authority.source_log_id
+            and marker.get("actual_transport") == proof_transport
+            and marker.get("principal_digest")
+            == request.principal_digest
+        )
+        exact_launch_marker = metadata.get(
+            WORKER_EXACT_LAUNCH_MARKER_METADATA_KEY
+        )
+        exact_launch_lineage = bool(
+            isinstance(exact_launch_marker, dict)
+            and exact_launch_marker
+            == {
+                "version": WORKER_EXACT_LAUNCH_MARKER_VERSION,
+                "worker_id": worker.id,
+                "incarnation_id": request.incarnation_id,
+                "retry_count": authority.retry_count,
+                "turn_generation": authority.from_generation,
+                "principal_digest": request.principal_digest,
+                "actual_transport": proof_transport,
+            }
+        )
+        handoff_lineage = False
+        if authority.from_generation >= 1:
+            receipts = list(
+                (
+                    await db.execute(
+                        select(WorkerTurnHandoffReceipt)
+                        .where(
+                            WorkerTurnHandoffReceipt.task_id == task.id,
+                            WorkerTurnHandoffReceipt.side == "manager",
+                            WorkerTurnHandoffReceipt.worker_id == worker.id,
+                            WorkerTurnHandoffReceipt.retry_count
+                            == authority.retry_count,
+                            WorkerTurnHandoffReceipt.from_generation
+                            == authority.from_generation - 1,
+                            WorkerTurnHandoffReceipt.status == "completed",
+                        )
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(receipts) == 1:
+                source = await db.get(
+                    LogEntry, receipts[0].source_log_id
+                )
+                handoff_lineage = bool(
+                    source is not None
+                    and source.task_id == task.id
+                    and source.event_type == "user_message"
+                    and self._handoff_launch_principal(receipts[0])
+                    == request.principal
+                )
+        if not (
+            current_request_marker
+            or predecessor_marker
+            or exact_launch_lineage
+            or handoff_lineage
+        ):
+            return None
+        return str(proof_transport)
+
+    async def _authorize_worker_launch_admission(
+        self,
+        request: WorkerLaunchAdmissionRequest,
+        worker: Worker,
+    ) -> tuple[bool, str]:
+        """Revalidate one delegated principal in the authoritative Manager DB."""
+
+        if settings.ccm_node_role != "manager":
+            return False, "not_manager"
+        target_manager_principal = canonical_manager_principal_from_delegated(
+            request.principal
+        )
+        if target_manager_principal is None:
+            return False, "invalid_principal"
+
+        from backend.models.user import User
+
+        async with self.db_factory() as db:
+            if not isinstance(worker.auth_token, str) or not worker.auth_token:
+                await db.rollback()
+                return False, "worker_not_ready"
+
+            # The no-op write is the portable Task writer fence.  The request
+            # is already inside the Manager's per-Task operation lock, while
+            # this predicate also orders cross-process termination admission.
+            # Keep the database lock order aligned with Manager chat
+            # admission: Project/Task first, then User.  Taking User first here
+            # would invert that order and can deadlock on PostgreSQL/MySQL when
+            # a follow-up and the Worker's final launch admission race.
+            fenced = await db.execute(
+                update(Task)
+                .where(
+                    Task.id == request.task_id,
+                    Task.worker_id == worker.id,
+                    Task.shared_from_id.is_(None),
+                    Task.incarnation_id == request.incarnation_id,
+                    _worker_task_termination_apply_predicate(),
+                )
+                .values(status=Task.status)
+            )
+            if fenced.rowcount != 1:
+                await db.rollback()
+                return False, "generation_changed"
+            task = (
+                await db.execute(
+                    select(Task)
+                    .where(
+                        Task.id == request.task_id,
+                        Task.worker_id == worker.id,
+                        Task.shared_from_id.is_(None),
+                        Task.incarnation_id == request.incarnation_id,
+                        _worker_task_termination_apply_predicate(),
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if task is None:
+                await db.rollback()
+                return False, "generation_changed"
+
+            # Global cross-process lifecycle order is Task -> Worker.  Lock the
+            # authoritative Worker row only after the Task writer fence and
+            # recheck both readiness and the exact relay credential here.  On
+            # PostgreSQL/MySQL SELECT FOR UPDATE serializes with stop/destroy;
+            # on SQLite the preceding no-op Task UPDATE already owns the
+            # database write transaction.  Avoiding a no-op Worker UPDATE is
+            # intentional: its ORM onupdate would advance ``updated_at`` and
+            # invalidate an otherwise exact destroy lifecycle claim.
+            current_worker = (
+                await db.execute(
+                    select(Worker)
+                    .where(
+                        Worker.id == worker.id,
+                        Worker.status == "ready",
+                        Worker.bootstrap_step.is_(None),
+                        Worker.auth_token == worker.auth_token,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+            ).scalar_one_or_none()
+            if current_worker is None:
+                await db.rollback()
+                return False, "worker_not_ready"
+
+            observed = worker_task_generation(
+                task,
+                expected_worker_id=worker.id,
+            )
+            if observed is None or not _valid_worker_turn_handoff(observed):
+                await db.rollback()
+                return False, "generation_changed"
+
+            # The transport is selected by the Worker's local runtime, but
+            # the authoritative Manager still owns the Task's provider.  A
+            # mixed-version or corrupted Worker must not borrow a valid Task
+            # generation to obtain a permit for a different provider.  Fast
+            # Codex has no exec fallback because that route cannot prove the
+            # requested priority tier before model input.
+            provider = str(task.provider or "claude").strip().lower()
+            allowed_transports = {
+                "claude": {"claude_pty", "claude_exec"},
+                "codex": {"codex_app_server", "codex_exec"},
+            }.get(provider)
+            if (
+                allowed_transports is None
+                or request.actual_transport not in allowed_transports
+                or (
+                    provider == "codex"
+                    and str(task.codex_service_tier or "default")
+                    .strip()
+                    .lower()
+                    == "priority"
+                    and request.actual_transport != "codex_app_server"
+                )
+            ):
+                await db.rollback()
+                return False, "transport_changed"
+
+            if request.principal["execution_principal_kind"] == "delegated_user":
+                principal_gate = await db.execute(
+                    update(User)
+                    .where(
+                        User.id == request.principal["execution_user_id"],
+                        User.is_active.is_(True),
+                        User.role
+                        == request.principal["execution_user_role"],
+                    )
+                    .values(role=User.role)
+                )
+                if principal_gate.rowcount != 1:
+                    await db.rollback()
+                    return False, "principal_revoked"
+
+            if request.context_retry is not None:
+                retry_authority = request.context_retry
+                rejected_transport = (
+                    await self._manager_context_retry_preflight_proof(
+                        db,
+                        task=task,
+                        observed=observed,
+                        request=request,
+                        worker=current_worker,
+                    )
+                )
+                if rejected_transport is None:
+                    await db.rollback()
+                    return False, "context_preflight_unproven"
+                next_marker = self._context_retry_marker_for_request(
+                    request,
+                    worker_id=current_worker.id,
+                    rejected_actual_transport=rejected_transport,
+                )
+                if next_marker is None:
+                    await db.rollback()
+                    return False, "context_preflight_unproven"
+                principal_current = (
+                    task_execution_principal_payload(task)
+                    == target_manager_principal
+                )
+                already_advanced = bool(
+                    principal_current
+                    and task.status in {"in_progress", "executing"}
+                    and task.retry_count == request.retry_count
+                    and task.turn_generation == request.turn_generation
+                )
+                existing_context_marker = (
+                    task.metadata_.get(
+                        WORKER_CONTEXT_RETRY_MARKER_METADATA_KEY
+                    )
+                    if isinstance(task.metadata_, dict)
+                    else None
+                )
+                existing_exact_launch_marker = (
+                    task.metadata_.get(
+                        WORKER_EXACT_LAUNCH_MARKER_METADATA_KEY
+                    )
+                    if isinstance(task.metadata_, dict)
+                    else None
+                )
+                if already_advanced and not (
+                    self._context_retry_marker_matches_request(
+                        existing_context_marker,
+                        request,
+                        worker_id=current_worker.id,
+                    )
+                    and existing_context_marker.get(
+                        "rejected_actual_transport"
+                    )
+                    == rejected_transport
+                    and self._exact_launch_marker_matches_request(
+                        existing_exact_launch_marker,
+                        request,
+                        worker_id=current_worker.id,
+                    )
+                ):
+                    await db.rollback()
+                    return False, "generation_changed"
+                if not already_advanced:
+                    if not (
+                        principal_current
+                        and task.status == "failed"
+                        and task.retry_count == retry_authority.retry_count
+                        and task.retry_count == request.retry_count
+                        and task.turn_generation
+                        == retry_authority.from_generation
+                        and request.turn_generation
+                        == retry_authority.from_generation + 1
+                    ):
+                        await db.rollback()
+                        return False, "generation_changed"
+                    # This is a fresh authority, independent from the already
+                    # consumed ordinary-chat handoff.  Advance only the exact
+                    # failed G and leave that old receipt untouched.
+                    next_metadata = dict(task.metadata_ or {})
+                    next_metadata[
+                        WORKER_CONTEXT_RETRY_MARKER_METADATA_KEY
+                    ] = next_marker
+                    next_metadata[
+                        WORKER_EXACT_LAUNCH_MARKER_METADATA_KEY
+                    ] = self._exact_launch_marker_for_request(
+                        request,
+                        worker_id=current_worker.id,
+                    )
+                    advanced = await db.execute(
+                        update(Task)
+                        .where(
+                            Task.id == task.id,
+                            Task.worker_id == worker.id,
+                            Task.shared_from_id.is_(None),
+                            Task.incarnation_id == request.incarnation_id,
+                            Task.status == "failed",
+                            Task.retry_count == retry_authority.retry_count,
+                            Task.turn_generation
+                            == retry_authority.from_generation,
+                            Task.execution_user_id
+                            == target_manager_principal[
+                                "execution_user_id"
+                            ],
+                            Task.execution_user_role
+                            == target_manager_principal[
+                                "execution_user_role"
+                            ],
+                            Task.execution_mode
+                            == target_manager_principal["execution_mode"],
+                            Task.execution_principal_kind
+                            == target_manager_principal[
+                                "execution_principal_kind"
+                            ],
+                            _worker_task_termination_apply_predicate(),
+                        )
+                        .values(
+                            status="executing",
+                            turn_generation=request.turn_generation,
+                            completed_at=None,
+                            error_message=None,
+                            session_id=None,
+                            turn_source_log_id=None,
+                            metadata_=next_metadata,
+                        )
+                    )
+                    if advanced.rowcount != 1:
+                        await db.rollback()
+                        return False, "generation_changed"
+                await db.commit()
+                return True, "admitted"
+
+            exact_current = bool(
+                task.status in {"in_progress", "executing"}
+                and task.retry_count == request.retry_count
+                and task.turn_generation == request.turn_generation
+                and task_execution_principal_payload(task)
+                == target_manager_principal
+            )
+            handoff_current = False
+            if _handoff_authorizes_next_turn(
+                observed,
+                retry_count=request.retry_count,
+                turn_generation=request.turn_generation,
+            ):
+                receipt = (
+                    await db.execute(
+                        select(WorkerTurnHandoffReceipt)
+                        .where(
+                            WorkerTurnHandoffReceipt.handoff_id
+                            == observed.worker_turn_handoff_id,
+                            WorkerTurnHandoffReceipt.task_id == task.id,
+                            WorkerTurnHandoffReceipt.source_log_id
+                            == observed.worker_turn_handoff_source_log_id,
+                            WorkerTurnHandoffReceipt.side == "manager",
+                            WorkerTurnHandoffReceipt.worker_id == worker.id,
+                            WorkerTurnHandoffReceipt.retry_count
+                            == observed.worker_turn_handoff_retry_count,
+                            WorkerTurnHandoffReceipt.from_generation
+                            == observed.worker_turn_handoff_from_generation,
+                            WorkerTurnHandoffReceipt.status.in_(
+                                ("prepared", "acknowledged")
+                            ),
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+                handoff_current = bool(
+                    receipt is not None
+                    and self._handoff_launch_principal(receipt)
+                    == request.principal
+                )
+
+            manual_retry_current = self._manual_retry_launch_authorized(
+                task,
+                observed,
+                request,
+                target_manager_principal,
+            )
+            if not (
+                exact_current
+                or handoff_current
+                or manual_retry_current
+            ):
+                await db.rollback()
+                return False, "generation_changed"
+
+            # Commit the precise launch identity before the Worker may cross
+            # the provider boundary.  Repeating an identical generation after
+            # a lost response is safe; changing its transport or principal is
+            # not.  The same marker later proves the predecessor generation
+            # for a structured Codex context-window retry.
+            metadata = task.metadata_ if isinstance(task.metadata_, dict) else {}
+            existing_exact_launch_marker = metadata.get(
+                WORKER_EXACT_LAUNCH_MARKER_METADATA_KEY
+            )
+            marker_matches = self._exact_launch_marker_matches_request(
+                existing_exact_launch_marker,
+                request,
+                worker_id=current_worker.id,
+            )
+            marker_advances = (
+                self._exact_launch_marker_is_immediate_predecessor(
+                    existing_exact_launch_marker,
+                    request,
+                    worker_id=current_worker.id,
+                )
+            )
+            if existing_exact_launch_marker is not None and not (
+                marker_matches or marker_advances
+            ):
+                await db.rollback()
+                return False, "generation_changed"
+            if not marker_matches:
+                next_metadata = dict(metadata)
+                next_metadata[
+                    WORKER_EXACT_LAUNCH_MARKER_METADATA_KEY
+                ] = self._exact_launch_marker_for_request(
+                    request,
+                    worker_id=current_worker.id,
+                )
+                marked = await db.execute(
+                    update(Task)
+                    .where(
+                        Task.id == task.id,
+                        Task.worker_id == worker.id,
+                        Task.shared_from_id.is_(None),
+                        Task.incarnation_id == request.incarnation_id,
+                        Task.status == task.status,
+                        Task.retry_count == task.retry_count,
+                        Task.turn_generation == task.turn_generation,
+                        _worker_task_termination_apply_predicate(),
+                    )
+                    .values(metadata_=next_metadata)
+                )
+                if marked.rowcount != 1:
+                    await db.rollback()
+                    return False, "generation_changed"
+            await db.commit()
+            return True, "admitted"
+
+    async def _send_worker_launch_admission_response(
+        self,
+        *,
+        ws,
+        worker: Worker,
+        request: WorkerLaunchAdmissionRequest,
+        admitted: bool,
+        reason_code: str,
+    ) -> None:
+        """Send only on the exact authenticated relay socket that requested."""
+
+        if not isinstance(worker.auth_token, str) or not worker.auth_token:
+            return
+        response = build_worker_launch_admission_response(
+            request,
+            worker_id=worker.id,
+            admitted=admitted,
+            reason_code=reason_code,
+            control_token=worker.auth_token,
+        )
+        async with self._connection_lock(worker.id):
+            if (
+                self._shutting_down
+                or worker.id in self._closing
+                or self._ws.get(worker.id) is not ws
+            ):
+                return
+            await ws.send(json.dumps(response))
+
     # ------------------------------------------------------------------
     # 事件中继主循环
     # ------------------------------------------------------------------
@@ -3470,7 +5203,7 @@ class WorkerRelay:
         try:
             async for raw in ws:
                 try:
-                    await self._handle(json.loads(raw), worker)
+                    await self._handle(json.loads(raw), worker, ws=ws)
                 except Exception:
                     logger.exception("relay handle error (worker %s)", worker.id)
         except (websockets.ConnectionClosed, OSError):
@@ -3611,7 +5344,7 @@ class WorkerRelay:
                 notify_completion=False,
             )
 
-    async def _handle(self, msg: dict, worker: Worker):
+    async def _handle(self, msg: dict, worker: Worker, *, ws=None):
         """Handle one relay event under the shared Task operation fence.
 
         Consuming the first reserved G+1 event may durably advance the mirror
@@ -3639,6 +5372,29 @@ class WorkerRelay:
         # mutation paths.
         from backend.services.worker_proxy import get_task_operation_lock
 
+        if data.get("event_type") == WORKER_LAUNCH_ADMISSION_EVENT:
+            request = parse_worker_launch_admission_request(data)
+            if request is None or request.task_id != task_id or ws is None:
+                return
+            # The operation/DB fences are released before touching the socket.
+            # A blocked send must never prevent termination, retry, or relay
+            # reconciliation from acquiring the Task's shared operation lock.
+            async with get_task_operation_lock(task_id):
+                admitted, reason_code = (
+                    await self._authorize_worker_launch_admission(
+                        request,
+                        worker,
+                    )
+                )
+            await self._send_worker_launch_admission_response(
+                ws=ws,
+                worker=worker,
+                request=request,
+                admitted=admitted,
+                reason_code=reason_code,
+            )
+            return
+
         async with get_task_operation_lock(task_id):
             completion = await self._handle_with_operation_lock(msg, worker)
         # PR completion itself takes the same operation lock in Dispatcher.
@@ -3658,6 +5414,11 @@ class WorkerRelay:
             return
         # monitor 事件用 "event" 键，chat 事件用 "event_type"，status_change 用 "event"
         event_type = data.get("event_type") or data.get("event")
+        ccm_sub_agent_relay_event = bool(
+            event_type
+            in {"sub_agent_session_created", "sub_agent_session_status"}
+            and data.get("event") == event_type
+        )
 
         # task_id：data 里有就用，没有从 channel 名解析（task:{id} 的 chat 事件不带）
         task_id = data.get("task_id")
@@ -3688,7 +5449,17 @@ class WorkerRelay:
         actual_transport = None
         worker_turn_handoff_id: str | None = None
         generation_scoped_event = (
-            event_type in EXACT_GENERATION_RELAY_EVENT_TYPES
+            (
+                event_type in EXACT_GENERATION_RELAY_EVENT_TYPES
+                and (
+                    event_type
+                    not in {
+                        "sub_agent_session_created",
+                        "sub_agent_session_status",
+                    }
+                    or ccm_sub_agent_relay_event
+                )
+            )
             or event_type in CHAT_EVENT_TYPES
         )
         if event_type in CHAT_EVENT_TYPES:
@@ -3902,6 +5673,13 @@ class WorkerRelay:
         # 2) chat 事件双写 LogEntry（instance_id=None；广播 payload 无 raw_json，存 None）
         persisted_forward = None
         if event_type in CHAT_EVENT_TYPES:
+            context_preflight_proof = (
+                parse_codex_context_preflight_relay_proof(
+                    data.get(WORKER_CONTEXT_PREFLIGHT_PROOF_KEY)
+                )
+                if WORKER_CONTEXT_PREFLIGHT_PROOF_KEY in data
+                else None
+            )
             async with self.db_factory() as db:
                 guard_values = {"status": observed.status}
                 if (
@@ -3951,7 +5729,15 @@ class WorkerRelay:
                     tool_name=data.get("tool_name"),
                     tool_input=data.get("tool_input"),
                     tool_output=data.get("tool_output"),
-                    raw_json=data.get("raw_json"),
+                    raw_json=(
+                        json.dumps(
+                            context_preflight_proof,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if context_preflight_proof is not None
+                        else None
+                    ),
                     is_error=data.get("is_error", False),
                     loop_iteration=data.get("loop_iteration"),
                 )
@@ -3968,6 +5754,7 @@ class WorkerRelay:
                             "task_retry_count",
                             "task_turn_generation",
                             "native_turn_id",
+                            WORKER_CONTEXT_PREFLIGHT_PROOF_KEY,
                         )
                     },
                 )
@@ -3984,11 +5771,16 @@ class WorkerRelay:
                     task_id,
                 )
                 if session_observed is not None:
-                    remote_task = await self._fetch_task_snapshot(worker, task_id)
+                    remote_task = await self._fetch_task_snapshot(
+                        worker,
+                        task_id,
+                        session_observed.incarnation_id,
+                    )
                     remote_values = (
                         authoritative_worker_task_values(
                             remote_task,
                             task_id=task_id,
+                            incarnation_id=session_observed.incarnation_id,
                         )
                         if remote_task is not None
                         else None
@@ -4046,7 +5838,11 @@ class WorkerRelay:
             # WebSocket ordering is not authoritative.  Re-read the Worker and
             # accept the event only when its strict boolean agrees with that
             # fresh snapshot, then CAS it onto the exact Manager generation.
-            remote_task = await self._fetch_task_snapshot(worker, task_id)
+            remote_task = await self._fetch_task_snapshot(
+                worker,
+                task_id,
+                observed.incarnation_id,
+            )
             if (
                 remote_task is None
                 or type(remote_task.get("background_active")) is not bool
@@ -4090,7 +5886,11 @@ class WorkerRelay:
             # it against the authoritative Worker task before touching the
             # Manager mirror; a mismatching status means this queued event is
             # stale and must be dropped.
-            remote_task = await self._fetch_task_snapshot(worker, task_id)
+            remote_task = await self._fetch_task_snapshot(
+                worker,
+                task_id,
+                observed.incarnation_id,
+            )
             if (
                 remote_task is None
                 or remote_task.get("status") != new_status
@@ -4145,7 +5945,11 @@ class WorkerRelay:
         elif event_type == "plan_ready":
             # plan_ready carries neither plan_content nor a remote generation.
             # Resolve both from one authoritative snapshot.
-            remote_task = await self._fetch_task_snapshot(worker, task_id)
+            remote_task = await self._fetch_task_snapshot(
+                worker,
+                task_id,
+                observed.incarnation_id,
+            )
             if (
                 remote_task is None
                 or remote_task.get("status") != "plan_review"
@@ -4203,6 +6007,33 @@ class WorkerRelay:
                     return
 
         elif event_type == "monitor_session_created":
+            remote_id = data.get("monitor_session_id")
+            description = data.get("description")
+            if (
+                type(remote_id) is not int
+                or remote_id <= 0
+                or not isinstance(description, str)
+                or len(description) > 500
+                or type(worker.id) is not int
+                or worker.id <= 0
+                or not isinstance(observed.incarnation_id, str)
+                or len(observed.incarnation_id) != 32
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in observed.incarnation_id
+                )
+            ):
+                return
+            expected_identity = (
+                worker.id,
+                observed.incarnation_id,
+                remote_id,
+            )
+            mirror_meta = _worker_child_mirror_meta(
+                worker_id=worker.id,
+                task_incarnation_id=observed.incarnation_id,
+                remote_id=remote_id,
+            )
             async with self.db_factory() as db:
                 guarded = await db.execute(
                     update(Task)
@@ -4212,23 +6043,77 @@ class WorkerRelay:
                 if guarded.rowcount != 1:
                     await db.rollback()
                     return
-                remote_id = data.get("monitor_session_id")
-                existing = (await db.execute(
-                    select(MonitorSession).where(
-                        MonitorSession.task_id == task_id,
-                        MonitorSession.remote_id == remote_id,
-                    )
-                )).scalar_one_or_none()
-                if existing is None and remote_id is not None:
-                    db.add(MonitorSession(
+                mirrors = list(
+                    (
+                        await db.execute(
+                            select(MonitorSession)
+                            .where(
+                                MonitorSession.task_id == task_id,
+                                MonitorSession.remote_id == remote_id,
+                            )
+                            .with_for_update()
+                        )
+                    ).scalars()
+                )
+                mirror, trusted_identity_set = _exact_worker_child_mirror(
+                    mirrors,
+                    expected_identity,
+                )
+                if not trusted_identity_set:
+                    await db.rollback()
+                    return
+                if mirror is not None:
+                    if (
+                        mirror.agent_type != "monitor"
+                        or mirror.source != "ccm"
+                        or mirror.status != "running"
+                        or mirror.description != description
+                    ):
+                        await db.rollback()
+                        return
+                else:
+                    mirror = MonitorSession(
                         remote_id=remote_id,
                         task_id=task_id,
-                        description=data.get("description") or "",
+                        agent_type="monitor",
+                        source="ccm",
+                        description=description,
                         status="running",
-                    ))
+                        meta=mirror_meta,
+                    )
+                    db.add(mirror)
+                    await db.flush()
+                canonical_forward = {
+                    **data,
+                    "monitor_session_id": mirror.id,
+                    "description": mirror.description,
+                }
                 await db.commit()
+            persisted_forward = canonical_forward
 
         elif event_type == "monitor_check":
+            remote_id = data.get("monitor_session_id")
+            check_number = data.get("check_number")
+            if (
+                type(remote_id) is not int
+                or remote_id <= 0
+                or type(check_number) is not int
+                or check_number < 0
+                or type(worker.id) is not int
+                or worker.id <= 0
+                or not isinstance(observed.incarnation_id, str)
+                or len(observed.incarnation_id) != 32
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in observed.incarnation_id
+                )
+            ):
+                return
+            expected_identity = (
+                worker.id,
+                observed.incarnation_id,
+                remote_id,
+            )
             async with self.db_factory() as db:
                 guarded = await db.execute(
                     update(Task)
@@ -4238,20 +6123,69 @@ class WorkerRelay:
                 if guarded.rowcount != 1:
                     await db.rollback()
                     return
-                ms = await self._local_monitor(db, task_id, data.get("monitor_session_id"))
-                if ms:
-                    db.add(MonitorCheck(
-                        monitor_session_id=ms.id,
-                        check_number=data.get("check_number") or 0,
-                        status=data.get("status") or "",
-                        summary=data.get("summary"),
-                        full_output=data.get("full_output"),
-                    ))
-                    ms.checks_done = data.get("check_number", ms.checks_done)
-                    ms.last_summary = data.get("summary")
+                mirrors = list(
+                    (
+                        await db.execute(
+                            select(MonitorSession)
+                            .where(
+                                MonitorSession.task_id == task_id,
+                                MonitorSession.remote_id == remote_id,
+                            )
+                            .with_for_update()
+                        )
+                    ).scalars()
+                )
+                mirror, trusted_identity_set = _exact_worker_child_mirror(
+                    mirrors,
+                    expected_identity,
+                )
+                if (
+                    not trusted_identity_set
+                    or mirror is None
+                    or mirror.agent_type != "monitor"
+                    or mirror.source != "ccm"
+                ):
+                    await db.rollback()
+                    return
+                db.add(MonitorCheck(
+                    monitor_session_id=mirror.id,
+                    check_number=check_number,
+                    status=data.get("status") or "",
+                    summary=data.get("summary"),
+                    full_output=data.get("full_output"),
+                ))
+                mirror.checks_done = check_number
+                mirror.last_summary = data.get("summary")
+                canonical_forward = {
+                    **data,
+                    "monitor_session_id": mirror.id,
+                    "check_number": check_number,
+                }
                 await db.commit()
+            persisted_forward = canonical_forward
 
         elif event_type == "monitor_session_status":
+            remote_id = data.get("monitor_session_id")
+            status = data.get("status")
+            if (
+                type(remote_id) is not int
+                or remote_id <= 0
+                or status not in {"completed", "failed", "cancelled"}
+                or type(worker.id) is not int
+                or worker.id <= 0
+                or not isinstance(observed.incarnation_id, str)
+                or len(observed.incarnation_id) != 32
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in observed.incarnation_id
+                )
+            ):
+                return
+            expected_identity = (
+                worker.id,
+                observed.incarnation_id,
+                remote_id,
+            )
             async with self.db_factory() as db:
                 guarded = await db.execute(
                     update(Task)
@@ -4261,12 +6195,272 @@ class WorkerRelay:
                 if guarded.rowcount != 1:
                     await db.rollback()
                     return
-                ms = await self._local_monitor(db, task_id, data.get("monitor_session_id"))
-                if ms:
-                    ms.status = data.get("status") or ms.status
-                    if ms.status in ("completed", "failed", "cancelled"):
-                        ms.completed_at = func.now()
+                mirrors = list(
+                    (
+                        await db.execute(
+                            select(MonitorSession)
+                            .where(
+                                MonitorSession.task_id == task_id,
+                                MonitorSession.remote_id == remote_id,
+                            )
+                            .with_for_update()
+                        )
+                    ).scalars()
+                )
+                mirror, trusted_identity_set = _exact_worker_child_mirror(
+                    mirrors,
+                    expected_identity,
+                )
+                if (
+                    not trusted_identity_set
+                    or mirror is None
+                    or mirror.agent_type != "monitor"
+                    or mirror.source != "ccm"
+                ):
+                    await db.rollback()
+                    return
+                if mirror.status in {"completed", "failed", "cancelled"}:
+                    if mirror.status != status:
+                        await db.rollback()
+                        return
+                elif mirror.status == "running":
+                    mirror.status = status
+                    mirror.completed_at = datetime.utcnow()
+                else:
+                    await db.rollback()
+                    return
+                canonical_forward = {
+                    **data,
+                    "monitor_session_id": mirror.id,
+                    "status": mirror.status,
+                }
                 await db.commit()
+            persisted_forward = canonical_forward
+
+        elif (
+            event_type == "sub_agent_session_created"
+            and ccm_sub_agent_relay_event
+        ):
+            payload = _validated_sub_agent_relay_payload(
+                data,
+                terminal=False,
+            )
+            if (
+                payload is None
+                or type(worker.id) is not int
+                or worker.id <= 0
+                or not isinstance(observed.incarnation_id, str)
+                or len(observed.incarnation_id) != 32
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in observed.incarnation_id
+                )
+            ):
+                return
+            remote_id = payload["remote_id"]
+            assert type(remote_id) is int
+            expected_identity = (
+                worker.id,
+                observed.incarnation_id,
+                remote_id,
+            )
+            mirror_meta = _worker_child_mirror_meta(
+                worker_id=worker.id,
+                task_incarnation_id=observed.incarnation_id,
+                remote_id=remote_id,
+            )
+            async with self.db_factory() as db:
+                guarded = await db.execute(
+                    update(Task)
+                    .where(*_worker_task_generation_write_predicates(observed))
+                    .values(status=observed.status)
+                )
+                if guarded.rowcount != 1:
+                    await db.rollback()
+                    return
+                mirrors = list(
+                    (
+                        await db.execute(
+                            select(SubAgentSession)
+                            .where(
+                                SubAgentSession.task_id == task_id,
+                                SubAgentSession.remote_id == remote_id,
+                            )
+                            .with_for_update()
+                        )
+                    ).scalars()
+                )
+                mirror, trusted_identity_set = _exact_worker_child_mirror(
+                    mirrors,
+                    expected_identity,
+                )
+                if not trusted_identity_set:
+                    await db.rollback()
+                    return
+                if mirror is not None:
+                    if (
+                        mirror.agent_type != "sub_agent"
+                        or mirror.source != "ccm"
+                        or mirror.status != "running"
+                        or mirror.description != payload["description"]
+                        or mirror.monitor_context != payload["monitor_context"]
+                        or mirror.checks_done != payload["checks_done"]
+                        or mirror.last_summary != payload["last_summary"]
+                    ):
+                        # A delayed created event must not revive a terminal
+                        # mirror or alias another child category/source.
+                        await db.rollback()
+                        return
+                else:
+                    mirror = SubAgentSession(
+                        task_id=task_id,
+                        remote_id=remote_id,
+                        agent_type="sub_agent",
+                        source="ccm",
+                        description=payload["description"],
+                        monitor_context=payload["monitor_context"],
+                        interval=0,
+                        max_checks=0,
+                        status="running",
+                        checks_done=payload["checks_done"],
+                        last_summary=payload["last_summary"],
+                        meta=mirror_meta,
+                    )
+                    db.add(mirror)
+                    await db.flush()
+                local_id = mirror.id
+                canonical_forward = {
+                    **data,
+                    "sub_agent_session_id": local_id,
+                    "description": mirror.description,
+                    "agent_type": "sub_agent",
+                    "source": "ccm",
+                    "monitor_context": mirror.monitor_context,
+                    "status": mirror.status,
+                    "checks_done": mirror.checks_done,
+                    "last_summary": mirror.last_summary,
+                }
+                await db.commit()
+            persisted_forward = canonical_forward
+
+        elif (
+            event_type == "sub_agent_session_status"
+            and ccm_sub_agent_relay_event
+        ):
+            payload = _validated_sub_agent_relay_payload(
+                data,
+                terminal=True,
+            )
+            if (
+                payload is None
+                or type(worker.id) is not int
+                or worker.id <= 0
+                or not isinstance(observed.incarnation_id, str)
+                or len(observed.incarnation_id) != 32
+                or any(
+                    char not in "0123456789abcdef"
+                    for char in observed.incarnation_id
+                )
+            ):
+                return
+            remote_id = payload["remote_id"]
+            assert type(remote_id) is int
+            expected_identity = (
+                worker.id,
+                observed.incarnation_id,
+                remote_id,
+            )
+            mirror_meta = _worker_child_mirror_meta(
+                worker_id=worker.id,
+                task_incarnation_id=observed.incarnation_id,
+                remote_id=remote_id,
+            )
+            async with self.db_factory() as db:
+                guarded = await db.execute(
+                    update(Task)
+                    .where(*_worker_task_generation_write_predicates(observed))
+                    .values(status=observed.status)
+                )
+                if guarded.rowcount != 1:
+                    await db.rollback()
+                    return
+                mirrors = list(
+                    (
+                        await db.execute(
+                            select(SubAgentSession)
+                            .where(
+                                SubAgentSession.task_id == task_id,
+                                SubAgentSession.remote_id == remote_id,
+                            )
+                            .with_for_update()
+                        )
+                    ).scalars()
+                )
+                mirror, trusted_identity_set = _exact_worker_child_mirror(
+                    mirrors,
+                    expected_identity,
+                )
+                if not trusted_identity_set:
+                    await db.rollback()
+                    return
+                if mirror is not None:
+                    if (
+                        mirror.agent_type != "sub_agent"
+                        or mirror.source != "ccm"
+                    ):
+                        await db.rollback()
+                        return
+                    if mirror.status in _SUB_AGENT_TERMINAL_STATUSES:
+                        if mirror.status != payload["status"]:
+                            # First terminal evidence wins.  A duplicate from
+                            # the Worker can acknowledge it but never rewrite
+                            # or revive it with a different terminal result.
+                            await db.rollback()
+                            return
+                    elif mirror.status == "running":
+                        mirror.status = payload["status"]
+                        mirror.description = payload["description"]
+                        mirror.monitor_context = payload["monitor_context"]
+                        mirror.checks_done = payload["checks_done"]
+                        mirror.last_summary = payload["last_summary"]
+                        mirror.completed_at = datetime.utcnow()
+                    else:
+                        await db.rollback()
+                        return
+                else:
+                    # Status is a complete snapshot so a lost/reordered
+                    # created event does not leave the Manager without a row.
+                    mirror = SubAgentSession(
+                        task_id=task_id,
+                        remote_id=remote_id,
+                        agent_type="sub_agent",
+                        source="ccm",
+                        description=payload["description"],
+                        monitor_context=payload["monitor_context"],
+                        interval=0,
+                        max_checks=0,
+                        status=payload["status"],
+                        checks_done=payload["checks_done"],
+                        last_summary=payload["last_summary"],
+                        meta=mirror_meta,
+                        completed_at=datetime.utcnow(),
+                    )
+                    db.add(mirror)
+                    await db.flush()
+                local_id = mirror.id
+                canonical_forward = {
+                    **data,
+                    "sub_agent_session_id": local_id,
+                    "description": mirror.description,
+                    "agent_type": "sub_agent",
+                    "source": "ccm",
+                    "monitor_context": mirror.monitor_context,
+                    "status": mirror.status,
+                    "checks_done": mirror.checks_done,
+                    "last_summary": mirror.last_summary,
+                }
+                await db.commit()
+            persisted_forward = canonical_forward
 
         # 4) 镜像广播到来源同名 channel（剥 worker 的 instance_id，对 Manager 无意义）
         forward = persisted_forward or {
@@ -4276,17 +6470,6 @@ class WorkerRelay:
             await self.broadcaster.broadcast(f"task:{task_id}", forward)
         elif channel == "tasks":
             await self.broadcaster.broadcast("tasks", forward)
-
-    @staticmethod
-    async def _local_monitor(db, task_id: int, remote_id) -> MonitorSession | None:
-        if remote_id is None:
-            return None
-        return (await db.execute(
-            select(MonitorSession).where(
-                MonitorSession.task_id == task_id,
-                MonitorSession.remote_id == remote_id,
-            )
-        )).scalar_one_or_none()
 
     # ------------------------------------------------------------------
     # Worker API 辅助
@@ -4647,6 +6830,7 @@ class WorkerRelay:
                     remote_task = await self._fetch_task_snapshot(
                         worker,
                         tid,
+                        status_observed.incarnation_id,
                         client=client,
                     )
                     if remote_task is None:

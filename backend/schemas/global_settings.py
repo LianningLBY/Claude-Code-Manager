@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class GlobalSettingsUpdate(BaseModel):
@@ -29,16 +29,15 @@ class RuntimeSettingsResponse(BaseModel):
     # Versioned capability signal. Exact Task scope is still enforced by the
     # Task/API gates; Worker and shared Codex Tasks remain unsupported.
     codex_monitor_enabled: bool
-    # Effective operator-owned setting (DB override, else env default).
-    agent_sandbox_unrestricted_enabled: bool
     auto_sort_on_access: bool
     # Effective value (DB override, else env default)
     context_compact_threshold: float
 
 
 class RuntimeSettingsUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     use_pty_mode: bool | None = None
-    agent_sandbox_unrestricted_enabled: bool | None = None
     auto_sort_on_access: bool | None = None
     context_compact_threshold: float | None = Field(default=None, ge=0.3, le=0.95)
 

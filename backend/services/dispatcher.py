@@ -39,6 +39,7 @@ from backend.models.project import Project
 from backend.models.global_settings import GlobalSettings
 from backend.models.secret import Secret
 from backend.services.git_config import merge_git_config, settings_to_dict
+from backend.services.cancellation import settle_awaitable
 from backend.services.context_compaction import (
     build_compacted_resume_prompt,
     build_compacted_task_retry_prompt,
@@ -68,6 +69,7 @@ from backend.services.task_queue import (
     TaskQueue,
     task_is_pr_review_superseded,
     task_retry_not_superseded_predicate,
+    fence_native_execution_principal,
 )
 from backend.services.task_skill_overrides import (
     TEMP_SKILLS_GENERATION_KEY,
@@ -79,12 +81,17 @@ from backend.services.task_artifact_contract import (
     configured_workspace_root,
     workspace_root_is_secure_directory,
 )
+from backend.services.skill_context import is_worker_managed_task_metadata
 from backend.services.worker_routing_config import (
     has_pending_worker_routing,
 )
 from backend.services.worker_task_termination import (
     active_worker_task_termination_receipt,
     no_active_worker_task_termination_predicate,
+)
+from backend.services.worker_relay import (
+    WORKER_REMOTE_MATERIALIZED_METADATA_KEY,
+    worker_remote_task_is_materialized,
 )
 from backend.services.ws_broadcaster import WebSocketBroadcaster
 
@@ -116,6 +123,9 @@ def _worker_handoff_message_matches_payload(
     msg: "QueuedMessage",
     payload: dict,
 ) -> bool:
+    principal = _canonical_queue_execution_principal(payload)
+    if principal is None:
+        return False
     expected = payload.get("expected_task_routing")
     expected_routing = (
         tuple(expected)
@@ -145,6 +155,58 @@ def _worker_handoff_message_matches_payload(
         == msg.worker_turn_handoff_retry_count
         and payload.get("worker_turn_handoff_from_generation")
         == msg.worker_turn_handoff_from_generation
+        and payload.get("worker_turn_handoff_incarnation_id")
+        == msg.worker_turn_handoff_incarnation_id
+        and principal["initiating_user_id"] == msg.initiating_user_id
+        and principal["initiating_user_role"] == msg.initiating_user_role
+        and principal["execution_mode"] == msg.execution_mode
+        and principal["execution_principal_kind"]
+        == msg.execution_principal_kind
+    )
+
+
+def _canonical_queue_execution_principal(
+    payload: object,
+) -> dict[str, object] | None:
+    """Return one exact, complete principal from a durable queue envelope.
+
+    Recovery payloads are authority, not optional compatibility metadata.
+    Missing fields must never silently become the sandboxed system principal:
+    that would change the identity of an already-admitted logical turn.
+    """
+
+    if type(payload) is not dict:
+        return None
+    required = {
+        "initiating_user_id",
+        "initiating_user_role",
+        "execution_mode",
+        "execution_principal_kind",
+    }
+    if not required.issubset(payload):
+        return None
+    from backend.services.task_creation import task_execution_principal_values
+
+    try:
+        canonical = task_execution_principal_values(
+            user_id=payload["initiating_user_id"],
+            role=payload["initiating_user_role"],
+            principal_kind=payload["execution_principal_kind"],
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    expected = {
+        "initiating_user_id": canonical["execution_user_id"],
+        "initiating_user_role": canonical["execution_user_role"],
+        "execution_mode": canonical["execution_mode"],
+        "execution_principal_kind": canonical[
+            "execution_principal_kind"
+        ],
+    }
+    return (
+        expected
+        if all(payload[key] == value for key, value in expected.items())
+        else None
     )
 
 class QueuedMessagePrelaunchError(RuntimeError):
@@ -198,18 +260,7 @@ async def _settle_despite_cancellation(awaitable):
     original ``CancelledError`` after restoring invariants.
     """
 
-    operation = asyncio.ensure_future(awaitable)
-    cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            if cancellation is None:
-                cancellation = exc
-        except BaseException:
-            # The operation itself failed and is now inspectable via result().
-            break
-    return operation, cancellation
+    return await settle_awaitable(awaitable)
 
 
 def _cleanup_skill_prompt_files(task_id: int):
@@ -596,6 +647,10 @@ class QueuedMessage:
     initiating_user_id: int | None = field(compare=False, default=None)
     initiating_user_role: str = field(compare=False, default="member")
     execution_mode: str = field(compare=False, default="sandbox")
+    execution_principal_kind: str = field(compare=False, default="system")
+    # Process-local authority captured only after Task/principal admission.
+    # Never deserialize this from HTTP or a durable cross-host outbox.
+    ssh_agent_socket_snapshot: object | None = field(compare=False, default=None)
     attachment_paths: tuple[str, ...] = field(compare=False, default=())
     # Durable Plan-application outbox identity. Repeated HTTP recovery and
     # startup recovery may request admission, but only one in-memory item is
@@ -625,6 +680,9 @@ class QueuedMessage:
     worker_turn_handoff_from_generation: int | None = field(
         compare=False, default=None
     )
+    worker_turn_handoff_incarnation_id: str | None = field(
+        compare=False, default=None
+    )
     # In-process launch retries reuse the already-claimed logical generation
     # instead of incorrectly turning one receipt into G+2.
     worker_turn_handoff_claimed_generation: int | None = field(
@@ -638,6 +696,13 @@ class QueuedMessage:
         compare=False, default=None, repr=False
     )
     claimed_turn_generation: int | None = field(
+        compare=False, default=None, repr=False
+    )
+    # Once a compact retry has claimed G+1, bind later in-process launch
+    # retries to the exact source row installed by that claim.  The original
+    # permit still names rejected G; this field prevents it from floating to a
+    # different G+1 source after a pre-launch rollback/requeue.
+    context_retry_claimed_source_log_id: int | None = field(
         compare=False, default=None, repr=False
     )
     # A queue clear can own recovery of an item during the tiny q.get() ->
@@ -696,6 +761,7 @@ class ContextRetryPermit:
     session_id: str | None
     started_at: datetime | None
     completed_at: datetime | None
+    authority_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -728,10 +794,12 @@ def _context_retry_permit_matches(
         # immutable rejected-generation proof must fail closed; ordinary
         # queued messages do not need this specialized permit.
         return msg.source != "compact_retry"
-    return bool(
-        msg.source == "compact_retry"
-        and isinstance(permit, ContextRetryPermit)
-        and task.id == permit.task_id
+    if msg.source != "compact_retry" or not isinstance(
+        permit, ContextRetryPermit
+    ):
+        return False
+    baseline_matches = bool(
+        task.id == permit.task_id
         # These are the only states the settling rejected consumer may leave
         # behind.  Keep the allow-list here rather than on the caller-supplied
         # dataclass so no producer can authorize cancelled/stopped/completed.
@@ -743,6 +811,23 @@ def _context_retry_permit_matches(
         and task.session_id == permit.session_id
         and task.started_at == permit.started_at
         and task.completed_at == permit.completed_at
+    )
+    if baseline_matches:
+        return True
+    # A temporary launch failure may safely requeue the same already-claimed
+    # G+1.  Its current Instance/status can be rolled back, so the durable
+    # source binding plus the exact next generation is the stable identity.
+    return bool(
+        task.id == permit.task_id
+        and task.status in {"executing", "in_progress", "failed"}
+        and task.retry_count == permit.retry_count
+        and task.turn_generation == permit.turn_generation + 1
+        and msg.claimed_retry_count == permit.retry_count
+        and msg.claimed_turn_generation == permit.turn_generation + 1
+        and type(msg.context_retry_claimed_source_log_id) is int
+        and task.turn_source_log_id
+        == msg.context_retry_claimed_source_log_id
+        and task.session_id is None
     )
 
 
@@ -1050,6 +1135,10 @@ class GlobalDispatcher:
         self._queued_delivery_keys: set[str] = set()
         self._queued_capability_resume_ids: set[int] = set()
         self._queued_worker_turn_handoffs: set[str] = set()
+        # Process-local, object-identity authorities for structured Codex
+        # context rejections.  A copied dataclass or guessed id is never a
+        # valid replacement for the exact permit issued by this Dispatcher.
+        self._context_retry_authorities: dict[str, ContextRetryPermit] = {}
         self._cancel_durable_queue_tasks: set[int] = set()
         self._task_queue_cancellation_lease_counts: dict[int, int] = {}
         # A waiting-Capability stop first reaps an already-dequeued resume
@@ -1117,6 +1206,80 @@ class GlobalDispatcher:
         # ("claude_account_id"/"codex_account_id") because instances are
         # generic workers that rotate between unrelated tasks.
         self.codex_pool: "CodexPool | None" = None
+
+    def issue_context_retry_permit(
+        self,
+        *,
+        task_id: int,
+        instance_id: int,
+        retry_count: int,
+        turn_generation: int,
+        turn_source_log_id: int,
+        session_id: str | None,
+        started_at: datetime | None,
+        completed_at: datetime | None,
+    ) -> ContextRetryPermit:
+        """Issue one volatile authority for rejected G -> compact G+1."""
+
+        authority_id = secrets.token_hex(16)
+        permit = ContextRetryPermit(
+            authority_id=authority_id,
+            task_id=task_id,
+            instance_id=instance_id,
+            retry_count=retry_count,
+            turn_generation=turn_generation,
+            turn_source_log_id=turn_source_log_id,
+            session_id=session_id,
+            started_at=started_at,
+            completed_at=completed_at,
+        )
+        # Only one compact authority for an exact rejected generation may be
+        # live in this process.  Re-issuing revokes an older unconsumed copy.
+        for existing_id, existing in tuple(
+            self._context_retry_authorities.items()
+        ):
+            if (
+                existing.task_id == task_id
+                and existing.retry_count == retry_count
+                and existing.turn_generation == turn_generation
+            ):
+                self._context_retry_authorities.pop(existing_id, None)
+        self._context_retry_authorities[authority_id] = permit
+        return permit
+
+    def _context_retry_authority_is_live(self, msg: QueuedMessage) -> bool:
+        if msg.source != "compact_retry":
+            return msg.context_retry_permit is None
+        permit = msg.context_retry_permit
+        return bool(
+            isinstance(permit, ContextRetryPermit)
+            and isinstance(permit.authority_id, str)
+            and len(permit.authority_id) == 32
+            and self._context_retry_authorities.get(permit.authority_id)
+            is permit
+        )
+
+    def revoke_context_retry_permit(
+        self,
+        permit: ContextRetryPermit | None,
+    ) -> None:
+        if not isinstance(permit, ContextRetryPermit):
+            return
+        authority_id = permit.authority_id
+        if (
+            isinstance(authority_id, str)
+            and self._context_retry_authorities.get(authority_id) is permit
+        ):
+            self._context_retry_authorities.pop(authority_id, None)
+
+    def _consume_context_retry_authority(self, msg: QueuedMessage) -> None:
+        if msg.source != "compact_retry":
+            return
+        if not self._context_retry_authority_is_live(msg):
+            raise QueuedMessagePrelaunchError(
+                "Compact retry launch authority is no longer current"
+            )
+        self.revoke_context_retry_permit(msg.context_retry_permit)
 
     @property
     def is_running(self) -> bool:
@@ -4905,6 +5068,20 @@ class GlobalDispatcher:
     ) -> tuple[int, int] | None:
         """Claim one local first-class PlanRun and its exact Instance owner."""
 
+        from backend.services.worker_node_control import (
+            WorkerNodeDrainingConflict,
+            fence_worker_node_mutation,
+        )
+
+        try:
+            # NodeControl is the first writer and remains held through the
+            # Run + Instance ownership commit.  If the destroy claim won, the
+            # local scheduler simply observes an empty Plan queue.
+            await fence_worker_node_mutation(db)
+        except WorkerNodeDrainingConflict:
+            await db.rollback()
+            return None
+
         row = (
             await db.execute(
                 select(PlanAgentRun, Plan)
@@ -5471,6 +5648,9 @@ class GlobalDispatcher:
                     Task.status == "pending",
                     Task.worker_id.isnot(None),
                     Task.shared_from_id.is_(None),
+                    Task.metadata_[WORKER_REMOTE_MATERIALIZED_METADATA_KEY]
+                    .as_boolean()
+                    .is_not(True),
                     task_retry_not_superseded_predicate(),
                     no_active_worker_task_termination_predicate(),
                 )
@@ -5478,6 +5658,8 @@ class GlobalDispatcher:
             worker_tasks = list(result.scalars().all())
 
         for task in worker_tasks:
+            if worker_remote_task_is_materialized(task.metadata_):
+                continue
             pending_generation = self._task_status_generation(task)
             if (
                 pending_generation.worker_id is None
@@ -5597,39 +5779,34 @@ class GlobalDispatcher:
                     WorkerModel,
                     pending_generation.worker_id,
                 )
-            if not worker or worker.status != "ready":
+            if (
+                not worker
+                or worker.status != "ready"
+                or worker.bootstrap_step is not None
+            ):
                 continue  # worker 没就绪，留在 pending 等下轮
-            # 与本地路径一致：把 project.local_path 写进 target_repo——
-            # 否则迁回本机后 chat 解析不出 cwd（实测 task 58 教训）
-            if task.project_id and not task.target_repo:
-                async with self.db_factory() as db:
-                    project = await db.get(Project, task.project_id)
-                    if project and project.local_path:
-                        target_updated = await db.execute(
-                            update(Task)
-                            .where(
-                                *self._task_status_generation_predicates(
-                                    pending_generation
-                                ),
-                                Task.project_id == task.project_id,
-                                (
-                                    Task.target_repo.is_(None)
-                                    if task.target_repo is None
-                                    else Task.target_repo == task.target_repo
-                                ),
-                                no_active_worker_task_termination_predicate(),
-                            )
-                            .values(target_repo=project.local_path)
-                        )
-                        if not target_updated.rowcount:
-                            await db.rollback()
-                            continue
-                        await db.commit()
-                        task.target_repo = project.local_path
             # Claiming a pending Worker task is execution admission. It must
             # share the same per-task fence as Skill saves and forwarding:
             # a save that wins first is included in the refreshed claim, while
-            # a save that loses observes ``in_progress`` and is rejected.
+            # a save that loses observes ``in_progress`` and is rejected. Keep
+            # project -> target_repo materialization in this same transaction:
+            # a termination receipt that wins the Task row must prevent both
+            # the routing write and the status claim.
+            target_repo_fill_requested = bool(
+                task.project_id and not task.target_repo
+            )
+            target_repo_guard_predicates = (
+                (
+                    Task.project_id == task.project_id,
+                    (
+                        Task.target_repo.is_(None)
+                        if task.target_repo is None
+                        else Task.target_repo == task.target_repo
+                    ),
+                )
+                if target_repo_fill_requested
+                else ()
+            )
             async with get_task_operation_lock(task.id):
                 async with self.db_factory() as db:
                     # Worker capacity is shared by ordinary Tasks and
@@ -5649,11 +5826,20 @@ class GlobalDispatcher:
                             Task.worker_id == pending_generation.worker_id,
                             Task.shared_from_id.is_(None),
                             task_retry_not_superseded_predicate(),
+                            *target_repo_guard_predicates,
                             no_active_worker_task_termination_predicate(),
                         )
                         .values(status=Task.status)
                     )
                     if task_fenced.rowcount != 1:
+                        await db.rollback()
+                        continue
+                    current_task = await db.get(
+                        Task,
+                        task.id,
+                        populate_existing=True,
+                    )
+                    if current_task is None:
                         await db.rollback()
                         continue
                     try:
@@ -5664,14 +5850,49 @@ class GlobalDispatcher:
                     except HTTPException:
                         await db.rollback()
                         continue
+                    if not await fence_native_execution_principal(
+                        db,
+                        user_id=current_task.execution_user_id,
+                        role=current_task.execution_user_role,
+                        principal_kind=current_task.execution_principal_kind,
+                    ):
+                        # Preserve the global Task -> Worker -> User lock
+                        # order used by the Manager's final delegated launch
+                        # permit.  The Manager owns native user authority; a
+                        # remote Worker receives a delegated snapshot and
+                        # must not resolve this user in its own database.
+                        await db.rollback()
+                        continue
+                    # Manager receipt admission takes
+                    # Task -> Worker -> User -> receipt. Re-read the receipt
+                    # only after the preceding writer fences: if the Task
+                    # UPDATE waited for a concurrently committing receipt,
+                    # this separate locking statement observes that winner
+                    # even on databases whose UPDATE snapshot was older.
+                    if await active_worker_task_termination_receipt(
+                        db,
+                        task.id,
+                        for_update=True,
+                    ):
+                        await db.rollback()
+                        continue
                     locked_worker = await db.get(
                         WorkerModel,
                         pending_generation.worker_id,
                         populate_existing=True,
                     )
-                    if locked_worker is None or locked_worker.status != "ready":
+                    if (
+                        locked_worker is None
+                        or locked_worker.status != "ready"
+                        or locked_worker.bootstrap_step is not None
+                    ):
                         await db.rollback()
                         continue
+                    target_repo_value = None
+                    if target_repo_fill_requested:
+                        project = await db.get(Project, task.project_id)
+                        if project is not None and project.local_path:
+                            target_repo_value = project.local_path
                     running_tasks = int(
                         await db.scalar(
                             select(func.count(Task.id)).where(
@@ -5695,6 +5916,26 @@ class GlobalDispatcher:
                     if running_tasks + running_plans >= locked_worker.max_tasks:
                         await db.rollback()
                         continue
+                    claim_values = {
+                        "status": "in_progress",
+                        "started_at": datetime.utcnow(),
+                        # Keep the Manager mirror on the same deterministic
+                        # admission generation as the Worker's local
+                        # TaskQueue.dequeue().  The remote row is created
+                        # pending at N and its dequeue advances it to N+1;
+                        # advancing the exact Manager pending generation in
+                        # this claim avoids both rejecting that legitimate
+                        # first turn and adopting an arbitrary remote value.
+                        "turn_generation": Task.turn_generation + 1,
+                        # Source identity is generation-scoped.  The Manager
+                        # mirror advances in lockstep with the Worker's dequeue,
+                        # so it must not carry G's pointer into G+1.
+                        "turn_source_log_id": None,
+                    }
+                    if target_repo_value:
+                        # 与本地路径一致：把 project.local_path 写进
+                        # target_repo，否则迁回本机后 chat 解析不出 cwd。
+                        claim_values["target_repo"] = target_repo_value
                     claimed = await db.execute(
                         update(Task)
                         .where(
@@ -5705,25 +5946,10 @@ class GlobalDispatcher:
                             Task.worker_id == locked_worker.id,
                             Task.shared_from_id.is_(None),
                             task_retry_not_superseded_predicate(),
+                            *target_repo_guard_predicates,
                             no_active_worker_task_termination_predicate(),
                         )
-                        .values(
-                            status="in_progress",
-                            started_at=datetime.utcnow(),
-                            # Keep the Manager mirror on the same deterministic
-                            # admission generation as the Worker's local
-                            # TaskQueue.dequeue().  The remote row is created
-                            # pending at N and its dequeue advances it to N+1;
-                            # advancing the exact Manager pending generation in
-                            # this claim avoids both rejecting that legitimate
-                            # first turn and adopting an arbitrary remote value.
-                            turn_generation=Task.turn_generation + 1,
-                            # Source identity is generation-scoped.  The
-                            # Manager mirror advances in lockstep with the
-                            # Worker's dequeue, so it must not carry G's
-                            # pointer into the newly admitted G+1.
-                            turn_source_log_id=None,
-                        )
+                        .values(**claim_values)
                     )
                     claimed_generation = None
                     claimed_task = None
@@ -5921,6 +6147,7 @@ class GlobalDispatcher:
                             Plan.archived_at.is_(None),
                             Plan.worker_id == PlanAgentRun.worker_id,
                             Worker.status == "ready",
+                            Worker.bootstrap_step.is_(None),
                         )
                         .order_by(
                             Plan.priority.asc(),
@@ -5949,7 +6176,11 @@ class GlobalDispatcher:
                     ):
                         continue
                     worker = await db.get(Worker, current.worker_id)
-                    if worker is None or worker.status != "ready":
+                    if (
+                        worker is None
+                        or worker.status != "ready"
+                        or worker.bootstrap_step is not None
+                    ):
                         continue
                     # Routing reads above are only a cheap candidate filter.
                     # End their SQLite WAL snapshot before the Task writer
@@ -5975,7 +6206,11 @@ class GlobalDispatcher:
                         worker_id,
                         populate_existing=True,
                     )
-                    if worker is None or worker.status != "ready":
+                    if (
+                        worker is None
+                        or worker.status != "ready"
+                        or worker.bootstrap_step is not None
+                    ):
                         await db.rollback()
                         continue
                     running_tasks = int(
@@ -6719,7 +6954,12 @@ class GlobalDispatcher:
                         worker_id=worker_id,
                         target_generation=generation,
                         payload_digest=payload_digest,
-                        remote_state="cancelled",
+                        # This audit state is the permanent pre-import
+                        # tombstone: no Worker Run graph ever existed.  Record
+                        # absence rather than the legacy ``remote_cancelled``
+                        # state, which did not prove whether child evidence was
+                        # imported and must remain fail-closed.
+                        remote_state="absent",
                     )
                 except (HTTPException, WorkerPlanDispatchConflict):
                     await db.rollback()
@@ -8377,7 +8617,7 @@ class GlobalDispatcher:
         that the user invoked its $command. Shared by the first launch and
         every fresh re-launch (rotation / transient retry)."""
         metadata = task.metadata_ or {}
-        image_paths = metadata.get("image_paths") or []
+        attachment_paths = self._task_attachment_paths(task)
         secret_ids = metadata.get("secret_ids") or []
         secrets_block = await _build_secrets_block(self.db_factory, secret_ids)
         # PR and Browser reviews receive a frozen, purpose-built prompt. Adding
@@ -8394,10 +8634,13 @@ class GlobalDispatcher:
         )
         if secrets_block:
             parts.append(secrets_block)
-        if image_paths:
-            image_list = "\n".join(f"- {p}" for p in image_paths)
+        if attachment_paths:
+            attachment_list = "\n".join(
+                f"- {path}" for path in attachment_paths
+            )
             parts.append(
-                f"用户提供了以下参考图片，请先用 Read 工具查看：\n{image_list}"
+                "用户提供了以下参考文件，请按任务需要用 Read 工具查看：\n"
+                f"{attachment_list}"
             )
         command, command_args = _initial_task_command(task)
         task_description = task.description
@@ -8418,6 +8661,61 @@ class GlobalDispatcher:
         if capability_instructions:
             parts.append(capability_instructions)
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _task_attachment_paths(task: Task) -> tuple[str, ...]:
+        """Return one complete, shape-checked persisted attachment ordering."""
+
+        metadata = task.metadata_ or {}
+        raw_paths = metadata.get("file_paths")
+        if raw_paths is None:
+            raw_paths = metadata.get("image_paths") or []
+        if not isinstance(raw_paths, (list, tuple)) or any(
+            not isinstance(path, str) or not path
+            for path in raw_paths
+        ):
+            raise RuntimeError("Task attachment metadata is malformed")
+        return tuple(raw_paths)
+
+    @staticmethod
+    def _task_execution_principal_launch_kwargs(task: Task) -> dict[str, object]:
+        """Project one durable Task principal onto a provider launch."""
+
+        from backend.services.task_creation import (
+            task_execution_principal_values,
+        )
+
+        kind = getattr(task, "execution_principal_kind", None)
+        role = getattr(task, "execution_user_role", None)
+        mode = getattr(task, "execution_mode", None)
+        user_id = getattr(task, "execution_user_id", None)
+        try:
+            canonical = task_execution_principal_values(
+                user_id=user_id,
+                role=role,
+                principal_kind=kind,
+            )
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "Task has an invalid execution principal"
+            ) from exc
+        if {
+            "execution_user_id": user_id,
+            "execution_user_role": role,
+            "execution_mode": mode,
+            "execution_principal_kind": kind,
+        } != canonical:
+            raise RuntimeError(
+                "Task execution principal role/mode is inconsistent"
+            )
+        return {
+            "initiating_user_id": canonical["execution_user_id"],
+            "initiating_user_role": canonical["execution_user_role"],
+            "execution_mode": canonical["execution_mode"],
+            "execution_principal_kind": canonical[
+                "execution_principal_kind"
+            ],
+        }
 
     async def _relaunch_and_wait(
         self,
@@ -8442,6 +8740,25 @@ class GlobalDispatcher:
                 instance_id,
             )
             return -2
+        # ``task`` is the detached lifecycle snapshot captured before Step 2
+        # binds the hidden/external source row.  Never derive replay identity
+        # from that stale object: reload the exact owned generation and carry
+        # its durable source pointer into InstanceManager's final transport
+        # admission fence.
+        async with self.db_factory() as db:
+            current = await self._read_owned_lifecycle_task(db, generation)
+            if current is None:
+                logger.info(
+                    "Skipping stale relaunch source for task %s on instance %s",
+                    task.id,
+                    instance_id,
+                )
+                return -2
+            source_log_id = current.turn_source_log_id
+        if type(source_log_id) is not int or source_log_id <= 0:
+            raise RuntimeError(
+                f"Task {task.id} has no exact source identity for relaunch"
+            )
         # Tool-free Codex PR reviews deliberately start a fresh isolated
         # thread even when a previous native thread id exists.  A relaunch
         # must therefore resend the complete immutable snapshot contract;
@@ -8449,6 +8766,7 @@ class GlobalDispatcher:
         fresh_codex_pr_review = (
             task.provider == "codex" and is_pr_sandbox_task(task)
         )
+        principal_kwargs = self._task_execution_principal_launch_kwargs(task)
         if session_id and not fresh_codex_pr_review:
             await self.instance_manager.launch(
                 instance_id=instance_id,
@@ -8469,6 +8787,9 @@ class GlobalDispatcher:
                 config_dir=config_dir,
                 enable_workflows=task.enable_workflows,
                 enabled_skills=task.enabled_skills,
+                source_log_id=source_log_id,
+                attachment_paths=self._task_attachment_paths(task),
+                **principal_kwargs,
             )
         else:
             full_prompt = await self._build_task_prompt(task)
@@ -8487,6 +8808,9 @@ class GlobalDispatcher:
                 config_dir=config_dir,
                 enable_workflows=task.enable_workflows,
                 enabled_skills=task.enabled_skills,
+                source_log_id=source_log_id,
+                attachment_paths=self._task_attachment_paths(task),
+                **principal_kwargs,
             )
 
         process = self.instance_manager.processes.get(instance_id)
@@ -8579,6 +8903,8 @@ class GlobalDispatcher:
                     enabled_skills=task.enabled_skills,
                     source_log_id=task.turn_source_log_id,
                     sequential_turn_token=attempt_token,
+                    attachment_paths=self._task_attachment_paths(task),
+                    **self._task_execution_principal_launch_kwargs(task),
                 )
             except BaseException:
                 if attempt_token is not None:
@@ -9873,6 +10199,13 @@ class GlobalDispatcher:
                 await db.rollback()
                 return None
 
+            principal_is_current = await fence_native_execution_principal(
+                db,
+                user_id=task.execution_user_id,
+                role=task.execution_user_role,
+                principal_kind=task.execution_principal_kind,
+            )
+
             source = await self._canonical_exact_turn_source(db, task)
             source_is_unbound = task.turn_source_log_id is None
             replay_is_proven_safe = bool(
@@ -9887,7 +10220,22 @@ class GlobalDispatcher:
             )
             observed_generation = self._task_status_generation(task)
             retry_budget_available = task.retry_count < task.max_retries
-            if replay_is_proven_safe and (
+            if not principal_is_current:
+                from backend.services.frontend_review_goal import (
+                    frontend_review_goal_terminal_updates,
+                )
+
+                values = {
+                    "status": "failed",
+                    "error_message": (
+                        "Task execution principal is inactive or its role "
+                        "changed; automatic replay was blocked"
+                    ),
+                    "completed_at": datetime.utcnow(),
+                    **frontend_review_goal_terminal_updates(task),
+                }
+                target_status = "failed"
+            elif replay_is_proven_safe and (
                 not consume_retry or retry_budget_available
             ):
                 values: dict = {
@@ -10924,6 +11272,12 @@ class GlobalDispatcher:
                                 current.model,
                                 current.codex_service_tier,
                             )
+                            task.execution_user_id = current.execution_user_id
+                            task.execution_user_role = current.execution_user_role
+                            task.execution_mode = current.execution_mode
+                            task.execution_principal_kind = (
+                                current.execution_principal_kind
+                            )
                             original_task_skills = dict(current.enabled_skills or {})
                             # The command/prompt belongs to the dequeued lifecycle
                             # generation; only its persistent skill baseline is
@@ -11144,6 +11498,8 @@ class GlobalDispatcher:
                 enabled_skills=task.enabled_skills,
                 system_prompt_mode=task.system_prompt_mode,
                 source_log_id=initial_source_log_id,
+                attachment_paths=self._task_attachment_paths(task),
+                **self._task_execution_principal_launch_kwargs(task),
             )
 
             # Wait for process to finish (with timeout)
@@ -11647,6 +12003,7 @@ class GlobalDispatcher:
     async def _handle_pty_background_completion(
         self,
         task_id: int,
+        expected_background_generation: str | None = None,
     ) -> None:
         """Run deferred terminal consumers after the exact PTY tail commits."""
 
@@ -11655,29 +12012,45 @@ class GlobalDispatcher:
             if (
                 task is None
                 or task.status != "completed"
-                or task.pty_background_generation is not None
+                or task.pty_background_generation
+                != expected_background_generation
             ):
                 return
             # Detach the ORM object before the session closes; the completion
             # handler only reads already-loaded scalar fields/metadata.
             db.expunge(task)
-        await self._handle_pr_review_completion(task)
+        await self._handle_pr_review_completion(
+            task,
+            expected_background_generation=expected_background_generation,
+        )
 
-    async def _handle_pr_review_completion(self, task: Task):
+    async def _handle_pr_review_completion(
+        self,
+        task: Task,
+        *,
+        expected_background_generation: str | None = None,
+    ):
         meta = task.metadata_ or {}
         fix_action_id = meta.get("pr_finding_action_id")
         if type(fix_action_id) is int:
             try:
                 from backend.services.pr_review_fix import handle_fix_task_completion
+                from backend.services.worker_node_control import (
+                    fence_worker_node_mutation,
+                )
                 from backend.services.worker_proxy import get_task_operation_lock
 
                 async with get_task_operation_lock(task.id):
                     async with self.db_factory() as db:
+                        await fence_worker_node_mutation(db)
                         await handle_fix_task_completion(
                             db,
                             action_id=fix_action_id,
                             task_id=task.id,
                             retry_count=task.retry_count,
+                            expected_background_generation=(
+                                expected_background_generation
+                            ),
                         )
             except Exception:
                 logger.exception(
@@ -11692,6 +12065,9 @@ class GlobalDispatcher:
         try:
             from backend.models.pr_monitor import MonitoredRepo, PRReview
             from backend.services.pr_review_service import check_and_update_review
+            from backend.services.worker_node_control import (
+                fence_worker_node_mutation,
+            )
             from backend.services.worker_proxy import get_task_operation_lock
 
             # Serialize the reviewing->publishing/terminal transition with
@@ -11701,6 +12077,7 @@ class GlobalDispatcher:
             # this transaction commits.
             async with get_task_operation_lock(task.id):
                 async with self.db_factory() as db:
+                    await fence_worker_node_mutation(db)
                     current_task = await db.get(Task, task.id)
                     session_id = (
                         current_task.session_id
@@ -11709,6 +12086,11 @@ class GlobalDispatcher:
                     )
 
                     def background_handoff_pending() -> bool:
+                        if expected_background_generation is not None:
+                            # The caller holds the exact PTY transition lock;
+                            # its own synchronous handoff token is not a newer
+                            # generation and must not veto this terminal turn.
+                            return False
                         return bool(
                             session_id
                             and self.instance_manager
@@ -11721,7 +12103,8 @@ class GlobalDispatcher:
                         current_task is None
                         or current_task.status != "completed"
                         or current_task.retry_count != task.retry_count
-                        or current_task.pty_background_generation is not None
+                        or current_task.pty_background_generation
+                        != expected_background_generation
                         or background_handoff_pending()
                     ):
                         return
@@ -11735,11 +12118,17 @@ class GlobalDispatcher:
                             adjudication_id=adjudication_id,
                             task_id=task.id,
                             retry_count=task.retry_count,
+                            expected_background_generation=(
+                                expected_background_generation
+                            ),
                         )
                         from backend.services.pr_review_adjudication import (
                             reconcile_rebuttal_resolutions,
                         )
-                        await reconcile_rebuttal_resolutions(self.db_factory)
+                        if expected_background_generation is None:
+                            await reconcile_rebuttal_resolutions(
+                                self.db_factory
+                            )
                         return
                     if reviewer_run_id:
                         from backend.services.pr_review_panel import (
@@ -11756,6 +12145,9 @@ class GlobalDispatcher:
                                 task_id=task.id,
                                 retry_count=task.retry_count,
                                 db_factory=self.db_factory,
+                                expected_background_generation=(
+                                    expected_background_generation
+                                ),
                             )
                         return
                     review = await db.get(PRReview, pr_review_id)
@@ -11773,6 +12165,9 @@ class GlobalDispatcher:
                         background_handoff_pending=background_handoff_pending,
                         db_factory=self.db_factory,
                         operation_lock_held=True,
+                        expected_background_generation=(
+                            expected_background_generation
+                        ),
                     )
         except Exception as e:
             logger.error(f"PR review completion handler error: {e}", exc_info=True)
@@ -13473,11 +13868,14 @@ class GlobalDispatcher:
         parts = [_agent_doc_preamble(task)]
 
         metadata = task.metadata_ or {}
-        image_paths = metadata.get("image_paths") or []
-        if image_paths:
-            image_list = "\n".join(f"- {p}" for p in image_paths)
+        attachment_paths = self._task_attachment_paths(task)
+        if attachment_paths:
+            attachment_list = "\n".join(
+                f"- {path}" for path in attachment_paths
+            )
             parts.append(
-                f"用户提供了以下参考图片，请先用 Read 工具查看：\n{image_list}"
+                "用户提供了以下参考文件，请按任务需要用 Read 工具查看：\n"
+                f"{attachment_list}"
             )
 
         from backend.services.frontend_review_goal import (
@@ -15689,6 +16087,10 @@ Do NOT create a new PR. Push fixes to the existing branch."""
         """Wait until due, then atomically claim one scheduled generation."""
 
         from backend.models.monitor_session import MonitorSession
+        from backend.services.worker_node_control import (
+            WorkerNodeDrainingConflict,
+            fence_worker_node_mutation,
+        )
 
         while True:
             now = datetime.utcnow()
@@ -15714,6 +16116,14 @@ Do NOT create a new PR. Push fixes to the existing branch."""
 
             claimed_at = datetime.utcnow()
             async with self.db_factory() as db:
+                try:
+                    # NodeControl must be the first writer. A generation claimed
+                    # after the irreversible drain snapshot could otherwise
+                    # reach a provider boundary after Task receipt cleanup.
+                    await fence_worker_node_mutation(db)
+                except WorkerNodeDrainingConflict:
+                    await db.rollback()
+                    return None
                 next_generation = MonitorSession.turn_generation + 1
                 claimed = await db.execute(
                     update(MonitorSession)
@@ -16061,6 +16471,9 @@ Do NOT create a new PR. Push fixes to the existing branch."""
         from backend.services.mcp_config import (
             build_monitor_agent_mcp_server_specs,
         )
+        from backend.services.worker_node_control import (
+            fence_worker_node_mutation,
+        )
         from backend.services.worker_proxy import get_task_operation_lock
 
         generation = int(snapshot["generation"])
@@ -16089,8 +16502,12 @@ Do NOT create a new PR. Push fixes to the existing branch."""
                 thread_id: str | None,
                 home: str | None,
             ) -> tuple[tuple[str, ...], int, int]:
-                """Lock Task -> Monitor for one exact launch generation."""
+                """Lock NodeControl -> Task -> Monitor for one launch generation."""
 
+                # ``guard_current_generation`` is reused after the Codex thread
+                # identity commit, so every new transaction independently
+                # re-establishes the irreversible Worker drain fence.
+                await fence_worker_node_mutation(db)
                 task_guard = await db.execute(
                     update(Task)
                     .where(
@@ -16571,6 +16988,9 @@ Do NOT create a new PR. Push fixes to the existing branch."""
             task_incarnation_id=task_incarnation_id,
         )
         from backend.models.monitor_session import MonitorSession
+        from backend.services.worker_node_control import (
+            fence_worker_node_mutation,
+        )
         from backend.services.worker_proxy import get_task_operation_lock
 
         expected_provider, expected_model, expected_tier = snapshot[
@@ -16582,6 +17002,7 @@ Do NOT create a new PR. Push fixes to the existing branch."""
         # the registered child and owns its cleanup.
         async with get_task_operation_lock(task_id):
             async with self.db_factory() as db:
+                await fence_worker_node_mutation(db)
                 task_guard = await db.execute(
                     update(Task)
                     .where(
@@ -17275,11 +17696,16 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 )
 
                 expected_provider, expected_model, expected_tier = task_routing
+                from backend.services.worker_node_control import (
+                    fence_worker_node_mutation,
+                )
+
                 # Serialize the last Task/session proof with receipt PUT and
                 # retain that boundary until the child process map owns the
                 # exact process generation.
                 async with get_task_operation_lock(task_id):
                     async with self.db_factory() as db:
+                        await fence_worker_node_mutation(db)
                         task_guard = await db.execute(
                             update(Task)
                             .where(
@@ -17634,6 +18060,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         """Launch an independent Codex thread with required callback tools."""
 
         from backend.services.codex_models import clamp_codex_effort
+        from backend.services.worker_node_control import (
+            fence_worker_node_mutation,
+        )
 
         codex_home: str | None = None
         pool = self.codex_pool
@@ -17676,6 +18105,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 task_private_tmpdir = None
                 try:
                     async with self.db_factory() as db:
+                        await fence_worker_node_mutation(db)
                         task_predicates = [
                             Task.id == task_id,
                             Task.incarnation_id == task_incarnation_id,
@@ -18016,6 +18446,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         initiating_user_id: int | None = None,
         initiating_user_role: str = "member",
         execution_mode: str = "sandbox",
+        execution_principal_kind: str = "system",
+        ssh_agent_socket_snapshot: object | None = None,
         attachment_paths: tuple[str, ...] = (),
     ) -> bool:
         """Enqueue a message for the main agent of a task.
@@ -18028,6 +18460,15 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         if self._shutting_down:
             raise RuntimeError(
                 "Dispatcher is shutting down; message admission is closed"
+            )
+        if source == "shared" and (
+            initiating_user_id is not None
+            or initiating_user_role != "member"
+            or execution_mode != "sandbox"
+            or execution_principal_kind != "system"
+        ):
+            raise ValueError(
+                "Shared messages must use the sandboxed system principal"
             )
         internal_session_report = source.startswith(("monitor:", "sub-agent:"))
         msg = QueuedMessage(
@@ -18044,6 +18485,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             initiating_user_id=initiating_user_id,
             initiating_user_role=initiating_user_role,
             execution_mode=execution_mode,
+            execution_principal_kind=execution_principal_kind,
+            ssh_agent_socket_snapshot=ssh_agent_socket_snapshot,
             attachment_paths=tuple(attachment_paths),
             delivery_key=delivery_key,
             current_message=prompt if current_message is None else current_message,
@@ -18114,6 +18557,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 else None
             ),
             claimed_turn_generation=envelope.claimed_generation,
+            initiating_user_id=envelope.execution_user_id,
+            initiating_user_role=envelope.execution_user_role,
+            execution_mode=envelope.execution_mode,
+            execution_principal_kind=envelope.execution_principal_kind,
         )
         if not isinstance(msg.capability_resume_lease_token, str):
             raise RuntimeError("Capability resume publication omitted its lease")
@@ -18258,6 +18705,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             ):
                 return False
             payload = receipt.queue_payload
+            payload_principal = _canonical_queue_execution_principal(payload)
             try:
                 payload_digest = (
                     _durable_json_digest(payload)
@@ -18284,6 +18732,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 == receipt.retry_count
                 and payload.get("worker_turn_handoff_from_generation")
                 == receipt.from_generation
+                and payload.get("worker_turn_handoff_incarnation_id")
+                == task.incarnation_id
+                and isinstance(receipt.request_payload, dict)
+                and receipt.request_payload.get(
+                    "worker_turn_handoff_incarnation_id"
+                )
+                == task.incarnation_id
             )
             claimed_generation = receipt.claimed_turn_generation
             if receipt.status == "accepted":
@@ -18351,9 +18806,16 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 if payload_identity_valid and isinstance(payload, dict)
                 else None
             )
+            from backend.services.task_creation import (
+                TASK_EXECUTION_WORKER_PRINCIPAL_KINDS,
+            )
+
             payload_replayable = bool(
                 payload_identity_valid
                 and isinstance(payload, dict)
+                and payload_principal is not None
+                and payload_principal["execution_principal_kind"]
+                in TASK_EXECUTION_WORKER_PRINCIPAL_KINDS
                 and "prompt" in payload
                 and delivery_key_valid
                 and isinstance(expected, list)
@@ -18364,12 +18826,25 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             if receipt.status == "claimed":
                 bound_source = await self._canonical_exact_turn_source(db, task)
                 source_matches = bool(
-                    bound_source is not None
+                    payload_principal is not None
+                    and bound_source is not None
                     and await self._turn_source_matches_exact_request(
                         db,
                         task=task,
                         source_log_id=source_log_id,
                         expected_bound_source_id=bound_source.id,
+                        expected_execution_principal={
+                            "user_id": payload_principal[
+                                "initiating_user_id"
+                            ],
+                            "role": payload_principal[
+                                "initiating_user_role"
+                            ],
+                            "mode": payload_principal["execution_mode"],
+                            "kind": payload_principal[
+                                "execution_principal_kind"
+                            ],
+                        },
                     )
                 )
                 actual_transport = (
@@ -18455,6 +18930,18 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     )
                     return False
             if not payload_replayable:
+                if receipt.status == "accepted":
+                    # ``accepted`` is durable proof that no provider boundary
+                    # was claimed. Retire a malformed authority envelope so a
+                    # restart cannot keep reinterpreting or retrying it.
+                    receipt.status = "cancelled"
+                    receipt.claimed_turn_generation = None
+                    receipt.cancel_reason = (
+                        "Worker handoff recovery envelope is missing or "
+                        "malformed, including its execution principal"
+                    )
+                    receipt.updated_at = datetime.utcnow()
+                    await db.commit()
                 return False
             if isinstance(delivery_key, str):
                 # Versioned Plan delivery already has its own durable outbox;
@@ -18468,6 +18955,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     receipt.from_generation,
                 )
             expected_routing = (expected[0], expected[1], expected[2])
+            assert payload_principal is not None
             msg = QueuedMessage(
                 priority=int(payload.get("priority", PRIORITY_USER)),
                 timestamp=float(timestamp),
@@ -18478,11 +18966,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 model_override=payload.get("model_override"),
                 expected_task_routing=expected_routing,
                 source_log_id=source_log_id,
-                initiating_user_id=payload.get("initiating_user_id"),
-                initiating_user_role=str(
-                    payload.get("initiating_user_role", "member")
-                ),
-                execution_mode=str(payload.get("execution_mode", "sandbox")),
+                initiating_user_id=payload_principal["initiating_user_id"],
+                initiating_user_role=payload_principal[
+                    "initiating_user_role"
+                ],
+                execution_mode=payload_principal["execution_mode"],
+                execution_principal_kind=payload_principal[
+                    "execution_principal_kind"
+                ],
                 attachment_paths=tuple(payload.get("attachment_paths") or ()),
                 current_message=payload.get("current_message"),
                 allow_new_session=bool(
@@ -18493,6 +18984,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 worker_turn_handoff_from_generation=(
                     receipt.from_generation
                 ),
+                worker_turn_handoff_incarnation_id=task.incarnation_id,
                 worker_turn_handoff_claimed_generation=(
                     claimed_generation if receipt.status == "claimed" else None
                 ),
@@ -18984,8 +19476,71 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         task: Task,
         source_log_id: int | None,
         expected_bound_source_id: int | None = None,
+        expected_execution_principal: dict[str, object] | None = None,
     ) -> bool:
-        """Validate the current source pointer, including hidden source aliases."""
+        """Validate the exact source, provenance, and frozen turn principal."""
+
+        from backend.services.task_creation import (
+            task_execution_principal_values,
+        )
+
+        def canonical_principal(value: object) -> dict[str, object] | None:
+            if type(value) is not dict or set(value) != {
+                "user_id",
+                "role",
+                "mode",
+                "kind",
+            }:
+                return None
+            try:
+                canonical = task_execution_principal_values(
+                    user_id=value["user_id"],
+                    role=value["role"],
+                    principal_kind=value["kind"],
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+            metadata = {
+                "user_id": canonical["execution_user_id"],
+                "role": canonical["execution_user_role"],
+                "mode": canonical["execution_mode"],
+                "kind": canonical["execution_principal_kind"],
+            }
+            return metadata if value == metadata else None
+
+        def raw_mapping(row: LogEntry) -> dict[str, object] | None:
+            try:
+                value = (
+                    row.raw_json
+                    if isinstance(row.raw_json, dict)
+                    else json.loads(row.raw_json)
+                )
+            except (TypeError, ValueError, RecursionError):
+                return None
+            return value if type(value) is dict else None
+
+        try:
+            task_canonical = task_execution_principal_values(
+                user_id=task.execution_user_id,
+                role=task.execution_user_role,
+                principal_kind=task.execution_principal_kind,
+            )
+        except (TypeError, ValueError):
+            return False
+        task_principal = {
+            "user_id": task_canonical["execution_user_id"],
+            "role": task_canonical["execution_user_role"],
+            "mode": task_canonical["execution_mode"],
+            "kind": task_canonical["execution_principal_kind"],
+        }
+        if task.execution_mode != task_principal["mode"]:
+            return False
+        if (
+            expected_execution_principal is not None
+            and canonical_principal(expected_execution_principal)
+            != task_principal
+        ):
+            return False
 
         pointer = task.turn_source_log_id
         if (
@@ -19006,6 +19561,8 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             or source.turn_scope != "source"
         ):
             return False
+        original: LogEntry | None = None
+        source_raw = raw_mapping(source)
         if source_log_id is not None:
             if type(source_log_id) is not int or source_log_id <= 0:
                 return False
@@ -19013,24 +19570,57 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             if original is None or original.task_id != task.id:
                 return False
             if pointer == source_log_id:
-                return True
+                if (
+                    source.event_type != "user_message"
+                    or source.role != "user"
+                    or source.is_error is not False
+                    or source_raw is None
+                ):
+                    return False
+                return canonical_principal(
+                    source_raw.get("execution_principal")
+                ) == task_principal
         if source.event_type != "turn_source":
             return False
-        try:
-            raw = (
-                source.raw_json
-                if isinstance(source.raw_json, dict)
-                else json.loads(source.raw_json)
+        if source_raw is None or "original_source_log_id" not in source_raw:
+            return False
+        original_source = source_raw["original_source_log_id"]
+        if source_log_id is None:
+            if original_source is not None:
+                return False
+            # Older source-less aliases predate principal metadata and have no
+            # visible Log to consult.  They retain the fail-closed Task/queue
+            # comparison above; every newly bound alias freezes the metadata.
+            alias_principal = source_raw.get("execution_principal")
+            return (
+                alias_principal is None
+                or canonical_principal(alias_principal) == task_principal
             )
-        except (TypeError, ValueError, RecursionError):
+        if type(original_source) is not int or original_source != source_log_id:
             return False
-        if not isinstance(raw, dict) or "original_source_log_id" not in raw:
+        if (
+            original is None
+            or original.event_type != "user_message"
+            or original.role != "user"
+            or original.is_error is not False
+        ):
             return False
-        original_source = raw["original_source_log_id"]
+        original_raw = raw_mapping(original)
+        if (
+            original_raw is None
+            or canonical_principal(
+                original_raw.get("execution_principal")
+            )
+            != task_principal
+        ):
+            return False
+        # Positive-id aliases created before this invariant can rely on the
+        # immutable original user Log.  If alias metadata exists, it must agree
+        # as well; a partial or forged shape is never ignored.
+        alias_principal = source_raw.get("execution_principal")
         return (
-            original_source is None
-            if source_log_id is None
-            else type(original_source) is int and original_source == source_log_id
+            alias_principal is None
+            or canonical_principal(alias_principal) == task_principal
         )
 
     async def _generic_plan_replay_claim(
@@ -19059,6 +19649,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         if any(field in payload for field in worker_fields):
             raise ValueError(
                 "Plan application launch evidence lost its Worker recovery owner"
+            )
+        payload_principal = _canonical_queue_execution_principal(payload)
+        if payload_principal is None:
+            raise ValueError(
+                "Plan application launch evidence lost its execution principal"
             )
         task_id = receipt.target_task_id
         source_log_id = payload.get("source_log_id")
@@ -19130,6 +19725,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 db,
                 task=task,
                 source_log_id=source_log_id,
+                expected_execution_principal={
+                    "user_id": payload_principal["initiating_user_id"],
+                    "role": payload_principal["initiating_user_role"],
+                    "mode": payload_principal["execution_mode"],
+                    "kind": payload_principal[
+                        "execution_principal_kind"
+                    ],
+                },
             )
         ):
             raise ValueError("Plan application launch evidence identity changed")
@@ -19222,11 +19825,22 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 != admitted_generation.pty_background_generation
                 or task.session_id != session_id
                 or task.turn_source_log_id != bound_source_id
+                or (
+                    msg.worker_turn_handoff_id is not None
+                    and task.incarnation_id
+                    != msg.worker_turn_handoff_incarnation_id
+                )
                 or not await self._turn_source_matches_exact_request(
                     db,
                     task=task,
                     source_log_id=request_source_log_id,
                     expected_bound_source_id=bound_source_id,
+                    expected_execution_principal={
+                        "user_id": msg.initiating_user_id,
+                        "role": msg.initiating_user_role,
+                        "mode": msg.execution_mode,
+                        "kind": msg.execution_principal_kind,
+                    },
                 )
             ):
                 return None
@@ -19317,6 +19931,11 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     != admitted_generation.turn_generation
                     or handoff.queue_payload_digest != queue_digest
                     or handoff.request_digest != request_digest
+                    or not isinstance(handoff.request_payload, dict)
+                    or handoff.request_payload.get(
+                        "worker_turn_handoff_incarnation_id"
+                    )
+                    != msg.worker_turn_handoff_incarnation_id
                     or not isinstance(handoff.queue_payload, dict)
                     or not _worker_handoff_message_matches_payload(
                         msg,
@@ -19735,6 +20354,34 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     return False
                 await db.commit()
                 raise RuntimeError(error)
+            payload_principal = _canonical_queue_execution_principal(payload)
+            if payload_principal is None:
+                error = (
+                    "Plan application outbox execution principal is missing "
+                    "or malformed"
+                )
+                if receipt.launch_evidence is not None:
+                    # A non-empty claim cannot be safely rolled back from an
+                    # authority envelope whose identity is incomplete.
+                    receipt.delivery_status = "uncertain"
+                    receipt.delivery_error = error
+                    receipt.updated_at = datetime.utcnow()
+                    await db.commit()
+                    return False
+                released = (
+                    await self._release_plan_delivery_with_worker_handoff(
+                        db,
+                        receipt_key=receipt_key,
+                        delivery_status="failed",
+                        error=error,
+                        expected_worker_handoff=expected_worker_handoff,
+                    )
+                )
+                if released is None:
+                    await db.rollback()
+                    return False
+                await db.commit()
+                return False
             recovered_plan_claim: tuple[int, int] | None = None
             if expected_worker_handoff is None and receipt.launch_evidence is not None:
                 try:
@@ -19775,11 +20422,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             expected_task_routing=expected_routing,
             monitor_session_id=payload.get("monitor_session_id"),
             source_log_id=payload.get("source_log_id"),
-            initiating_user_id=payload.get("initiating_user_id"),
-            initiating_user_role=str(
-                payload.get("initiating_user_role", "member")
-            ),
-            execution_mode=str(payload.get("execution_mode", "sandbox")),
+            initiating_user_id=payload_principal["initiating_user_id"],
+            initiating_user_role=payload_principal[
+                "initiating_user_role"
+            ],
+            execution_mode=payload_principal["execution_mode"],
+            execution_principal_kind=payload_principal[
+                "execution_principal_kind"
+            ],
             attachment_paths=tuple(payload.get("attachment_paths") or ()),
             delivery_key=receipt_key,
             worker_turn_handoff_id=payload.get(
@@ -19790,6 +20440,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             ),
             worker_turn_handoff_from_generation=payload.get(
                 "worker_turn_handoff_from_generation"
+            ),
+            worker_turn_handoff_incarnation_id=payload.get(
+                "worker_turn_handoff_incarnation_id"
             ),
             worker_turn_handoff_claimed_generation=(
                 worker_handoff_claimed_generation
@@ -20038,6 +20691,21 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     task=task,
                     source_log_id=source_log_id,
                     expected_bound_source_id=bound_source.id,
+                    expected_execution_principal={
+                        "user_id": payload.get("initiating_user_id"),
+                        "role": payload.get(
+                            "initiating_user_role",
+                            "member",
+                        ),
+                        "mode": payload.get(
+                            "execution_mode",
+                            "sandbox",
+                        ),
+                        "kind": payload.get(
+                            "execution_principal_kind",
+                            "system",
+                        ),
+                    },
                 )
             )
             actual_transport = (
@@ -20603,6 +21271,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             )
             if cancelled_handoff:
                 handoff.queue_clear_handled = True
+                self.revoke_context_retry_permit(
+                    handoff.context_retry_permit
+                )
                 if handoff.delivery_key is not None:
                     delivery_keys.append(handoff.delivery_key)
                 if handoff.capability_resume_outbox_id is not None:
@@ -20626,6 +21297,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         queued = q.get_nowait()
                     except asyncio.QueueEmpty:
                         break
+                    self.revoke_context_retry_permit(
+                        queued.context_retry_permit
+                    )
                     if queued.delivery_key is not None:
                         delivery_keys.append(queued.delivery_key)
                     if queued.capability_resume_outbox_id is not None:
@@ -21663,6 +22337,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             self._queued_capability_resume_ids.discard(
                                 msg.capability_resume_outbox_id
                             )
+                    if not message_requeued:
+                        self.revoke_context_retry_permit(
+                            msg.context_retry_permit
+                        )
                     q.task_done()
                     async with self._dispatch_claim_lock:
                         active = self._task_queue_active_messages.get(task_id)
@@ -21685,10 +22363,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             orphaned_delivery_key = None
             orphaned_capability_resume: tuple[int, str] | None = None
             orphaned_worker_handoff_id = None
+            orphaned_context_retry_permit = None
             async with self._dispatch_claim_lock:
                 handoff = self._task_queue_dequeued.get(task_id)
                 if handoff is not None:
                     self._task_queue_dequeued.pop(task_id, None)
+                    orphaned_context_retry_permit = (
+                        handoff.context_retry_permit
+                    )
                     orphaned_worker_handoff_id = (
                         handoff.worker_turn_handoff_id
                     )
@@ -21713,6 +22395,9 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     self._queued_capability_resume_ids.discard(
                         orphaned_capability_resume[0]
                     )
+            self.revoke_context_retry_permit(
+                orphaned_context_retry_permit
+            )
             if orphaned_delivery_key is not None:
                 await self._reset_plan_deliveries_after_queue_clear(
                     [orphaned_delivery_key],
@@ -22094,30 +22779,77 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 return
             from backend.models.user import User
 
-            if msg.execution_mode not in {"sandbox", "unrestricted"}:
-                raise QueuedMessageRoutingMismatchError(
-                    "Queued message has an invalid execution mode"
+            from backend.services.task_creation import (
+                TASK_EXECUTION_DELEGATED_PRINCIPAL_KINDS,
+                TASK_EXECUTION_WORKER_PRINCIPAL_KINDS,
+                task_execution_principal_values,
+            )
+
+            try:
+                principal_snapshot = task_execution_principal_values(
+                    user_id=msg.initiating_user_id,
+                    role=msg.initiating_user_role,
+                    principal_kind=msg.execution_principal_kind,
                 )
-            if msg.initiating_user_id is None:
-                principal_role = msg.initiating_user_role
-            else:
+            except ValueError as exc:
+                raise QueuedMessageRoutingMismatchError(
+                    "Queued message has an invalid execution principal"
+                ) from exc
+            if msg.execution_mode != principal_snapshot["execution_mode"]:
+                raise QueuedMessageRoutingMismatchError(
+                    "Queued message execution principal is inconsistent"
+                )
+            if msg.execution_principal_kind == "user":
                 principal = await db.get(User, msg.initiating_user_id)
                 if principal is None or not principal.is_active:
                     raise QueuedMessageRoutingMismatchError(
                         "Queued message initiator is no longer active"
                     )
                 principal_role = principal.role
-            expected_execution_mode = (
-                "unrestricted"
-                if principal_role in {"admin", "super_admin"}
-                else "sandbox"
+                if principal_role != msg.initiating_user_role:
+                    raise QueuedMessageRoutingMismatchError(
+                        "Queued message initiator role changed after admission"
+                    )
+            worker_managed = is_worker_managed_task_metadata(task.metadata_)
+            delegated_principal = (
+                msg.execution_principal_kind
+                in TASK_EXECUTION_DELEGATED_PRINCIPAL_KINDS
             )
-            if (
-                principal_role != msg.initiating_user_role
-                or expected_execution_mode != msg.execution_mode
+            worker_wire_principal = (
+                msg.execution_principal_kind
+                in TASK_EXECUTION_WORKER_PRINCIPAL_KINDS
+            )
+            if worker_managed and not worker_wire_principal:
+                raise QueuedMessageRoutingMismatchError(
+                    "Worker-managed Task lost its delegated/system principal"
+                )
+            if not worker_managed and delegated_principal:
+                raise QueuedMessageRoutingMismatchError(
+                    "Delegated principal is valid only on a Worker-managed "
+                    "Task"
+                )
+            live_context_retry_authority = bool(
+                worker_managed
+                and self._context_retry_authority_is_live(msg)
+                and _context_retry_permit_matches(task, msg)
+            )
+            if delegated_principal and not (
+                worker_managed
+                and (
+                    msg.worker_turn_handoff_id is not None
+                    or live_context_retry_authority
+                )
             ):
                 raise QueuedMessageRoutingMismatchError(
-                    "Queued message initiator role changed after admission"
+                    "Delegated principal is valid only for an exact Worker "
+                    "handoff or context retry on a Worker-managed Task"
+                )
+            if msg.worker_turn_handoff_id is not None and not (
+                worker_managed and worker_wire_principal
+            ):
+                raise QueuedMessageRoutingMismatchError(
+                    "Worker handoff lost its delegated principal or Worker "
+                    "Task identity"
                 )
             if await active_worker_task_termination_receipt(db, task_id):
                 raise QueuedMessagePrelaunchError(
@@ -22144,7 +22876,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     task_id,
                 )
                 return
-            if not _context_retry_permit_matches(task, msg):
+            if not (
+                self._context_retry_authority_is_live(msg)
+                and _context_retry_permit_matches(task, msg)
+            ):
                 logger.info(
                     "Discarding compact retry for task %s because its exact "
                     "rejected generation no longer owns the Task",
@@ -22304,7 +23039,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     task_id,
                 )
                 return
-            if not _context_retry_permit_matches(task, msg):
+            if not (
+                self._context_retry_authority_is_live(msg)
+                and _context_retry_permit_matches(task, msg)
+            ):
                 logger.info(
                     "Discarding compact retry for task %s after its rejected "
                     "generation was cancelled or superseded",
@@ -22740,7 +23478,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 initiating_user_id=msg.initiating_user_id,
                 initiating_user_role=msg.initiating_user_role,
                 execution_mode=msg.execution_mode,
+                execution_principal_kind=msg.execution_principal_kind,
+                ssh_agent_socket_snapshot=msg.ssh_agent_socket_snapshot,
                 attachment_paths=msg.attachment_paths,
+                context_retry_permit=msg.context_retry_permit,
+                context_retry_claimed_source_log_id=(
+                    msg.context_retry_claimed_source_log_id
+                ),
             )
             inst_id = inst.id
             task_provider = (task.provider or "claude").lower()
@@ -22764,7 +23508,15 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 src_label = (
                     "monitor" if msg.source.startswith("monitor:") else "sub-agent"
                 )
-                log_raw: dict = {"source": src_label}
+                log_raw: dict = {
+                    "source": src_label,
+                    "execution_principal": {
+                        "user_id": msg.initiating_user_id,
+                        "role": msg.initiating_user_role,
+                        "mode": msg.execution_mode,
+                        "kind": msg.execution_principal_kind,
+                    },
+                }
                 if msg.monitor_session_id:
                     log_raw["monitor_session_id"] = msg.monitor_session_id
                 monitor_log = LogEntry(
@@ -22899,6 +23651,17 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     raise QueuedMessagePrelaunchError(
                         "Queued task disappeared after launch barrier"
                     )
+                if not await fence_native_execution_principal(
+                    db,
+                    user_id=msg.initiating_user_id,
+                    role=msg.initiating_user_role,
+                    principal_kind=msg.execution_principal_kind,
+                ):
+                    await db.rollback()
+                    raise QueuedMessageRoutingMismatchError(
+                        "Queued message initiator authority changed before "
+                        "final launch claim"
+                    )
                 task = current
                 if (
                     task.status == "waiting_capability"
@@ -22908,7 +23671,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     raise QueuedMessagePrelaunchError(
                         "Task entered waiting_capability before final claim"
                     )
-                if not _context_retry_permit_matches(task, msg):
+                if not (
+                    self._context_retry_authority_is_live(msg)
+                    and _context_retry_permit_matches(task, msg)
+                ):
                     await db.rollback()
                     logger.info(
                         "Discarding compact retry for task %s at the final "
@@ -22967,6 +23733,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         len(msg.worker_turn_handoff_id) != 32
                         or type(msg.worker_turn_handoff_retry_count) is not int
                         or type(msg.worker_turn_handoff_from_generation) is not int
+                        or not isinstance(
+                            msg.worker_turn_handoff_incarnation_id,
+                            str,
+                        )
+                        or len(msg.worker_turn_handoff_incarnation_id) != 32
+                        or task.incarnation_id
+                        != msg.worker_turn_handoff_incarnation_id
                         or type(msg.source_log_id) is not int
                     ):
                         await db.rollback()
@@ -23063,7 +23836,28 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         transport=_turn_transport_name(task),
                     )
                     claimed_turn_retry = capability_turn_claim.replay
+                    if (
+                        task.execution_user_id,
+                        task.execution_user_role,
+                        task.execution_mode,
+                        task.execution_principal_kind,
+                    ) != (
+                        msg.initiating_user_id,
+                        msg.initiating_user_role,
+                        msg.execution_mode,
+                        msg.execution_principal_kind,
+                    ):
+                        await db.rollback()
+                        raise QueuedMessageRoutingMismatchError(
+                            "Capability resume execution principal changed"
+                        )
                 else:
+                    task.execution_user_id = msg.initiating_user_id
+                    task.execution_user_role = msg.initiating_user_role
+                    task.execution_mode = msg.execution_mode
+                    task.execution_principal_kind = (
+                        msg.execution_principal_kind
+                    )
                     task.status = "executing"
                     task.instance_id = inst.id
                     task.completed_at = None
@@ -23162,6 +23956,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         != handoff_payload_digest
                         or handoff_receipt.request_digest
                         != handoff_request_digest
+                        or not isinstance(
+                            handoff_receipt.request_payload,
+                            dict,
+                        )
+                        or handoff_receipt.request_payload.get(
+                            "worker_turn_handoff_incarnation_id"
+                        )
+                        != msg.worker_turn_handoff_incarnation_id
                         or not _worker_handoff_message_matches_payload(
                             msg,
                             handoff_receipt.queue_payload,
@@ -23256,6 +24058,22 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     instance_id=inst.id,
                     transport=_turn_transport_name(task),
                 )
+                if not await self._turn_source_matches_exact_request(
+                    db,
+                    task=task,
+                    source_log_id=source_log_id,
+                    expected_bound_source_id=bound_source.id,
+                    expected_execution_principal={
+                        "user_id": msg.initiating_user_id,
+                        "role": msg.initiating_user_role,
+                        "mode": msg.execution_mode,
+                        "kind": msg.execution_principal_kind,
+                    },
+                ):
+                    await db.rollback()
+                    raise QueuedMessageRoutingMismatchError(
+                        "Queued turn source execution principal changed"
+                    )
                 if (
                     capability_turn_claim is not None
                     and bound_source.id != capability_turn_claim.source_log_id
@@ -23277,6 +24095,13 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     msg.claimed_turn_generation = (
                         queued_turn_generation.turn_generation
                     )
+                    if msg.context_retry_permit is not None:
+                        msg.context_retry_claimed_source_log_id = (
+                            bound_source.id
+                        )
+                        launch_kwargs[
+                            "context_retry_claimed_source_log_id"
+                        ] = bound_source.id
                     if msg.worker_turn_handoff_id is not None:
                         msg.worker_turn_handoff_claimed_generation = (
                             queued_turn_generation.turn_generation
@@ -23454,6 +24279,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                             "Worker termination receipt or newer Task generation"
                         )
                     await permit_db.commit()
+                self._consume_context_retry_authority(msg)
                 if msg.capability_resume_outbox_id is not None:
                     from backend.services.capability_resume import (
                         mark_resume_launch_boundary_in_tx,

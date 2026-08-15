@@ -64,6 +64,7 @@ from backend.services.capability_service import (
     consume_ready_invocation,
     create_controller_invocation,
 )
+from backend.services.cancellation import await_task_completion
 from backend.services.delivery_reducer import DeliveryReducerEvent
 from backend.services.delivery_service import (
     DeliveryConflictError,
@@ -446,14 +447,7 @@ async def _await_task_settled(task: asyncio.Task[Any]) -> Any:
     Run lease is released for takeover.
     """
 
-    cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-        except BaseException:
-            break
+    cancellation = await await_task_completion(task)
     result = task.result()
     if cancellation is not None:
         raise cancellation

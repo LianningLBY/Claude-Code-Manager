@@ -8,6 +8,7 @@ import {
   type DeliveryStageKey,
   type DeliveryStageProgress,
   type DeliveryTimelineEvent,
+  type PlanInputRequest,
   type PlanVersion,
   type PRMonitorRun,
   type Project,
@@ -65,6 +66,10 @@ function deliveryStatusLabel(run: DeliveryRunDetail): string {
   if (run.activity !== 'terminal') return `${titleCase(run.phase)} · ${titleCase(run.activity)}`;
   if (run.outcome === 'success') return run.terminal === 'merged' ? 'Merged' : 'Ready to merge';
   return titleCase(run.outcome || 'completed');
+}
+
+function isPlanInputRequester(value: string): value is PlanInputRequest['requested_by'] {
+  return value === 'planner' || value === 'reviewer';
 }
 
 const HARNESS_TERMINAL = new Set(['completed', 'failed', 'cancelled', 'stale']);
@@ -493,24 +498,35 @@ export function DeliveryRunDialog({
     if (!run || !progress || !selectedCycle) return null;
     if (stage === 'planning') {
       const plan = selectedCycle.plan_version_id ? plans[selectedCycle.plan_version_id] : null;
+      const planInput = selectedIsCurrent ? progress.plan_input : null;
+      const planInputRequest = planInput && isPlanInputRequester(planInput.request.requested_by)
+        ? { ...planInput.request, requested_by: planInput.request.requested_by }
+        : null;
       const currentPlanId = selectedIsCurrent ? progress.plan_id : null;
       return (
         <div className="space-y-4">
-          {selectedIsCurrent && progress.plan_input && (
+          {planInput && (
             <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4">
               <div className="mb-3 flex items-center justify-between gap-3">
                 <div>
                   <p className="text-sm font-semibold text-amber-200">The Loop needs your choice</p>
                   <p className="mt-1 text-xs text-amber-100/60">Answer here; you do not need to switch to the Plans page.</p>
                 </div>
-                <button type="button" onClick={() => onOpenPlan(progress.plan_input!.plan_id)} className="text-xs text-indigo-300 hover:underline">Open full Plan</button>
+                <button type="button" onClick={() => onOpenPlan(planInput.plan_id)} className="text-xs text-indigo-300 hover:underline">Open full Plan</button>
               </div>
-              <PlanInputForm
-                compact
-                run={progress.plan_input.run}
-                request={progress.plan_input.request}
-                onAnswered={() => load()}
-              />
+              {planInputRequest ? (
+                <PlanInputForm
+                  compact
+                  run={planInput.run}
+                  request={planInputRequest}
+                  onAnswered={() => load()}
+                />
+              ) : (
+                <Notice
+                  tone="red"
+                  text="The server returned an invalid Plan input requester. Inline answering is disabled until the response is corrected."
+                />
+              )}
             </div>
           )}
           {plan ? (
@@ -523,7 +539,7 @@ export function DeliveryRunDialog({
               </div>
               <div className="prose prose-invert mt-3 max-w-none text-xs text-gray-300"><MarkdownRenderer content={plan.content} /></div>
             </article>
-          ) : currentPlanId && !progress.plan_input ? (
+          ) : currentPlanId && !planInput ? (
             <div className="flex flex-wrap items-center justify-between gap-3 border-l-2 border-indigo-400/60 bg-indigo-500/5 px-4 py-3">
               <div>
                 <p className="text-sm font-medium text-gray-200">Plan #{currentPlanId} is being prepared</p>

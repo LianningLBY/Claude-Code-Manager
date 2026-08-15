@@ -144,6 +144,12 @@ async def test_bind_turn_source_aliases_cross_generation_without_mutating_histor
     assert source.turn_scope == "source"
     assert source.is_error is False
     assert json.loads(source.raw_json) == {
+        "execution_principal": {
+            "kind": "system",
+            "mode": "sandbox",
+            "role": "member",
+            "user_id": None,
+        },
         "original_source_log_id": historical.id,
         "transport": "claude_pty",
     }
@@ -246,6 +252,12 @@ async def test_bind_turn_source_none_creates_one_durable_hidden_source(db_sessio
     assert source.event_type == "turn_source"
     assert source.turn_scope == "source"
     assert json.loads(source.raw_json) == {
+        "execution_principal": {
+            "kind": "system",
+            "mode": "sandbox",
+            "role": "member",
+            "user_id": None,
+        },
         "original_source_log_id": None,
         "transport": "codex_exec",
     }

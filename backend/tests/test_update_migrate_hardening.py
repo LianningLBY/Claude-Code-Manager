@@ -330,6 +330,17 @@ def test_linux_prerequisite_gate_fails_before_service_stop(
     _write_sqlite(backup, "unchanged")
     env, service_log, uv_log, python_wrapper = _fake_tools(tmp_path)
     (Path(env["PATH"].split(":", 1)[0]) / "socat").unlink()
+    lookup_mask = tmp_path / "mask-socat-command.bash"
+    lookup_mask.write_text(
+        "command() {\n"
+        "  if [ \"${1:-}\" = \"-v\" ] && "
+        "[ \"${2:-}\" = \"socat\" ]; then return 1; fi\n"
+        "  builtin command \"$@\"\n"
+        "}\n"
+    )
+    # Keep the prerequisite probe hermetic even when the test host itself has
+    # /usr/bin/socat installed later in PATH.
+    env["BASH_ENV"] = str(lookup_mask)
 
     result = _run(
         project=project,

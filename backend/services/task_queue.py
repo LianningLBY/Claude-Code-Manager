@@ -14,6 +14,7 @@ from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 from backend.models.test_harness import TestHarnessChildBinding
 from backend.models.task_ssh_grant import TaskSSHGrant
+from backend.models.user import User
 from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 from backend.services.task_creation import (
     purge_task_access_grants,
@@ -58,6 +59,38 @@ TASK_KIND_MAIN = "main"
 
 class TaskWaitingCapabilityConflict(RuntimeError):
     """An ordinary Task mutation raced with its durable capability wait."""
+
+
+async def fence_native_execution_principal(
+    db: AsyncSession,
+    *,
+    user_id: int | None,
+    role: str,
+    principal_kind: str,
+) -> bool:
+    """Writer-fence one native user principal in the caller's transaction.
+
+    Worker-side delegated principals deliberately have no local ``User`` row;
+    their authority is revalidated by the Manager's generation-bound launch
+    permit.  System/token principals likewise do not derive authority from a
+    user record.  Only a native ``user`` principal therefore participates in
+    this fence.
+    """
+
+    if principal_kind != "user":
+        return True
+    if type(user_id) is not int or user_id <= 0:
+        return False
+    fenced = await db.execute(
+        update(User)
+        .where(
+            User.id == user_id,
+            User.is_active.is_(True),
+            User.role == role,
+        )
+        .values(role=User.role)
+    )
+    return fenced.rowcount == 1
 
 
 def _dispatcher_scope_predicate():
@@ -111,6 +144,82 @@ def _task_kind_predicate(task_kind: str):
     if task_kind == TASK_KIND_MAIN:
         return Task.mode != "plan"
     raise ValueError(f"Unsupported task kind: {task_kind}")
+
+
+def ordinary_task_visibility_predicate():
+    """Keep Controller-owned PR Monitor Tasks out of ordinary task lists.
+
+    Older deployments created reviewer, finding-fix, and rebuttal Tasks as
+    unarchived rows, so filtering on ``Task.archived`` alone can leak raw
+    Controller protocol into the normal Tasks/Chat UI.  Durable owner links
+    classify both legacy and current workflows.
+    """
+
+    from backend.services.pr_monitor_task_access import (
+        pr_monitor_owned_task_predicate,
+    )
+
+    return ~pr_monitor_owned_task_predicate(Task.id)
+
+
+def _ordinary_task_visibility_predicate():
+    """Compatibility alias for the former private visibility helper."""
+
+    return ordinary_task_visibility_predicate()
+
+
+def _pr_review_dispatch_predicate():
+    """Only dispatch a reviewer Task while its durable owner is runnable.
+
+    The first panel Task is also stored in ``PRReview.task_id`` for legacy
+    compatibility.  A panel link must therefore take precedence over the
+    single-review link; otherwise cancelling that reviewer run would still
+    leave the Task runnable through the parent review's ``reviewing`` state.
+    Correlated ``EXISTS`` predicates keep the same semantics on SQLite,
+    PostgreSQL, and MySQL and can be repeated in the final Task claim CAS.
+    """
+
+    from backend.models.pr_monitor import PRReview, PRReviewerRun
+
+    panel_review = (
+        select(PRReviewerRun.id)
+        .where(PRReviewerRun.task_id == Task.id)
+        .correlate(Task)
+        .exists()
+    )
+    runnable_panel_review = (
+        select(PRReviewerRun.id)
+        .join(PRReview, PRReview.id == PRReviewerRun.pr_review_id)
+        .where(
+            PRReviewerRun.task_id == Task.id,
+            PRReviewerRun.status.in_(("pending", "reviewing")),
+            PRReview.status == "reviewing",
+        )
+        .correlate(Task)
+        .exists()
+    )
+    single_review = (
+        select(PRReview.id)
+        .where(PRReview.task_id == Task.id)
+        .correlate(Task)
+        .exists()
+    )
+    runnable_single_review = (
+        select(PRReview.id)
+        .where(
+            PRReview.task_id == Task.id,
+            PRReview.status == "reviewing",
+        )
+        .correlate(Task)
+        .exists()
+    )
+    return or_(
+        runnable_panel_review,
+        and_(
+            ~panel_review,
+            or_(~single_review, runnable_single_review),
+        ),
+    )
 
 
 def is_task_status_deletable(*, mode: str, status: str) -> bool:
@@ -806,7 +915,10 @@ class TaskQueue:
     ) -> list[Task]:
         auto_sort = await self._auto_sort_enabled()
         effective_key = _effective_key_expr(auto_sort)
-        stmt = select(Task).where(Task.shared_from_id.is_(None)).order_by(Task.starred.desc(), effective_key.desc(), Task.id.desc())
+        stmt = select(Task).where(
+            Task.shared_from_id.is_(None),
+            ordinary_task_visibility_predicate(),
+        ).order_by(Task.starred.desc(), effective_key.desc(), Task.id.desc())
         if archived_only:
             stmt = stmt.where(Task.archived.is_(True))
         elif not include_archived:
@@ -822,16 +934,18 @@ class TaskQueue:
             stmt = stmt.where(Task.has_unread == has_unread)
         if task_kind is not None:
             stmt = stmt.where(_task_kind_predicate(task_kind))
-        # Team CCM: member sees tasks on own Workers, created by them, or shared to them
+        # Worker is only an execution location. Member visibility comes from
+        # Task ownership, an explicit Task share, or a Project share.
         if user_id is not None:
-            from backend.models.worker import Worker
             from backend.models.team_share import TeamTaskShare, TeamProjectShare
             from backend.models.user_group import UserGroupMember
-            owned_worker_ids_q = select(Worker.id).where(Worker.owner_user_id == user_id)
             user_group_ids_q = select(UserGroupMember.group_id).where(UserGroupMember.user_id == user_id)
             shared_task_ids_q = select(TeamTaskShare.task_id).where(
-                ((TeamTaskShare.target_type == "user") & (TeamTaskShare.target_id == user_id))
-                | ((TeamTaskShare.target_type == "group") & TeamTaskShare.target_id.in_(user_group_ids_q))
+                TeamTaskShare.permission == "chat",
+                (
+                    ((TeamTaskShare.target_type == "user") & (TeamTaskShare.target_id == user_id))
+                    | ((TeamTaskShare.target_type == "group") & TeamTaskShare.target_id.in_(user_group_ids_q))
+                ),
             )
             shared_project_ids_q = select(TeamProjectShare.project_id).where(
                 ((TeamProjectShare.target_type == "user") & (TeamProjectShare.target_id == user_id))
@@ -839,7 +953,6 @@ class TaskQueue:
             )
             stmt = stmt.where(
                 (Task.created_by == user_id)
-                | Task.worker_id.in_(owned_worker_ids_q)
                 | Task.id.in_(shared_task_ids_q)
                 | Task.project_id.in_(shared_project_ids_q)
             )
@@ -855,7 +968,10 @@ class TaskQueue:
         task_kind: str | None = None,
         user_id: int | None = None,
     ) -> int:
-        stmt = select(func.count(Task.id)).where(Task.shared_from_id.is_(None))
+        stmt = select(func.count(Task.id)).where(
+            Task.shared_from_id.is_(None),
+            ordinary_task_visibility_predicate(),
+        )
         if archived_only:
             stmt = stmt.where(Task.archived.is_(True))
         elif not include_archived:
@@ -872,14 +988,15 @@ class TaskQueue:
         if task_kind is not None:
             stmt = stmt.where(_task_kind_predicate(task_kind))
         if user_id is not None:
-            from backend.models.worker import Worker
             from backend.models.team_share import TeamTaskShare, TeamProjectShare
             from backend.models.user_group import UserGroupMember
-            owned_worker_ids_q = select(Worker.id).where(Worker.owner_user_id == user_id)
             user_group_ids_q = select(UserGroupMember.group_id).where(UserGroupMember.user_id == user_id)
             shared_task_ids_q = select(TeamTaskShare.task_id).where(
-                ((TeamTaskShare.target_type == "user") & (TeamTaskShare.target_id == user_id))
-                | ((TeamTaskShare.target_type == "group") & TeamTaskShare.target_id.in_(user_group_ids_q))
+                TeamTaskShare.permission == "chat",
+                (
+                    ((TeamTaskShare.target_type == "user") & (TeamTaskShare.target_id == user_id))
+                    | ((TeamTaskShare.target_type == "group") & TeamTaskShare.target_id.in_(user_group_ids_q))
+                ),
             )
             shared_project_ids_q = select(TeamProjectShare.project_id).where(
                 ((TeamProjectShare.target_type == "user") & (TeamProjectShare.target_id == user_id))
@@ -887,7 +1004,6 @@ class TaskQueue:
             )
             stmt = stmt.where(
                 (Task.created_by == user_id)
-                | Task.worker_id.in_(owned_worker_ids_q)
                 | Task.id.in_(shared_task_ids_q)
                 | Task.project_id.in_(shared_project_ids_q)
             )
@@ -1057,6 +1173,7 @@ class TaskQueue:
         self,
         task_id: int,
         *,
+        owner_fence_held: bool = False,
         expected_fence: TaskDeleteFence | None = None,
         remote_worker_deleted: bool = False,
         before_delete: (
@@ -1074,16 +1191,18 @@ class TaskQueue:
             test_harness_owner_fence,
         )
 
+        kwargs = {
+            "expected_fence": expected_fence,
+            "remote_worker_deleted": remote_worker_deleted,
+            "before_delete": before_delete,
+            "remote_delete_confirm": remote_delete_confirm,
+            "prepare_remote_worker_delete": prepare_remote_worker_delete,
+            "worker_delete_operation_id": worker_delete_operation_id,
+        }
+        if owner_fence_held:
+            return await self._delete_under_owner_fence(task_id, **kwargs)
         async with test_harness_owner_fence(task_id):
-            return await self._delete_under_owner_fence(
-                task_id,
-                expected_fence=expected_fence,
-                remote_worker_deleted=remote_worker_deleted,
-                before_delete=before_delete,
-                remote_delete_confirm=remote_delete_confirm,
-                prepare_remote_worker_delete=prepare_remote_worker_delete,
-                worker_delete_operation_id=worker_delete_operation_id,
-            )
+            return await self._delete_under_owner_fence(task_id, **kwargs)
 
     async def _delete_under_owner_fence(
         self,
@@ -2018,9 +2137,25 @@ class TaskQueue:
         has no identifiable owner.
         """
 
+        from backend.services.worker_node_control import (
+            WorkerNodeDrainingConflict,
+            fence_worker_node_mutation,
+        )
+
+        try:
+            # On a Worker this is the first writer lock and remains held until
+            # the Task claim commits. A drain claim that wins first prevents a
+            # new generation; a dequeue that wins first is visible to the
+            # later node proof. Manager queues skip the fence internally.
+            await fence_worker_node_mutation(self.db)
+        except WorkerNodeDrainingConflict:
+            await self.db.rollback()
+            return None
+
         blocked_ids = set(exclude_ids or ())
         while True:
             dispatcher_scope = _dispatcher_scope_predicate()
+            pr_review_scope = _pr_review_dispatch_predicate()
             stmt = (
                 select(Task.id)
                 # worker task 不走本地 instance；shadow task (shared_from_id) 不执行
@@ -2031,6 +2166,7 @@ class TaskQueue:
                     task_retry_not_superseded_predicate(),
                     no_active_worker_task_termination_predicate(),
                     dispatcher_scope,
+                    pr_review_scope,
                 )
                 .order_by(Task.priority.asc(), Task.created_at.asc())
                 .limit(1)
@@ -2040,6 +2176,8 @@ class TaskQueue:
 
             candidate_id = (await self.db.execute(stmt)).scalar_one_or_none()
             if candidate_id is None:
+                # Release the Worker node writer fence when the queue is idle.
+                await self.db.rollback()
                 return None
             candidate = await self.db.get(
                 Task,
@@ -2175,6 +2313,7 @@ class TaskQueue:
                     task_retry_not_superseded_predicate(),
                     no_active_worker_task_termination_predicate(),
                     dispatcher_scope,
+                    pr_review_scope,
                 )
                 .values(**values)
             )
@@ -2184,6 +2323,29 @@ class TaskQueue:
                 # than publishing a phantom running Browser generation.
                 await self.db.rollback()
                 self.db.expire_all()
+                continue
+            claimed_candidate = None
+            if claimed.rowcount:
+                claimed_candidate = await self.db.get(
+                    Task,
+                    candidate_id,
+                    populate_existing=True,
+                )
+            if claimed.rowcount and (
+                claimed_candidate is None
+                or not await fence_native_execution_principal(
+                    self.db,
+                    user_id=claimed_candidate.execution_user_id,
+                    role=claimed_candidate.execution_user_role,
+                    principal_kind=claimed_candidate.execution_principal_kind,
+                )
+            ):
+                # Roll the uncommitted Task/binding claim back atomically.
+                # Keep revoked work pending for explicit authority repair and
+                # continue looking so it cannot starve unrelated queue items.
+                await self.db.rollback()
+                self.db.expire_all()
+                blocked_ids.add(candidate_id)
                 continue
             await self.db.commit()
             if not claimed.rowcount:
@@ -2291,6 +2453,11 @@ class TaskQueue:
         The active-status guard is intentional: a concurrent user cancellation
         must win instead of being overwritten back to ``pending``.
         """
+        from backend.services.worker_node_control import (
+            fence_worker_node_mutation,
+        )
+
+        await fence_worker_node_mutation(self.db)
         predicate = [
             Task.id == task_id,
             Task.status.in_(("in_progress", "executing")),
@@ -2402,6 +2569,8 @@ class TaskQueue:
         generation_fence: TaskGenerationFence | None = None,
         rollback_on_miss: bool = False,
         task_updates: dict | None = None,
+        expected_incarnation_id: str | None = None,
+        expected_principal: dict | None = None,
         commit: bool = True,
     ) -> Task | None:
         """CAS a retryable task back to pending and release old ownership.
@@ -2413,6 +2582,11 @@ class TaskQueue:
         a slot has been recycled.
         """
 
+        from backend.services.worker_node_control import (
+            fence_worker_node_mutation,
+        )
+
+        await fence_worker_node_mutation(self.db)
         predicates = [
             Task.id == task_id,
             Task.status.in_(expected_statuses),
@@ -2424,6 +2598,25 @@ class TaskQueue:
         if instance_id is not None:
             predicates.append(Task.instance_id == instance_id)
         append_task_generation_predicates(predicates, generation_fence)
+        if expected_incarnation_id is not None:
+            predicates.append(Task.incarnation_id == expected_incarnation_id)
+        if expected_principal is not None:
+            predicates.extend(
+                [
+                    Task.execution_user_role
+                    == expected_principal.get("execution_user_role"),
+                    Task.execution_mode
+                    == expected_principal.get("execution_mode"),
+                    Task.execution_principal_kind
+                    == expected_principal.get("execution_principal_kind"),
+                    (
+                        Task.execution_user_id.is_(None)
+                        if expected_principal.get("execution_user_id") is None
+                        else Task.execution_user_id
+                        == expected_principal.get("execution_user_id")
+                    ),
+                ]
+            )
         values = {
             "status": "pending",
             "retry_count": Task.retry_count + 1,

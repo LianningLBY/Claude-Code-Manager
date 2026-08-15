@@ -10,6 +10,7 @@ requirements fail closed instead of asking the user to fill Monitor fields.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import logging
 import secrets
@@ -25,6 +26,10 @@ from backend.models.project import Project
 from backend.services.delivery_service import (
     _configured_delivery_providers,
     _github_repo_from_url,
+)
+from backend.services.pr_review_actions import (
+    FindingActionConflict,
+    lock_pr_repo_action_boundary,
 )
 from backend.services.pr_review_service import GhError, _gh_api_json
 
@@ -160,20 +165,90 @@ def _monitor_problem(
 async def _existing_monitor(
     db: AsyncSession,
     identity: _ProjectIdentity,
-    *,
-    lock: bool,
 ) -> MonitoredRepo | None:
+    """Read a candidate without taking the repository topology lock.
+
+    The post-discovery caller already holds Project while resolving a
+    concurrent creator. Taking MonitoredRepo there would invert the global
+    MonitoredRepo -> Project order used by PR Monitor mutations. A plain MVCC
+    read is sufficient: monitor creation is serialized by the Project fence,
+    and Quick Start subsequently reacquires both rows in canonical order.
+    """
+
     statement = select(MonitoredRepo).where(
         func.lower(MonitoredRepo.repo_full_name) == identity.repo_full_name.lower()
     )
-    if lock:
-        statement = statement.with_for_update()
     rows = list((await db.execute(statement)).scalars())
     if len(rows) > 1:
         raise DeliverySetupConflictError(
             "Multiple PR Monitor rows differ only by GitHub repository casing"
         )
     return rows[0] if rows else None
+
+
+async def _lock_project_identity(
+    db: AsyncSession,
+    project_id: int,
+) -> _ProjectIdentity:
+    """Fence Project identity after any required MonitoredRepo writer lock."""
+
+    await db.execute(
+        update(Project).where(Project.id == project_id).values(id=Project.id)
+    )
+    return _project_identity(
+        await db.get(Project, project_id, populate_existing=True)
+    )
+
+
+async def _reconcile_existing_monitor(
+    db: AsyncSession,
+    *,
+    repo_id: int,
+    identity: _ProjectIdentity,
+    policies: list[dict[str, str]],
+    source: str,
+    create_authorizer: Callable[[AsyncSession], Awaitable[None]] | None,
+) -> DeliveryMonitorSetup:
+    """Update an existing Monitor under the canonical topology lock order."""
+
+    # A plain discovery read may already have started a transaction. Re-enter
+    # on a clean transaction so the writer order is always MonitoredRepo ->
+    # Project -> membership/User authority. Merely assigning ORM attributes
+    # while Project is locked is not safe: flush would acquire the repository
+    # row lock in the reverse order.
+    await db.rollback()
+    try:
+        existing = await lock_pr_repo_action_boundary(db, repo_id)
+    except FindingActionConflict as exc:
+        await db.rollback()
+        raise DeliverySetupConflictError(
+            "The existing PR Monitor changed during Delivery setup; retry"
+        ) from exc
+
+    current = await _lock_project_identity(db, identity.project_id)
+    if current != identity:
+        await db.rollback()
+        raise DeliverySetupConflictError(
+            "Project GitHub identity changed during PR Monitor setup; retry"
+        )
+    problem = _monitor_problem(existing, current)
+    if problem:
+        await db.rollback()
+        raise DeliverySetupConflictError(
+            f"Cannot configure Delivery automatically because {problem}. "
+            "An administrator must resolve the conflicting legacy binding."
+        )
+
+    # User-driven Quick Start can spend substantial time on GitHub discovery.
+    # Revalidate its cached principal after both topology rows are fenced.
+    if create_authorizer is not None:
+        await create_authorizer(db)
+    if policies:
+        existing.wait_for_ci = True
+        existing.required_checks = policies
+    await db.commit()
+    await db.refresh(existing)
+    return DeliveryMonitorSetup(existing, False, source)
 
 
 def _parse_ci_candidates(
@@ -441,11 +516,13 @@ async def ensure_default_delivery_monitor(
     *,
     allow_create: bool = True,
     strict_branch_protection: bool = False,
+    create_authorizer: Callable[[AsyncSession], Awaitable[None]] | None = None,
 ) -> DeliveryMonitorSetup:
     """Return a compatible Monitor or create its conservative default."""
 
     identity = _project_identity(await db.get(Project, project_id))
-    existing = await _existing_monitor(db, identity, lock=False)
+    existing = await _existing_monitor(db, identity)
+    existing_id = existing.id if existing is not None else None
     if existing is not None:
         problem = _monitor_problem(existing, identity)
         if problem:
@@ -453,8 +530,17 @@ async def ensure_default_delivery_monitor(
                 f"Cannot configure Delivery automatically because {problem}. "
                 "An administrator must resolve the conflicting legacy binding."
             )
+        if not allow_create:
+            if strict_branch_protection:
+                await db.rollback()
+                raise DeliverySetupPermissionError(
+                    "A CCM administrator must refresh this Project's strict "
+                    "PR Monitor CI policy"
+                )
+            await db.commit()
+            return DeliveryMonitorSetup(existing, False, None)
         if not strict_branch_protection and (
-            existing.required_checks or not allow_create
+            existing.required_checks
         ):
             await db.commit()
             return DeliveryMonitorSetup(existing, False, None)
@@ -481,35 +567,46 @@ async def ensure_default_delivery_monitor(
             identity.default_branch,
         )
 
-    # Serialize against Project identity edits and re-prove the exact snapshot
-    # used for the external discovery before creating a durable Monitor.
-    await db.execute(
-        update(Project).where(Project.id == project_id).values(id=Project.id)
-    )
-    current = _project_identity(
-        await db.get(Project, project_id, populate_existing=True)
-    )
+    if existing_id is not None:
+        return await _reconcile_existing_monitor(
+            db,
+            repo_id=existing_id,
+            identity=identity,
+            policies=policies,
+            source=source,
+            create_authorizer=create_authorizer,
+        )
+
+    # No Monitor existed before discovery. Serialize creation against Project
+    # identity edits and re-prove the exact snapshot used for GitHub discovery.
+    current = await _lock_project_identity(db, project_id)
     if current != identity:
         await db.rollback()
         raise DeliverySetupConflictError(
             "Project GitHub identity changed during PR Monitor setup; retry"
         )
 
-    existing = await _existing_monitor(db, current, lock=True)
+    existing = await _existing_monitor(db, current)
     if existing is not None:
-        problem = _monitor_problem(existing, current)
-        if problem:
-            await db.rollback()
-            raise DeliverySetupConflictError(
-                f"Cannot configure Delivery automatically because {problem}. "
-                "An administrator must resolve the conflicting legacy binding."
-            )
-        if policies:
-            existing.wait_for_ci = True
-            existing.required_checks = policies
-        await db.commit()
-        await db.refresh(existing)
-        return DeliveryMonitorSetup(existing, False, source)
+        # A creator may have committed while GitHub discovery was in flight.
+        # Release Project before taking that existing repository writer lock,
+        # then re-enter both rows in canonical order and revalidate everything.
+        existing_id = existing.id
+        await db.rollback()
+        return await _reconcile_existing_monitor(
+            db,
+            repo_id=existing_id,
+            identity=identity,
+            policies=policies,
+            source=source,
+            create_authorizer=create_authorizer,
+        )
+
+    # Background post-clone setup is a system producer and intentionally has
+    # no authorizer. Quick Start revalidates the cached HTTP principal inside
+    # the same Project-fenced transaction that inserts the Monitor.
+    if create_authorizer is not None:
+        await create_authorizer(db)
 
     repo = MonitoredRepo(
         repo_full_name=current.repo_full_name,
@@ -538,7 +635,7 @@ async def ensure_default_delivery_monitor(
         # A concurrent quick-start may have won the global repository unique
         # key.  Re-read and accept only the exact compatible result.
         await db.rollback()
-        winner = await _existing_monitor(db, current, lock=False)
+        winner = await _existing_monitor(db, current)
         if winner is None or _monitor_problem(winner, current):
             raise DeliverySetupConflictError(
                 "Another PR Monitor setup won concurrently with incompatible settings"

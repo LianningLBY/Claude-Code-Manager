@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import httpx
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, or_, select, update
 
 from backend.config import settings
 from backend.database import async_session
@@ -68,6 +68,7 @@ from backend.services.test_harness_owner_fence import (
     test_harness_owner_identity,
     test_harness_owner_locality_error,
 )
+from backend.services.worker_node_control import fence_worker_node_mutation
 
 
 logger = logging.getLogger(__name__)
@@ -441,14 +442,19 @@ class TestHarnessService:
         async with self._lock:
             async with self.db_factory() as db:
                 owner: Task | None = None
+                # Global Worker writer order is node-control -> owner Task.
+                # Holding this fence through Run/Event commit makes a run
+                # that wins first visible to the later drain proof, while an
+                # irreversible drain that wins first rejects materialization.
+                await fence_worker_node_mutation(db)
                 if task_id is not None:
                     if owner_identity is None or owner_identity.task_id != task_id:
                         raise TestHarnessError(
                             "Harness Run has no exact owner generation"
                         )
                     try:
-                        # This is intentionally the first statement in the
-                        # materialization transaction. It turns a stale
+                        # This is the first Task statement after the node
+                        # mutation fence. It turns a stale
                         # preflight identity into a serialized writer CAS on
                         # SQLite WAL as well as a row lock on server databases.
                         owner = await lock_test_harness_owner(db, owner_identity)
@@ -2100,20 +2106,52 @@ class TestHarnessService:
     ) -> None:
         async with self._db_lock:
             async with self.db_factory() as db:
-                run = await db.get(TestHarnessRun, run_id)
+                # ``FOR UPDATE`` is ignored by SQLite.  The no-op UPDATE is
+                # therefore the portable first-writer barrier for both the
+                # lifecycle projection and its monotonically allocated event
+                # sequence.  Separate Manager processes cannot otherwise both
+                # read the same cleanup/event state and commit out of order.
+                await db.execute(
+                    update(TestHarnessRun)
+                    .where(TestHarnessRun.id == run_id)
+                    .values(event_sequence=TestHarnessRun.event_sequence)
+                )
+                run = (
+                    await db.execute(
+                        select(TestHarnessRun)
+                        .where(TestHarnessRun.id == run_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
                 if run is None:
                     return
-                proposed_status = values.get("status")
-                cleanup_only = set(values).issubset(
+                effective_values = dict(values)
+                proposed_cleanup = effective_values.get("cleanup_status")
+                if run.cleanup_status == "completed":
+                    # External cleanup proof is an absorbing state.  A late
+                    # executor may still publish an otherwise valid terminal
+                    # lifecycle update, but it can never replace durable proof
+                    # with failed/cleaning/unconfirmed or restore an error.
+                    effective_values.pop("cleanup_status", None)
+                    effective_values.pop("cleanup_error", None)
+                elif proposed_cleanup == "completed":
+                    effective_values["cleanup_error"] = None
+                if not effective_values:
+                    await db.rollback()
+                    return
+                proposed_status = effective_values.get("status")
+                cleanup_only = set(effective_values).issubset(
                     {"cleanup_status", "cleanup_error"}
                 )
                 if run.status in HARNESS_TERMINAL_STATUSES:
                     if not cleanup_only and proposed_status != run.status:
+                        await db.rollback()
                         return
                 elif run.status == "cancelling":
                     if not cleanup_only and proposed_status != "cancelled":
+                        await db.rollback()
                         return
-                for key, value in values.items():
+                for key, value in effective_values.items():
                     setattr(run, key, value)
                 await self._append_event(
                     db,
@@ -2121,7 +2159,7 @@ class TestHarnessService:
                     event_type=event_type,
                     title=title,
                     detail=detail,
-                    stage=str(values.get("stage") or run.stage),
+                    stage=str(effective_values.get("stage") or run.stage),
                     source_key=source_key,
                 )
                 await db.commit()
@@ -2702,6 +2740,9 @@ class TestHarnessService:
         *,
         reason: str,
         expected_identity: TestHarnessOwnerIdentity | None = None,
+        locked_owner_validator: (
+            Callable[[Any], Awaitable[None]] | None
+        ) = None,
     ):
         """Drain the owner graph and fence a terminal Task writer.
 
@@ -2723,6 +2764,7 @@ class TestHarnessService:
                         task_id,
                         reason=reason,
                         expected_identity=expected_identity,
+                        locked_owner_validator=locked_owner_validator,
                     )
             yield
             return
@@ -2735,6 +2777,7 @@ class TestHarnessService:
                     task_id,
                     reason=reason,
                     expected_identity=None,
+                    locked_owner_validator=locked_owner_validator,
                 )
                 yield
 
@@ -2744,6 +2787,9 @@ class TestHarnessService:
         *,
         reason: str,
         expected_identity: TestHarnessOwnerIdentity | None,
+        locked_owner_validator: (
+            Callable[[Any], Awaitable[None]] | None
+        ) = None,
     ) -> None:
         """Install the exact gate, drain its graph, and verify cleanup."""
 
@@ -2761,6 +2807,7 @@ class TestHarnessService:
                         db,
                         expected_identity,
                         reason=reason,
+                        locked_owner_validator=locked_owner_validator,
                     )
                 except RuntimeError as exc:
                     raise TestHarnessError(str(exc)) from exc
@@ -2778,6 +2825,10 @@ class TestHarnessService:
                 # terminal Run whose cleanup still needs a retry.
                 await db.commit()
             for run_id in sorted(run_ids):
+                # The durable gate itself is the cleanup authorization.  The
+                # ordinary exact-owner admission lock intentionally rejects a
+                # terminalizing generation, so cleanup consumes only these
+                # frozen UUIDs instead of attempting admission again.
                 await self.cancel(run_id)
             linked_workspace_ids: set[str] = set()
             if run_ids:
@@ -2804,8 +2855,19 @@ class TestHarnessService:
                         await workspace_review_manager.cancel(workspace_id)
                     except Exception as exc:
                         raise TestHarnessError(str(exc)) from exc
-        await self._cancel_for_task_unlocked(task_id, reason=reason)
-        if expected_identity is None:
+            # A binding may have been committed before its parent Run linked
+            # the child identity, or its parent cancellation may already have
+            # become terminal.  Stop exactly the bindings frozen into this
+            # gate; never broaden an exact-generation cleanup by owner Task.
+            for binding_id in sorted(binding_ids):
+                await self.child_service.stop_binding(
+                    binding_id,
+                    reason=reason,
+                )
+        else:
+            # Legacy callers have no durable generation identity.  Preserve
+            # their historical owner-wide cascade under the process fence.
+            await self._cancel_for_task_unlocked(task_id, reason=reason)
             return
         async with self.db_factory() as db:
             try:
@@ -2813,6 +2875,7 @@ class TestHarnessService:
                     db,
                     expected_identity,
                     reason=reason,
+                    locked_owner_validator=locked_owner_validator,
                 )
             except RuntimeError as exc:
                 raise TestHarnessError(str(exc)) from exc
@@ -2951,15 +3014,32 @@ class TestHarnessService:
             ).scalars()
         )
         workspace_payload = None
+        private_preview_urls: list[str] = []
         if run.workspace_review_run_id:
             workspace = await db.get(WorkspaceReviewRun, run.workspace_review_run_id)
             if workspace is not None:
                 from backend.services.workspace_review import workspace_review_run_dict
 
                 workspace_payload = workspace_review_run_dict(workspace)
-        browser_payload = attempts[-1].result_data if attempts else None
+                if isinstance(workspace.preview_url, str) and workspace.preview_url:
+                    private_preview_urls.append(workspace.preview_url)
+        raw_browser_payload = attempts[-1].result_data if attempts else None
+        if isinstance(raw_browser_payload, dict):
+            from backend.services.browser_review_jobs import (
+                public_browser_review_payload,
+            )
+
+            browser_payload = public_browser_review_payload(raw_browser_payload)
+            if (
+                raw_browser_payload.get("network_policy") == "managed_preview"
+                and isinstance(raw_browser_payload.get("url"), str)
+                and raw_browser_payload["url"]
+            ):
+                private_preview_urls.append(raw_browser_payload["url"])
+        else:
+            browser_payload = raw_browser_payload
         latest_attempt = attempts[-1] if attempts else None
-        return {
+        payload = {
             "id": run.id,
             "task_id": run.task_id,
             "project_id": run.project_id,
@@ -3073,6 +3153,15 @@ class TestHarnessService:
             "workspace_review": workspace_payload,
             "browser_review": browser_payload,
         }
+        if private_preview_urls:
+            from backend.services.browser_review_jobs import (
+                redact_managed_preview_urls,
+            )
+
+            payload = redact_managed_preview_urls(payload, private_preview_urls)
+            if isinstance(payload.get("browser_review"), dict):
+                payload["browser_review"]["url"] = None
+        return payload
 
     async def open_evidence(
         self,

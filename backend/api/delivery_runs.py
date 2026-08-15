@@ -8,7 +8,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.api.deps import get_current_user_id, is_admin, require_project_access
+from backend.api.deps import (
+    get_current_user_id,
+    is_admin,
+    lock_project_effect_access,
+    lock_request_user_authority,
+    require_project_access,
+)
 from backend.config import settings
 from backend.database import get_db
 from backend.models.capability import CapabilityInvocation
@@ -22,10 +28,12 @@ from backend.models.delivery import (
     DeliveryTurn,
 )
 from backend.models.instance import Instance
+from backend.models.pr_monitor import MonitoredRepo
 from backend.models.task import Task
 from backend.schemas.delivery import (
     DeliveryAttentionCount,
     DeliveryCommand,
+    DeliveryCycleResponse,
     DeliveryProgressResponse,
     DeliveryQuickStartCreate,
     DeliveryRetryCommand,
@@ -33,11 +41,17 @@ from backend.schemas.delivery import (
     DeliveryRunCreate,
     DeliveryRunDetail,
     DeliveryRunResponse,
+    DeliveryTransitionResponse,
+    DeliveryTurnResponse,
 )
 from backend.services.delivery_events import broadcast_delivery_event
 from backend.services.delivery_progress import (
     build_delivery_progress,
     delivery_run_attention_required,
+)
+from backend.services.pr_review_actions import (
+    FindingActionConflict,
+    lock_pr_repo_action_boundary,
 )
 from backend.services.delivery_reducer import DeliveryReducerEvent
 from backend.services.delivery_service import (
@@ -255,11 +269,210 @@ def _response(
     return payload.model_copy(
         update={
             "terminal": terminal,
+            "wait_reason": _public_delivery_text(run.wait_reason, run),
+            "pause_reason": _public_delivery_text(run.pause_reason, run),
+            "error_message": _public_delivery_text(run.error_message, run),
             "allowed_actions": _allowed_actions(
                 run,
                 has_active_controller_capability=has_active_controller_capability,
                 has_active_delivery_action=has_active_delivery_action,
             )
+        }
+    )
+
+
+def _delivery_path_prefixes(run: DeliveryRun) -> tuple[str, ...]:
+    """Return exact host prefixes which must never cross the human API."""
+
+    workspace = run.workspace_path
+    if not isinstance(workspace, str) or not workspace.startswith("/"):
+        return ()
+    values = {workspace.rstrip("/")}
+    marker = "/.claude-manager/worktrees/"
+    if marker in workspace:
+        project_root = workspace.split(marker, 1)[0].rstrip("/")
+        if project_root:
+            values.add(project_root)
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def _public_delivery_text(value: object, run: DeliveryRun) -> str | None:
+    if not isinstance(value, str):
+        return None
+    result = value
+    for prefix in _delivery_path_prefixes(run):
+        result = result.replace(prefix, "[delivery-workspace]")
+    return result
+
+
+_PUBLIC_FINDING_KEYS = frozenset({
+    "severity",
+    "category",
+    "title",
+    "summary",
+    "message",
+    "file",
+    "path",
+    "line",
+    "column",
+    "route",
+    "locator",
+    "expected",
+    "actual",
+    "reproduction",
+    "evidence",
+})
+
+
+def _public_finding(value: object, run: DeliveryRun) -> dict | None:
+    if not isinstance(value, dict):
+        return None
+    result = {}
+    for key in _PUBLIC_FINDING_KEYS:
+        if key not in value:
+            continue
+        item = value.get(key)
+        if isinstance(item, str):
+            result[key] = _public_delivery_text(item, run)
+        elif type(item) in {int, float, bool} or item is None:
+            result[key] = item
+        elif isinstance(item, list) and key == "evidence":
+            result[key] = [
+                text
+                for raw in item[:100]
+                if (text := _public_delivery_text(raw, run)) is not None
+            ]
+    return result or None
+
+
+def _public_cycle_trigger_payload(
+    cycle: DeliveryCycle,
+    run: DeliveryRun,
+) -> dict:
+    """Keep user-facing retry/finding context, not controller receipts."""
+
+    raw = cycle.trigger_payload if isinstance(cycle.trigger_payload, dict) else {}
+    result = {}
+    for key in ("reason", "previous_error_message", "summary", "report"):
+        text = _public_delivery_text(raw.get(key), run)
+        if text is not None:
+            result["summary" if key == "report" else key] = text
+    monitor_status = raw.get("monitor_status")
+    if isinstance(monitor_status, str):
+        result["monitor_status"] = monitor_status
+    no_progress_count = raw.get("no_progress_count")
+    if type(no_progress_count) is int:
+        result["no_progress_count"] = no_progress_count
+
+    findings = raw.get("findings")
+    if isinstance(findings, list):
+        result["findings"] = [
+            finding
+            for item in findings[:200]
+            if (finding := _public_finding(item, run)) is not None
+        ]
+    evidence = raw.get("evidence")
+    if isinstance(evidence, dict):
+        public_evidence = {}
+        evidence_summary = _public_delivery_text(evidence.get("summary"), run)
+        if evidence_summary is not None:
+            public_evidence["summary"] = evidence_summary
+        evidence_findings = evidence.get("findings")
+        if isinstance(evidence_findings, list):
+            public_evidence["findings"] = [
+                finding
+                for item in evidence_findings[:200]
+                if (finding := _public_finding(item, run)) is not None
+            ]
+        if public_evidence:
+            result["evidence"] = public_evidence
+    return result
+
+
+def _public_cycle_response(
+    cycle: DeliveryCycle,
+    run: DeliveryRun,
+) -> DeliveryCycleResponse:
+    payload = DeliveryCycleResponse.model_validate(cycle)
+    return payload.model_copy(
+        update={
+            "trigger_payload": _public_cycle_trigger_payload(cycle, run),
+            "review_summary": _public_delivery_text(cycle.review_summary, run),
+            "frontend_review_summary": _public_delivery_text(
+                cycle.frontend_review_summary,
+                run,
+            ),
+            "frontend_review_skip_reason": _public_delivery_text(
+                cycle.frontend_review_skip_reason,
+                run,
+            ),
+            "error_message": _public_delivery_text(cycle.error_message, run),
+        }
+    )
+
+
+def _public_turn_response(
+    turn: DeliveryTurn,
+    run: DeliveryRun,
+) -> DeliveryTurnResponse:
+    return DeliveryTurnResponse.model_validate(turn).model_copy(
+        update={"last_error": _public_delivery_text(turn.last_error, run)}
+    )
+
+
+def _public_transition_response(
+    transition: DeliveryTransition,
+) -> DeliveryTransitionResponse:
+    return DeliveryTransitionResponse.model_validate(transition)
+
+
+def _public_progress_response(
+    progress: DeliveryProgressResponse,
+    run: DeliveryRun,
+) -> DeliveryProgressResponse:
+    active_agent = progress.active_agent
+    if active_agent is not None:
+        active_agent = active_agent.model_copy(
+            update={"detail": _public_delivery_text(active_agent.detail, run)}
+        )
+    frontend = progress.frontend_review.model_copy(
+        update={
+            "report": _public_delivery_text(progress.frontend_review.report, run),
+            "error": _public_delivery_text(progress.frontend_review.error, run),
+            "skip_reason": _public_delivery_text(
+                progress.frontend_review.skip_reason,
+                run,
+            ),
+        }
+    )
+    events = [
+        event.model_copy(
+            update={
+                # Stable list position is sufficient for the UI; raw DB ids
+                # and cross-domain receipt handles stay server-side.
+                "id": f"event:{index}",
+                "title": _public_delivery_text(event.title, run) or "Delivery event",
+                "detail": _public_delivery_text(event.detail, run),
+            }
+        )
+        for index, event in enumerate(progress.events, start=1)
+    ]
+    stages = [
+        stage.model_copy(
+            update={
+                "summary": _public_delivery_text(stage.summary, run)
+                or "Delivery stage"
+            }
+        )
+        for stage in progress.stages
+    ]
+    return progress.model_copy(
+        update={
+            "detail": _public_delivery_text(progress.detail, run),
+            "active_agent": active_agent,
+            "frontend_review": frontend,
+            "events": events,
+            "stages": stages,
         }
     )
 
@@ -343,6 +556,47 @@ async def _response_with_effect_fence(
     )
 
 
+async def _lock_delivery_admission_topology(
+    request: Request,
+    db: AsyncSession,
+    *,
+    project_id: int,
+    monitored_repo_id: int,
+) -> None:
+    """Authorize and lock one Delivery scope in global topology order.
+
+    The optimistic read prevents an unauthorized caller from using the
+    repository writer fence as a cross-Project lock oracle. The authoritative
+    transaction then takes MonitoredRepo before Project, matching every PR
+    Monitor mutation that reauthorizes through Project-derived ACLs.
+    """
+
+    await require_project_access(request, project_id, db)
+    repo = await db.get(MonitoredRepo, monitored_repo_id)
+    if repo is None:
+        raise HTTPException(404, "Monitored repository not found")
+    if repo.project_id != project_id:
+        raise HTTPException(
+            400,
+            "Monitored repository must be bound to the selected Project",
+        )
+
+    await db.rollback()
+    try:
+        locked_repo = await lock_pr_repo_action_boundary(
+            db,
+            monitored_repo_id,
+        )
+    except FindingActionConflict as exc:
+        raise HTTPException(404, "Monitored repository not found") from exc
+    if locked_repo.project_id != project_id:
+        raise HTTPException(
+            409,
+            "PR Monitor Project changed before Delivery admission",
+        )
+    await lock_project_effect_access(request, project_id, db)
+
+
 @router.post("", response_model=DeliveryRunResponse, status_code=201)
 async def create_run(
     body: DeliveryRunCreate,
@@ -356,7 +610,12 @@ async def create_run(
         admission_disabled_reason = (
             "Delivery Loop requires Capability Core for Plan and Code Review"
         )
-    await require_project_access(request, body.project_id, db)
+    await _lock_delivery_admission_topology(
+        request,
+        db,
+        project_id=body.project_id,
+        monitored_repo_id=body.monitored_repo_id,
+    )
     try:
         run = await create_delivery_run(
             db,
@@ -418,12 +677,17 @@ async def quick_start_run(
             "Delivery Loop requires Capability Core for Plan and Code Review"
         )
     await require_project_access(request, body.project_id, db)
+
+    async def authorize_monitor_create(effect_db: AsyncSession) -> None:
+        await lock_request_user_authority(request, effect_db)
+
     try:
         setup = await ensure_default_delivery_monitor(
             db,
             body.project_id,
             allow_create=(admission_disabled_reason is None and is_admin(request)),
             strict_branch_protection=body.strict_branch_protection,
+            create_authorizer=authorize_monitor_create,
         )
     except DeliverySetupPermissionError as exc:
         await db.rollback()
@@ -435,18 +699,32 @@ async def quick_start_run(
         raise _map_setup_error(exc) from exc
 
     title = body.title or _quick_start_title(body.requirements)
+    setup_repo_id = setup.repo.id
+    setup_default_branch = setup.repo.default_branch
+    setup_provider = setup.repo.provider
     try:
+        # Monitor discovery/existing-row reconciliation may commit and release
+        # the optimistic ACL snapshot.  Reacquire the canonical Project and
+        # group-membership writer fence in the transaction that materializes
+        # the Run, Developer Task, and first Cycle.
+        await db.rollback()
+        await _lock_delivery_admission_topology(
+            request,
+            db,
+            project_id=body.project_id,
+            monitored_repo_id=setup_repo_id,
+        )
         run = await create_delivery_run(
             db,
             DeliveryCreateSpec(
                 idempotency_key=body.idempotency_key,
                 project_id=body.project_id,
-                monitored_repo_id=setup.repo.id,
+                monitored_repo_id=setup_repo_id,
                 title=title,
                 requirements=body.requirements,
                 created_by=get_current_user_id(request),
-                base_branch=setup.repo.default_branch,
-                provider=setup.repo.provider,
+                base_branch=setup_default_branch,
+                provider=setup_provider,
                 timeout_hours=body.timeout_hours,
                 max_cycles=body.max_cycles,
                 max_no_progress=body.max_no_progress,
@@ -552,7 +830,8 @@ async def read_run_progress(
     db: AsyncSession = Depends(get_db),
 ):
     run = await _accessible_run(request, db, run_id)
-    return await build_delivery_progress(db, run)
+    progress = await build_delivery_progress(db, run)
+    return _public_progress_response(progress, run)
 
 
 @router.get("/{run_id}", response_model=DeliveryRunDetail)
@@ -593,10 +872,18 @@ async def read_run(
     return DeliveryRunDetail.model_validate(
         {
             **base,
-            "policy_snapshot": run.policy_snapshot,
-            "cycles": cycles,
-            "turns": turns,
-            "transitions": transitions,
+            "cycles": [
+                _public_cycle_response(cycle, run)
+                for cycle in cycles
+            ],
+            "turns": [
+                _public_turn_response(turn, run)
+                for turn in turns
+            ],
+            "transitions": [
+                _public_transition_response(transition)
+                for transition in transitions
+            ],
         }
     )
 
@@ -609,8 +896,16 @@ async def _command(
     event: DeliveryReducerEvent,
 ) -> DeliveryRunResponse:
     accessible = await _accessible_run(request, db, run_id)
+    accessible_run_id = accessible.id
+    accessible_project_id = accessible.project_id
     try:
-        run = await lock_run(db, accessible.id)
+        await db.rollback()
+        await lock_project_effect_access(request, accessible_project_id, db)
+        run = await lock_run(db, accessible_run_id)
+        if run.project_id != accessible_project_id:
+            raise DeliveryConflictError(
+                "Delivery Run Project changed before command admission"
+            )
         await _require_command_safe_state(db, run, event_kind=event.kind)
         if event.kind == "cancel":
             if run.current_cycle_id is not None:
@@ -739,8 +1034,16 @@ async def retry_failed_run(
     """Restart a failed pre-publication Run from Plan without recreating it."""
 
     accessible = await _accessible_run(request, db, run_id)
+    accessible_run_id = accessible.id
+    accessible_project_id = accessible.project_id
     try:
-        run = await lock_run(db, accessible.id)
+        await db.rollback()
+        await lock_project_effect_access(request, accessible_project_id, db)
+        run = await lock_run(db, accessible_run_id)
+        if run.project_id != accessible_project_id:
+            raise DeliveryConflictError(
+                "Delivery Run Project changed before retry admission"
+            )
         if run.state_version != body.expected_state_version:
             raise DeliveryConflictError(
                 "Delivery Run changed before retry; refresh and retry again"

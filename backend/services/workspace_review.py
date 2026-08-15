@@ -28,7 +28,7 @@ from typing import Any, Sequence
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, update
 
 from backend.config import settings
 from backend.database import async_session
@@ -1316,7 +1316,11 @@ def workspace_review_capability(task: Task, project: Project | None) -> dict[str
             ),
             "repo_path": str(workspace),
             "configured": configured is not None,
-            "config": configured,
+            # The stored profile is private execution configuration. Public
+            # callers need only its availability; returning argv/environment
+            # here would disclose administrator-supplied values to every
+            # Project member with Task control.
+            "config": None,
             "suggested_config": suggestion,
         }
     except (WorkspaceReviewError, TypeError, ValueError) as exc:
@@ -1328,6 +1332,31 @@ def workspace_review_capability(task: Task, project: Project | None) -> dict[str
             "config": None,
             "suggested_config": None,
         }
+
+
+def public_workspace_review_capability(
+    capability: dict[str, Any],
+    *,
+    include_suggestion: bool = False,
+) -> dict[str, Any]:
+    """Project one capability result without exposing Manager host routes.
+
+    The repository path and approved Preview profile are execution-only
+    inputs.  Automatic suggestions are useful only to administrators because
+    only administrators can approve them; ordinary Project collaborators get
+    the availability result without checkout-derived command details.
+    """
+
+    return {
+        "available": bool(capability.get("available")),
+        "reason": capability.get("reason"),
+        "repo_path": None,
+        "configured": bool(capability.get("configured")),
+        "config": None,
+        "suggested_config": (
+            capability.get("suggested_config") if include_suggestion else None
+        ),
+    }
 
 
 def _browser_agent_prompt(
@@ -1687,18 +1716,46 @@ class WorkspaceReviewManager:
 
     async def _update(self, run_id: str, **values: Any) -> None:
         async with async_session() as db:
-            run = await db.get(WorkspaceReviewRun, run_id)
+            # A row lock alone is not a writer fence on SQLite.  Reserve the
+            # database writer before observing cleanup state so independent
+            # Manager processes cannot reorder success and late failure.
+            await db.execute(
+                update(WorkspaceReviewRun)
+                .where(WorkspaceReviewRun.id == run_id)
+                .values(id=WorkspaceReviewRun.id)
+            )
+            run = (
+                await db.execute(
+                    select(WorkspaceReviewRun)
+                    .where(WorkspaceReviewRun.id == run_id)
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if run is None:
                 return
-            proposed_status = values.get("status")
-            cleanup_only = set(values).issubset({"cleanup_status", "cleanup_error"})
+            effective_values = dict(values)
+            proposed_cleanup = effective_values.get("cleanup_status")
+            if run.cleanup_status == "completed":
+                effective_values.pop("cleanup_status", None)
+                effective_values.pop("cleanup_error", None)
+            elif proposed_cleanup == "completed":
+                effective_values["cleanup_error"] = None
+            if not effective_values:
+                await db.rollback()
+                return
+            proposed_status = effective_values.get("status")
+            cleanup_only = set(effective_values).issubset(
+                {"cleanup_status", "cleanup_error"}
+            )
             if run.status in _TERMINAL:
                 if not cleanup_only and proposed_status != run.status:
+                    await db.rollback()
                     return
             elif run.status == "cancelling":
                 if not cleanup_only and proposed_status != "cancelled":
+                    await db.rollback()
                     return
-            for key, value in values.items():
+            for key, value in effective_values.items():
                 setattr(run, key, value)
             await db.commit()
 
@@ -2211,16 +2268,36 @@ class WorkspaceReviewManager:
                 else:
                     cleanup_error = None
             async with async_session() as db:
-                current = await db.get(WorkspaceReviewRun, run_id)
+                await db.execute(
+                    update(WorkspaceReviewRun)
+                    .where(WorkspaceReviewRun.id == run_id)
+                    .values(id=WorkspaceReviewRun.id)
+                )
+                current = (
+                    await db.execute(
+                        select(WorkspaceReviewRun)
+                        .where(WorkspaceReviewRun.id == run_id)
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
                 if current is not None:
                     if current.status not in _TERMINAL:
                         current.status = "cancelled"
                         current.stage = "cancelled"
-                        current.completed_at = current.completed_at or datetime.utcnow()
-                    current.cleanup_status = (
-                        "completed" if cleanup_error is None else "failed"
-                    )
-                    current.cleanup_error = cleanup_error
+                        current.completed_at = (
+                            current.completed_at or datetime.utcnow()
+                        )
+                    if current.cleanup_status == "completed":
+                        # A successful cleanup committed by another executor
+                        # is authoritative even if this executor observed a
+                        # late local failure.
+                        cleanup_error = None
+                        current.cleanup_error = None
+                    else:
+                        current.cleanup_status = (
+                            "completed" if cleanup_error is None else "failed"
+                        )
+                        current.cleanup_error = cleanup_error
                     await db.commit()
         if cleanup_error is not None:
             raise WorkspaceReviewError(cleanup_error)
@@ -2355,11 +2432,16 @@ def workspace_review_run_dict(run: WorkspaceReviewRun) -> dict[str, Any]:
         "goal": run.goal,
         "status": run.status,
         "stage": run.stage,
-        "workspace_path": run.workspace_path,
+        # Host checkout paths and the ephemeral loopback route are private
+        # execution inputs.  Human Task/Project ACLs grant access to the
+        # result, not to Manager filesystem or routing metadata.
+        "workspace_path": None,
         "git_head": run.git_head,
         "workspace_fingerprint": run.workspace_fingerprint,
-        "preview_config": run.preview_config,
-        "preview_url": run.preview_url,
+        # Runs retain the exact private profile for deterministic execution,
+        # but it is never part of the public/Task-scoped projection.
+        "preview_config": None,
+        "preview_url": None,
         "stale": run.stale,
         "report": run.report,
         "error": run.error,

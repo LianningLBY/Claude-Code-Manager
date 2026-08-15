@@ -135,7 +135,9 @@ vi.mock('../components/Tasks/TaskBadges', () => ({
   ),
 }));
 vi.mock('../components/TeamShareModal', () => ({
-  TeamShareModal: () => null,
+  TeamShareModal: ({ itemId }: { itemId: number }) => (
+    <div data-testid="team-share-modal">Task {itemId} sharing</div>
+  ),
 }));
 
 const task = {
@@ -174,6 +176,44 @@ describe('TasksPage realtime reconciliation', () => {
         removeEventListener: vi.fn(),
       }),
     });
+  });
+
+  it('does not open Team Share for a member who does not own the Task', async () => {
+    localStorage.setItem('cc_user', JSON.stringify({ id: 42, role: 'member' }));
+    render(
+      <TasksPage
+        chatTaskId={null}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(api.listTasks).toHaveBeenCalled());
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('ccm-team-share-task', {
+        detail: { task: { ...task, created_by: 7 } },
+      }));
+    });
+
+    expect(screen.queryByTestId('team-share-modal')).not.toBeInTheDocument();
+  });
+
+  it('opens Team Share for the Task creator', async () => {
+    localStorage.setItem('cc_user', JSON.stringify({ id: 42, role: 'member' }));
+    render(
+      <TasksPage
+        chatTaskId={null}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(api.listTasks).toHaveBeenCalled());
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('ccm-team-share-task', {
+        detail: { task: { ...task, created_by: 42 } },
+      }));
+    });
+
+    expect(screen.getByTestId('team-share-modal')).toHaveTextContent('Task 7 sharing');
   });
 
   it('refreshes counts/filter membership after status_change but not a marker-only event', async () => {
@@ -335,6 +375,84 @@ describe('TasksPage realtime reconciliation', () => {
     );
 
     expect(await screen.findByText('等待任务结束')).toBeInTheDocument();
+  });
+
+  it('opens Team Share from the split sidebar for the Task creator', async () => {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 1440,
+    });
+    localStorage.setItem('cc_user', JSON.stringify({ id: 42, role: 'member' }));
+    vi.mocked(api.listTasks).mockResolvedValue([{
+      ...task,
+      created_by: 42,
+    }] as never);
+
+    render(
+      <TasksPage
+        chatTaskId={task.id}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    const row = await screen.findByTestId('task-sidebar-row-7');
+    await userEvent.click(within(row).getByTitle('Team Share'));
+    expect(screen.getByTestId('team-share-modal')).toHaveTextContent(
+      'Task 7 sharing',
+    );
+  });
+
+  it('hides Team Share in the split sidebar from a non-owner member', async () => {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 1440,
+    });
+    localStorage.setItem('cc_user', JSON.stringify({ id: 42, role: 'member' }));
+    vi.mocked(api.listTasks).mockResolvedValue([{
+      ...task,
+      created_by: 7,
+    }] as never);
+
+    render(
+      <TasksPage
+        chatTaskId={task.id}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    const row = await screen.findByTestId('task-sidebar-row-7');
+    expect(within(row).queryByTitle('Team Share')).not.toBeInTheDocument();
+  });
+
+  it('keeps every Task control hidden for a chat-only split-sidebar row', async () => {
+    Object.defineProperty(window, 'innerWidth', {
+      configurable: true,
+      value: 1440,
+    });
+    localStorage.setItem('cc_user', JSON.stringify({ id: 42, role: 'member' }));
+    vi.mocked(api.listTasks).mockResolvedValue([{
+      ...task,
+      access_scope: 'chat',
+      created_by: 42,
+      has_session: true,
+    }] as never);
+
+    render(
+      <TasksPage
+        chatTaskId={task.id}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    const row = await screen.findByTestId('task-sidebar-row-7');
+    expect(row).toHaveAttribute('data-reorder-target', 'true');
+    expect(row).not.toHaveAttribute('data-reorder-source');
+    expect(row).not.toHaveAttribute('draggable');
+    expect(within(row).queryByTestId('plugins-badge-7')).not.toBeInTheDocument();
+    expect(within(row).queryByTitle('Star')).not.toBeInTheDocument();
+    expect(within(row).queryByTitle('Team Share')).not.toBeInTheDocument();
+    expect(within(row).queryByTitle('Archive')).not.toBeInTheDocument();
+    expect(within(row).getByTestId('sub-agents-badge-7')).toBeInTheDocument();
   });
 
   it('keeps Delivery rows read-only in the split sidebar', async () => {

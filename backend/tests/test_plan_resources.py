@@ -2,11 +2,12 @@ from datetime import datetime
 import asyncio
 import hashlib
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
-from sqlalchemy import event, func, select, update
+from sqlalchemy import delete, event, func, select, update
 from sqlalchemy.exc import IntegrityError
 
 from backend.config import settings
@@ -24,13 +25,22 @@ from backend.models.plan import (
 )
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
-from backend.models.worker import Worker
+from backend.models.worker import Worker, WorkerNodeControl
 from backend.schemas.plan import default_plan_pipeline_config
 from backend.services.plan_agent_runner import PlanAgentRunner
 from backend.services.plan_runtime_receipt import new_prepared_runtime_receipt
 from backend.services.plan_service import (
     apply_worker_plan_outcome,
+    decide_version,
     materialize_execution_task,
+)
+from backend.tests.group_acl_test_helpers import (
+    grant_group_project_access,
+    revoke_group_membership_at_effect_fence,
+)
+from backend.tests.test_auth_ws_security import (
+    _create_user,
+    secured_client as secured_client,
 )
 
 
@@ -62,6 +72,282 @@ async def _target(client, session_factory) -> Task:
         await db.refresh(task)
         db.expunge(task)
         return task
+
+
+@pytest.mark.asyncio
+async def test_standalone_plan_effect_rejects_cached_jwt_role_change(
+    secured_client,
+):
+    """Projectless Plan effects still fence their mutable User authority."""
+
+    from backend.api.plan_resources import _lock_standalone_plan_effect_access
+
+    _client, session_factory = secured_client
+    user_id, _ = await _create_user(
+        session_factory,
+        email="standalone-plan-stale-admin@example.com",
+        role="member",
+    )
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=user_id,
+            user_role="admin",
+            auth_type="jwt",
+        ),
+        headers={},
+    )
+    async with session_factory() as db:
+        with pytest.raises(HTTPException) as caught:
+            await _lock_standalone_plan_effect_access(
+                request,
+                db,
+                project_id=None,
+                plan_created_by=user_id,
+            )
+
+    assert caught.value.status_code == 409
+    assert "changed role" in caught.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["target_task", "project"])
+async def test_initial_plan_creation_rejects_concurrent_wal_group_revocation(
+    tmp_path,
+    monkeypatch,
+    scope,
+):
+    """The POST /api/plans commit cannot cross a revoked group ACL."""
+
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.api import plan_resources as api
+    from backend.database import Base
+    from backend.models.team_share import TeamProjectShare
+    from backend.models.user import User
+    from backend.models.user_group import UserGroup, UserGroupMember
+    from backend.schemas.plan_resource import PlanCreateRequest
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / f'initial-plan-{scope}-acl.db'}",
+        connect_args={"timeout": 2},
+    )
+    try:
+        async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql(
+                "PRAGMA journal_mode=WAL"
+            )
+            assert journal_mode.scalar_one().lower() == "wal"
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with sessions() as setup:
+            user = User(
+                email=f"initial-plan-{scope}-member@example.com",
+                name="initial-plan-member",
+                password_hash="not-used",
+                role="member",
+                is_active=True,
+            )
+            group = UserGroup(name=f"initial-plan-{scope}-group")
+            project = Project(
+                name=f"initial-plan-{scope}-project",
+                local_path="/tmp",
+                status="ready",
+            )
+            setup.add_all([user, group, project])
+            await setup.flush()
+            membership = UserGroupMember(
+                group_id=group.id,
+                user_id=user.id,
+            )
+            setup.add_all(
+                [
+                    membership,
+                    TeamProjectShare(
+                        project_id=project.id,
+                        target_type="group",
+                        target_id=group.id,
+                        shared_by=999,
+                    ),
+                ]
+            )
+            target = None
+            if scope == "target_task":
+                target = Task(
+                    title="Initial Plan WAL ACL target",
+                    description="protected by Project group membership",
+                    status="completed",
+                    session_id="initial-plan-wal-session",
+                    project_id=project.id,
+                    target_repo="/tmp",
+                    created_by=999,
+                )
+                setup.add(target)
+            await setup.commit()
+            user_id = user.id
+            membership_id = membership.id
+            project_id = project.id
+            target_task_id = target.id if target is not None else None
+
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                user_id=user_id,
+                user_role="member",
+                auth_type="jwt",
+            ),
+            headers={},
+        )
+        capture_entered = asyncio.Event()
+        release_capture = asyncio.Event()
+
+        async def blocked_capture(*_args, **_kwargs):
+            capture_entered.set()
+            await release_capture.wait()
+            return (None, None, None, {"available": False, "reason": "test"})
+
+        monkeypatch.setattr(settings, "auth_token", "plan-wal-auth-token")
+        monkeypatch.setattr(settings, "ccm_node_role", "manager")
+        monkeypatch.setattr(api, "_capture_context_for_plan", blocked_capture)
+        body = PlanCreateRequest(
+            input="Do not publish after access is revoked",
+            target_task_id=target_task_id,
+            project_id=project_id if target_task_id is None else None,
+        )
+
+        async def create_initial_plan():
+            async with sessions() as creator:
+                return await api.create_plan(
+                    body=body,
+                    request=request,
+                    db=creator,
+                )
+
+        pending = asyncio.create_task(create_initial_plan())
+        await asyncio.wait_for(capture_entered.wait(), timeout=2)
+        async with sessions() as revoker:
+            revoked = await revoker.execute(
+                delete(UserGroupMember).where(
+                    UserGroupMember.id == membership_id
+                )
+            )
+            assert revoked.rowcount == 1
+            await revoker.commit()
+        release_capture.set()
+
+        with pytest.raises(HTTPException) as rejected:
+            await pending
+        assert rejected.value.status_code == 403
+        async with sessions() as verify:
+            assert await verify.scalar(select(func.count(Plan.id))) == 0
+            assert await verify.scalar(select(func.count(PlanAgentRun.id))) == 0
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_projectless_initial_plan_rejects_concurrent_wal_admin_demotion(
+    tmp_path,
+    monkeypatch,
+):
+    """A cached admin role is fenced again in the Plan commit transaction."""
+
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.api import plan_resources as api
+    from backend.database import Base
+    from backend.models.user import User
+    from backend.schemas.plan_resource import PlanCreateRequest
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'initial-plan-admin-role.db'}",
+        connect_args={"timeout": 2},
+    )
+    try:
+        async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql(
+                "PRAGMA journal_mode=WAL"
+            )
+            assert journal_mode.scalar_one().lower() == "wal"
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        async with sessions() as setup:
+            admin = User(
+                email="initial-plan-demoted-admin@example.com",
+                name="initial-plan-admin",
+                password_hash="not-used",
+                role="admin",
+                is_active=True,
+            )
+            setup.add(admin)
+            await setup.commit()
+            admin_id = admin.id
+
+        request = SimpleNamespace(
+            state=SimpleNamespace(
+                user_id=admin_id,
+                user_role="admin",
+                auth_type="jwt",
+            ),
+            headers={},
+        )
+        capture_entered = asyncio.Event()
+        release_capture = asyncio.Event()
+
+        async def blocked_capture(*_args, **_kwargs):
+            capture_entered.set()
+            await release_capture.wait()
+            return (None, None, None, {"available": False, "reason": "test"})
+
+        monkeypatch.setattr(settings, "auth_token", "plan-wal-auth-token")
+        monkeypatch.setattr(settings, "ccm_node_role", "manager")
+        monkeypatch.setattr(api, "_capture_context_for_plan", blocked_capture)
+
+        async def create_initial_plan():
+            async with sessions() as creator:
+                return await api.create_plan(
+                    body=PlanCreateRequest(
+                        input="Projectless admin Plan must retain authority",
+                    ),
+                    request=request,
+                    db=creator,
+                )
+
+        pending = asyncio.create_task(create_initial_plan())
+        await asyncio.wait_for(capture_entered.wait(), timeout=2)
+        async with sessions() as demoter:
+            changed = await demoter.execute(
+                update(User)
+                .where(User.id == admin_id, User.role == "admin")
+                .values(role="member")
+            )
+            assert changed.rowcount == 1
+            await demoter.commit()
+        release_capture.set()
+
+        with pytest.raises(HTTPException) as rejected:
+            await pending
+        assert rejected.value.status_code == 409
+        assert "changed role" in rejected.value.detail
+        async with sessions() as verify:
+            assert await verify.scalar(select(func.count(Plan.id))) == 0
+            assert await verify.scalar(select(func.count(PlanAgentRun.id))) == 0
+    finally:
+        await engine.dispose()
 
 
 async def _finish_current_run_with_version(
@@ -201,9 +487,9 @@ async def test_create_plan_rechecks_task_control_in_final_transaction(
 
     target = await _target(client, session_factory)
     revoked = AsyncMock(
-        side_effect=[None, HTTPException(403, "control was revoked")]
+        side_effect=HTTPException(403, "control was revoked")
     )
-    monkeypatch.setattr(api, "require_task_control", revoked)
+    monkeypatch.setattr(api, "lock_task_effect_access", revoked)
 
     response = await client.post(
         "/api/plans",
@@ -214,7 +500,7 @@ async def test_create_plan_rechecks_task_control_in_final_transaction(
     )
 
     assert response.status_code == 403
-    assert revoked.await_count == 2
+    assert revoked.await_count == 1
     async with session_factory() as db:
         assert await db.scalar(select(func.count(Plan.id))) == 0
         assert await db.scalar(select(func.count(PlanAgentRun.id))) == 0
@@ -240,9 +526,9 @@ async def test_create_project_plan_rechecks_access_in_final_transaction(
 
     monkeypatch.setattr(settings, "auth_token", "plan-acl-test-token")
     revoked = AsyncMock(
-        side_effect=[None, HTTPException(403, "project access was revoked")]
+        side_effect=HTTPException(403, "project access was revoked")
     )
-    monkeypatch.setattr(api, "require_project_access", revoked)
+    monkeypatch.setattr(api, "_lock_standalone_plan_effect_access", revoked)
     response = await client.post(
         "/api/plans",
         headers={"Authorization": "Bearer plan-acl-test-token"},
@@ -253,7 +539,7 @@ async def test_create_project_plan_rechecks_access_in_final_transaction(
     )
 
     assert response.status_code == 403
-    assert revoked.await_count == 2
+    assert revoked.await_count == 1
     async with session_factory() as db:
         assert await db.scalar(select(func.count(Plan.id))) == 0
         assert await db.scalar(select(func.count(PlanAgentRun.id))) == 0
@@ -386,6 +672,105 @@ async def test_create_run_rechecks_plan_control_in_final_transaction(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("effect", ["run", "decision", "execution"])
+async def test_plan_effect_rejects_group_revoked_at_final_project_fence(
+    secured_client,
+    monkeypatch,
+    effect,
+):
+    """No Plan effect can use stale group-derived Project access."""
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email=f"plan-{effect}-effect@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        project = Project(
+            name=f"plan-{effect}-effect-project",
+            local_path="/tmp",
+            status="ready",
+        )
+        db.add(project)
+        await db.commit()
+        project_id = project.id
+    created = await client.post(
+        "/api/plans",
+        headers={"Authorization": "Bearer security-service-token"},
+        json={
+            "input": f"Seed the {effect} effect fence",
+            "project_id": project_id,
+        },
+    )
+    assert created.status_code == 201, created.text
+    plan_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+    )
+    await grant_group_project_access(
+        session_factory,
+        project_id=project_id,
+        user_id=member_id,
+    )
+    async with session_factory() as db:
+        initial_run_count = await db.scalar(
+            select(func.count(PlanAgentRun.id)).where(
+                PlanAgentRun.plan_id == plan_id
+            )
+        )
+    fence = revoke_group_membership_at_effect_fence(monkeypatch)
+    headers = {"Authorization": f"Bearer {member_token}"}
+
+    if effect == "run":
+        response = await client.post(
+            f"/api/plans/{plan_id}/runs",
+            headers=headers,
+            json={
+                "run_type": "user_revision",
+                "request": "must not create another Run",
+                "base_version_id": version_id,
+                "expected_current_version_id": version_id,
+            },
+        )
+    elif effect == "decision":
+        response = await client.post(
+            f"/api/plan-versions/{version_id}/approve",
+            headers=headers,
+            json={"expected_current_version_id": version_id},
+        )
+    else:
+        response = await client.post(
+            f"/api/plan-versions/{version_id}/create-execution-task",
+            headers=headers,
+            json={
+                "expected_current_version_id": version_id,
+                "approve_if_pending": True,
+            },
+        )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "revoked": True}
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        version = await db.get(PlanVersion, version_id)
+        assert plan.active_run_id is None
+        assert version.human_decision == "pending"
+        assert await db.scalar(
+            select(func.count(PlanAgentRun.id)).where(
+                PlanAgentRun.plan_id == plan_id
+            )
+        ) == initial_run_count
+        assert await db.scalar(
+            select(func.count(PlanApplication.id)).where(
+                PlanApplication.plan_id == plan_id
+            )
+        ) == 0
+        assert await db.scalar(select(func.count(Task.id))) == 0
+
+
+@pytest.mark.asyncio
 async def test_fork_rechecks_source_plan_control_in_final_transaction(
     client,
     session_factory,
@@ -448,10 +833,199 @@ async def test_worker_lifecycle_fences_new_plan_admission(client, session_factor
     )
 
     assert created.status_code == 409
-    assert "lifecycle" in created.json()["detail"]
+    assert "not ready for assignment" in created.json()["detail"]
     async with session_factory() as db:
         assert await db.scalar(select(func.count(Plan.id))) == 0
         assert await db.scalar(select(func.count(PlanAgentRun.id))) == 0
+
+
+@pytest.mark.asyncio
+async def test_worker_node_drain_claim_blocks_plan_version_decision(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A Worker drain that wins first leaves the pending Version untouched."""
+
+    created = await client.post(
+        "/api/plans",
+        json={"input": "Do not decide after Worker drain", "target_repo": "/tmp"},
+    )
+    assert created.status_code == 201, created.text
+    plan_id = created.json()["id"]
+    version_id = await _finish_current_run_with_version(
+        session_factory,
+        plan_id=plan_id,
+    )
+    async with session_factory() as db:
+        control = await db.get(WorkerNodeControl, 1)
+        assert control is not None
+        control.drain_claim = "d" * 64
+        control.drain_started_at = datetime.utcnow()
+        await db.commit()
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    async with session_factory() as db:
+        plan = await db.get(Plan, plan_id)
+        version = await db.get(PlanVersion, version_id)
+        assert plan is not None and version is not None
+        with pytest.raises(HTTPException) as blocked:
+            await decide_version(
+                db,
+                plan=plan,
+                version=version,
+                decision="approved",
+                decided_by=7,
+                expected_current_version_id=version_id,
+            )
+    assert blocked.value.status_code == 409
+    assert "destruction has begun" in str(blocked.value.detail)
+
+    async with session_factory() as db:
+        version = await db.get(PlanVersion, version_id)
+        assert version is not None
+        assert version.human_decision == "pending"
+        assert version.decided_at is None
+        assert version.decided_by is None
+
+
+@pytest.mark.asyncio
+async def test_plan_version_decision_holds_worker_node_fence_through_commit(
+    tmp_path,
+    monkeypatch,
+):
+    """If a decision wins first, node drain waits and then observes it."""
+
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.database import Base
+    from backend.services import plan_service
+    from backend.services.worker_node_control import begin_worker_node_drain
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'plan-decision-drain-order.db'}",
+        connect_args={"timeout": 5},
+    )
+    decision_task = None
+    drain_task = None
+    release_decision = asyncio.Event()
+    try:
+        async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql(
+                "PRAGMA journal_mode=WAL"
+            )
+            assert journal_mode.scalar_one().lower() == "wal"
+            await connection.run_sync(Base.metadata.create_all)
+        sessions = async_sessionmaker(
+            engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+        )
+        pipeline = default_plan_pipeline_config().model_dump(mode="json")
+        async with sessions() as setup:
+            plan = Plan(
+                title="Decision wins Worker drain",
+                initial_request="Persist the exact human decision",
+                target_repo="/tmp",
+                pipeline_config=pipeline,
+            )
+            setup.add(plan)
+            await setup.flush()
+            run = PlanAgentRun(
+                plan_id=plan.id,
+                run_type="initial",
+                status="completed",
+                current_stage="complete",
+                pipeline_config=pipeline,
+                finished_at=datetime.utcnow(),
+            )
+            setup.add(run)
+            await setup.flush()
+            version = PlanVersion(
+                plan_id=plan.id,
+                version_number=1,
+                produced_by_run_id=run.id,
+                content="# Exact decision",
+                review_verdict="approve",
+                reviewed_at=datetime.utcnow(),
+            )
+            setup.add(version)
+            await setup.flush()
+            plan.current_version_id = version.id
+            run.result_version_id = version.id
+            await setup.commit()
+            plan_id = plan.id
+            version_id = version.id
+
+        monkeypatch.setattr(settings, "ccm_node_role", "worker")
+        original_fence = plan_service.fence_worker_node_mutation
+        decision_fence_held = asyncio.Event()
+
+        async def hold_decision_fence(db):
+            await original_fence(db)
+            decision_fence_held.set()
+            await release_decision.wait()
+
+        monkeypatch.setattr(
+            plan_service,
+            "fence_worker_node_mutation",
+            hold_decision_fence,
+        )
+
+        async def decide():
+            async with sessions() as db:
+                plan = await db.get(Plan, plan_id)
+                version = await db.get(PlanVersion, version_id)
+                assert plan is not None and version is not None
+                return await plan_service.decide_version(
+                    db,
+                    plan=plan,
+                    version=version,
+                    decision="approved",
+                    decided_by=7,
+                    expected_current_version_id=version_id,
+                )
+
+        async def begin_drain():
+            async with sessions() as db:
+                await begin_worker_node_drain(db, claim="e" * 64)
+                await db.commit()
+
+        decision_task = asyncio.create_task(decide())
+        await asyncio.wait_for(decision_fence_held.wait(), timeout=2)
+        drain_task = asyncio.create_task(begin_drain())
+        await asyncio.sleep(0.05)
+        assert not drain_task.done()
+
+        release_decision.set()
+        decided = await asyncio.wait_for(decision_task, timeout=5)
+        await asyncio.wait_for(drain_task, timeout=5)
+        assert decided.human_decision == "approved"
+
+        async with sessions() as verify:
+            version = await verify.get(PlanVersion, version_id)
+            control = await verify.get(WorkerNodeControl, 1)
+            assert version is not None and version.human_decision == "approved"
+            assert version.decided_by == 7
+            assert control is not None and control.drain_claim == "e" * 64
+    finally:
+        release_decision.set()
+        for pending in (decision_task, drain_task):
+            if pending is not None and not pending.done():
+                pending.cancel()
+        await asyncio.gather(
+            *(
+                pending
+                for pending in (decision_task, drain_task)
+                if pending is not None
+            ),
+            return_exceptions=True,
+        )
+        await engine.dispose()
 
 
 @pytest.mark.asyncio
@@ -511,7 +1085,7 @@ async def test_worker_lifecycle_fences_new_run_and_restore(
     assert forked.status_code == 409
     assert "Archived Plan" in forked.json()["detail"]
     assert new_run.status_code == 409
-    assert "lifecycle" in new_run.json()["detail"]
+    assert "not ready for assignment" in new_run.json()["detail"]
     async with session_factory() as db:
         assert (
             await db.scalar(
@@ -1193,8 +1767,9 @@ async def test_execution_materialization_loses_cleanly_to_concurrent_plan_writer
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,
@@ -1318,8 +1893,9 @@ async def test_execution_materialization_reauthorizes_concurrent_exact_winner(
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,
@@ -1478,7 +2054,7 @@ async def test_undecided_superseded_version_has_derived_historical_state(
 
 @pytest.mark.asyncio
 async def test_execution_task_materializer_is_directly_callable_and_idempotent(
-    client, session_factory
+    client, session_factory, monkeypatch
 ):
     created = await client.post(
         "/api/plans",
@@ -1495,6 +2071,38 @@ async def test_execution_task_materializer_is_directly_callable_and_idempotent(
     )
 
     async with session_factory() as db:
+        # Worker is only an execution location.  Applying the approved Plan
+        # must retain this native Manager principal so WorkerProxy can delegate
+        # it, rather than silently replacing it with system/member/sandbox.
+        worker = Worker(
+            name="execution-principal-worker",
+            status="ready",
+        )
+        db.add(worker)
+        await db.flush()
+        worker_id = worker.id
+        plan = await db.get(Plan, plan_id)
+        plan.worker_id = worker_id
+        await db.commit()
+        from backend.services import plan_staleness
+
+        monkeypatch.setattr(
+            plan_staleness,
+            "version_staleness",
+            AsyncMock(return_value={
+                "stale": False,
+                "reasons": [],
+                "hard_conflict": False,
+                "hard_conflicts": [],
+                "can_confirm": False,
+            }),
+        )
+        principal = {
+            "execution_user_id": None,
+            "execution_user_role": "super_admin",
+            "execution_mode": "unrestricted",
+            "execution_principal_kind": "deployment_token",
+        }
         first = await materialize_execution_task(
             db,
             plan_id=plan_id,
@@ -1503,6 +2111,7 @@ async def test_execution_task_materializer_is_directly_callable_and_idempotent(
             confirm_stale=False,
             approve_if_pending=True,
             actor_id=42,
+            execution_principal=principal,
             execution_metadata={
                 "auto_run_id": "auto-7",
                 "created_from_plan_id": -1,
@@ -1516,6 +2125,7 @@ async def test_execution_task_materializer_is_directly_callable_and_idempotent(
             confirm_stale=False,
             approve_if_pending=False,
             actor_id=42,
+            execution_principal=principal,
             execution_metadata={"auto_run_id": "ignored-on-replay"},
         )
 
@@ -1535,6 +2145,11 @@ async def test_execution_task_materializer_is_directly_callable_and_idempotent(
         assert first.task.effort_level == settings.default_effort
         assert first.task.codex_service_tier == "default"
         assert first.task.timeout_hours == 3.5
+        assert first.task.worker_id == worker_id
+        assert first.task.execution_user_id is None
+        assert first.task.execution_user_role == "super_admin"
+        assert first.task.execution_mode == "unrestricted"
+        assert first.task.execution_principal_kind == "deployment_token"
         assert (
             await db.scalar(
                 select(func.count(PlanApplication.id)).where(
@@ -1719,8 +2334,9 @@ async def test_plan_admission_loses_cleanly_to_concurrent_wal_receipt(
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,

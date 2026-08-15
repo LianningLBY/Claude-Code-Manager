@@ -49,15 +49,6 @@ describe('DeliveryCreateForm', () => {
     }));
     expect(vi.mocked(api.quickStartDelivery).mock.calls[0][0].title).toBeUndefined();
   });
-
-  it('warns when Delivery coding turns can bypass the CCM sandbox', () => {
-    render(<DeliveryCreateForm projects={[project]} repos={[repo]} config={{ ...config, agent_sandbox_unrestricted_enabled: true }} onCreated={() => {}} onNavigateProjects={() => {}} onNavigatePRMonitor={() => {}} />);
-
-    expect(screen.getByRole('alert')).toHaveTextContent(
-      'All Delivery permissions are ON',
-    );
-  });
-
   it('freezes the explicit automatic merge choice for this Delivery', async () => {
     vi.mocked(api.quickStartDelivery).mockResolvedValue({ id: 11 } as never);
     render(<DeliveryCreateForm projects={[project]} repos={[repo]} config={config} onCreated={() => {}} onNavigateProjects={() => {}} onNavigatePRMonitor={() => {}} />);

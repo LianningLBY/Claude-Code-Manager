@@ -184,6 +184,7 @@ async def test_plan_deletion_locks_run_plan_receipts_children_then_input(
     db_session.add(input_request)
     await db_session.flush()
     step.input_request_id = input_request.id
+    run.interaction_count = 1
     runtime_receipt = new_prepared_runtime_receipt(step, attempt_index=1)
     runtime_receipt.status = "cleaned"
     runtime_receipt.cleaned_at = datetime.utcnow()
@@ -642,6 +643,23 @@ async def test_historical_settled_worker_dispatch_and_mirror_step_are_deletable(
         finished_at=datetime.utcnow(),
     )
     db_session.add(step)
+    await db_session.flush()
+    version = PlanVersion(
+        plan_id=plan.id,
+        worker_id=9,
+        worker_version_id=801,
+        version_number=1,
+        produced_by_run_id=run.id,
+        produced_by_step_id=step.id,
+        content="remote completed plan",
+    )
+    db_session.add(version)
+    await db_session.flush()
+    step.plan_version_id = version.id
+    run.result_version_id = version.id
+    run.draft_step_id = step.id
+    run.draft_content = version.content
+    plan.current_version_id = version.id
     historical = PlanAgentWorkerDispatchReceipt(
         plan_id=plan.id,
         run_id=run.id,
@@ -679,6 +697,7 @@ async def test_historical_settled_worker_dispatch_and_mirror_step_are_deletable(
 
     assert graph is not None
     assert graph.step_ids == (step.id,)
+    assert graph.version_ids == (version.id,)
     assert graph.runtime_receipt_ids == ()
     assert graph.worker_dispatch_receipt_ids == (
         historical.id,
@@ -982,6 +1001,38 @@ async def test_worker_cancel_accepts_answered_generation_without_dispatch_receip
     )
     db_session.add(waiting)
     await db_session.flush()
+    step = PlanAgentStep(
+        run_id=run.id,
+        plan_id=plan.id,
+        worker_id=9,
+        worker_step_id=702,
+        generation=0,
+        step_type="planner",
+        round=1,
+        provider="claude",
+        status="completed",
+        finished_at=datetime.utcnow(),
+    )
+    db_session.add(step)
+    await db_session.flush()
+    input_request = PlanInputRequest(
+        plan_id=plan.id,
+        run_id=run.id,
+        worker_id=9,
+        worker_input_request_id=703,
+        source_step_id=step.id,
+        requested_by="planner",
+        questions=[],
+        status="answered",
+        idempotency_key="worker:9:input:703",
+        opened_at=datetime.utcnow(),
+        answered_at=datetime.utcnow(),
+    )
+    db_session.add(input_request)
+    await db_session.flush()
+    step.input_request_id = input_request.id
+
+    run.interaction_count = 1
 
     graph = await lock_target_plan_delete_graph(
         db_session,
@@ -993,6 +1044,8 @@ async def test_worker_cancel_accepts_answered_generation_without_dispatch_receip
 
     assert graph is not None
     assert graph.worker_dispatch_receipt_ids == (waiting.id,)
+    assert graph.step_ids == (step.id,)
+    assert graph.input_request_ids == (input_request.id,)
 
 
 @pytest.mark.asyncio

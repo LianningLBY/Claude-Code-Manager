@@ -192,7 +192,9 @@ vi.mock('./SubAgentIndicator', () => ({
 
 import { api } from '../../api/client';
 
-function makeTask(overrides: Partial<Task> = {}): Task {
+type LegacyTaskFixture = Task & { session_id?: string | null };
+
+function makeTask(overrides: Partial<LegacyTaskFixture> = {}): LegacyTaskFixture {
   return {
     id: 1,
     title: '',
@@ -219,6 +221,9 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     archived: false,
     has_unread: false,
     session_id: 'session-123',
+    has_session: true,
+    access_scope: 'control',
+    is_worker_managed: false,
     error_message: null,
     provider: 'claude',
     model: null,
@@ -454,6 +459,138 @@ describe('ChatView', () => {
       'https://github.com/acme/repo/pull/123',
     );
     expect(screen.getByTitle('Star')).toBeInTheDocument();
+  });
+
+  it('keeps chat-only shares conversational while withholding control capabilities', async () => {
+    const task = makeTask({
+      id: 88,
+      access_scope: 'chat',
+      provider: 'codex',
+      session_id: undefined,
+      has_session: true,
+    });
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    await waitFor(() => {
+      expect(api.getTaskChatHistory).toHaveBeenCalledWith(88, true, 200, 0, false);
+    });
+    expect(api.getRuntimeSettings).not.toHaveBeenCalled();
+    expect(api.getWorkerRuntimeSettings).not.toHaveBeenCalled();
+    expect(api.getTestHarnessRuntimeConfig).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('codex-main-mcp-status')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Distill skill from conversation')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Toggle Frontend Review panel')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('Star')).not.toBeInTheDocument();
+
+    await userEvent.type(
+      screen.getByPlaceholderText('Type a follow-up message...'),
+      'Shared follow-up',
+    );
+    await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+    await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalledWith(
+      88,
+      'Shared follow-up',
+      undefined,
+    ));
+
+    act(() => {
+      capturedOnMessage?.({
+        channel: 'system',
+        data: {
+          event: 'runtime_settings_changed',
+          codex_main_mcp_enabled: true,
+        },
+      });
+      capturedOnMessage?.({
+        channel: 'task:88',
+        data: {
+          event_type: 'permission_request',
+          request_id: 'permission-1',
+          tool_name: 'Bash',
+          description: 'Run a command?',
+        },
+      });
+      capturedOnMessage?.({
+        channel: 'task:88',
+        data: {
+          event_type: 'ask_user_question',
+          request_id: 'ask-1',
+          questions: [{
+            question: 'Proceed?',
+            options: [{ label: 'Yes' }, { label: 'No' }],
+          }],
+        },
+      });
+    });
+
+    expect(screen.queryByTestId('codex-main-mcp-status')).not.toBeInTheDocument();
+    expect(screen.getByText('等待 Task 控制者处理')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '允许' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '拒绝' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: /Yes/ }));
+    await userEvent.click(screen.getByRole('button', { name: '提交' }));
+    await waitFor(() => expect(api.submitAskUser).toHaveBeenCalled());
+    expect(api.resolvePermission).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Open monitors' }));
+    expect(screen.queryByText('Sub-Agents')).not.toBeInTheDocument();
+    expect(api.deleteMonitorSession).not.toHaveBeenCalled();
+  });
+
+  it('does not mount Delivery controls for a chat-only Delivery conversation', async () => {
+    render(
+      <ChatView
+        task={makeTask({
+          access_scope: 'chat',
+          mode: 'delivery_loop',
+          delivery_run_id: 42,
+        })}
+        projects={projects}
+        onBack={onBack}
+      />,
+    );
+
+    await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+    expect(screen.queryByRole('region', { name: 'Delivery Run #42' })).not.toBeInTheDocument();
+    expect(api.getDeliveryRun).not.toHaveBeenCalled();
+  });
+
+  it('does not restore a control draft or fork uploads into a chat-only share', () => {
+    const task = makeTask({ id: 89, access_scope: 'chat' });
+    const ownerUpload = makeUpload('owner-private', 'owner-private.txt');
+    localStorage.setItem(`ccm-chat-draft-${task.id}`, 'owner unsent draft');
+    localStorage.setItem(
+      `ccm-fork-seed-uploads-${task.id}`,
+      JSON.stringify([ownerUpload]),
+    );
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    expect(screen.getByRole('textbox')).toHaveValue('');
+    expect(screen.queryByText('owner-private.txt')).not.toBeInTheDocument();
+  });
+
+  it('isolates queued messages by both browser user and access scope', () => {
+    const task = makeTask({ id: 90, access_scope: 'chat' });
+    localStorage.setItem('cc_user', JSON.stringify({ id: 8, role: 'member' }));
+    localStorage.setItem(
+      `ccm-chat-queue-${task.id}`,
+      JSON.stringify([{ text: 'legacy owner queue' }]),
+    );
+    localStorage.setItem(
+      `ccm-chat-queue-${task.id}-control-user-7`,
+      JSON.stringify([{ text: 'other user control queue' }]),
+    );
+    localStorage.setItem(
+      `ccm-chat-queue-${task.id}-chat-user-8`,
+      JSON.stringify([{ text: 'my shared queue' }]),
+    );
+
+    render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+    expect(screen.getByText('my shared queue')).toBeInTheDocument();
+    expect(screen.queryByText('legacy owner queue')).not.toBeInTheDocument();
+    expect(screen.queryByText('other user control queue')).not.toBeInTheDocument();
   });
 
   it('keeps mobile header badges and compact actions on one row', async () => {
@@ -1747,7 +1884,7 @@ describe('ChatView', () => {
       expect(screen.getByText('report.md')).toBeInTheDocument();
       await waitFor(() => {
         expect(JSON.parse(
-          localStorage.getItem(`ccm-chat-draft-uploads-${task.id}`) || '[]',
+          localStorage.getItem(`ccm-chat-draft-uploads-${task.id}-control-anonymous`) || '[]',
         )).toEqual([attachment]);
       });
 
@@ -1789,7 +1926,7 @@ describe('ChatView', () => {
 
       await userEvent.click(screen.getByRole('button', { name: 'Merge' }));
       await waitFor(() => {
-        expect(localStorage.getItem(`ccm-chat-draft-uploads-${task.id}`)).not.toBeNull();
+        expect(localStorage.getItem(`ccm-chat-draft-uploads-${task.id}-control-anonymous`)).not.toBeNull();
       });
       first.unmount();
 
@@ -1835,7 +1972,9 @@ describe('ChatView', () => {
       expect(screen.getByText('after edit')).toBeInTheDocument();
       await waitFor(() => {
         expect(JSON.parse(
-          localStorage.getItem(`ccm-chat-queue-${task.id}`) || '[]',
+          localStorage.getItem(
+            `ccm-chat-queue-${task.id}-control-anonymous`,
+          ) || '[]',
         )).toEqual([{
           text: 'after edit',
           uploadResults: [attachment],
@@ -1912,7 +2051,7 @@ describe('ChatView', () => {
       expect(screen.getByRole('textbox')).toHaveValue('retry this');
       expect(screen.getByText('retry.txt')).toBeInTheDocument();
       await waitFor(() => {
-        expect(localStorage.getItem(`ccm-chat-draft-uploads-${task.id}`)).not.toBeNull();
+        expect(localStorage.getItem(`ccm-chat-draft-uploads-${task.id}-control-anonymous`)).not.toBeNull();
       });
     });
 
@@ -2393,7 +2532,7 @@ describe('ChatView', () => {
       const first = render(<ChatView task={task} projects={projects} onBack={onBack} />);
       expect(screen.getByRole('textbox')).toHaveValue('editable fork prompt');
       first.unmount();
-      localStorage.removeItem(`ccm-chat-draft-${task.id}`);
+      localStorage.removeItem(`ccm-chat-draft-${task.id}-control-anonymous`);
 
       render(<ChatView task={task} projects={projects} onBack={onBack} />);
       expect(screen.getByRole('textbox')).toHaveValue('');
@@ -3184,7 +3323,7 @@ describe('ChatView', () => {
   });
 
   describe('Draft buffering (localStorage)', () => {
-    const draftKey = (id: number) => `ccm-chat-draft-${id}`;
+    const draftKey = (id: number) => `ccm-chat-draft-${id}-control-anonymous`;
 
     beforeEach(() => {
       localStorage.clear();

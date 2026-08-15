@@ -196,8 +196,9 @@ async def test_admin_owner_fence_serializes_concurrent_demotion(tmp_path):
     db_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.execute(text("PRAGMA journal_mode=WAL"))
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.execute(text("PRAGMA journal_mode=WAL"))
         task_id, owner_id = await _create_scope(db_factory, role="admin")
         assert owner_id is not None
 
@@ -243,8 +244,9 @@ async def test_read_skill_does_not_self_deadlock_behind_task_writer_fence(
     db_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.execute(text("PRAGMA journal_mode=WAL"))
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.execute(text("PRAGMA journal_mode=WAL"))
         monkeypatch.setattr(skill_tool_rpc, "async_session", db_factory)
         async with db_factory() as setup_db:
             task = Task(

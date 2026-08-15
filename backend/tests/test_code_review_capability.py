@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -274,6 +275,33 @@ async def test_started_review_replays_one_tool_free_task(
     assert PRE_PR_CODE_REVIEW_TAG in reviewer_task.tags
     assert run.prompt_hash == adapter_module._review_task_prompt_hash(reviewer_task)
     assert wake.await_count == 1
+
+    # Runtime sandbox classification is not a PR Monitor ACL identity.  The
+    # requesting member remains the creator of this ordinary Capability child,
+    # so direct access and the ordinary Task list must agree.
+    from backend.api.deps import require_task_access
+    from backend.services.pr_monitor_task_access import is_pr_monitor_owned_task
+    from backend.services.task_queue import TaskQueue
+
+    assert reviewer_task.created_by == 7
+    assert not await is_pr_monitor_owned_task(db_session, reviewer_task)
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=7,
+            user_role="member",
+            auth_type="jwt",
+        ),
+        headers={},
+    )
+    await require_task_access(request, reviewer_task, db_session)
+    visible_ids = {
+        task.id
+        for task in await TaskQueue(db_session).list_tasks(
+            user_id=7,
+            include_archived=True,
+        )
+    }
+    assert reviewer_task.id in visible_ids
 
 
 @pytest.mark.asyncio

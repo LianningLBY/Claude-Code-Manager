@@ -14,7 +14,6 @@ from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.task_share import ProjectShare
 from backend.models.sub_agent import SubAgentSession
-from backend.models.team_share import TeamProjectShare
 
 if TYPE_CHECKING:
     from backend.services.instance_manager import InstanceManager
@@ -38,16 +37,11 @@ async def project_has_active_share(
     db: AsyncSession,
     project_id: int,
 ) -> bool:
-    """Return the unified Team + Feishu outbound Project visibility state."""
+    """Return legacy cross-CCM outbound Project sharing state.
 
-    team_share = await db.scalar(
-        select(TeamProjectShare.id)
-        .where(TeamProjectShare.project_id == project_id)
-        .limit(1)
-        .with_for_update()
-    )
-    if team_share is not None:
-        return True
+    TeamProjectShare is a local authorization grant. It does not change the
+    Project's execution trust boundary and must not disable local Agents.
+    """
     feishu_share = await db.scalar(
         select(ProjectShare.id)
         .where(

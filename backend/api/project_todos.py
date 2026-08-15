@@ -8,7 +8,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.database import get_db
-from backend.api.deps import get_current_user_id, require_project_access
+from backend.api.deps import (
+    get_current_user_id,
+    lock_project_effect_access,
+    lock_project_worker_effect_access,
+    require_project_access,
+    task_execution_principal_from_request,
+)
+from backend.api.task_projection import task_response
 from backend.models.delivery import DeliveryRun
 from backend.models.project import Project
 from backend.models.project_todo import ProjectTodo
@@ -36,6 +43,34 @@ async def _require_project(project_id: int, db: AsyncSession) -> Project:
     if not project:
         raise HTTPException(404, "Project not found")
     return project
+
+
+async def _lock_authorized_project_effect(
+    request: Request,
+    project_id: int,
+    db: AsyncSession,
+    *,
+    fence_worker_assignment: bool = False,
+) -> Project:
+    """Fence one Todo write against concurrent Project ACL revocation.
+
+    Team Project share add/remove uses the Project row as its portable writer
+    boundary.  Every Todo mutation must take that same boundary and then
+    re-read the caller's ACL inside the resulting transaction.  The optimistic
+    check at the route entry avoids taking a write lock for callers that were
+    already unauthorized; this check is the authoritative one after waiting.
+    """
+
+    # End the optimistic ACL/read snapshot before SQLite's portable writer
+    # fence. No durable Todo mutation has started at this point.
+    await db.rollback()
+    if fence_worker_assignment:
+        return await lock_project_worker_effect_access(
+            request,
+            project_id,
+            db,
+        )
+    return await lock_project_effect_access(request, project_id, db)
 
 
 async def _require_todo(
@@ -155,11 +190,13 @@ async def create_project_todo(
     db: AsyncSession = Depends(get_db),
 ):
     await require_project_access(request, project_id, db)
-    await _require_project(project_id, db)
     title = body.title.strip()
     prompt = body.prompt.strip()
     if not title or not prompt:
         raise HTTPException(400, "Title and prompt are required")
+
+    await db.rollback()
+    await _lock_authorized_project_effect(request, project_id, db)
 
     # New todos go to the top: one step above the current max sort_order.
     max_sort_order = await db.scalar(
@@ -189,6 +226,8 @@ async def update_project_todo(
     """Partial update. Also the canonical way to archive (status='archived')
     or restore (status='open') — DELETE is reserved for permanent removal."""
     await require_project_access(request, project_id, db)
+    await db.rollback()
+    await _lock_authorized_project_effect(request, project_id, db)
     todo = await _require_todo(project_id, todo_id, db, for_update=True)
     await _require_unowned_todo(db, todo)
     updates = body.model_dump(exclude_unset=True)
@@ -238,6 +277,8 @@ async def delete_project_todo(
 ):
     """Permanently delete a todo. To hide without destroying, PATCH status='archived'."""
     await require_project_access(request, project_id, db)
+    await db.rollback()
+    await _lock_authorized_project_effect(request, project_id, db)
     todo = await _require_todo(project_id, todo_id, db, for_update=True)
     await _require_unowned_todo(db, todo)
     deleted = await db.execute(
@@ -276,7 +317,13 @@ async def create_task_from_todo(
     """
 
     await require_project_access(request, project_id, db)
-    project = await _require_project(project_id, db)
+    await db.rollback()
+    project = await _lock_authorized_project_effect(
+        request,
+        project_id,
+        db,
+        fence_worker_assignment=True,
+    )
     todo = await _require_todo(project_id, todo_id, db, for_update=True)
     await _require_unowned_todo(db, todo)
     request_hash = _todo_task_request_hash(body)
@@ -307,6 +354,12 @@ async def create_task_from_todo(
                 target_branch=project.default_branch or "main",
                 worker_id=project.worker_id,
                 created_by=get_current_user_id(request),
+                # Worker is an execution location, not a lower-trust user.
+                # Keep the Manager-side native principal here; forwarding
+                # converts it to the delegated wire form after the Worker
+                # protocol preflight.  Purpose-built Plan/Review children use
+                # their own system principal at their separate boundaries.
+                **task_execution_principal_from_request(request),
                 provider=body.provider,
                 model=body.model,
                 codex_service_tier=body.codex_service_tier,
@@ -363,11 +416,9 @@ async def create_task_from_todo(
             dispatcher.wake()
     except (ImportError, AttributeError):
         pass
-    if task.project_id is not None:
-        try:
-            from backend.services.task_sharing import auto_share_new_task
-
-            await auto_share_new_task(db, task.id, task.project_id)
-        except Exception:
-            pass
-    return task
+    return await task_response(
+        request,
+        task,
+        db,
+        status_code=response.status_code or 201,
+    )

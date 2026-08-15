@@ -22,10 +22,7 @@ from backend.services.discussion_service import (
     DiscussionService,
 )
 from backend.services.project_share_admission import (
-    ProjectShareAdmissionError,
     lock_project_share_authority,
-    project_has_active_share,
-    require_project_agents_quiescent,
 )
 
 
@@ -43,14 +40,6 @@ def _admin_request() -> Request:
     request.state.user_id = None
     request.state.user_role = "super_admin"
     return request
-
-
-def _quiescent_runtime_stubs():
-    instance_manager = MagicMock()
-    instance_manager.project_share_runtime_block_reason.return_value = None
-    dispatcher = MagicMock()
-    dispatcher.project_share_auxiliary_runtime_block_reason.return_value = None
-    return instance_manager, dispatcher
 
 
 @pytest.mark.asyncio
@@ -71,7 +60,7 @@ async def test_create_discussion(client):
 
 
 @pytest.mark.asyncio
-async def test_shared_project_rejects_discussion_creation(
+async def test_local_project_acl_does_not_disable_discussion_creation(
     client,
     session_factory,
 ):
@@ -90,21 +79,20 @@ async def test_shared_project_rejects_discussion_creation(
 
     response = await client.post(
         "/api/discussions",
-        json={"title": "must stay private", "project_id": project_id},
+        json={"title": "local ACL is not isolation", "project_id": project_id},
     )
 
-    assert response.status_code == 409
-    assert "shared Project" in response.json()["detail"]
+    assert response.status_code == 201
     async with session_factory() as db:
         assert await db.scalar(
             select(func.count())
             .select_from(Discussion)
             .where(Discussion.project_id == project_id)
-        ) == 0
+        ) == 1
 
 
 @pytest.mark.asyncio
-async def test_discussion_create_and_first_share_serialize_to_one_winner(
+async def test_discussion_create_and_local_acl_share_can_coexist(
     tmp_path,
 ):
     db_path = tmp_path / "discussion-create-share-race.db"
@@ -122,49 +110,31 @@ async def test_discussion_create_and_first_share_serialize_to_one_winner(
         project_id = project.id
 
     gate = asyncio.Event()
-    instance_manager, dispatcher = _quiescent_runtime_stubs()
-
     async def create_discussion():
         async with session_factory() as db:
             await gate.wait()
-            try:
-                await discussions_api.create_discussion(
-                    DiscussionCreate(
-                        title="serialized provider lease",
-                        project_id=project_id,
-                    ),
-                    _admin_request(),
-                    db,
-                )
-                return "discussion"
-            except HTTPException as exc:
-                await db.rollback()
-                assert exc.status_code == 409
-                return "discussion-rejected"
+            await discussions_api.create_discussion(
+                DiscussionCreate(
+                    title="serialized provider lease",
+                    project_id=project_id,
+                ),
+                _admin_request(),
+                db,
+            )
+            return "discussion"
 
     async def create_share():
         async with session_factory() as db:
             await gate.wait()
-            try:
-                project = await lock_project_share_authority(db, project_id)
-                assert not await project_has_active_share(db, project_id)
-                await require_project_agents_quiescent(
-                    db,
-                    project,
-                    instance_manager=instance_manager,
-                    dispatcher=dispatcher,
-                )
-                db.add(TeamProjectShare(
-                    project_id=project_id,
-                    target_type="user",
-                    target_id=994,
-                    shared_by=0,
-                ))
-                await db.commit()
-                return "share"
-            except ProjectShareAdmissionError:
-                await db.rollback()
-                return "share-rejected"
+            await lock_project_share_authority(db, project_id)
+            db.add(TeamProjectShare(
+                project_id=project_id,
+                target_type="user",
+                target_id=994,
+                shared_by=0,
+            ))
+            await db.commit()
+            return "share"
 
     try:
         creating = asyncio.create_task(create_discussion())
@@ -175,10 +145,7 @@ async def test_discussion_create_and_first_share_serialize_to_one_winner(
             timeout=15,
         )
 
-        assert set(outcomes) in (
-            {"discussion", "share-rejected"},
-            {"discussion-rejected", "share"},
-        )
+        assert outcomes == ["discussion", "share"]
         async with session_factory() as db:
             discussion_count = await db.scalar(
                 select(func.count())
@@ -193,7 +160,7 @@ async def test_discussion_create_and_first_share_serialize_to_one_winner(
                 .select_from(TeamProjectShare)
                 .where(TeamProjectShare.project_id == project_id)
             )
-        assert (discussion_count, share_count) in {(1, 0), (0, 1)}
+        assert (discussion_count, share_count) == (1, 1)
     finally:
         await engine.dispose()
 
@@ -277,7 +244,7 @@ async def test_discussion_create_and_project_delete_serialize_to_one_winner(
 
 
 @pytest.mark.asyncio
-async def test_first_share_racing_discussion_trigger_is_vetoed(
+async def test_local_acl_share_racing_discussion_trigger_can_coexist(
     tmp_path,
 ):
     db_path = tmp_path / "discussion-share-trigger-race.db"
@@ -311,7 +278,6 @@ async def test_first_share_racing_discussion_trigger_is_vetoed(
         agent_id = agent.id
 
     gate = asyncio.Event()
-    instance_manager, dispatcher = _quiescent_runtime_stubs()
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
     service = DiscussionService(session_factory, broadcaster)
@@ -327,18 +293,15 @@ async def test_first_share_racing_discussion_trigger_is_vetoed(
     async def share():
         async with session_factory() as db:
             await gate.wait()
-            try:
-                project = await lock_project_share_authority(db, project_id)
-                await require_project_agents_quiescent(
-                    db,
-                    project,
-                    instance_manager=instance_manager,
-                    dispatcher=dispatcher,
-                )
-            except ProjectShareAdmissionError:
-                await db.rollback()
-                return "share-rejected"
-            raise AssertionError("active Discussion lease allowed first share")
+            await lock_project_share_authority(db, project_id)
+            db.add(TeamProjectShare(
+                project_id=project_id,
+                target_type="user",
+                target_id=995,
+                shared_by=0,
+            ))
+            await db.commit()
+            return "shared"
 
     try:
         triggering = asyncio.create_task(trigger())
@@ -347,7 +310,7 @@ async def test_first_share_racing_discussion_trigger_is_vetoed(
         assert await asyncio.wait_for(
             asyncio.gather(triggering, sharing),
             timeout=15,
-        ) == ["triggered", "share-rejected"]
+        ) == ["triggered", "shared"]
 
         service._launch_agent_with_prompt.assert_called_once()
         async with session_factory() as db:
@@ -357,7 +320,7 @@ async def test_first_share_racing_discussion_trigger_is_vetoed(
                 select(func.count())
                 .select_from(TeamProjectShare)
                 .where(TeamProjectShare.project_id == project_id)
-            ) == 0
+            ) == 1
     finally:
         await engine.dispose()
 
@@ -759,7 +722,7 @@ async def test_trigger_running_agent_409(client, session_factory):
 
 
 @pytest.mark.asyncio
-async def test_shared_project_trigger_is_rejected_before_agent_claim_or_spawn(
+async def test_local_project_acl_does_not_disable_discussion_trigger(
     client,
     session_factory,
 ):
@@ -800,12 +763,11 @@ async def test_shared_project_trigger_is_rejected_before_agent_claim_or_spawn(
             f"/api/discussions/{discussion_id}/agents/{agent_id}/trigger"
         )
 
-    assert response.status_code == 409
-    assert "shared" in response.json()["detail"]
-    service._launch_agent_with_prompt.assert_not_called()
+    assert response.status_code == 200
+    service._launch_agent_with_prompt.assert_called_once()
     async with session_factory() as db:
         current = await db.get(DiscussionAgent, agent_id)
-        assert current.status == "idle"
+        assert current.status == "running"
         assert current.pid is None
 
 

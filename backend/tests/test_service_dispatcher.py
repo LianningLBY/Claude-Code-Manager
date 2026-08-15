@@ -14,6 +14,7 @@ from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.config import settings
 from backend.services.dispatcher import (
     ContextRetryPermit,
     GlobalDispatcher,
@@ -50,10 +51,34 @@ from backend.models.plan import (
 )
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.task import Task
+from backend.models.user import User
 from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.tests.worker_termination_helpers import (
     persist_active_worker_receipt,
 )
+from backend.services.worker_node_control import begin_worker_node_drain
+
+
+_SYSTEM_SOURCE_PRINCIPAL = {
+    "user_id": None,
+    "role": "member",
+    "mode": "sandbox",
+    "kind": "system",
+}
+
+_SYSTEM_QUEUE_PRINCIPAL = {
+    "initiating_user_id": None,
+    "initiating_user_role": "member",
+    "execution_mode": "sandbox",
+    "execution_principal_kind": "system",
+}
+
+
+def _system_source_metadata(**extra):
+    return json.dumps({
+        **extra,
+        "execution_principal": dict(_SYSTEM_SOURCE_PRINCIPAL),
+    })
 
 
 def _make_dispatcher(db_factory):
@@ -633,6 +658,55 @@ async def test_claim_plan_run_returns_exact_persisted_generation(db_factory):
         assert persisted_run.instance_id == instance_id
         assert persisted_owner.status == "running"
         assert persisted_owner.current_plan_run_id == run_id
+
+
+@pytest.mark.asyncio
+async def test_claim_plan_run_refuses_new_owner_after_worker_drain(
+    db_factory,
+    monkeypatch,
+):
+    """A drained Worker must not reactivate a queued first-class Plan Run."""
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    dispatcher = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        instance = Instance(name="drained-plan-worker", status="idle")
+        plan = Plan(
+            title="Do not claim after drain",
+            initial_request="Plan this",
+            pipeline_config={},
+        )
+        db.add_all((instance, plan))
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            run_type="initial",
+            status="queued",
+            generation=0,
+            pipeline_config={},
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        await db.commit()
+        run_id = run.id
+        instance_id = instance.id
+
+        await begin_worker_node_drain(db, claim="d" * 64)
+        await db.commit()
+
+        assert await dispatcher._claim_plan_run(
+            db,
+            instance_id=instance_id,
+        ) is None
+
+    async with db_factory() as db:
+        persisted_run = await db.get(PlanAgentRun, run_id)
+        persisted_owner = await db.get(Instance, instance_id)
+        assert persisted_run.status == "queued"
+        assert persisted_run.instance_id is None
+        assert persisted_owner.status == "idle"
+        assert persisted_owner.current_plan_run_id is None
 
 
 @pytest.mark.asyncio
@@ -1416,13 +1490,24 @@ async def test_lifecycle_defers_pr_completion_until_background_epoch_finishes(
         assert current.pty_background_generation == ("exact-background-epoch")
     d._handle_pr_review_completion.assert_not_awaited()
 
-    async with db_factory() as db:
-        current = await db.get(Task, task_id)
-        current.pty_background_generation = None
-        await db.commit()
-    await d.instance_manager.pty_background_completion_handler(task_id)
+    await d.instance_manager.pty_background_completion_handler(
+        task_id,
+        "exact-background-epoch",
+    )
     d._handle_pr_review_completion.assert_awaited_once()
     assert d._handle_pr_review_completion.await_args.args[0].id == task_id
+    assert (
+        d._handle_pr_review_completion.await_args.kwargs[
+            "expected_background_generation"
+        ]
+        == "exact-background-epoch"
+    )
+    d._handle_pr_review_completion.reset_mock()
+    await d.instance_manager.pty_background_completion_handler(
+        task_id,
+        "different-background-epoch",
+    )
+    d._handle_pr_review_completion.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -3084,6 +3169,10 @@ async def test_lifecycle_prompt_includes_images(db_factory):
     assert "/uploads/a.png" in prompt_used
     assert "/uploads/b.jpg" in prompt_used
     assert "Read" in prompt_used
+    assert call_kwargs.kwargs["attachment_paths"] == (
+        "/uploads/a.png",
+        "/uploads/b.jpg",
+    )
 
 
 @pytest.mark.asyncio
@@ -7419,12 +7508,17 @@ async def test_mode_turn_retries_same_native_session_after_codex_rotation(db_fac
     )
     task = MagicMock(
         id=42,
+        metadata_={},
         model="gpt-5.6-sol",
         provider="codex",
         thinking_budget=None,
         effort_level="high",
         enable_workflows=False,
         enabled_skills=None,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
     )
 
     exit_code, home = await d._launch_mode_turn_with_rotation(
@@ -7479,6 +7573,7 @@ async def test_failed_sequential_mode_turn_never_receives_rotation_replay(db_fac
     )
     task = MagicMock(
         id=45,
+        metadata_={},
         model="gpt-5.6-sol",
         provider="codex",
         codex_service_tier="default",
@@ -7487,6 +7582,10 @@ async def test_failed_sequential_mode_turn_never_receives_rotation_replay(db_fac
         enable_workflows=False,
         enabled_skills=None,
         turn_source_log_id=11,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
     )
     token = object()
     sequence = _ModeTurnSequence(next_token=token)
@@ -7605,7 +7704,14 @@ async def test_mode_continuation_is_revoked_when_launch_cancels_before_admission
     with pytest.raises(asyncio.CancelledError):
         await d._launch_mode_turn_with_rotation(
             7,
-            MagicMock(id=48),
+            MagicMock(
+                id=48,
+                metadata_={},
+                execution_user_id=None,
+                execution_user_role="member",
+                execution_mode="sandbox",
+                execution_principal_kind="system",
+            ),
             MagicMock(turn_generation=3),
             "/repo",
             {},
@@ -7639,12 +7745,17 @@ async def test_successful_mode_turn_returns_home_after_proactive_switch(db_facto
     d._task_claim_is_active = AsyncMock(return_value=True)
     task = MagicMock(
         id=43,
+        metadata_={},
         model="gpt-5.6-sol",
         provider="codex",
         thinking_budget=None,
         effort_level="high",
         enable_workflows=False,
         enabled_skills=None,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
     )
 
     exit_code, home = await d._launch_mode_turn_with_rotation(
@@ -7702,12 +7813,17 @@ async def test_codex_mode_turn_does_not_timeout_output_consumer(
     d._task_claim_is_active = AsyncMock(return_value=True)
     task = MagicMock(
         id=44,
+        metadata_={},
         model="gpt-5.6-sol",
         provider="codex",
         thinking_budget=None,
         effort_level="high",
         enable_workflows=False,
         enabled_skills=None,
+        execution_user_id=None,
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
     )
 
     # Claude retains its bounded cleanup wait. Codex must not use that timeout:
@@ -8383,6 +8499,7 @@ async def test_watchdog_never_starts_replacement_before_old_cleanup(
 
 def _plan_delivery_payload(*, queue_timestamp: float) -> dict:
     return {
+        **_SYSTEM_QUEUE_PRINCIPAL,
         "prompt": "[Approved Plan]\nImplement exactly",
         "priority": 0,
         "source": "user",
@@ -8394,6 +8511,10 @@ def _plan_delivery_payload(*, queue_timestamp: float) -> dict:
         "current_message": "[Approved Plan]\nImplement exactly",
         "attachment_paths": [],
         "queue_timestamp": queue_timestamp,
+        "initiating_user_id": None,
+        "initiating_user_role": "member",
+        "execution_mode": "sandbox",
+        "execution_principal_kind": "system",
     }
 
 
@@ -8424,6 +8545,7 @@ async def _seed_worker_handoff_delivery(
             retry_count=retry_count,
             turn_generation=from_generation,
             session_id="worker-handoff-session",
+            metadata_={"ccm_worker_managed_task": True},
         )
         db.add(task)
         await db.flush()
@@ -8432,7 +8554,7 @@ async def _seed_worker_handoff_delivery(
             event_type="user_message",
             role="user",
             content=prompt,
-            raw_json=json.dumps({"raw_content": prompt}),
+            raw_json=_system_source_metadata(raw_content=prompt),
         )
         db.add(log)
         await db.flush()
@@ -8441,8 +8563,10 @@ async def _seed_worker_handoff_delivery(
             "worker_turn_handoff_id": handoff_id,
             "worker_turn_handoff_retry_count": retry_count,
             "worker_turn_handoff_from_generation": from_generation,
+            "worker_turn_handoff_incarnation_id": task.incarnation_id,
         }
         queue_payload = {
+            **_SYSTEM_QUEUE_PRINCIPAL,
             "prompt": prompt,
             "priority": 0,
             "source": "user",
@@ -8458,6 +8582,11 @@ async def _seed_worker_handoff_delivery(
             "worker_turn_handoff_id": handoff_id,
             "worker_turn_handoff_retry_count": retry_count,
             "worker_turn_handoff_from_generation": from_generation,
+            "worker_turn_handoff_incarnation_id": task.incarnation_id,
+            "initiating_user_id": None,
+            "initiating_user_role": "member",
+            "execution_mode": "sandbox",
+            "execution_principal_kind": "system",
         }
         db.add(
             WorkerTurnHandoffReceipt(
@@ -8508,11 +8637,9 @@ async def _seed_plan_delivery(
             event_type="user_message",
             role="user",
             content="Implement exactly",
-            raw_json=json.dumps(
-                {
-                    "raw_content": "Implement exactly",
-                    "applied_plans": [{"plan_id": plan.id}],
-                }
+            raw_json=_system_source_metadata(
+                raw_content="Implement exactly",
+                applied_plans=[{"plan_id": plan.id}],
             ),
         )
         db.add_all([version, log])
@@ -8569,6 +8696,7 @@ async def _seed_plan_worker_handoff_delivery(
             retry_count=retry_count,
             turn_generation=from_generation,
             session_id="worker-plan-session",
+            metadata_={"ccm_worker_managed_task": True},
         )
         plan = Plan(
             title="worker plan",
@@ -8588,10 +8716,10 @@ async def _seed_plan_worker_handoff_delivery(
             event_type="user_message",
             role="user",
             content="Implement exactly",
-            raw_json=json.dumps({
-                "raw_content": "Implement exactly",
-                "applied_plans": [{"plan_id": plan.id}],
-            }),
+            raw_json=_system_source_metadata(
+                raw_content="Implement exactly",
+                applied_plans=[{"plan_id": plan.id}],
+            ),
         )
         db.add_all([version, log])
         await db.flush()
@@ -8603,6 +8731,7 @@ async def _seed_plan_worker_handoff_delivery(
             "worker_turn_handoff_id": handoff_id,
             "worker_turn_handoff_retry_count": retry_count,
             "worker_turn_handoff_from_generation": from_generation,
+            "worker_turn_handoff_incarnation_id": task.incarnation_id,
         })
         request_payload = {
             "message": "Implement exactly",
@@ -8610,6 +8739,7 @@ async def _seed_plan_worker_handoff_delivery(
             "worker_turn_handoff_id": handoff_id,
             "worker_turn_handoff_retry_count": retry_count,
             "worker_turn_handoff_from_generation": from_generation,
+            "worker_turn_handoff_incarnation_id": task.incarnation_id,
         }
         db.add_all([
             PlanApplicationReceipt(
@@ -8659,6 +8789,86 @@ async def _seed_plan_worker_handoff_delivery(
         ])
         await db.commit()
         return task.id, version.id, log.id, handoff_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("principal_shape", ["missing", "native_user"])
+async def test_worker_handoff_recovery_rejects_non_delegated_principal(
+    db_factory,
+    principal_shape,
+):
+    handoff_id = hashlib.sha256(
+        f"invalid-principal-{principal_shape}".encode("utf-8")
+    ).hexdigest()[:32]
+    task_id, source_log_id = await _seed_worker_handoff_delivery(
+        db_factory,
+        handoff_id=handoff_id,
+    )
+    async with db_factory() as db:
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        payload = dict(receipt.queue_payload)
+        if principal_shape == "missing":
+            payload.pop("execution_principal_kind")
+        else:
+            payload.update({
+                "initiating_user_id": 99,
+                "initiating_user_role": "member",
+                "execution_mode": "sandbox",
+                "execution_principal_kind": "user",
+            })
+        receipt.queue_payload = payload
+        receipt.queue_payload_digest = _plan_delivery_digest(payload)
+        await db.commit()
+
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._ensure_queue_worker = MagicMock()
+
+    assert not await dispatcher.enqueue_worker_turn_handoff(
+        task_id=task_id,
+        source_log_id=source_log_id,
+        handoff_id=handoff_id,
+    )
+    assert dispatcher._get_task_queue(task_id).empty()
+    async with db_factory() as db:
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+    assert receipt.status == "cancelled"
+    assert "execution principal" in receipt.cancel_reason
+
+
+@pytest.mark.asyncio
+async def test_plan_recovery_fails_closed_without_explicit_principal(
+    db_factory,
+):
+    receipt_key = "plan-missing-explicit-principal"
+    task_id, _plan_id, _version_id, _log_id = await _seed_plan_delivery(
+        db_factory,
+        receipt_key=receipt_key,
+    )
+    async with db_factory() as db:
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        payload = dict(receipt.outbox_payload)
+        payload.pop("execution_mode")
+        receipt.outbox_payload = payload
+        receipt.payload_digest = _plan_delivery_digest(payload)
+        await db.commit()
+
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._ensure_queue_worker = MagicMock()
+
+    assert not await dispatcher.enqueue_plan_application_receipt(receipt_key)
+    assert dispatcher._get_task_queue(task_id).empty()
+    async with db_factory() as db:
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+    assert receipt.delivery_status == "failed"
+    assert "execution principal" in receipt.delivery_error
 
 
 @pytest.mark.asyncio
@@ -8798,6 +9008,123 @@ async def test_plan_recovery_defers_linked_accepted_handoff_to_worker_outbox(
     assert recovered.worker_turn_handoff_id == handoff_id
     assert recovered.worker_turn_handoff_claimed_generation is None
     assert recovered.source_log_id == log_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "principal_field",
+    [
+        "initiating_user_id",
+        "initiating_user_role",
+        "execution_mode",
+        "execution_principal_kind",
+    ],
+)
+async def test_generic_plan_recovery_requires_complete_execution_principal(
+    db_factory,
+    principal_field,
+):
+    receipt_key = f"plan-missing-principal-{principal_field}"
+    task_id, _plan_id, version_id, _log_id = await _seed_plan_delivery(
+        db_factory,
+        receipt_key=receipt_key,
+    )
+    async with db_factory() as db:
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        payload = dict(receipt.outbox_payload)
+        payload.pop(principal_field)
+        receipt.outbox_payload = payload
+        receipt.payload_digest = _plan_delivery_digest(payload)
+        await db.commit()
+
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._ensure_queue_worker = MagicMock()
+    await dispatcher._recover_plan_application_outbox(after_restart=True)
+
+    assert dispatcher._get_task_queue(task_id).empty()
+    async with db_factory() as db:
+        receipt = await db.scalar(
+            select(PlanApplicationReceipt).where(
+                PlanApplicationReceipt.receipt_key == receipt_key
+            )
+        )
+        application = await db.scalar(
+            select(PlanApplication).where(
+                PlanApplication.plan_version_id == version_id
+            )
+        )
+    assert receipt.delivery_status == "failed"
+    assert "execution principal" in receipt.delivery_error
+    assert application is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt_status", ["accepted", "claimed"])
+@pytest.mark.parametrize(
+    "principal_field",
+    [
+        "initiating_user_id",
+        "initiating_user_role",
+        "execution_mode",
+        "execution_principal_kind",
+    ],
+)
+async def test_worker_handoff_recovery_requires_complete_execution_principal(
+    db_factory,
+    receipt_status,
+    principal_field,
+):
+    handoff_id = hashlib.sha256(
+        f"{receipt_status}:{principal_field}".encode("utf-8")
+    ).hexdigest()[:32]
+    task_id, log_id = await _seed_worker_handoff_delivery(
+        db_factory,
+        handoff_id=handoff_id,
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        source = await db.get(LogEntry, log_id)
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+        payload = dict(receipt.queue_payload)
+        payload.pop(principal_field)
+        receipt.queue_payload = payload
+        receipt.queue_payload_digest = _plan_delivery_digest(payload)
+        if receipt_status == "claimed":
+            claimed_generation = receipt.from_generation + 1
+            task.status = "failed"
+            task.turn_generation = claimed_generation
+            task.turn_source_log_id = log_id
+            source.task_retry_count = receipt.retry_count
+            source.task_turn_generation = claimed_generation
+            source.turn_scope = "source"
+            source.is_error = False
+            receipt.status = "claimed"
+            receipt.claimed_turn_generation = claimed_generation
+        await db.commit()
+
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._ensure_queue_worker = MagicMock()
+    assert not await dispatcher.enqueue_worker_turn_handoff(
+        task_id=task_id,
+        source_log_id=log_id,
+        handoff_id=handoff_id,
+    )
+    await dispatcher._recover_worker_turn_handoff_outbox()
+
+    assert dispatcher._get_task_queue(task_id).empty()
+    async with db_factory() as db:
+        receipt = await db.get(WorkerTurnHandoffReceipt, handoff_id)
+    if receipt_status == "accepted":
+        assert receipt.status == "cancelled"
+        assert "malformed" in receipt.cancel_reason
+        assert receipt.claimed_turn_generation is None
+    else:
+        assert receipt.status == "launching"
+        assert receipt.claimed_turn_generation == receipt.from_generation + 1
 
 
 @pytest.mark.asyncio
@@ -9023,11 +9350,14 @@ async def test_generic_plan_safe_prelaunch_restart_reuses_claimed_generation(
             event_type="user_message",
             role="user",
             content="apply this generic plan exactly once",
-            raw_json=json.dumps({"raw_content": "apply this generic plan exactly once"}),
+            raw_json=_system_source_metadata(
+                raw_content="apply this generic plan exactly once",
+            ),
         )
         db.add(source)
         await db.flush()
         payload = {
+            **_SYSTEM_QUEUE_PRINCIPAL,
             "prompt": "[Approved Plan]\nApply exactly once",
             "priority": 0,
             "source": "user",
@@ -10555,6 +10885,9 @@ async def test_queued_claim_binds_visible_source_and_task_pointer(
             event_type="user_message",
             role="user",
             content="one exact request",
+            raw_json=_system_source_metadata(
+                raw_content="one exact request",
+            ),
             is_error=False,
         )
         db.add(source)
@@ -10597,6 +10930,142 @@ async def test_queued_claim_binds_visible_source_and_task_pointer(
     assert len(executing_events) == 1
     assert executing_events[0]["task_retry_count"] == task.retry_count
     assert executing_events[0]["task_turn_generation"] == task.turn_generation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_metadata",
+    (
+        {"raw_content": "missing frozen principal"},
+        {
+            "raw_content": "forged frozen principal",
+            "execution_principal": {
+                "user_id": None,
+                "role": "super_admin",
+                "mode": "unrestricted",
+                "kind": "deployment_token",
+            },
+        },
+    ),
+    ids=("missing", "different"),
+)
+async def test_queued_claim_rejects_source_principal_drift(
+    db_factory,
+    monkeypatch,
+    source_metadata,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        source = LogEntry(
+            task_id=task_id,
+            event_type="user_message",
+            role="user",
+            content="principal must stay exact",
+            raw_json=json.dumps(source_metadata),
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        source_id = source.id
+        await db.commit()
+    msg.source_log_id = source_id
+    msg.current_message = msg.prompt
+
+    with pytest.raises(
+        QueuedMessageRoutingMismatchError,
+        match="source execution principal changed",
+    ):
+        await d._process_queued_message(task_id, msg)
+
+    d.instance_manager.launch.assert_not_awaited()
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        source = await db.get(LogEntry, source_id)
+    assert task.status == "completed"
+    assert task.turn_generation == 0
+    assert task.turn_source_log_id is None
+    assert source.turn_scope is None
+
+
+@pytest.mark.asyncio
+async def test_queued_final_claim_rechecks_native_user_after_early_read(
+    db_factory,
+    monkeypatch,
+):
+    d, _id1, _id2, task_id, msg = await _setup_queued_msg_two_idle(
+        db_factory,
+        monkeypatch,
+    )
+    async with db_factory() as db:
+        user = User(
+            email="queued-final-fence@example.com",
+            name="queued final principal",
+            password_hash="unused",
+            role="admin",
+            is_active=True,
+        )
+        db.add(user)
+        await db.flush()
+        task = await db.get(Task, task_id)
+        task.status = "completed"
+        task.execution_user_id = user.id
+        task.execution_user_role = "admin"
+        task.execution_mode = "unrestricted"
+        task.execution_principal_kind = "user"
+        source = LogEntry(
+            task_id=task_id,
+            event_type="user_message",
+            role="user",
+            content="authority must still be current",
+            raw_json=json.dumps(
+                {
+                    "execution_principal": {
+                        "user_id": user.id,
+                        "role": "admin",
+                        "mode": "unrestricted",
+                        "kind": "user",
+                    }
+                }
+            ),
+            is_error=False,
+        )
+        db.add(source)
+        await db.flush()
+        source_id = source.id
+        user_id = user.id
+        await db.commit()
+    msg.source_log_id = source_id
+    msg.current_message = msg.prompt
+    msg.initiating_user_id = user_id
+    msg.initiating_user_role = "admin"
+    msg.execution_mode = "unrestricted"
+    msg.execution_principal_kind = "user"
+
+    final_fence = AsyncMock(return_value=False)
+    monkeypatch.setattr(
+        "backend.services.dispatcher.fence_native_execution_principal",
+        final_fence,
+    )
+    with pytest.raises(
+        QueuedMessageRoutingMismatchError,
+        match="authority changed before final launch claim",
+    ):
+        await d._process_queued_message(task_id, msg)
+
+    final_fence.assert_awaited_once()
+    d.instance_manager.launch.assert_not_awaited()
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        source = await db.get(LogEntry, source_id)
+    assert task.status == "completed"
+    assert task.turn_generation == 0
+    assert task.turn_source_log_id is None
+    assert source.turn_scope is None
 
 
 @pytest.mark.asyncio
@@ -10721,6 +11190,11 @@ async def test_queued_cross_generation_alias_does_not_replace_visible_launch_sou
             event_type="user_message",
             role="user",
             content="visible request must remain the compaction boundary",
+            raw_json=_system_source_metadata(
+                raw_content=(
+                    "visible request must remain the compaction boundary"
+                ),
+            ),
             is_error=False,
         )
         db.add(historical_source)
@@ -11107,12 +11581,15 @@ async def _attach_accepted_worker_handoff(
         task.retry_count = retry_count
         task.turn_generation = from_generation
         task.instance_id = None
+        task.metadata_ = {"ccm_worker_managed_task": True}
         log = LogEntry(
             task_id=task_id,
             event_type="user_message",
             role="user",
             content="exact Worker follow-up",
-            raw_json=json.dumps({"raw_content": "exact Worker follow-up"}),
+            raw_json=_system_source_metadata(
+                raw_content="exact Worker follow-up",
+            ),
         )
         db.add(log)
         await db.flush()
@@ -11121,14 +11598,17 @@ async def _attach_accepted_worker_handoff(
         msg.worker_turn_handoff_id = handoff_id
         msg.worker_turn_handoff_retry_count = retry_count
         msg.worker_turn_handoff_from_generation = from_generation
+        msg.worker_turn_handoff_incarnation_id = task.incarnation_id
         msg.expected_task_routing = ("claude", None, "default")
         request_payload = {
             "message": "exact Worker follow-up",
             "worker_turn_handoff_id": handoff_id,
             "worker_turn_handoff_retry_count": retry_count,
             "worker_turn_handoff_from_generation": from_generation,
+            "worker_turn_handoff_incarnation_id": task.incarnation_id,
         }
         queue_payload = {
+            **_SYSTEM_QUEUE_PRINCIPAL,
             "prompt": msg.prompt,
             "priority": msg.priority,
             "source": msg.source,
@@ -11144,6 +11624,11 @@ async def _attach_accepted_worker_handoff(
             "worker_turn_handoff_id": handoff_id,
             "worker_turn_handoff_retry_count": retry_count,
             "worker_turn_handoff_from_generation": from_generation,
+            "worker_turn_handoff_incarnation_id": task.incarnation_id,
+            "initiating_user_id": msg.initiating_user_id,
+            "initiating_user_role": msg.initiating_user_role,
+            "execution_mode": msg.execution_mode,
+            "execution_principal_kind": msg.execution_principal_kind,
         }
         db.add(
             WorkerTurnHandoffReceipt(
@@ -11269,19 +11754,20 @@ async def test_worker_handoff_claim_binds_user_log_to_exact_next_turn(
         task.retry_count = 2
         task.turn_generation = 8
         task.instance_id = None
+        task.metadata_ = {"ccm_worker_managed_task": True}
         log = LogEntry(
             task_id=task_id,
             event_type="user_message",
             role="user",
             content="exact Worker follow-up",
-            raw_json=json.dumps({
-                "raw_content": "exact Worker follow-up",
-                "worker_turn_handoff": {
+            raw_json=_system_source_metadata(
+                raw_content="exact Worker follow-up",
+                worker_turn_handoff={
                     "id": handoff_id,
                     "retry_count": 2,
                     "from_generation": 8,
                 },
-            }),
+            ),
         )
         db.add(log)
         await db.flush()
@@ -11291,13 +11777,16 @@ async def test_worker_handoff_claim_binds_user_log_to_exact_next_turn(
         msg.worker_turn_handoff_id = handoff_id
         msg.worker_turn_handoff_retry_count = 2
         msg.worker_turn_handoff_from_generation = 8
+        msg.worker_turn_handoff_incarnation_id = task.incarnation_id
         request_payload = {
             "message": "exact Worker follow-up",
             "worker_turn_handoff_id": handoff_id,
             "worker_turn_handoff_retry_count": 2,
             "worker_turn_handoff_from_generation": 8,
+            "worker_turn_handoff_incarnation_id": task.incarnation_id,
         }
         queue_payload = {
+            **_SYSTEM_QUEUE_PRINCIPAL,
             "prompt": msg.prompt,
             "priority": msg.priority,
             "source": msg.source,
@@ -11313,6 +11802,11 @@ async def test_worker_handoff_claim_binds_user_log_to_exact_next_turn(
             "worker_turn_handoff_id": handoff_id,
             "worker_turn_handoff_retry_count": 2,
             "worker_turn_handoff_from_generation": 8,
+            "worker_turn_handoff_incarnation_id": task.incarnation_id,
+            "initiating_user_id": msg.initiating_user_id,
+            "initiating_user_role": msg.initiating_user_role,
+            "execution_mode": msg.execution_mode,
+            "execution_principal_kind": msg.execution_principal_kind,
         }
         canonical = lambda payload: hashlib.sha256(
             json.dumps(
@@ -13038,6 +13532,68 @@ async def test_browser_replay_finalizer_atomically_releases_running_binding(
         assert binding.state == "running"
         assert binding.claimed_retry_count == reclaimed.retry_count
         assert binding.claimed_instance_id == scope.instance_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    (("is_active", False), ("role", "member")),
+    ids=("disabled", "demoted"),
+)
+async def test_prelaunch_replay_never_repends_revoked_native_principal(
+    db_factory,
+    changed_field,
+    changed_value,
+):
+    dispatcher = _make_dispatcher(db_factory)
+    async with db_factory() as db:
+        user = User(
+            email=f"replay-{changed_field}@example.com",
+            name="replay principal",
+            password_hash="unused",
+            role="admin",
+            is_active=True,
+        )
+        instance = Instance(name=f"replay-{changed_field}")
+        db.add_all([user, instance])
+        await db.flush()
+        task = Task(
+            title="revoked replay",
+            description="must fail closed",
+            status="executing",
+            instance_id=instance.id,
+            retry_count=0,
+            max_retries=2,
+            execution_user_id=user.id,
+            execution_user_role="admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="user",
+        )
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+    await _bind_hidden_lifecycle_source(db_factory, task_id)
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        generation = dispatcher._task_lifecycle_generation(task)
+        principal = await db.get(User, task.execution_user_id)
+        setattr(principal, changed_field, changed_value)
+        await db.commit()
+
+    finalized = await dispatcher._finalize_fresh_lifecycle_replay_safely(
+        generation,
+        pending_reason="retry unlaunched turn",
+        failure_reason="prelaunch routing failed",
+        consume_retry=True,
+    )
+
+    assert finalized is not None
+    assert finalized.generation.status == "failed"
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == "failed"
+    assert current.retry_count == 0
+    assert "principal is inactive or its role changed" in current.error_message
 
 
 @pytest.mark.asyncio
@@ -14975,6 +15531,7 @@ async def test_missing_session_recovery_uses_recency_wrapper(
                 event_type="user_message",
                 role="user",
                 content=msg.prompt,
+                raw_json=_system_source_metadata(raw_content=msg.prompt),
                 is_error=False,
             )
         )
@@ -15081,6 +15638,7 @@ async def test_codex_precompact_uses_full_context_tokens(
                 event_type="user_message",
                 role="user",
                 content=msg.prompt,
+                raw_json=_system_source_metadata(raw_content=msg.prompt),
                 is_error=False,
             )
         )
@@ -15223,6 +15781,28 @@ async def test_abort_task_queue_cancels_message_already_removed_by_get(db_factor
     assert cleared == 0  # item was already held by the consumer
     assert not reached_launch.is_set()
     assert 11 not in d._task_queue_workers
+
+
+@pytest.mark.asyncio
+async def test_shared_queue_admission_rejects_human_admin_principal(db_factory):
+    d = _make_dispatcher(db_factory)
+    d._ensure_queue_worker = MagicMock()
+
+    with pytest.raises(
+        ValueError,
+        match="Shared messages must use the sandboxed system principal",
+    ):
+        await d.enqueue_message(
+            11,
+            "remote shared message",
+            source="shared",
+            initiating_user_id=7,
+            initiating_user_role="admin",
+            execution_mode="unrestricted",
+            execution_principal_kind="user",
+        )
+
+    assert d._task_queues.get(11) is None
 
 
 @pytest.mark.asyncio
@@ -17557,6 +18137,9 @@ async def test_codex_pr_review_relaunch_uses_fresh_thread_and_full_snapshot_prom
 ):
     dispatcher = _make_dispatcher(db_factory)
     dispatcher._task_claim_is_active = AsyncMock(return_value=True)
+    dispatcher._read_owned_lifecycle_task = AsyncMock(
+        return_value=SimpleNamespace(turn_source_log_id=431)
+    )
     dispatcher._build_task_prompt = AsyncMock(
         return_value="FULL_IMMUTABLE_PR_SNAPSHOT_AND_TERMINAL_SCHEMA"
     )
@@ -17568,6 +18151,9 @@ async def test_codex_pr_review_relaunch_uses_fresh_thread_and_full_snapshot_prom
         model="gpt-5.6-sol",
         tags=["pr-review"],
         metadata_={"pr_review_id": 17},
+        execution_user_role="member",
+        execution_mode="sandbox",
+        execution_principal_kind="system",
     )
 
     await dispatcher._relaunch_and_wait(
@@ -17588,6 +18174,7 @@ async def test_codex_pr_review_relaunch_uses_fresh_thread_and_full_snapshot_prom
         "FULL_IMMUTABLE_PR_SNAPSHOT_AND_TERMINAL_SCHEMA"
     )
     assert "resume_session_id" not in launch
+    assert launch["source_log_id"] == 431
     assert "请继续之前的工作" not in launch["prompt"]
     dispatcher._build_task_prompt.assert_awaited_once_with(task)
 

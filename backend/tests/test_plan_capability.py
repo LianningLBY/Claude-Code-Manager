@@ -604,8 +604,9 @@ async def test_capability_claim_and_cancel_race_has_no_cross_aggregate_deadlock(
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         db_factory = async_sessionmaker(
             engine,
             class_=AsyncSession,

@@ -27,6 +27,11 @@ import { SecretPicker } from '../Secrets/SecretPicker';
 import { QuickPhraseDropdown } from '../QuickPhrases/QuickPhraseDropdown';
 import { ListFilter, Syringe } from '../icons';
 import { FastModeBadge, PlanPipelineBadge, TaskConfigBadge } from '../Tasks/TaskBadges';
+import {
+  canControlTask,
+  readStoredUserIdentity,
+  taskHasSession,
+} from '../Tasks/taskSharePermissions';
 import { VersionedPlansDialog } from '../PlanReview/VersionedPlansDialog';
 import { planStalenessConfirmationMessage } from '../PlanReview/planStaleness';
 import { AttentionTag } from '../Tasks/AttentionTag';
@@ -307,6 +312,33 @@ function loadStoredUploadResults(key: string): UploadResult[] {
   }
 }
 
+function parseStoredMessageQueue(raw: string | null): QueuedMessage[] {
+  try {
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    // Migrate the historical string[] representation without carrying any
+    // now-stale control metadata into a fresh browser session.
+    if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
+      return (parsed as string[]).map((text) => ({ text }));
+    }
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((item): QueuedMessage[] => {
+      if (!item || typeof item !== 'object') return [];
+      const candidate = item as Partial<QueuedMessage>;
+      if (typeof candidate.text !== 'string') return [];
+      const uploadResults = Array.isArray(candidate.uploadResults)
+        ? dedupeUploadResults(candidate.uploadResults.filter(isUploadResult))
+        : undefined;
+      return [{
+        text: candidate.text,
+        uploadResults: uploadResults?.length ? uploadResults : undefined,
+      }];
+    });
+  } catch {
+    return [];
+  }
+}
+
 type MessageGroup =
   | { type: 'tool-group'; messages: ChatMessage[] }
   | { type: 'single'; message: ChatMessage };
@@ -422,6 +454,8 @@ function injectAttachments(uploadResults: UploadResult[]): InjectTaskAttachments
 }
 
 export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, inline }: ChatViewProps) {
+  const hasTaskSession = taskHasSession(task);
+  const hasControlAccess = canControlTask(task);
   const projectName = useMemo(() => {
     if (!task.project_id) return null;
     const p = projects.find((p) => p.id === task.project_id);
@@ -431,31 +465,54 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const deliveryReadOnly = task.mode === 'delivery_loop' || task.delivery_run_id != null;
   const [messages, setMessages] = useState<ChatMessage[]>(() => restoreLiveStreamCache(task));
   const activeTaskTurnRef = useRef<TaskTurnIdentity>(taskTurnIdentity(task));
-  const forkSeedKey = `ccm-fork-seed-consumed-${task.id}`;
-  const forkSeedUploadsKey = `ccm-fork-seed-uploads-${task.id}`;
-  const forkSeedUploadsConsumedKey = `ccm-fork-seed-uploads-consumed-${task.id}`;
-  const draftUploadsKey = `ccm-chat-draft-uploads-${task.id}`;
+  const storedUser = readStoredUserIdentity();
+  const storagePrincipal = typeof storedUser.id === 'number'
+    ? `user-${storedUser.id}`
+    : 'anonymous';
+  const storageAccessScope = task.access_scope === 'control'
+    ? 'control'
+    : task.access_scope === 'chat'
+      ? 'chat'
+      : hasControlAccess ? 'legacy-control' : 'restricted';
+  const draftStorageNamespace = `${task.id}-${storageAccessScope}-${storagePrincipal}`;
+  const legacyForkSeedKey = `ccm-fork-seed-consumed-${task.id}`;
+  const legacyForkSeedUploadsKey = `ccm-fork-seed-uploads-${task.id}`;
+  const legacyForkSeedUploadsConsumedKey = `ccm-fork-seed-uploads-consumed-${task.id}`;
+  const legacyDraftKey = `ccm-chat-draft-${task.id}`;
+  const legacyDraftUploadsKey = `ccm-chat-draft-uploads-${task.id}`;
+  const forkSeedKey = `ccm-fork-seed-consumed-${draftStorageNamespace}`;
+  const forkSeedUploadsKey = `ccm-fork-seed-uploads-${draftStorageNamespace}`;
+  const forkSeedUploadsConsumedKey = `ccm-fork-seed-uploads-consumed-${draftStorageNamespace}`;
+  const draftKey = `ccm-chat-draft-${draftStorageNamespace}`;
+  const draftUploadsKey = `ccm-chat-draft-uploads-${draftStorageNamespace}`;
+  const legacyMessageQueueKey = `ccm-chat-queue-${task.id}`;
+  const messageQueueKey = `ccm-chat-queue-${draftStorageNamespace}`;
+  const readScopedItem = (key: string, legacyKey: string): string | null => {
+    const scoped = localStorage.getItem(key);
+    if (scoped !== null || !hasControlAccess) return scoped;
+    return localStorage.getItem(legacyKey);
+  };
   const [forkSeedUploads, setForkSeedUploads] = useState<UploadResult[]>(() => {
     try {
-      if (localStorage.getItem(forkSeedUploadsConsumedKey)) return [];
-      const saved = localStorage.getItem(forkSeedUploadsKey);
+      if (readScopedItem(forkSeedUploadsConsumedKey, legacyForkSeedUploadsConsumedKey)) return [];
+      const saved = readScopedItem(forkSeedUploadsKey, legacyForkSeedUploadsKey);
       if (saved) return JSON.parse(saved) as UploadResult[];
     } catch { /* storage may be unavailable */ }
-    return task.metadata_?.fork_seed_uploads || [];
+    return hasControlAccess ? task.metadata_?.fork_seed_uploads || [] : [];
   });
   // Draft buffer: unsent input survives refresh / re-entering the chat
   const [input, setInput] = useState(() => {
     try {
-      const draft = localStorage.getItem(`ccm-chat-draft-${task.id}`);
+      const draft = readScopedItem(draftKey, legacyDraftKey);
       if (draft) return draft;
       const seed = task.metadata_?.fork_seed_message;
-      if (seed && !localStorage.getItem(forkSeedKey)) {
+      if (hasControlAccess && seed && !readScopedItem(forkSeedKey, legacyForkSeedKey)) {
         localStorage.setItem(forkSeedKey, '1');
         return seed;
       }
       return '';
     } catch {
-      return task.metadata_?.fork_seed_message || '';
+      return hasControlAccess ? task.metadata_?.fork_seed_message || '' : '';
     }
   });
   const [sending, setSending] = useState(false);
@@ -499,10 +556,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [stillRunning, setStillRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dropError, setDropError] = useState<string | null>(null);
-  const initialDraftUploads = useMemo(
-    () => loadStoredUploadResults(draftUploadsKey),
-    [draftUploadsKey],
-  );
+  const initialDraftUploads = useMemo(() => {
+    try {
+      const key = localStorage.getItem(draftUploadsKey) !== null
+        ? draftUploadsKey
+        : hasControlAccess ? legacyDraftUploadsKey : draftUploadsKey;
+      return loadStoredUploadResults(key);
+    } catch {
+      return [];
+    }
+  }, [draftUploadsKey, hasControlAccess, legacyDraftUploadsKey]);
   const fileUpload = useFileUpload(initialDraftUploads);
   const addChatFiles = fileUpload.addFiles;
   const consumeForkSeedUploads = useCallback(() => {
@@ -518,6 +581,34 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     forkSeedUploadsKey,
   ]);
   const [selectedSecretIds, setSelectedSecretIds] = useState<number[]>([]);
+  const activeDraftStorageNamespaceRef = useRef(draftStorageNamespace);
+  useEffect(() => {
+    if (activeDraftStorageNamespaceRef.current === draftStorageNamespace) return;
+    activeDraftStorageNamespaceRef.current = draftStorageNamespace;
+    let nextInput = '';
+    let nextForkSeedUploads: UploadResult[] = [];
+    let nextDraftUploads: UploadResult[] = [];
+    try {
+      nextInput = localStorage.getItem(draftKey) || '';
+      if (!localStorage.getItem(forkSeedUploadsConsumedKey)) {
+        nextForkSeedUploads = loadStoredUploadResults(forkSeedUploadsKey);
+      }
+      nextDraftUploads = loadStoredUploadResults(draftUploadsKey);
+    } catch { /* storage may be unavailable */ }
+    setInput(nextInput);
+    setForkSeedUploads(nextForkSeedUploads);
+    setSelectedSecretIds([]);
+    fileUpload.clear();
+    fileUpload.addUploadedResults(nextDraftUploads);
+  }, [
+    draftKey,
+    draftStorageNamespace,
+    draftUploadsKey,
+    fileUpload.addUploadedResults,
+    fileUpload.clear,
+    forkSeedUploadsConsumedKey,
+    forkSeedUploadsKey,
+  ]);
   const [contextUsage, setContextUsage] = useState<ContextUsage | null>(task.context_window_usage ?? null);
   const [editingTitle, setEditingTitle] = useState(false);
   const [editingAttentionTag, setEditingAttentionTag] = useState(false);
@@ -571,7 +662,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const injectingRef = useRef(false);
   // 注入模式开关：开启后「发送」直达当前 turn，而不是排队新 turn。
   const [injectMode, setInjectMode] = useState(false);
-  const canInject = !deliveryReadOnly && task.worker_id == null && task.shared_from_id == null && (
+  const canInject = hasControlAccess && !deliveryReadOnly && task.worker_id == null && task.shared_from_id == null && (
     task.provider === 'codex' ? codexAppServerEnabled : ptyMode
   );
   const injectTransport = task.provider === 'codex' ? 'Codex turn/steer' : 'Claude PTY';
@@ -580,6 +671,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     let active = true;
     setCodexMainMcpEnabled(null);
     setCodexMonitorEnabled(null);
+    setPtyMode(false);
+    setCodexAppServerEnabled(false);
+    if (!hasControlAccess) return () => { active = false; };
     const settingsRequest = task.worker_id == null
       ? api.getRuntimeSettings()
       : api.getWorkerRuntimeSettings(task.worker_id);
@@ -599,7 +693,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       );
     }).catch(() => {});
     return () => { active = false; };
-  }, [task.worker_id]);
+  }, [hasControlAccess, task.worker_id]);
 
   useEffect(() => {
     if (!canInject) setInjectMode(false);
@@ -686,10 +780,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // Persist the draft as the user types; cleared when input empties (e.g. send)
   useEffect(() => {
     try {
-      if (input) localStorage.setItem(`ccm-chat-draft-${task.id}`, input);
-      else localStorage.removeItem(`ccm-chat-draft-${task.id}`);
+      if (input) localStorage.setItem(draftKey, input);
+      else localStorage.removeItem(draftKey);
+      if (hasControlAccess) localStorage.removeItem(legacyDraftKey);
     } catch { /* storage may be unavailable */ }
-  }, [input, task.id]);
+  }, [draftKey, hasControlAccess, input, legacyDraftKey]);
   useEffect(() => {
     try {
       if (fileUpload.uploadedResults.length > 0) {
@@ -700,8 +795,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       } else {
         localStorage.removeItem(draftUploadsKey);
       }
+      if (hasControlAccess) localStorage.removeItem(legacyDraftUploadsKey);
     } catch { /* storage may be unavailable */ }
-  }, [draftUploadsKey, fileUpload.uploadedResults]);
+  }, [draftUploadsKey, fileUpload.uploadedResults, hasControlAccess, legacyDraftUploadsKey]);
   useEffect(() => {
     try {
       if (localStorage.getItem(forkSeedUploadsConsumedKey)) {
@@ -709,8 +805,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       } else {
         localStorage.setItem(forkSeedUploadsKey, JSON.stringify(forkSeedUploads));
       }
+      if (hasControlAccess) {
+        localStorage.removeItem(legacyForkSeedUploadsKey);
+        localStorage.removeItem(legacyForkSeedUploadsConsumedKey);
+      }
     } catch { /* storage may be unavailable */ }
-  }, [forkSeedUploads, forkSeedUploadsConsumedKey, forkSeedUploadsKey]);
+  }, [
+    forkSeedUploads,
+    forkSeedUploadsConsumedKey,
+    forkSeedUploadsKey,
+    hasControlAccess,
+    legacyForkSeedUploadsConsumedKey,
+    legacyForkSeedUploadsKey,
+  ]);
   const [monitorSessions, setMonitorSessions] = useState<MonitorSession[]>([]);
   const [showMonitorPanel, setShowMonitorPanel] = useState(false);
   const [browserReviewAvailable, setBrowserReviewAvailable] = useState(false);
@@ -788,7 +895,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     let active = true;
     setFrontendReviewGoalCapability(null);
     setWorkspaceReviewCapability(null);
-    if (task.worker_id != null || task.shared_from_id != null || !task.session_id) {
+    if (!hasControlAccess || task.worker_id != null || task.shared_from_id != null || !hasTaskSession) {
       setFrontendReviewGoalCapabilityLoading(false);
       return () => { active = false; };
     }
@@ -826,8 +933,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     return () => { active = false; };
   }, [
     task.id,
+    hasControlAccess,
+    hasTaskSession,
     task.project_id,
-    task.session_id,
     task.shared_from_id,
     task.status,
     task.target_repo,
@@ -861,7 +969,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   }, [task.id]);
 
   const refreshVersionedPlans = useCallback(async () => {
-    if (!task.session_id || task.shared_from_id != null) return;
+    if (!hasControlAccess || !hasTaskSession || task.shared_from_id != null) return;
     try {
       const rows = await api.listPlans({ target_task_id: task.id });
       setVersionedPlans(rows);
@@ -872,7 +980,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       );
       setSelectedPlanVersionIds((current) => current.filter((id) => attachable.has(id)));
     } catch { /* modal exposes actionable errors; passive polling is best-effort */ }
-  }, [task.id, task.session_id, task.shared_from_id]);
+  }, [hasControlAccess, hasTaskSession, task.id, task.shared_from_id]);
 
   useEffect(() => {
     void refreshVersionedPlans();
@@ -901,6 +1009,20 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [distillSaving, setDistillSaving] = useState(false);
   const [distillError, setDistillError] = useState<string | null>(null);
   const [distillInstruction, setDistillInstruction] = useState('');
+  useEffect(() => {
+    if (hasControlAccess) return;
+    setDistillOpen(false);
+    setForkOpen(false);
+    setShowModelMenu(false);
+    setModelOverride(null);
+    setPlansOpen(false);
+    setShowMonitorPanel(false);
+    setShowBrowserReviewPanel(false);
+    setFrontendReviewComposerMode(false);
+    setWorkspaceReviewComposerMode(false);
+    setInjectMode(false);
+    setSelectedSecretIds([]);
+  }, [hasControlAccess]);
   const effectiveStatus = localStatus || task.status;
   const backgroundActive = localBackgroundActive ?? task.background_active === true;
   const isWaitingCapability = effectiveStatus === 'waiting_capability';
@@ -931,43 +1053,52 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     || workspaceReviewCapability?.suggested_config != null
   );
   const canStartWorkspaceReview = (
-    task.worker_id == null
+    hasControlAccess
+    && task.worker_id == null
     && task.shared_from_id == null
-    && Boolean(task.session_id)
+    && hasTaskSession
     && ['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus)
     && !isProcessing
     && workspaceReviewCanBeConfigured
   );
   const canStartConfiguredBrowserReview = (
-    task.worker_id == null
+    hasControlAccess
+    && task.worker_id == null
     && task.shared_from_id == null
     && ['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus)
     && !isProcessing
   );
   const canStartFrontendReviewGoal = (
-    task.worker_id == null
+    hasControlAccess
+    && task.worker_id == null
     && task.shared_from_id == null
-    && Boolean(task.session_id)
+    && hasTaskSession
     && ['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus)
     && !isProcessing
     && frontendReviewGoalCapability?.available === true
     && workspaceReviewCanBeConfigured
   );
-  const workspaceReviewUnavailableReason = !task.session_id
+  const workspaceReviewUnavailableReason = !hasControlAccess
+    ? '此 Task 仅授予聊天权限'
+    : !hasTaskSession
     ? 'Task 完成并建立 session 后才能审查当前分支'
     : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || isProcessing
       ? 'Task 正在执行；Agent 可在对话中调用测试工具，或等待完成后从这里启动'
       : frontendReviewGoalCapabilityLoading
         ? '正在确认本地 Git 仓库与 Preview 配置…'
         : workspaceReviewCapability?.reason || '当前 Task 没有可运行的本地 Preview';
-  const frontendReviewGoalUnavailableReason = !task.session_id
+  const frontendReviewGoalUnavailableReason = !hasControlAccess
+    ? '此 Task 仅授予聊天权限'
+    : !hasTaskSession
     ? 'Task 完成并建立 session 后才能启动循环审查'
     : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || isProcessing
       ? 'Task 正在执行，请等待完成后再启动循环审查'
       : frontendReviewGoalCapabilityLoading
         ? '正在确认可修改的本地 Git 仓库…'
         : workspaceReviewCapability?.reason || frontendReviewGoalCapability?.reason || '尚未确认存在可修改的本地 Git 仓库';
-  const configuredBrowserReviewUnavailableReason = task.worker_id != null
+  const configuredBrowserReviewUnavailableReason = !hasControlAccess
+    ? '此 Task 仅授予聊天权限'
+    : task.worker_id != null
     ? 'Worker Task 暂不支持从 Manager 界面直接启动网站测试'
     : task.shared_from_id != null
       ? '共享 Task 只能查看已有测试记录'
@@ -1072,33 +1203,32 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // Message queue: pre-queue messages to auto-send after current turn completes
   const [messageQueue, setMessageQueue] = useState<QueuedMessage[]>(() => {
     try {
-      const saved = localStorage.getItem(`ccm-chat-queue-${task.id}`);
-      if (!saved) return [];
-      const parsed = JSON.parse(saved);
-      // Migrate legacy string[] format
-      if (Array.isArray(parsed) && parsed.length > 0 && typeof parsed[0] === 'string') {
-        return (parsed as string[]).map(text => ({ text }));
-      }
-      if (!Array.isArray(parsed)) return [];
-      return parsed.flatMap((item): QueuedMessage[] => {
-        if (!item || typeof item !== 'object') return [];
-        const candidate = item as Partial<QueuedMessage>;
-        if (typeof candidate.text !== 'string') return [];
-        const uploadResults = Array.isArray(candidate.uploadResults)
-          ? dedupeUploadResults(candidate.uploadResults.filter(isUploadResult))
-          : undefined;
-        return [{
-          text: candidate.text,
-          uploadResults: uploadResults?.length ? uploadResults : undefined,
-        }];
-      });
+      const scoped = localStorage.getItem(messageQueueKey);
+      const saved = scoped ?? (
+        hasControlAccess ? localStorage.getItem(legacyMessageQueueKey) : null
+      );
+      return parseStoredMessageQueue(saved);
     } catch { return []; }
   });
   const messageQueueRef = useRef(messageQueue);
+  const activeMessageQueueKeyRef = useRef(messageQueueKey);
   useEffect(() => {
+    if (activeMessageQueueKeyRef.current !== messageQueueKey) {
+      activeMessageQueueKeyRef.current = messageQueueKey;
+      let next: QueuedMessage[] = [];
+      try {
+        next = parseStoredMessageQueue(localStorage.getItem(messageQueueKey));
+      } catch { /* storage may be unavailable */ }
+      messageQueueRef.current = next;
+      setMessageQueue(next);
+      return;
+    }
     messageQueueRef.current = messageQueue;
-    localStorage.setItem(`ccm-chat-queue-${task.id}`, JSON.stringify(messageQueue));
-  }, [messageQueue, task.id]);
+    try {
+      localStorage.setItem(messageQueueKey, JSON.stringify(messageQueue));
+      if (hasControlAccess) localStorage.removeItem(legacyMessageQueueKey);
+    } catch { /* storage may be unavailable */ }
+  }, [hasControlAccess, legacyMessageQueueKey, messageQueue, messageQueueKey]);
 
   const addToQueue = useCallback((
     text: string,
@@ -1344,7 +1474,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (msg.channel === 'system' && msg.data?.event === 'runtime_settings_changed') {
       // Manager broadcasts describe Manager capabilities only. Worker tasks
       // display the proxied Worker runtime settings loaded above.
-      if (task.worker_id == null) {
+      if (hasControlAccess && task.worker_id == null) {
         setPtyMode(Boolean(msg.data.use_pty_mode));
         if (typeof msg.data.codex_app_server_enabled === 'boolean') {
           setCodexAppServerEnabled(msg.data.codex_app_server_enabled);
@@ -1479,7 +1609,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       ? msg.data.tool_name
       : '';
     if (
-      eventType === 'tool_use'
+      hasControlAccess
+      && eventType === 'tool_use'
       && frontendReviewGoalActiveRef.current
       && WORKSPACE_REVIEW_START_TOOLS.has(workspaceReviewToolName)
     ) {
@@ -1985,12 +2116,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       syncLiveStreamCache(activeTaskTurnRef.current, next);
       return next;
     });
-  }, [markAskUserResolved, observeTaskTurn, onTaskUpdated, refreshVersionedPlans, task.goal_max_turns, task.id, task.worker_id]);
+  }, [hasControlAccess, markAskUserResolved, observeTaskTurn, onTaskUpdated, refreshVersionedPlans, task.goal_max_turns, task.id, task.worker_id]);
 
   const fetchHistory = useCallback(() => {
     setHistoryLoading(true);
     Promise.all([
-      api.getTaskChatHistory(task.id, true, HISTORY_PAGE_SIZE, 0, true),
+      api.getTaskChatHistory(
+        task.id,
+        true,
+        HISTORY_PAGE_SIZE,
+        0,
+        hasControlAccess,
+      ),
       api.getAskUserPending(task.id).catch(() => ({ pending: [] as { request_id: string; questions: AskUserQuestion[] }[] })),
     ]).then(([msgs, askPending]) => {
       const filtered = msgs
@@ -2048,7 +2185,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         return next;
       });
     }).catch(() => {}).finally(() => setHistoryLoading(false));
-  }, [task.id]);
+  }, [hasControlAccess, task.id]);
   useEffect(() => {
     refreshHistoryRef.current = fetchHistory;
   }, [fetchHistory]);
@@ -2192,8 +2329,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     () => monitorSessions.filter((s) => s.status === 'running').length,
     [monitorSessions]
   );
-  const workerManagedTask = task.metadata_?.ccm_worker_managed_task === true
-    || task.metadata_?.ccm_user_skill_snapshots !== undefined;
+  const workerManagedTask = task.is_worker_managed;
   const monitorSupported = task.provider !== 'codex' || (
     codexMainMcpEnabled === true
     && codexMonitorEnabled === true
@@ -2260,11 +2396,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         addChatFiles(files, (msg) => setDropError(msg));
       }
     },
-    disabled: deliveryReadOnly || injecting || (!task.session_id && !task.shared_from_id),
+    disabled: deliveryReadOnly || injecting || (!hasTaskSession && !task.shared_from_id),
   });
 
   useEffect(() => {
-    if (deliveryReadOnly || injecting || (!task.session_id && !task.shared_from_id)) return;
+    if (deliveryReadOnly || injecting || (!hasTaskSession && !task.shared_from_id)) return;
     const handlePaste = (e: ClipboardEvent) => {
       if (injectingRef.current) return;
       const target = e.target;
@@ -2286,7 +2422,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     document.addEventListener('paste', handlePaste);
     return () => document.removeEventListener('paste', handlePaste);
   }, [
-    task.session_id,
+    hasTaskSession,
     task.shared_from_id,
     addChatFiles,
     deliveryReadOnly,
@@ -2333,7 +2469,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   };
 
   const openFork = async () => {
-    if (task.provider !== 'codex' || !task.session_id) return;
+    if (!hasControlAccess || task.provider !== 'codex' || !hasTaskSession) return;
     setForkOpen(true);
     setSelectedForkAnchor(null);
     setForkAnchors([]);
@@ -2609,7 +2745,16 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         let chatResponse: Awaited<ReturnType<typeof api.sendTaskChat>> | null = null;
         for (;;) {
           try {
-            if (planVersionIdsForTurn.length > 0) {
+            if (!hasControlAccess) {
+              // A Task chat share may contribute only text and already
+              // validated CCM uploads.  Do not serialize the control-plane
+              // routing tuple (or any hidden composer state) into its request.
+              chatResponse = await api.sendTaskChat(
+                task.id,
+                text || '(files attached)',
+                uploadedPaths,
+              );
+            } else if (planVersionIdsForTurn.length > 0) {
               chatResponse = await api.sendTaskChat(
                 task.id,
                 text || '(files attached)',
@@ -2818,7 +2963,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   Goal 审查 · 第 {Math.max(1, frontendReviewGoalProgress.turn + (frontendReviewGoalProgress.active ? 1 : 0))} 轮 · 自动
                 </span>
               )}
-              {!deliveryReadOnly && task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
+              {hasControlAccess && !deliveryReadOnly && task.mode !== 'plan' && task.provider === 'codex' && codexMainMcpEnabled !== null && (
                 <span
                   data-testid="codex-main-mcp-status"
                   className={`text-xs px-1.5 rounded font-medium whitespace-nowrap ${
@@ -2846,7 +2991,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               )}
             </div>
           </div>
-          {!deliveryReadOnly && task.mode !== 'plan' && (
+          {hasControlAccess && !deliveryReadOnly && task.mode !== 'plan' && (
             <TaskSSHAccessBadge task={task} />
           )}
           <div
@@ -2857,9 +3002,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               taskId={task.id}
               count={monitorCount}
               active={monitorCount > 0}
-              onNavigate={() => setShowMonitorPanel(!showMonitorPanel)}
+              onNavigate={hasControlAccess
+                ? () => setShowMonitorPanel(!showMonitorPanel)
+                : undefined}
             />
-            {!deliveryReadOnly && (
+            {hasControlAccess && !deliveryReadOnly && (
               <button
                 type="button"
                 onClick={() => setShowBrowserReviewPanel((value) => !value)}
@@ -2889,7 +3036,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 )}
               </button>
             )}
-            {!deliveryReadOnly && task.session_id && task.shared_from_id == null && (
+            {hasControlAccess && !deliveryReadOnly && hasTaskSession && task.shared_from_id == null && (
               <button
                 onClick={() => setPlansOpen((open) => !open)}
                 className={`flex items-center gap-1.5 rounded px-1.5 py-1 text-xs font-medium transition-colors sm:px-2 ${
@@ -2909,10 +3056,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 )}
               </button>
             )}
-            {!deliveryReadOnly && task.mode !== 'plan' && (
+            {hasControlAccess && !deliveryReadOnly && task.mode !== 'plan' && (
               <TaskConfigBadge task={task} onRefresh={() => onTaskUpdated?.()} align="right" />
             )}
-            {!deliveryReadOnly && (
+            {hasControlAccess && !deliveryReadOnly && (
               <button
                 onClick={() => {
                   setDistillOpen(true);
@@ -2927,14 +3074,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 <Sparkles size={18} />
               </button>
             )}
-            <button
+            {hasControlAccess && <button
               onClick={handleStar}
               className={`p-1.5 transition-colors ${starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
               title={starred ? "Unstar" : "Star"}
             >
               <Star size={18} fill={starred ? 'currentColor' : 'none'} />
-            </button>
-            {!deliveryReadOnly && (isProcessing || stillRunning) && (
+            </button>}
+            {hasControlAccess && !deliveryReadOnly && (isProcessing || stillRunning) && (
               <button
                 onClick={async () => {
                   setInterrupting(true);
@@ -3019,7 +3166,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   onClick={() => setTitleExpanded(!titleExpanded)}
                   className="text-[10px] text-gray-600 hover:text-gray-300 shrink-0 whitespace-nowrap"
                 >{titleExpanded ? 'less' : 'more'}</button>
-                {!deliveryReadOnly && (
+                {hasControlAccess && !deliveryReadOnly && (
                   <button
                     onClick={() => { setTitleDraft(task.title || ''); setEditingTitle(true); }}
                     className="text-gray-600 hover:text-gray-400 opacity-0 group-hover/title:opacity-100 transition-opacity shrink-0"
@@ -3031,7 +3178,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               </div>
             )}
           </div>}
-          {deliveryReadOnly ? (
+          {deliveryReadOnly || !hasControlAccess ? (
             task.attention_tag ? (
               <span
                 className="inline-flex min-w-0 max-w-[45vw] items-center gap-1 rounded-md border border-amber-400/25 bg-amber-500/15 px-1.5 py-0.5 text-xs font-medium text-amber-300 sm:max-w-xs"
@@ -3064,7 +3211,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         </div>
       </div>
 
-      {deliveryReadOnly && task.delivery_run_id != null && (
+      {hasControlAccess && deliveryReadOnly && task.delivery_run_id != null && (
         <div className="border-b border-gray-800 bg-gray-950 px-3 py-2 sm:px-4">
           <DeliveryRunPanel runId={task.delivery_run_id} />
         </div>
@@ -3077,7 +3224,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         </div>
       )}
 
-      {forkOpen && (
+      {hasControlAccess && forkOpen && (
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/60 p-4">
           <div className="flex max-h-[80vh] w-full max-w-lg flex-col rounded-xl border border-gray-700 bg-gray-800 shadow-2xl">
             <div className="flex items-center justify-between border-b border-gray-700 px-4 py-3">
@@ -3182,7 +3329,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       )}
 
       {/* Monitor Panel */}
-      {showMonitorPanel && (
+      {hasControlAccess && showMonitorPanel && (
         <div className="px-4 py-2 border-b border-gray-800">
           <MonitorPanel
             taskId={task.id}
@@ -3195,7 +3342,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         </div>
       )}
 
-      {plansOpen && <VersionedPlansDialog
+      {hasControlAccess && plansOpen && <VersionedPlansDialog
         open={plansOpen}
         taskId={task.id}
         refreshGeneration={planRefreshGeneration}
@@ -3207,7 +3354,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       />}
 
       {/* Distill modal */}
-      {distillOpen && (
+      {hasControlAccess && distillOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
           <div className="bg-gray-800 rounded-lg shadow-xl w-full max-w-2xl max-h-[80vh] flex flex-col m-4 border border-gray-700">
             <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
@@ -3391,7 +3538,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           <div className="text-center text-gray-600 mt-20">
             <p className="text-lg mb-2">Chat with this task</p>
             <p className="text-sm">
-              {task.session_id
+              {hasTaskSession
                 ? 'Send a follow-up message to continue the conversation'
                 : 'This task has no session yet. Run it first via Ralph Loop or manually.'}
             </p>
@@ -3446,6 +3593,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               key={group.message.id}
               message={group.message}
               taskId={task.id}
+              canResolvePermission={hasControlAccess}
               onAskUserResolved={markAskUserResolved}
             />
           )
@@ -3735,7 +3883,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               onClick={() => fileInputRef.current?.click()}
               disabled={
                 injecting
-                || (!task.session_id && !task.shared_from_id)
+                || (!hasTaskSession && !task.shared_from_id)
                 || fileUpload.uploads.length + forkSeedUploads.length >= MAX_FILES
               }
               className="p-2 text-gray-500 hover:text-gray-300 disabled:opacity-40 disabled:cursor-not-allowed"
@@ -3743,9 +3891,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             >
               <Paperclip size={18} />
             </button>
-            <SecretPicker selectedIds={selectedSecretIds} onChange={setSelectedSecretIds} disabled={injecting || (!task.session_id && !task.shared_from_id) || (injectMode && canInjectNow)} />
-            <QuickPhraseDropdown onSelect={(text) => handleSend(text)} disabled={injecting || frontendReviewComposerMode || workspaceReviewComposerMode || (!task.session_id && !task.shared_from_id)} />
-            {task.worker_id == null && task.shared_from_id == null && (
+            {hasControlAccess && (
+              <SecretPicker
+                selectedIds={selectedSecretIds}
+                onChange={setSelectedSecretIds}
+                disabled={injecting || (!hasTaskSession && !task.shared_from_id) || (injectMode && canInjectNow)}
+              />
+            )}
+            <QuickPhraseDropdown onSelect={(text) => handleSend(text)} disabled={injecting || frontendReviewComposerMode || workspaceReviewComposerMode || (!hasTaskSession && !task.shared_from_id)} />
+            {hasControlAccess && task.worker_id == null && task.shared_from_id == null && (
               <button
                 type="button"
                 onClick={() => {
@@ -3771,7 +3925,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 <Eye size={16} />
               </button>
             )}
-            {task.worker_id == null && task.shared_from_id == null && (
+            {hasControlAccess && task.worker_id == null && task.shared_from_id == null && (
               <button
                 type="button"
                 onClick={() => {
@@ -3802,7 +3956,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               <button
                 type="button"
                 onClick={() => setShowModelMenu((v) => !v)}
-                disabled={injecting || frontendReviewComposerMode || workspaceReviewComposerMode || (!task.session_id && !task.shared_from_id)}
+                disabled={!hasControlAccess || injecting || frontendReviewComposerMode || workspaceReviewComposerMode || (!hasTaskSession && !task.shared_from_id)}
                 className={`p-2 rounded-lg transition-colors disabled:opacity-40 ${
                   modelOverride ? 'text-indigo-300 bg-indigo-600/20' : 'text-gray-500 hover:text-gray-300'
                 }`}
@@ -3851,7 +4005,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               <button
                 type="button"
                 onClick={() => setInjectMode((v) => !v)}
-                disabled={injecting || !task.session_id}
+                disabled={injecting || !hasTaskSession}
                 className={`p-2 rounded-lg transition-colors disabled:opacity-40 ${
                   injectMode ? 'text-teal-300 bg-teal-600/20' : 'text-gray-500 hover:text-teal-300'
                 }`}
@@ -3862,7 +4016,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 <Syringe size={18} />
               </button>
             )}
-            {task.provider === 'codex' && task.session_id && task.worker_id == null && task.shared_from_id == null && (
+            {hasControlAccess && task.provider === 'codex' && hasTaskSession && task.worker_id == null && task.shared_from_id == null && (
               <ForkButton onClick={openFork} disabled={isProcessing} />
             )}
             {/* Message navigation — always visible, right-aligned */}
@@ -3915,7 +4069,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               placeholder={
-                !task.session_id && !task.shared_from_id
+                !hasTaskSession && !task.shared_from_id
                   ? 'Run the task first to start a session...'
                   : injectMode && canInjectNow
                     ? '注入模式：消息将直接注入运行中的 turn...'
@@ -3927,14 +4081,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                       ? 'Type next message to queue...'
                       : 'Type a follow-up message...'
               }
-              disabled={injecting || (!task.session_id && !task.shared_from_id)}
+              disabled={injecting || (!hasTaskSession && !task.shared_from_id)}
               rows={1}
               className="flex-1 bg-gray-800 text-foreground rounded-xl px-4 py-2.5 text-sm border border-gray-700/70 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/25 resize-none disabled:opacity-50 max-h-48 overflow-y-auto transition-colors"
               style={{ minHeight: '40px' }}
             />
             <button
               onClick={() => handleSend()}
-              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim()) || (!task.session_id && !task.shared_from_id) || (frontendReviewComposerMode && !canStartFrontendReviewGoal) || (workspaceReviewComposerMode && !canStartWorkspaceReview) || (injectMode && canInjectNow && !isProcessing) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
+              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim()) || (!hasTaskSession && !task.shared_from_id) || (frontendReviewComposerMode && !canStartFrontendReviewGoal) || (workspaceReviewComposerMode && !canStartWorkspaceReview) || (injectMode && canInjectNow && !isProcessing) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
               title={fileUpload.hasFailed
                 ? 'Retry or remove failed attachments before sending'
                 : injectMode && canInjectNow
@@ -3957,7 +4111,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       </div>
       )}
         </div>
-        <BrowserReviewPanel
+        {hasControlAccess && <BrowserReviewPanel
           taskId={task.id}
           taskActive={isProcessing}
           taskProvider={task.provider}
@@ -3979,7 +4133,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           goalStart={frontendReviewGoalStart}
           onGoalReviewFound={handleFrontendReviewGoalFound}
           goalProgress={showFrontendReviewGoal ? frontendReviewGoalProgress : undefined}
-        />
+        />}
       </div>
     </div>
   );
@@ -4365,11 +4519,22 @@ function MessageImages({ urls }: { urls: string[] }) {
 /** 权限透传卡片：CC 在 PTY 里请求权限 → 用户点 允许/拒绝 回包。
  * CC 侧最多等 120s，超时默认拒绝；过期点击会得到 410 并标记过期。
  * 历史消息没有 request_id（只入库描述），渲染为只读。 */
-function PermissionCard({ message, taskId }: { message: ChatMessage; taskId?: number }) {
+function PermissionCard({
+  message,
+  taskId,
+  canResolve,
+}: {
+  message: ChatMessage;
+  taskId?: number;
+  canResolve: boolean;
+}) {
   const [submitting, setSubmitting] = useState(false);
   const [localStatus, setLocalStatus] = useState<string | null>(null);
   const status = localStatus || message.permission_status || (message.request_id ? 'pending' : 'expired');
-  const actionable = status === 'pending' && !!message.request_id && taskId !== undefined;
+  const actionable = canResolve
+    && status === 'pending'
+    && !!message.request_id
+    && taskId !== undefined;
 
   const decide = async (behavior: 'allow' | 'deny') => {
     if (!actionable || submitting) return;
@@ -4385,6 +4550,7 @@ function PermissionCard({ message, taskId }: { message: ChatMessage; taskId?: nu
   };
 
   const statusBadge: Record<string, { text: string; cls: string }> = {
+    pending: { text: '等待 Task 控制者处理', cls: 'text-amber-300' },
     allow: { text: '✓ 已允许', cls: 'text-emerald-400' },
     deny: { text: '✕ 已拒绝', cls: 'text-red-400' },
     expired: { text: '⏱ 已过期（CC 侧默认拒绝）', cls: 'text-gray-500' },
@@ -4570,10 +4736,12 @@ function AskUserCard({
 const MessageBubble = memo(function MessageBubble({
   message,
   taskId,
+  canResolvePermission,
   onAskUserResolved,
 }: {
   message: ChatMessage;
   taskId: number;
+  canResolvePermission: boolean;
   onAskUserResolved?: (requestId: string, status: 'answered' | 'expired') => void;
 }) {
   const isUser = message.role === 'user';
@@ -4581,7 +4749,13 @@ const MessageBubble = memo(function MessageBubble({
   if (message.event_type === 'background_lifecycle') return null;
 
   if (message.event_type === 'permission_request') {
-    return <PermissionCard message={message} taskId={taskId} />;
+    return (
+      <PermissionCard
+        message={message}
+        taskId={taskId}
+        canResolve={canResolvePermission}
+      />
+    );
   }
 
   if (message.event_type === 'ask_user_question') {

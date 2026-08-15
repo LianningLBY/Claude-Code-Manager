@@ -297,7 +297,7 @@ export function TaskSSHAccessBadge({ task }: { task: Task }) {
 
   const remoteScope = task.worker_id != null
     || task.shared_from_id != null
-    || task.metadata_?.ccm_worker_managed_task === true;
+    || task.is_worker_managed;
   if (!isAdmin && value.length === 0) return null;
 
   const persistedValue = snapshots.map((grant) => ({

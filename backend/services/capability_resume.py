@@ -109,6 +109,10 @@ class ResumeEnvelope:
     payload_hash: str
     claimed_generation: int | None
     source_log_id: int | None
+    execution_user_id: int | None
+    execution_user_role: str
+    execution_mode: str
+    execution_principal_kind: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +321,11 @@ def _request_identity_matches(
         and invocation.request_terminal_log_id
         == outbox.request_terminal_log_id
         and invocation.request_native_turn_id == outbox.request_native_turn_id
+        and outbox.request_execution_user_id == task.execution_user_id
+        and outbox.request_execution_user_role == task.execution_user_role
+        and outbox.request_execution_mode == task.execution_mode
+        and outbox.request_execution_principal_kind
+        == task.execution_principal_kind
         and outbox.active_task_id in (None, task.id)
         and outbox.active_invocation_id in (None, invocation.id)
     )
@@ -543,6 +552,12 @@ async def _build_frozen_payload(
             "retry_count": outbox.request_task_retry_count,
             "from_turn_generation": outbox.from_turn_generation,
             "session_id": outbox.request_task_session_id,
+            "execution_principal": {
+                "user_id": outbox.request_execution_user_id,
+                "role": outbox.request_execution_user_role,
+                "mode": outbox.request_execution_mode,
+                "kind": outbox.request_execution_principal_kind,
+            },
         },
         "routing": {
             "provider": (task.provider or "claude").lower(),
@@ -601,6 +616,7 @@ def _envelope_from_payload(
         routing = payload["routing"]
         queue = payload["queue"]
         task_payload = payload["task"]
+        principal = task_payload["execution_principal"]
         prompt = queue["prompt"]
         current_message = queue["current_message"]
         timestamp = queue["timestamp"]
@@ -621,6 +637,10 @@ def _envelope_from_payload(
         or task_payload.get("from_turn_generation")
         != outbox.from_turn_generation
         or task_payload.get("session_id") != outbox.request_task_session_id
+        or principal.get("user_id") != outbox.request_execution_user_id
+        or principal.get("role") != outbox.request_execution_user_role
+        or principal.get("mode") != outbox.request_execution_mode
+        or principal.get("kind") != outbox.request_execution_principal_kind
         or not isinstance(prompt, str)
         or not isinstance(current_message, str)
         or current_message != prompt
@@ -652,6 +672,10 @@ def _envelope_from_payload(
         payload_hash=outbox.resume_payload_hash,
         claimed_generation=outbox.claimed_turn_generation,
         source_log_id=outbox.resume_source_log_id,
+        execution_user_id=outbox.request_execution_user_id,
+        execution_user_role=outbox.request_execution_user_role,
+        execution_mode=outbox.request_execution_mode,
+        execution_principal_kind=outbox.request_execution_principal_kind,
     )
 
 
@@ -1420,6 +1444,10 @@ async def claim_resume_turn_locked(
         payload_hash=envelope.payload_hash,
         claimed_generation=task.turn_generation,
         source_log_id=source.id,
+        execution_user_id=envelope.execution_user_id,
+        execution_user_role=envelope.execution_user_role,
+        execution_mode=envelope.execution_mode,
+        execution_principal_kind=envelope.execution_principal_kind,
     )
     return ResumeTurnClaim(
         envelope=claimed_envelope,

@@ -196,11 +196,13 @@ def _alias_payload(
     *,
     original_source_log_id: int | None,
     transport: str | None,
+    execution_principal: Mapping[str, object],
 ) -> str:
     return json.dumps(
         {
             "original_source_log_id": original_source_log_id,
             "transport": transport,
+            "execution_principal": dict(execution_principal),
         },
         ensure_ascii=True,
         separators=(",", ":"),
@@ -249,6 +251,28 @@ async def bind_turn_source(
         raise TurnSourceBindingError(
             "task turn_generation must be an exact generation"
         )
+    from backend.services.task_creation import task_execution_principal_values
+
+    try:
+        canonical_principal = task_execution_principal_values(
+            user_id=task.execution_user_id,
+            role=task.execution_user_role,
+            principal_kind=task.execution_principal_kind,
+        )
+    except ValueError as exc:
+        raise TurnSourceBindingError(
+            "task execution principal is invalid"
+        ) from exc
+    if canonical_principal["execution_mode"] != task.execution_mode:
+        raise TurnSourceBindingError(
+            "task execution principal mode is inconsistent"
+        )
+    execution_principal = {
+        "user_id": canonical_principal["execution_user_id"],
+        "role": canonical_principal["execution_user_role"],
+        "mode": canonical_principal["execution_mode"],
+        "kind": canonical_principal["execution_principal_kind"],
+    }
 
     original: LogEntry | None = None
     if source_log_id is not None:
@@ -335,6 +359,7 @@ async def bind_turn_source(
             raw_json=_alias_payload(
                 original_source_log_id=source_log_id,
                 transport=transport,
+                execution_principal=execution_principal,
             ),
             is_error=False,
         )

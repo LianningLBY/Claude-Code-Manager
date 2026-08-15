@@ -92,11 +92,6 @@ export function DeliveryCreateForm({ projects, repos, config, onCreated, onNavig
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div><h2 className="text-sm font-semibold text-gray-100">New Delivery</h2><p className="mt-1 text-xs text-gray-500">Choose a Project and describe the outcome.</p></div>
       </div>
-      {config?.agent_sandbox_unrestricted_enabled && (
-        <div role="alert" className="mt-4 rounded-lg border border-red-500/50 bg-red-950/50 px-3 py-2 text-xs leading-5 text-red-200">
-          All Delivery permissions are ON. Plan, Coding, Reviewer and Browser turns can access the host filesystem and network without CCM permission prompts. Turn this off in Settings to restore the restricted capability boundaries.
-        </div>
-      )}
       <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(220px,.7fr)_1fr]">
         <ProjectSelect projects={projects.filter((item) => item.show_in_selector)} value={projectId} onChange={(value) => setProjectId(value ? Number(value) : undefined)} placeholder="Select Project" />
         <input aria-label="Delivery title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={200} placeholder="Optional short title (defaults to the first line)" className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500" />

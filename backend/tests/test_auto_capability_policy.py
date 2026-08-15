@@ -356,7 +356,10 @@ async def test_clone_requires_explicit_policy_opt_in(client):
 async def test_migration_import_cannot_repurpose_existing_policy_task(
     client,
     session_factory,
+    monkeypatch,
+    worker_control_plane_auth,
 ):
+    from backend.config import settings
     from backend.models.task import Task
 
     created = await client.post("/api/tasks", json={
@@ -366,9 +369,21 @@ async def test_migration_import_cannot_repurpose_existing_policy_task(
     })
     assert created.status_code == 201, created.text
     task_id = created.json()["id"]
+    async with session_factory() as db:
+        task = await db.get(Task, task_id)
+        assert task is not None
+        source_incarnation_id = task.incarnation_id
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
 
     response = await client.post("/api/tasks/migration-import", json={
         "id": task_id,
+        "source_incarnation_id": source_incarnation_id,
+        "migration_operation_id": "a" * 32,
+        "migration_operation_sequence": 1,
+        "execution_user_id": None,
+        "execution_user_role": "member",
+        "execution_mode": "sandbox",
+        "execution_principal_kind": "system",
         "title": "Remote mirror collision",
         "description": "manager task",
         "source_status": "cancelled",

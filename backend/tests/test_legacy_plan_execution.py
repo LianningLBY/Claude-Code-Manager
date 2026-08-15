@@ -85,6 +85,7 @@ async def _carrier(db_session) -> Task:
 def _remote_snapshot(task: Task, *, status: str | None = None) -> dict:
     fields = (
         "id",
+        "incarnation_id",
         "title",
         "description",
         "target_branch",
@@ -115,6 +116,10 @@ def _remote_snapshot(task: Task, *, status: str | None = None) -> dict:
         "retry_count",
         "turn_generation",
         "session_id",
+        "execution_user_id",
+        "execution_user_role",
+        "execution_mode",
+        "execution_principal_kind",
     )
     snapshot = {field: getattr(task, field) for field in fields}
     snapshot["status"] = status or task.status

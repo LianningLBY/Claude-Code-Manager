@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import inspect
@@ -15,9 +16,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from backend.api.deps import (
     get_current_user_id,
     get_current_user_role,
+    lock_task_effect_access,
     require_internal_service,
     require_task_access,
     require_task_control,
+    require_worker_task_incarnation_header,
+    task_execution_principal_from_request,
 )
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import and_, not_, select, update as sa_update
@@ -34,19 +38,25 @@ from backend.api.uploads import (
     ValidatedUploadAttachment,
     validate_upload_attachments,
 )
+from backend.api.task_projection import task_response
 from backend.schemas.task import TaskResponse, TaskRoutingExpectation
 from backend.services.task_creation import stage_task_record
+from backend.services.cancellation import await_task_completion
 from backend.services.chat_event_identity import persisted_chat_event
 from backend.services.task_queue import TaskQueue, task_is_pr_review_superseded
 from backend.services.pr_review_runtime import (
     PR_REVIEW_TERMINAL_CHAT_HEADER,
     PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE,
 )
-from backend.services.worker_proxy import get_task_operation_lock
+from backend.services.worker_proxy import (
+    get_task_operation_lock,
+    worker_managed_upload_paths,
+)
 from backend.services.worker_relay import (
     acknowledge_worker_turn_handoff,
     has_worker_execution_quarantine,
     reserve_worker_turn_handoff,
+    worker_turn_handoff_request_identity,
     worker_task_generation,
     worker_task_generation_predicates,
 )
@@ -159,11 +169,16 @@ class ChatMessage(BaseModel):
     )
     worker_turn_handoff_retry_count: int | None = Field(default=None, ge=0)
     worker_turn_handoff_from_generation: int | None = Field(default=None, ge=0)
+    worker_turn_handoff_incarnation_id: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{32}$",
+    )
     # Manager -> Worker only.  The Worker authenticates the internal-service
     # request and freezes this origin principal into its own durable outbox.
     execution_user_id: int | None = None
     execution_user_role: str | None = None
     execution_mode: str | None = None
+    execution_principal_kind: str | None = None
 
     @model_validator(mode="after")
     def validate_plan_attachment_generation(self):
@@ -173,25 +188,139 @@ class ChatMessage(BaseModel):
             self.worker_turn_handoff_id,
             self.worker_turn_handoff_retry_count,
             self.worker_turn_handoff_from_generation,
+            self.worker_turn_handoff_incarnation_id,
         )
         if any(value is not None for value in handoff) and not all(
             value is not None for value in handoff
         ):
             raise ValueError("Worker turn handoff fields must be provided together")
-        principal = (self.execution_user_role, self.execution_mode)
+        principal = (
+            self.execution_user_id,
+            self.execution_user_role,
+            self.execution_mode,
+            self.execution_principal_kind,
+        )
         if any(value is not None for value in principal):
-            if self.worker_turn_handoff_id is None or not all(principal):
+            if self.worker_turn_handoff_id is None:
                 raise ValueError(
                     "Execution principal is valid only for a Worker handoff"
                 )
-            expected_mode = (
-                "unrestricted"
-                if self.execution_user_role in {"admin", "super_admin"}
-                else "sandbox"
+            required = (
+                self.execution_user_role,
+                self.execution_mode,
+                self.execution_principal_kind,
             )
-            if self.execution_mode != expected_mode:
-                raise ValueError("Execution principal role/mode mismatch")
+            if not all(required):
+                raise ValueError(
+                    "Worker execution principal fields must be provided together"
+                )
+            from backend.services.task_creation import (
+                TASK_EXECUTION_WORKER_PRINCIPAL_KINDS,
+                task_execution_principal_values,
+            )
+
+            if (
+                self.execution_principal_kind
+                not in TASK_EXECUTION_WORKER_PRINCIPAL_KINDS
+            ):
+                raise ValueError(
+                    "Worker execution principal must be delegated or system"
+                )
+            try:
+                canonical = task_execution_principal_values(
+                    user_id=self.execution_user_id,
+                    role=self.execution_user_role,
+                    principal_kind=self.execution_principal_kind,
+                )
+            except ValueError as exc:
+                raise ValueError(str(exc)) from exc
+            supplied = {
+                "execution_user_id": self.execution_user_id,
+                "execution_user_role": self.execution_user_role,
+                "execution_mode": self.execution_mode,
+                "execution_principal_kind": self.execution_principal_kind,
+            }
+            if supplied != canonical:
+                raise ValueError("Worker execution principal role/mode mismatch")
         return self
+
+
+def _chat_payload_allows_chat_share(body: ChatMessage) -> bool:
+    """Return whether this request is only the narrow shared-chat effect.
+
+    A ``TeamTaskShare(permission="chat")`` lets its recipient contribute text
+    and CCM-managed uploads to an existing conversation.  It is deliberately
+    not authority to select execution routing, apply a Plan, inject secrets,
+    or invoke a command/Skill.  Keep this predicate value-based so normal
+    clients may continue omitting optional fields or serializing them as
+    ``null`` without accidentally widening an effect.
+    """
+
+    return not (
+        body.model is not None
+        or body.expected_routing is not None
+        or bool(body.secret_ids)
+        or bool(body.plan_task_ids)
+        or bool(body.confirmed_stale_plan_task_ids)
+        or bool(body.plan_version_ids)
+        or bool(body.confirmed_stale_plan_version_ids)
+        or body.plan_application_receipt_key is not None
+        or body.worker_turn_handoff_id is not None
+        or body.message.lstrip().startswith("$")
+    )
+
+
+def _validate_and_normalize_chat_attachments(
+    body: ChatMessage,
+) -> list[ValidatedUploadAttachment]:
+    """Replace browser upload references with canonical managed paths.
+
+    Public callers may send either the absolute path returned by the upload
+    endpoint or its opaque ``/api/uploads/<id>`` URL.  Neither is trusted
+    until the upload boundary has reopened the file no-follow and proved it
+    is a direct, owned regular file below this node's upload root.  A Worker
+    handoff runs this same check only after the Manager has copied the exact
+    managed file to the Worker's corresponding upload root.
+    """
+
+    raw_file_paths = list(body.file_paths or [])
+    raw_image_paths = list(body.image_paths or [])
+    try:
+        uploads = validate_upload_attachments(
+            file_paths=body.file_paths,
+            image_paths=body.image_paths,
+        )
+    except UploadAttachmentValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    raw_paths = raw_file_paths or raw_image_paths
+    canonical_by_reference = {
+        reference: upload.path
+        for reference, upload in zip(raw_paths, uploads, strict=True)
+    }
+    if body.file_paths is not None:
+        body.file_paths = [upload.path for upload in uploads]
+    if body.image_paths is not None:
+        body.image_paths = [
+            canonical_by_reference[reference]
+            for reference in raw_image_paths
+        ]
+    return uploads
+
+
+def _public_chat_response(
+    payload: dict[str, Any],
+    *,
+    has_session: bool,
+) -> dict[str, Any]:
+    """Remove node-local execution identities from a human chat receipt."""
+
+    projected = dict(payload)
+    has_session = bool(projected.get("session_id")) or has_session
+    projected.pop("session_id", None)
+    projected.pop("instance_id", None)
+    projected["has_session"] = has_session
+    return projected
 
 
 class FrontendReviewGoalMessage(BaseModel):
@@ -227,16 +356,10 @@ def _worker_turn_handoff_request_identity(
 ) -> dict:
     """Canonical immutable Manager -> Worker request, excluding its receipt."""
 
-    payload = body.model_dump(
-        mode="json",
-        exclude={
-            "worker_turn_handoff_id",
-            "worker_turn_handoff_retry_count",
-            "worker_turn_handoff_from_generation",
-        },
+    return worker_turn_handoff_request_identity(
+        body.model_dump(mode="json"),
+        admitted_routing,
     )
-    payload["admitted_routing"] = list(admitted_routing)
-    return payload
 
 
 def _worker_turn_handoff_request_digest(
@@ -253,8 +376,11 @@ def _remote_worker_turn_handoff_matches(
     *,
     handoff_id: str,
     task_id: int,
+    incarnation_id: str,
     retry_count: int,
     from_generation: int,
+    request_digest: str,
+    principal_digest: str,
 ) -> bool:
     """Validate one Worker's durable ACK without trusting its HTTP outcome."""
 
@@ -276,6 +402,7 @@ def _remote_worker_turn_handoff_matches(
         receipt.get("handoff_id") == handoff_id
         and type(remote_task_id) is int
         and remote_task_id == task_id
+        and receipt.get("incarnation_id") == incarnation_id
         and type(remote_retry_count) is int
         and remote_retry_count == retry_count
         and type(remote_from_generation) is int
@@ -283,8 +410,24 @@ def _remote_worker_turn_handoff_matches(
         and status
         in {"accepted", "claimed", "launching", "launched", "cancelled"}
         and valid_generation
+        and receipt.get("request_digest") == request_digest
+        and receipt.get("principal_digest") == principal_digest
         and isinstance(receipt.get("response"), dict)
     )
+
+
+def _worker_execution_principal_identity(payload: dict) -> dict[str, object]:
+    """Return the exact delegated principal covered by a Worker receipt."""
+
+    return {
+        field: payload.get(field)
+        for field in (
+            "execution_user_id",
+            "execution_user_role",
+            "execution_mode",
+            "execution_principal_kind",
+        )
+    }
 
 
 async def _find_worker_turn_handoff_receipt(
@@ -341,6 +484,39 @@ class ForkAnchor(BaseModel):
         if self.type in {"initial", "latest"} and self.id is not None:
             raise ValueError(f"{self.type} fork anchors cannot include an id")
         return self
+
+
+@dataclass(frozen=True, slots=True)
+class _ForkLogSnapshot:
+    """Detached log evidence retained after fork admission commits."""
+
+    id: int
+    event_type: str | None
+    role: str | None
+    content: str | None
+    tool_name: str | None
+    tool_input: str | None
+    tool_output: str | None
+    raw_json: str | None
+    is_error: bool
+    loop_iteration: int | None
+    timestamp: datetime | None
+
+    @classmethod
+    def capture(cls, row: LogEntry) -> "_ForkLogSnapshot":
+        return cls(
+            id=row.id,
+            event_type=row.event_type,
+            role=row.role,
+            content=row.content,
+            tool_name=row.tool_name,
+            tool_input=row.tool_input,
+            tool_output=row.tool_output,
+            raw_json=row.raw_json,
+            is_error=row.is_error,
+            loop_iteration=row.loop_iteration,
+            timestamp=row.timestamp,
+        )
 
 
 class CodexForkRequest(BaseModel):
@@ -482,7 +658,7 @@ def _turn_item_ids(item: object) -> set[str]:
     return found
 
 
-def _raw_log_metadata(row: LogEntry) -> dict:
+def _raw_log_metadata(row: LogEntry | _ForkLogSnapshot) -> dict:
     if not row.raw_json:
         return {}
     try:
@@ -496,6 +672,7 @@ def _fork_seed_uploads(metadata: dict) -> list[dict]:
     """Rebuild composer-ready upload records without trusting client paths."""
 
     from backend.api.uploads import UPLOAD_DIR
+    from backend.services.upload_references import managed_upload_url_basename
 
     attachments = metadata.get("attachments") or []
     explicit_paths = (
@@ -508,7 +685,8 @@ def _fork_seed_uploads(metadata: dict) -> list[dict]:
             continue
         url = attachment.get("url")
         name = attachment.get("name")
-        if not isinstance(url, str) or not isinstance(name, str):
+        managed_basename = managed_upload_url_basename(url)
+        if managed_basename is None or not isinstance(name, str):
             continue
 
         path: str | None = None
@@ -522,9 +700,8 @@ def _fork_seed_uploads(metadata: dict) -> list[dict]:
                     path = candidate
             except ValueError:
                 pass
-        if path is None and url.startswith("/api/uploads/"):
-            filename = url.removeprefix("/api/uploads/")
-            candidate_path = (upload_root / filename).resolve()
+        if path is None:
+            candidate_path = (upload_root / managed_basename).resolve()
             try:
                 candidate_path.relative_to(upload_root)
             except ValueError:
@@ -543,7 +720,7 @@ def _fork_seed_uploads(metadata: dict) -> list[dict]:
     return uploads
 
 
-def _is_forkable_user_message(row: LogEntry) -> bool:
+def _is_forkable_user_message(row: LogEntry | _ForkLogSnapshot) -> bool:
     """Only ordinary human follow-up messages are precise fork boundaries."""
 
     if row.event_type != "user_message" or row.role != "user":
@@ -556,7 +733,7 @@ def _is_forkable_user_message(row: LogEntry) -> bool:
 def _resolve_fork_turn(
     *,
     anchor: ForkAnchor,
-    rows: list[LogEntry],
+    rows: list[LogEntry | _ForkLogSnapshot],
     turns: list[dict],
 ) -> tuple[str, int]:
     """Resolve the completed native turn immediately before a user message."""
@@ -635,7 +812,7 @@ def _resolve_fork_turn(
 
 def _resolve_latest_fork_turn(
     turns: list[dict],
-    rows: list[LogEntry],
+    rows: list[LogEntry | _ForkLogSnapshot],
 ) -> tuple[str, int]:
     """Resolve an exact full-context copy through the latest completed turn."""
 
@@ -710,26 +887,73 @@ async def send_chat_message(
     db: AsyncSession = Depends(get_db),
 ):
     """Send a follow-up message on a task, resuming its previous session."""
+    forwarded_worker_task = None
+    if (
+        getattr(request.state, "auth_type", None) == "worker_control_plane"
+        and body.worker_turn_handoff_id is None
+    ):
+        # The deployment token authenticates the Manager node, not a model
+        # turn.  Every Manager→Worker chat mutation must therefore carry the
+        # exact durable handoff and delegated principal envelope; otherwise a
+        # direct control-plane POST could overwrite the Worker mirror with the
+        # fallback system principal before final launch admission rejects it.
+        raise HTTPException(
+            403,
+            "Worker control-plane chat requires an exact turn handoff",
+        )
     if body.plan_application_receipt_key or body.worker_turn_handoff_id:
         require_internal_service(request)
-    task = await db.get(Task, task_id)
+    if body.worker_turn_handoff_id is not None:
+        forwarded_worker_task = await require_worker_task_incarnation_header(
+            request,
+            task_id,
+            db,
+        )
+    task = forwarded_worker_task or await db.get(Task, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, task, db)
-    if body.worker_turn_handoff_id is not None:
-        initiating_user_id = None
-        initiating_user_role = body.execution_user_role or "member"
-        execution_mode = body.execution_mode or "sandbox"
-        originating_user_id = body.execution_user_id
+    allow_chat_share = _chat_payload_allows_chat_share(body)
+    if allow_chat_share:
+        await require_task_access(request, task, db)
     else:
-        initiating_user_id = get_current_user_id(request)
-        initiating_user_role = get_current_user_role(request)
-        execution_mode = (
-            "unrestricted"
-            if initiating_user_role in ("admin", "super_admin")
-            else "sandbox"
+        await require_task_control(request, task, db)
+    _validate_and_normalize_chat_attachments(body)
+    # Resolve authority once from the authenticated request.  Every durable
+    # projection below (source log, outbox and in-memory queue envelope) must
+    # carry this exact snapshot; unknown/internal identities fail closed in
+    # the shared helper instead of being mistaken for a deployment token.
+    if body.worker_turn_handoff_id is not None:
+        if body.worker_turn_handoff_incarnation_id != task.incarnation_id:
+            raise HTTPException(
+                409,
+                "Worker turn handoff Task incarnation changed",
+            )
+        from backend.services.task_creation import (
+            task_execution_principal_values,
         )
-        originating_user_id = initiating_user_id
+
+        try:
+            principal_values = task_execution_principal_values(
+                user_id=body.execution_user_id,
+                role=body.execution_user_role,
+                principal_kind=body.execution_principal_kind,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        if principal_values["execution_mode"] != body.execution_mode:
+            raise HTTPException(
+                422,
+                "Worker execution principal role/mode mismatch",
+            )
+    else:
+        principal_values = task_execution_principal_from_request(request)
+    initiating_user_id = principal_values["execution_user_id"]
+    initiating_user_role = principal_values["execution_user_role"]
+    execution_mode = principal_values["execution_mode"]
+    execution_principal_kind = principal_values[
+        "execution_principal_kind"
+    ]
+    originating_user_id = initiating_user_id
     if task.status == "waiting_capability":
         raise HTTPException(
             409,
@@ -773,25 +997,30 @@ async def send_chat_message(
         )
     command, command_args = _parse_chat_command(body.message)
     if task.shared_from_id is not None:
-        if body.plan_task_ids or body.plan_version_ids:
-            raise HTTPException(
-                400,
-                "Shared shadow tasks do not support Plan attachments",
-            )
-        return await _send_shared_chat(
-            task,
-            body,
-            db,
-            command=command,
+        # ``shared_from_id`` belongs to the retired cross-CCM share-token
+        # protocol.  It has no authenticated CCM User principal to freeze for
+        # a provider turn.  Keep legacy rows readable for migration/support,
+        # but never proxy a mutation that would become system/member/sandbox.
+        raise HTTPException(
+            410,
+            "Legacy cross-CCM shared tasks are read-only; share the Task "
+            "with a CCM user instead",
         )
     if task.worker_id is not None:
-        return await _send_worker_chat(
+        public_has_session = bool(task.session_id)
+        result = await _send_worker_chat(
             task,
             body,
             db,
             request,
             command=command,
         )
+        if body.worker_turn_handoff_id is None:
+            return _public_chat_response(
+                result,
+                has_session=public_has_session,
+            )
+        return result
     if body.secret_ids:
         from backend.api.deps import require_admin
 
@@ -834,7 +1063,12 @@ async def send_chat_message(
         task = await db.get(Task, task_id)
         if task is None:
             raise HTTPException(404, "Task not found")
-        await require_task_access(request, task, db)
+        task = await lock_task_effect_access(
+            request,
+            task,
+            db,
+            allow_chat_share=allow_chat_share,
+        )
         if task.status == "waiting_capability":
             raise HTTPException(
                 409,
@@ -877,6 +1111,19 @@ async def send_chat_message(
                 request
             ),
         )
+        if terminal_pr_review_chat:
+            principal_values = task_execution_principal_from_request(
+                request,
+                force_sandbox=True,
+            )
+            initiating_user_id = principal_values["execution_user_id"]
+            initiating_user_role = principal_values[
+                "execution_user_role"
+            ]
+            execution_mode = principal_values["execution_mode"]
+            execution_principal_kind = principal_values[
+                "execution_principal_kind"
+            ]
         if task.status in _MANUAL_RETRYABLE_STATUSES:
             from backend.services.frontend_review_goal import (
                 frontend_review_goal_terminal_updates,
@@ -1127,6 +1374,24 @@ async def send_chat_message(
                 ) from exc
             raise HTTPException(400, str(exc)) from exc
 
+        # Prompt/attachment preparation below intentionally runs without the
+        # Task operation lock.  Freeze the exact aggregate admitted here, then
+        # re-lock Project -> Task and compare every value immediately before
+        # the durable user-log/outbox transaction.  This closes revocation,
+        # migration and retry windows without holding an in-process lock while
+        # building presentation-only prompt data.
+        admitted_task_identity = {
+            "incarnation_id": task.incarnation_id,
+            "project_id": task.project_id,
+            "session_id": task.session_id,
+            "status": task.status,
+            "retry_count": task.retry_count,
+            "turn_generation": task.turn_generation,
+            "worker_id": task.worker_id,
+            "shared_from_id": task.shared_from_id,
+            "mode": task.mode,
+        }
+
     command_skills: dict | None = None
 
     # Keep sender identity presentation-only.  The raw text is what the model
@@ -1244,10 +1509,16 @@ async def send_chat_message(
     # Store user message as a log entry (use instance_id=1 as placeholder)
     log_metadata: dict = {"raw_content": model_message}
     log_metadata["execution_principal"] = {
-        "user_id": originating_user_id,
+        "user_id": initiating_user_id,
         "role": initiating_user_role,
         "mode": execution_mode,
+        "kind": execution_principal_kind,
     }
+    if originating_user_id != initiating_user_id:
+        # A purpose-built route may intentionally force the model principal to
+        # system/sandbox while retaining a human actor for audit/presentation.
+        # Never mix that actor id into the canonical execution principal.
+        log_metadata["actor_user_id"] = originating_user_id
     if attachments:
         log_metadata["attachments"] = attachments
         log_metadata["file_paths"] = all_paths
@@ -1260,6 +1531,170 @@ async def send_chat_message(
         # The Plan row may later be revised or deleted, but chat history must
         # still explain what context the model actually received.
         log_metadata["applied_plans"] = applied_plan_data
+
+    # Plan lookups, frontend-goal restoration and prompt preparation may have
+    # committed or released the first ACL transaction.  Re-establish the
+    # Worker node -> Project -> Task writer order in the *same* transaction that
+    # persists the user log and durable outbox.  The Project row is only an
+    # ordering fence; the same payload-sensitive Task authorization used at
+    # the route boundary is repeated here after every fallible preparation.
+    expected_applied_plan_data = applied_plan_data
+    await db.rollback()
+    db.expire_all()
+    task = await db.get(Task, task_id)
+    if task is None:
+        raise HTTPException(404, "Task not found")
+    task = await lock_task_effect_access(
+        request,
+        task,
+        db,
+        allow_chat_share=allow_chat_share,
+        fence_worker_node=True,
+    )
+    current_task_identity = {
+        "incarnation_id": task.incarnation_id,
+        "project_id": task.project_id,
+        "session_id": task.session_id,
+        "status": task.status,
+        "retry_count": task.retry_count,
+        "turn_generation": task.turn_generation,
+        "worker_id": task.worker_id,
+        "shared_from_id": task.shared_from_id,
+        "mode": task.mode,
+    }
+    if current_task_identity != admitted_task_identity:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task routing, session, or execution generation changed while "
+            "chat admission was in progress",
+        )
+    if task.status == "waiting_capability":
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task is waiting for its requested capability and cannot accept "
+            "another chat turn",
+        )
+    if task.worker_id is not None or task.shared_from_id is not None:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task routing changed while chat admission was in progress",
+        )
+    if task.mode == "plan":
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Plan Tasks do not accept direct chat messages; revise the Plan "
+            "or create an execution Task instead",
+        )
+    if await active_worker_task_termination_receipt(db, task_id):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task has an active Worker termination receipt",
+        )
+    await _require_not_isolated_browser_child(
+        db,
+        task,
+        action="sent direct chat messages",
+    )
+    _require_no_pending_worker_routing(task)
+    current_terminal_pr_review_chat = await _require_pr_review_chat_allowed(
+        db,
+        task_id,
+        trusted_unlinked_terminal=_trusted_terminal_pr_review_chat(request),
+    )
+    if current_terminal_pr_review_chat != terminal_pr_review_chat:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "PR Review chat admission changed while the message was prepared",
+        )
+    current_routing = _require_expected_task_routing(
+        task,
+        body.expected_routing,
+        effective_model=body.model or task.model,
+    )
+    _validate_chat_service_tier(task, body.model)
+    if tuple(current_routing) != tuple(admitted_routing):
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Task provider routing changed while the message was prepared",
+        )
+    await _validate_chat_command_admission(task, command, db)
+
+    # The prompt must name the same immutable Plan evidence that is committed
+    # below.  Re-read it after the ACL rollback; never access expired ORM
+    # objects from the first admission transaction.
+    try:
+        if body.plan_version_ids:
+            from backend.services.plan_service import (
+                approved_versions_for_message,
+                versioned_plan_snapshots,
+            )
+
+            approved_versions = await approved_versions_for_message(
+                db,
+                target=task,
+                version_ids=body.plan_version_ids,
+                confirmed_stale_version_ids=(
+                    body.confirmed_stale_plan_version_ids
+                ),
+            )
+            refreshed_applied_plan_data = versioned_plan_snapshots(
+                approved_versions
+            )
+            approved_plans = []
+        else:
+            from backend.services.plan_tasks import (
+                applied_plan_snapshots,
+                approved_plans_for_message,
+            )
+
+            approved_plans = await approved_plans_for_message(
+                db,
+                task,
+                body.plan_task_ids,
+                confirmed_stale_plan_task_ids=(
+                    body.confirmed_stale_plan_task_ids
+                ),
+            )
+            for plan in approved_plans:
+                if await active_worker_task_termination_receipt(db, plan.id):
+                    raise HTTPException(
+                        409,
+                        f"Plan Task #{plan.id} has an active Worker "
+                        "termination receipt",
+                    )
+            refreshed_applied_plan_data = applied_plan_snapshots(
+                approved_plans
+            )
+            approved_versions = []
+    except ValueError as exc:
+        await db.rollback()
+        staleness = getattr(exc, "staleness", None)
+        if staleness is not None:
+            raise HTTPException(
+                409,
+                detail={
+                    "message": str(exc),
+                    "plan_task_id": getattr(exc, "plan_task_id", None),
+                    "plan_version_id": getattr(exc, "plan_version_id", None),
+                    "staleness": staleness,
+                },
+            ) from exc
+        raise HTTPException(400, str(exc)) from exc
+    if refreshed_applied_plan_data != expected_applied_plan_data:
+        await db.rollback()
+        raise HTTPException(
+            409,
+            "Approved Plan evidence changed while the message was prepared",
+        )
+    applied_plan_data = refreshed_applied_plan_data
+
     user_log = LogEntry(
         instance_id=1,
         task_id=task_id,
@@ -1277,6 +1712,18 @@ async def send_chat_message(
         sa_update(Task)
         .where(
             Task.id == task_id,
+            Task.incarnation_id == admitted_task_identity["incarnation_id"],
+            (
+                Task.project_id.is_(None)
+                if admitted_task_identity["project_id"] is None
+                else Task.project_id == admitted_task_identity["project_id"]
+            ),
+            Task.session_id == admitted_task_identity["session_id"],
+            Task.status == admitted_task_identity["status"],
+            Task.retry_count == admitted_task_identity["retry_count"],
+            Task.turn_generation == admitted_task_identity["turn_generation"],
+            Task.worker_id.is_(None),
+            Task.shared_from_id.is_(None),
             no_active_worker_task_termination_predicate(),
             no_active_test_harness_owner_graph_predicate(),
         )
@@ -1308,7 +1755,7 @@ async def send_chat_message(
     response = {
         "ok": True,
         "queued": True,
-        "session_id": task.session_id,
+        "has_session": bool(task.session_id),
         "applied_plan_task_ids": [plan.id for plan in approved_plans],
         "applied_plan_version_ids": [
             version.id for _plan, version in approved_versions
@@ -1318,6 +1765,10 @@ async def send_chat_message(
             workspace_review_baseline_run_id
         ),
     }
+    if body.worker_turn_handoff_id is not None:
+        # Manager→Worker reconciliation needs the node-local native session;
+        # human callers receive only ``has_session`` above.
+        response["session_id"] = task.session_id
     if application_receipt_key is not None:
         response["plan_application_receipt_key"] = application_receipt_key
     worker_queue_payload = {
@@ -1337,6 +1788,7 @@ async def send_chat_message(
         "initiating_user_id": initiating_user_id,
         "initiating_user_role": initiating_user_role,
         "execution_mode": execution_mode,
+        "execution_principal_kind": execution_principal_kind,
     }
     if body.worker_turn_handoff_id is not None:
         worker_queue_payload.update({
@@ -1347,11 +1799,15 @@ async def send_chat_message(
             "worker_turn_handoff_from_generation": (
                 body.worker_turn_handoff_from_generation
             ),
+            "worker_turn_handoff_incarnation_id": (
+                body.worker_turn_handoff_incarnation_id
+            ),
         })
         log_metadata["worker_turn_handoff"] = {
             "id": body.worker_turn_handoff_id,
             "retry_count": body.worker_turn_handoff_retry_count,
             "from_generation": body.worker_turn_handoff_from_generation,
+            "incarnation_id": body.worker_turn_handoff_incarnation_id,
             "request_digest": handoff_digest,
             "queue_payload": worker_queue_payload,
             "response": response,
@@ -1512,6 +1968,7 @@ async def send_chat_message(
                 initiating_user_id=initiating_user_id,
                 initiating_user_role=initiating_user_role,
                 execution_mode=execution_mode,
+                execution_principal_kind=execution_principal_kind,
                 attachment_paths=tuple(all_paths),
             )
     except (TaskStartPausedError, RuntimeError) as exc:
@@ -1646,6 +2103,7 @@ async def start_frontend_review_goal(
     if task is None:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, task, db)
+    _validate_and_normalize_chat_attachments(body)
     if body.secret_ids:
         from backend.api.deps import require_admin
 
@@ -1669,7 +2127,7 @@ async def start_frontend_review_goal(
             validate_task_service_tier_configuration,
         )
 
-        _require_expected_task_routing(
+        admitted_routing = _require_expected_task_routing(
             current,
             body.expected_routing,
             effective_model=current.model,
@@ -1782,6 +2240,7 @@ async def start_frontend_review_goal(
             "retry_count": 0,
             "metadata_": metadata,
         }
+        task_updates.update(task_execution_principal_from_request(request))
 
         display_content = body.message
         sender_display_name = await _sender_display_name(request, db)
@@ -1819,12 +2278,19 @@ async def start_frontend_review_goal(
                     expected_identity=expected_harness_owner,
                     task_updates=task_updates,
                     commit=False,
+                    effect_request=request,
                 )
                 if activated is None:
                     raise HTTPException(409, "Task disappeared during Goal activation")
                 log_metadata: dict[str, Any] = {
                     "source": "frontend-review-goal",
                     "raw_content": body.message,
+                    "execution_principal": {
+                        "user_id": task_updates["execution_user_id"],
+                        "role": task_updates["execution_user_role"],
+                        "mode": task_updates["execution_mode"],
+                        "kind": task_updates["execution_principal_kind"],
+                    },
                 }
                 if attachments:
                     log_metadata.update({
@@ -1880,7 +2346,7 @@ async def start_frontend_review_goal(
 
     await broadcast_status_change(task_id, "pending")
     dispatcher.wake()
-    return activated
+    return await task_response(request, activated, db)
 
 
 @router.get("/{task_id}/worker-turn-handoffs/{handoff_id}")
@@ -1903,9 +2369,11 @@ async def get_worker_turn_handoff_receipt(
         or any(char not in "0123456789abcdef" for char in handoff_id)
     ):
         raise HTTPException(404, "Worker turn handoff not found")
-    task = await db.get(Task, task_id)
-    if task is None:
-        raise HTTPException(404, "Task not found")
+    task = await require_worker_task_incarnation_header(
+        request,
+        task_id,
+        db,
+    )
     await require_task_access(request, task, db)
     found = await _find_worker_turn_handoff_receipt(
         db,
@@ -1920,15 +2388,30 @@ async def get_worker_turn_handoff_receipt(
             )
         raise HTTPException(404, "Worker turn handoff not found")
     receipt, row = found
+    request_payload = receipt.request_payload
+    if (
+        not isinstance(request_payload, dict)
+        or request_payload.get("worker_turn_handoff_incarnation_id")
+        != task.incarnation_id
+    ):
+        raise HTTPException(
+            409,
+            "Worker turn handoff incarnation is invalid",
+        )
     return {
         "handoff_id": handoff_id,
         "task_id": task_id,
+        "incarnation_id": task.incarnation_id,
         "status": receipt.status,
         "retry_count": receipt.retry_count,
         "from_generation": receipt.from_generation,
         "turn_generation": receipt.claimed_turn_generation,
         "source_log_id": row.id,
         "cancel_reason": receipt.cancel_reason,
+        "request_digest": receipt.request_digest,
+        "principal_digest": _plan_delivery_digest(
+            _worker_execution_principal_identity(receipt.request_payload)
+        ),
         # The acknowledgement contains no model prompt or attachment content;
         # it is safe for the Manager to reconstruct the lost POST response.
         "response": receipt.response,
@@ -2067,7 +2550,19 @@ async def fork_codex_task(
     source = await db.get(Task, task_id)
     if not source:
         raise HTTPException(404, "Task not found")
-    await require_task_control(request, source, db)
+    # Forking crosses an external native-thread boundary.  Serialize the final
+    # Project/Task/membership/User decision first, freeze every input needed by
+    # the RPC and outcome, then commit that no-op writer transaction as the
+    # admission linearization point.  Never hold SQLite's database-wide writer
+    # reservation while waiting for Codex.
+    source = await lock_task_effect_access(
+        request,
+        source,
+        db,
+        allow_chat_share=False,
+    )
+    fork_principal = task_execution_principal_from_request(request)
+    fork_created_by = get_current_user_id(request)
     from backend.api.tasks import (
         _require_not_delivery_owned_task,
         _require_not_isolated_browser_child,
@@ -2109,7 +2604,7 @@ async def fork_codex_task(
         if not source.description:
             raise HTTPException(404, "Initial prompt not found")
         seed_message = source.description
-        selected_metadata = source.metadata_ or {}
+        selected_metadata = deepcopy(source.metadata_ or {})
     elif body.anchor.type == "user_message":
         selected = next(
             (row for row in rows if row.id == body.anchor.id),
@@ -2128,6 +2623,36 @@ async def fork_codex_task(
         )
 
     codex_home, account_id = _codex_fork_home(source)
+    source_snapshot = {
+        "id": source.id,
+        "metadata_": deepcopy(source.metadata_ or {}),
+        "title": source.title,
+        "description": source.description,
+        "priority": source.priority,
+        "project_id": source.project_id,
+        "target_repo": source.target_repo,
+        "target_branch": source.target_branch,
+        "max_retries": source.max_retries,
+        "session_id": source.session_id,
+        "last_cwd": source.last_cwd,
+        "model": source.model,
+        "codex_service_tier": source.codex_service_tier,
+        "effort_level": source.effort_level,
+        "thinking_budget": source.thinking_budget,
+        "system_prompt_mode": source.system_prompt_mode,
+        "timeout_hours": source.timeout_hours,
+        "enable_workflows": source.enable_workflows,
+        "enabled_skills": deepcopy(source.enabled_skills),
+        "selected_user_skills": deepcopy(source.selected_user_skills),
+        "tags": deepcopy(source.tags),
+        "attention_tag": source.attention_tag,
+    }
+    row_snapshots = [_ForkLogSnapshot.capture(row) for row in rows]
+    # The admission commit orders this effect against concurrent ACL removal
+    # and user disable/demotion.  A change committed afterwards may proceed
+    # immediately; this already-admitted request finishes from detached data.
+    await db.commit()
+
     from backend.main import instance_manager
     from backend.services.codex_app_server import (
         CodexAppServerBusyError,
@@ -2140,29 +2665,36 @@ async def fork_codex_task(
             cutoff = -1
             forked_thread = await instance_manager.create_codex_thread(
                 codex_home,
-                cwd=source.last_cwd or source.target_repo or os.getcwd(),
-                model=source.model,
+                cwd=(
+                    source_snapshot["last_cwd"]
+                    or source_snapshot["target_repo"]
+                    or os.getcwd()
+                ),
+                model=source_snapshot["model"],
             )
         else:
             native_thread = await instance_manager.read_codex_thread(
                 codex_home,
-                source.session_id,
+                source_snapshot["session_id"],
             )
             turns = [
                 turn for turn in (native_thread.get("turns") or [])
                 if isinstance(turn, dict)
             ]
             if body.anchor.type == "latest":
-                last_turn_id, cutoff = _resolve_latest_fork_turn(turns, rows)
+                last_turn_id, cutoff = _resolve_latest_fork_turn(
+                    turns,
+                    row_snapshots,
+                )
             else:
                 last_turn_id, cutoff = _resolve_fork_turn(
                     anchor=body.anchor,
-                    rows=rows,
+                    rows=row_snapshots,
                     turns=turns,
                 )
             forked_thread = await instance_manager.fork_codex_thread(
                 codex_home,
-                source.session_id,
+                source_snapshot["session_id"],
                 last_turn_id=last_turn_id,
             )
     except CodexAppServerBusyError as exc:
@@ -2173,10 +2705,10 @@ async def fork_codex_task(
     forked_thread_id = str(forked_thread["id"])
     committed = False
     try:
-        metadata = deepcopy(source.metadata_ or {})
+        metadata = deepcopy(source_snapshot["metadata_"])
         if account_id:
             metadata["codex_account_id"] = account_id
-        metadata["forked_from_task_id"] = source.id
+        metadata["forked_from_task_id"] = source_snapshot["id"]
         metadata["forked_from_log_id"] = (
             body.anchor.id if body.anchor.type == "user_message" else None
         )
@@ -2201,48 +2733,51 @@ async def fork_codex_task(
             metadata.pop("image_paths", None)
 
         default_title = (
-            f"Fork of #{source.id}: {source.title}"
-            if source.title
-            else f"Fork of #{source.id}"
+            f"Fork of #{source_snapshot['id']}: {source_snapshot['title']}"
+            if source_snapshot["title"]
+            else f"Fork of #{source_snapshot['id']}"
         )
         now = datetime.utcnow()
         forked_task = await stage_task_record(
             db,
             title=(body.title.strip() if body.title and body.title.strip() else default_title)[:200],
             description=(
-                source.description
+                source_snapshot["description"]
                 if body.anchor.type in {"user_message", "latest"}
                 else None
             ),
             status="completed",
-            priority=source.priority,
-            project_id=source.project_id,
-            target_repo=source.target_repo,
-            target_branch=source.target_branch,
+            priority=source_snapshot["priority"],
+            project_id=source_snapshot["project_id"],
+            target_repo=source_snapshot["target_repo"],
+            target_branch=source_snapshot["target_branch"],
             merge_status="pending",
             worker_id=None,
-            created_by=get_current_user_id(request),
-            max_retries=source.max_retries,
+            created_by=fork_created_by,
+            **fork_principal,
+            max_retries=source_snapshot["max_retries"],
             mode="auto",
             session_id=forked_thread_id,
-            last_cwd=source.last_cwd,
+            last_cwd=source_snapshot["last_cwd"],
             provider="codex",
-            model=source.model,
-            codex_service_tier=source.codex_service_tier,
-            effort_level=source.effort_level,
-            thinking_budget=source.thinking_budget,
-            system_prompt_mode=source.system_prompt_mode,
-            timeout_hours=source.timeout_hours,
-            enable_workflows=source.enable_workflows,
-            enabled_skills=deepcopy(source.enabled_skills),
-            selected_user_skills=deepcopy(source.selected_user_skills),
-            tags=deepcopy(source.tags),
-            attention_tag=source.attention_tag,
+            model=source_snapshot["model"],
+            codex_service_tier=source_snapshot["codex_service_tier"],
+            effort_level=source_snapshot["effort_level"],
+            thinking_budget=source_snapshot["thinking_budget"],
+            system_prompt_mode=source_snapshot["system_prompt_mode"],
+            timeout_hours=source_snapshot["timeout_hours"],
+            enable_workflows=source_snapshot["enable_workflows"],
+            enabled_skills=deepcopy(source_snapshot["enabled_skills"]),
+            selected_user_skills=deepcopy(
+                source_snapshot["selected_user_skills"]
+            ),
+            tags=deepcopy(source_snapshot["tags"]),
+            attention_tag=source_snapshot["attention_tag"],
             metadata_=metadata,
             started_at=now,
             completed_at=now,
         )
-        for row in rows:
+        for row in row_snapshots:
             if row.id > cutoff:
                 break
             db.add(LogEntry(
@@ -2264,9 +2799,9 @@ async def fork_codex_task(
             task_id=forked_task.id,
             event_type="system_event",
             role="system",
-            content=f"Forked from Task #{source.id}",
+            content=f"Forked from Task #{source_snapshot['id']}",
             raw_json=json.dumps({
-                "forked_from_task_id": source.id,
+                "forked_from_task_id": source_snapshot["id"],
                 "forked_from_log_id": metadata["forked_from_log_id"],
                 "forked_from_turn_id": last_turn_id,
             }),
@@ -2276,12 +2811,7 @@ async def fork_codex_task(
         # cancellation. Settle the commit before deciding whether compensation
         # is still allowed.
         commit_task = asyncio.create_task(db.commit())
-        cancellation: asyncio.CancelledError | None = None
-        while not commit_task.done():
-            try:
-                await asyncio.shield(commit_task)
-            except asyncio.CancelledError as exc:
-                cancellation = exc
+        cancellation = await await_task_completion(commit_task)
         commit_task.result()
         committed = True
         if cancellation is not None:
@@ -2296,28 +2826,16 @@ async def fork_codex_task(
                     forked_thread_id,
                 )
             )
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    continue
+            await await_task_completion(cleanup)
             cleanup.result()
         raise
 
-    if forked_task.project_id:
-        try:
-            from backend.services.task_sharing import auto_share_new_task
-            await auto_share_new_task(
-                db,
-                forked_task.id,
-                forked_task.project_id,
-            )
-        except Exception:
-            logger.exception(
-                "Could not auto-share forked task %s",
-                forked_task.id,
-            )
-    return forked_task
+    return await task_response(
+        request,
+        forked_task,
+        db,
+        status_code=201,
+    )
 
 
 async def _send_shared_chat(
@@ -2491,6 +3009,8 @@ async def _send_worker_chat(
 ):
     """Worker task 的 chat 代理。"""
     from backend.main import broadcaster, worker_proxy
+
+    allow_chat_share = _chat_payload_allows_chat_share(body)
     if worker_proxy is None:
         raise HTTPException(503, "Worker 功能未启用")
     if body.secret_ids:
@@ -2505,6 +3025,13 @@ async def _send_worker_chat(
     ):
         db.expire_all()
         current = await db.get(Task, task_id)
+        if current is not None and request is not None:
+            current = await lock_task_effect_access(
+                request,
+                current,
+                db,
+                allow_chat_share=allow_chat_share,
+            )
         observed = (
             worker_task_generation(current)
             if current is not None
@@ -2552,7 +3079,7 @@ async def _send_worker_chat(
             _require_pr_review_chat_allowed,
         )
 
-        _require_expected_task_routing(
+        admitted_worker_routing = _require_expected_task_routing(
             current,
             body.expected_routing,
             effective_model=body.model or current.model,
@@ -2615,6 +3142,12 @@ async def _send_worker_chat(
                 display_content = f"[{sender_display_name}] {model_message}"
 
         worker = await worker_proxy.require_ready_worker(observed.worker_id)
+        # Older Workers may silently ignore the delegated principal fields and
+        # enqueue this turn under their deployment token.  Negotiate before any
+        # Plan materialization, attachment upload, durable user Log, or /chat
+        # mutation so a mixed-version rollout remains side-effect free.
+        await worker_proxy.require_worker_delegated_principal_support(worker)
+        await worker_proxy.require_worker_task_incarnation_support(worker)
         if terminal_pr_review_chat:
             # Old Workers permanently freeze pr-review chat. Confirm the
             # matching endpoint contract before the Manager stores a user
@@ -2851,6 +3384,20 @@ async def _send_worker_chat(
             remote_confirmed_version_ids.append(remote_version_id)
 
         all_paths = body.file_paths or body.image_paths or []
+        remote_all_paths = worker_managed_upload_paths(all_paths)
+        remote_path_by_local = dict(
+            zip(all_paths, remote_all_paths, strict=True)
+        )
+        worker_file_paths = (
+            [remote_path_by_local[path] for path in body.file_paths]
+            if body.file_paths is not None
+            else None
+        )
+        worker_image_paths = (
+            [remote_path_by_local[path] for path in body.image_paths]
+            if body.image_paths is not None
+            else None
+        )
         _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
         attachments = [
             {
@@ -2869,7 +3416,11 @@ async def _send_worker_chat(
         # visible message that no recovery path can ever deliver.
         if all_paths:
             try:
-                await worker_proxy.push_files(worker, all_paths)
+                await worker_proxy.push_files(
+                    worker,
+                    all_paths,
+                    remote_paths=remote_all_paths,
+                )
             except Exception as e:
                 raise HTTPException(503, f"附件同步到 Worker 失败: {e}")
 
@@ -2883,10 +3434,28 @@ async def _send_worker_chat(
             str(uuid.uuid4()) if approved_versions else None
         )
         handoff_id = uuid.uuid4().hex
+        from backend.services.task_creation import (
+            delegated_task_execution_principal_values,
+        )
+
+        request_principal = task_execution_principal_from_request(request)
+        manager_principal = (
+            task_execution_principal_from_request(
+                request,
+                force_sandbox=True,
+            )
+            if terminal_pr_review_chat
+            else request_principal
+        )
+        delegated_principal = delegated_task_execution_principal_values(
+            user_id=manager_principal["execution_user_id"],
+            role=manager_principal["execution_user_role"],
+            principal_kind=manager_principal["execution_principal_kind"],
+        )
         worker_request_body = {
             "message": model_message,
-            "image_paths": body.image_paths,
-            "file_paths": body.file_paths,
+            "image_paths": worker_image_paths,
+            "file_paths": worker_file_paths,
             "model": body.model,
             "plan_task_ids": body.plan_task_ids,
             "plan_version_ids": remote_version_ids or None,
@@ -2905,18 +3474,95 @@ async def _send_worker_chat(
             "worker_turn_handoff_id": handoff_id,
             "worker_turn_handoff_retry_count": observed.retry_count,
             "worker_turn_handoff_from_generation": observed.turn_generation,
-            "execution_user_id": get_current_user_id(request),
-            "execution_user_role": get_current_user_role(request),
-            "execution_mode": (
-                "unrestricted"
-                if get_current_user_role(request) in ("admin", "super_admin")
-                else "sandbox"
-            ),
+            "worker_turn_handoff_incarnation_id": current.incarnation_id,
+            **delegated_principal,
         }
-        worker_request_digest = _plan_delivery_digest(worker_request_body)
+        # Normalize through the same Pydantic model used by the Worker before
+        # computing the cross-database digest.  This fills optional defaults
+        # (for example ``secret_ids=None``) identically on both sides.
+        worker_request_model = ChatMessage.model_validate(worker_request_body)
+        worker_request_body = worker_request_model.model_dump(mode="json")
+        worker_request_identity = _worker_turn_handoff_request_identity(
+            worker_request_model,
+            admitted_worker_routing,
+        )
+        worker_request_digest = _plan_delivery_digest(
+            worker_request_identity
+        )
+        # ``lock_task_effect_access`` deliberately rolls back the prior read
+        # transaction before taking Project -> Task writer fences.  Freeze the
+        # immutable identities now and rehydrate the ORM rows afterwards;
+        # retaining expired async ORM objects across that rollback would make
+        # later ``version.id`` access attempt implicit IO outside greenlet.
+        approved_version_keys = [
+            (plan.id, version.id)
+            for plan, version in approved_versions
+        ]
+
+        # Revalidate both ACL sources after all network preflight, then publish
+        # the complete durable outbox while the Project -> Task fences remain
+        # held. A concurrent TeamProjectShare or TeamTaskShare revoke either
+        # commits first and vetoes this turn, or waits for this admission.
+        if request is not None:
+            current = await lock_task_effect_access(
+                request,
+                current,
+                db,
+                allow_chat_share=allow_chat_share,
+            )
+            refreshed_observed = worker_task_generation(
+                current,
+                expected_worker_id=observed.worker_id,
+            )
+            if refreshed_observed != observed:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Task Worker generation changed before chat authorization",
+                )
+            if approved_version_keys:
+                from backend.models.plan import Plan, PlanVersion
+
+                rehydrated_versions = []
+                for plan_id, version_id in approved_version_keys:
+                    plan = await db.get(Plan, plan_id)
+                    version = await db.get(PlanVersion, version_id)
+                    if (
+                        plan is None
+                        or version is None
+                        or version.plan_id != plan.id
+                        or plan.target_task_id != current.id
+                    ):
+                        await db.rollback()
+                        raise HTTPException(
+                            409,
+                            "Approved Plan Version changed while Worker chat "
+                            "authorization was fenced",
+                        )
+                    rehydrated_versions.append((plan, version))
+                approved_versions = rehydrated_versions
 
         # Revalidate the exact Worker generation after all network preflight,
         # then publish the complete durable outbox atomically.
+        if manager_principal["execution_principal_kind"] == "user":
+            from backend.models.user import User
+
+            principal_gate = await db.execute(
+                sa_update(User)
+                .where(
+                    User.id == manager_principal["execution_user_id"],
+                    User.is_active.is_(True),
+                    User.role == manager_principal["execution_user_role"],
+                )
+                .values(role=User.role)
+            )
+            if principal_gate.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Worker follow-up principal is no longer active or its "
+                    "role changed",
+                )
         guarded = await db.execute(
             sa_update(Task)
             .where(
@@ -2931,7 +3577,30 @@ async def _send_worker_chat(
                 409,
                 "Task Worker generation changed before chat could be sent",
             )
-        log_metadata: dict = {"raw_content": model_message}
+        log_metadata: dict = {
+            "raw_content": model_message,
+            # The source Log is the durable audit boundary for this exact
+            # G -> G+1 handoff.  Freeze the native Manager principal here as
+            # well as in the delegated request/receipt so later recovery never
+            # has to infer who authorized the turn from mutable Task state.
+            "execution_principal": {
+                "user_id": manager_principal["execution_user_id"],
+                "role": manager_principal["execution_user_role"],
+                "mode": manager_principal["execution_mode"],
+                "kind": manager_principal["execution_principal_kind"],
+            },
+        }
+        if (
+            request_principal["execution_user_id"]
+            != manager_principal["execution_user_id"]
+        ):
+            # Terminal PR discussions deliberately execute as the canonical
+            # sandboxed system principal.  Keep the authenticated human actor
+            # as separate audit evidence, matching the Manager-local path,
+            # without corrupting the runtime principal shape.
+            log_metadata["actor_user_id"] = request_principal[
+                "execution_user_id"
+            ]
         if attachments:
             log_metadata["attachments"] = attachments
             log_metadata["file_paths"] = all_paths
@@ -2970,8 +3639,9 @@ async def _send_worker_chat(
             observed,
             handoff_id=handoff_id,
             source_log_id=manager_user_log.id,
-            request_payload=worker_request_body,
+            request_payload=worker_request_identity,
             request_digest=worker_request_digest,
+            replay_payload=worker_request_body,
             terminal_pr_review_chat=terminal_pr_review_chat,
         )
         if reserved is None:
@@ -3003,13 +3673,7 @@ async def _send_worker_chat(
         # never re-raise that cancellation until the durable marker has a live
         # recovery owner in this process.
         commit_task = asyncio.create_task(db.commit())
-        handoff_cancellation: asyncio.CancelledError | None = None
-        while not commit_task.done():
-            try:
-                await asyncio.shield(commit_task)
-            except asyncio.CancelledError as exc:
-                if handoff_cancellation is None:
-                    handoff_cancellation = exc
+        handoff_cancellation = await await_task_completion(commit_task)
         commit_task.result()
 
         # Arm durable recovery immediately after the outbox/marker commit,
@@ -3025,12 +3689,11 @@ async def _send_worker_chat(
             scheduled = recovery_scheduler(worker, reserved)
             if inspect.isawaitable(scheduled):
                 recovery_task = asyncio.ensure_future(scheduled)
-                while not recovery_task.done():
-                    try:
-                        await asyncio.shield(recovery_task)
-                    except asyncio.CancelledError as exc:
-                        if handoff_cancellation is None:
-                            handoff_cancellation = exc
+                recovery_cancellation = await await_task_completion(
+                    recovery_task
+                )
+                if handoff_cancellation is None:
+                    handoff_cancellation = recovery_cancellation
                 recovery_task.result()
         if handoff_cancellation is not None:
             raise handoff_cancellation
@@ -3056,6 +3719,7 @@ async def _send_worker_chat(
                 body=worker_request_body,
                 operation_lock_held=True,
                 pr_review_terminal_chat=terminal_pr_review_chat,
+                require_task_incarnation_fence=True,
             )
         except Exception as proxy_error:
             remote_handoff = None
@@ -3065,6 +3729,7 @@ async def _send_worker_chat(
                         worker,
                         current.id,
                         handoff_id,
+                        current.incarnation_id,
                     )
                 )
                 if (
@@ -3073,9 +3738,14 @@ async def _send_worker_chat(
                         remote_handoff,
                         handoff_id=handoff_id,
                         task_id=current.id,
+                        incarnation_id=current.incarnation_id,
                         retry_count=reserved.worker_turn_handoff_retry_count,
                         from_generation=(
                             reserved.worker_turn_handoff_from_generation
+                        ),
+                        request_digest=worker_request_digest,
+                        principal_digest=_plan_delivery_digest(
+                            delegated_principal
                         ),
                     )
                 ):
@@ -3092,6 +3762,7 @@ async def _send_worker_chat(
                             worker,
                             current.id,
                             handoff_id,
+                            current.incarnation_id,
                         )
                     )
                     remote_handoff = (
@@ -3100,11 +3771,16 @@ async def _send_worker_chat(
                             resumed_handoff,
                             handoff_id=handoff_id,
                             task_id=current.id,
+                            incarnation_id=current.incarnation_id,
                             retry_count=(
                                 reserved.worker_turn_handoff_retry_count
                             ),
                             from_generation=(
                                 reserved.worker_turn_handoff_from_generation
+                            ),
+                            request_digest=worker_request_digest,
+                            principal_digest=_plan_delivery_digest(
+                                delegated_principal
                             ),
                         )
                         else {}
@@ -3135,6 +3811,7 @@ async def _send_worker_chat(
                         body=worker_request_body,
                         operation_lock_held=True,
                         pr_review_terminal_chat=terminal_pr_review_chat,
+                        require_task_incarnation_fence=True,
                     )
                 except Exception:
                     raise proxy_error
@@ -3435,7 +4112,18 @@ async def get_chat_history(
     if not task:
         raise HTTPException(404, "Task not found")
 
+    touch_allowed = False
     if touch:
+        try:
+            await require_task_control(request, task, db)
+            touch_allowed = True
+        except HTTPException as exc:
+            if exc.status_code != 403:
+                raise
+            # A chat-only recipient may read and participate in the
+            # conversation, but opening somebody else's shared Task must not
+            # reorder the owner's/project collaborators' Task list.
+    if touch_allowed:
         from datetime import datetime as _dt
         task.last_accessed_at = _dt.utcnow()
         await db.commit()
@@ -3804,6 +4492,7 @@ async def _store_injected_message(
     uploads: list[ValidatedUploadAttachment],
     instance_id: int | None,
     generation_audit_matched: bool,
+    execution_principal: dict[str, object],
 ) -> None:
     attachments = [upload.public_dict() for upload in uploads]
     file_paths = [upload.path for upload in uploads]
@@ -3818,6 +4507,12 @@ async def _store_injected_message(
             if generation_audit_matched
             else "changed_after_transport"
         ),
+        "execution_principal": {
+            "user_id": execution_principal["execution_user_id"],
+            "role": execution_principal["execution_user_role"],
+            "mode": execution_principal["execution_mode"],
+            "kind": execution_principal["execution_principal_kind"],
+        },
     }
     if attachments:
         raw_metadata.update({
@@ -3871,6 +4566,7 @@ async def _audit_and_store_injected_message(
     task_session_id: str,
     task_instance_id: int | None,
     task_provider_db_value: str | None,
+    execution_principal: dict[str, object],
     raw_content: str,
     uploads: list[ValidatedUploadAttachment],
 ) -> None:
@@ -3900,6 +4596,17 @@ async def _audit_and_store_injected_message(
                 if task_provider_db_value is None
                 else Task.provider == task_provider_db_value
             ),
+            (
+                Task.execution_user_id.is_(None)
+                if execution_principal["execution_user_id"] is None
+                else Task.execution_user_id
+                == execution_principal["execution_user_id"]
+            ),
+            Task.execution_user_role
+            == execution_principal["execution_user_role"],
+            Task.execution_mode == execution_principal["execution_mode"],
+            Task.execution_principal_kind
+            == execution_principal["execution_principal_kind"],
         )
         .values(status=Task.status)
     )
@@ -3932,6 +4639,7 @@ async def _audit_and_store_injected_message(
         uploads=uploads,
         instance_id=task_instance_id,
         generation_audit_matched=generation_audit_matched,
+        execution_principal=execution_principal,
     )
 
 
@@ -3939,13 +4647,7 @@ async def _settle_injected_message_audit(operation) -> None:
     """Finish the audit after transport success even if HTTP is cancelled."""
 
     audit_task = asyncio.create_task(operation)
-    delayed_cancel: asyncio.CancelledError | None = None
-    while not audit_task.done():
-        try:
-            await asyncio.shield(audit_task)
-        except asyncio.CancelledError as exc:
-            if delayed_cancel is None:
-                delayed_cancel = exc
+    delayed_cancel = await await_task_completion(audit_task)
     audit_task.result()
     if delayed_cancel is not None:
         raise delayed_cancel
@@ -3960,7 +4662,7 @@ async def inject_capabilities(
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     from backend.api.tasks import (
         _require_not_delivery_owned_task,
         _require_not_isolated_browser_child,
@@ -3986,10 +4688,14 @@ async def inject_message(
     db: AsyncSession = Depends(get_db),
 ):
     """Inject a message into the task's currently running turn."""
+    # Freeze the authenticated HTTP principal once.  Live injection steers an
+    # already-admitted provider turn and therefore must carry exactly the same
+    # authority as that turn; ordinary ACL access alone is insufficient.
+    request_principal = task_execution_principal_from_request(request)
     task = await db.get(Task, task_id)
     if task is None:
         raise HTTPException(404, "Task not found")
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
 
     # Serialize with routing edits and migration.  Re-read after acquiring the
     # lock so the expected route and transport are one admission decision.
@@ -3999,25 +4705,72 @@ async def inject_message(
         task = await db.get(Task, task_id)
         if task is None:
             raise HTTPException(404, "Task not found")
-        await require_task_access(request, task, db)
-        if await active_worker_task_termination_receipt(db, task_id):
-            raise HTTPException(
-                409,
-                "Task has an active Worker termination receipt",
-            )
-        from backend.api.tasks import _require_not_delivery_owned_task
+        task = await lock_task_effect_access(
+            request,
+            task,
+            db,
+            allow_chat_share=False,
+        )
+        from backend.api.tasks import (
+            _require_not_delivery_owned_task,
+            _require_not_isolated_browser_child,
+            _require_pr_review_chat_allowed,
+        )
 
+        # Structural lifecycle ownership is checked before comparing the
+        # active execution principal.  An isolated child is never a public
+        # injection target, regardless of which caller principal happens to
+        # be frozen on its archived/internal row.
         _require_not_delivery_owned_task(
             task,
             action="received direct injection",
         )
-        from backend.api.tasks import _require_not_isolated_browser_child
-
         await _require_not_isolated_browser_child(
             db,
             task,
             action="received direct injection",
         )
+        await _require_pr_review_chat_allowed(db, task_id)
+        if request_principal["execution_principal_kind"] == "user":
+            from backend.models.user import User
+
+            # Authentication populated request.state earlier in the request.
+            # Fence the durable User row in this admission transaction so a
+            # concurrent disable/demotion cannot race an old admin snapshot
+            # through the Task gate and into an unrestricted live turn.
+            current_user_gate = await db.execute(
+                sa_update(User)
+                .where(
+                    User.id == request_principal["execution_user_id"],
+                    User.is_active.is_(True),
+                    User.role == request_principal["execution_user_role"],
+                )
+                .values(role=User.role)
+            )
+            if current_user_gate.rowcount != 1:
+                await db.rollback()
+                raise HTTPException(
+                    409,
+                    "Live injection principal is no longer active or its "
+                    "role changed; send a normal next-turn message instead",
+                )
+        task_principal = {
+            "execution_user_id": task.execution_user_id,
+            "execution_user_role": task.execution_user_role,
+            "execution_mode": task.execution_mode,
+            "execution_principal_kind": task.execution_principal_kind,
+        }
+        if task_principal != request_principal:
+            raise HTTPException(
+                409,
+                "Live injection requires the exact principal that started "
+                "the active turn; send a normal next-turn message instead",
+            )
+        if await active_worker_task_termination_receipt(db, task_id):
+            raise HTTPException(
+                409,
+                "Task has an active Worker termination receipt",
+            )
         if task_is_pr_review_superseded(task):
             raise HTTPException(
                 409,
@@ -4027,7 +4780,6 @@ async def inject_message(
         from backend.api.tasks import (
             _require_expected_task_routing,
             _require_no_pending_worker_routing,
-            _require_pr_review_chat_allowed,
         )
 
         if task.worker_id is not None:
@@ -4036,10 +4788,6 @@ async def inject_message(
                 "Worker task 暂不支持执行中注入",
             )
         _require_no_pending_worker_routing(task)
-        await _require_pr_review_chat_allowed(
-            db,
-            task_id,
-        )
         if task.status not in {"in_progress", "executing"}:
             detail = (
                 "Task is waiting for its requested capability and has no "
@@ -4076,6 +4824,7 @@ async def inject_message(
         admitted_session_id = task.session_id
         admitted_provider_db_value = task.provider
         admitted_provider = (task.provider or "claude").lower()
+        admitted_execution_principal = dict(request_principal)
 
         # Take a short exact-generation admission gate, then COMMIT it before
         # awaiting the provider.  The PTY consumer may need to persist an
@@ -4101,6 +4850,20 @@ async def inject_message(
                     if admitted_provider_db_value is None
                     else Task.provider == admitted_provider_db_value
                 ),
+                (
+                    Task.execution_user_id.is_(None)
+                    if admitted_execution_principal["execution_user_id"] is None
+                    else Task.execution_user_id
+                    == admitted_execution_principal["execution_user_id"]
+                ),
+                Task.execution_user_role
+                == admitted_execution_principal["execution_user_role"],
+                Task.execution_mode
+                == admitted_execution_principal["execution_mode"],
+                Task.execution_principal_kind
+                == admitted_execution_principal[
+                    "execution_principal_kind"
+                ],
                 Task.worker_id.is_(None),
                 Task.shared_from_id.is_(None),
                 no_active_worker_task_termination_predicate(),
@@ -4226,6 +4989,7 @@ async def inject_message(
                 task_session_id=admitted_session_id,
                 task_instance_id=admitted_instance_id,
                 task_provider_db_value=admitted_provider_db_value,
+                execution_principal=admitted_execution_principal,
                 raw_content=body.message,
                 uploads=uploads,
             )
@@ -4253,13 +5017,29 @@ async def resolve_permission(
         raise HTTPException(400, "behavior must be 'allow' or 'deny'")
 
     task = await db.get(Task, task_id)
-    if task:
-        await require_task_access(request, task, db)
     if not task:
         raise HTTPException(404, "Task not found")
 
+    # A PTY permission response changes the executable authority of the
+    # active model turn.  A chat-only TeamTaskShare may send follow-up text,
+    # but must never approve or deny Bash/tool execution for somebody else's
+    # Task.  Hold the Project/Task share-revocation fence through the short
+    # in-memory bridge effect so a concurrent revocation has one exact winner.
+    task = await lock_task_effect_access(
+        request,
+        task,
+        db,
+        allow_chat_share=False,
+        fence_worker_node=True,
+    )
+
     from backend.main import instance_manager
-    ok = await instance_manager.resolve_pty_permission(request_id, body.behavior)
+    ok = await instance_manager.resolve_pty_permission(
+        request_id,
+        body.behavior,
+        fenced_db=db,
+        authorized_task_id=task.id,
+    )
     if not ok:
         raise HTTPException(410, "权限请求已过期或不存在（CC 侧可能已超时默认拒绝）")
     return {"ok": True, "behavior": body.behavior}
@@ -4358,7 +5138,18 @@ async def distill_task(
         task = await db.get(Task, task_id)
         if not task:
             raise HTTPException(404, "Task not found")
-        await require_task_control(request, task, db)
+        # Distillation is a real provider effect.  Serialize and revalidate
+        # Project/Task/membership/User authority, then commit that writer
+        # transaction as the admission point before starting the model call.
+        # The in-process operation lock remains held for routing consistency,
+        # but SQLite must not retain a database-wide writer while the provider
+        # is running.
+        task = await lock_task_effect_access(
+            request,
+            task,
+            db,
+            allow_chat_share=False,
+        )
         from backend.api.tasks import _require_expected_task_routing
 
         _require_expected_task_routing(
@@ -4381,6 +5172,19 @@ async def distill_task(
         if not conversation.strip():
             raise HTTPException(400, "No conversation history to distill")
 
+        title = (
+            task.title
+            or (task.description[:100] if task.description else "")
+            or "Untitled"
+        )
+        suggested_name = (
+            task.title or task.description or "untitled"
+        )[:50].strip()
+        provider = task.provider or "claude"
+        codex_account_id = (task.metadata_ or {}).get("codex_account_id")
+        admitted_task_id = task.id
+        await db.commit()
+
         from backend.main import (
             cloudrouter_store,
             codex_pool,
@@ -4393,23 +5197,16 @@ async def distill_task(
             TaskDistillTimeoutError,
             distill_task_conversation,
         )
-        title = (
-            task.title
-            or (task.description[:100] if task.description else "")
-            or "Untitled"
-        )
         try:
             result = await distill_task_conversation(
                 title=title,
                 conversation=conversation,
-                provider=task.provider or "claude",
+                provider=provider,
                 custom_instruction=body.custom_instruction,
                 claude_pool=dispatcher.pool,
                 codex_pool=codex_pool,
-                codex_account_id=(task.metadata_ or {}).get(
-                    "codex_account_id"
-                ),
-                task_id=task.id,
+                codex_account_id=codex_account_id,
+                task_id=admitted_task_id,
                 instance_manager=instance_manager,
                 cloudrouter_store=cloudrouter_store,
             )
@@ -4430,10 +5227,6 @@ async def distill_task(
                 message = f"{message}: {detail}"
             raise HTTPException(502, message) from exc
 
-        suggested_name = (
-            task.title or task.description or "untitled"
-        )[:50].strip()
-
         return {
             "task_id": task_id,
             "suggested_name": suggested_name,
@@ -4453,7 +5246,12 @@ async def save_distilled_skill(
     task = await db.get(Task, task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    await require_task_control(request, task, db)
+    task = await lock_task_effect_access(
+        request,
+        task,
+        db,
+        allow_chat_share=False,
+    )
 
     existing = await db.execute(
         select(UserSkill).where(UserSkill.name == body.name)

@@ -576,16 +576,12 @@ async def test_ordinary_task_browser_review_requires_auth_before_materialization
         async def commit(self):
             return None
 
-    async def allow_task_access(*_args):
-        return None
-
     task_state = {"status": "in_progress", "trace_events": []}
 
     async def read_task(_task_id: int):
         return dict(task_state)
 
     monkeypatch.setattr(settings, "auth_token", "")
-    monkeypatch.setattr(browser_reviews, "require_task_access", allow_task_access)
     manager = BrowserReviewJobManager(
         task_reader=read_task,
         artifact_store=ArtifactStore(tmp_path / "artifacts"),

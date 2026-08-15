@@ -24,7 +24,7 @@ from typing import Awaitable, Callable
 from urllib.parse import urlsplit
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from backend.database import async_session
 from backend.models.test_harness import TestHarnessRun, TestHarnessSandboxLease
@@ -1675,21 +1675,26 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
         if any(_CONTAINER_ID_RE.fullmatch(item) is None for item in resources):
             raise TestHarnessSandboxError("sandbox cleanup returned an invalid resource")
         for resource_id in resources:
-            await self._verify_resource(
-                binary=binary,
-                resource_id=resource_id,
-                run_id=run_id,
-                lease_id=lease_id,
-                lease_nonce=lease_nonce,
-                expected_role=None,
-                require_running=False,
-            )
-            remove_code, _ = await self._runner(
+            try:
+                await self._verify_resource(
+                    binary=binary,
+                    resource_id=resource_id,
+                    run_id=run_id,
+                    lease_id=lease_id,
+                    lease_nonce=lease_nonce,
+                    expected_role=None,
+                    require_running=False,
+                )
+            except TestHarnessSandboxError:
+                # A concurrent cleanup may remove the exact resource between
+                # discovery and inspect.  Do not weaken identity verification
+                # by issuing rm in that case; the authoritative exact-label
+                # absence proof below decides whether cleanup succeeded.
+                continue
+            await self._runner(
                 [binary, "rm", "-f", resource_id],
                 30.0,
             )
-            if remove_code != 0:
-                raise TestHarnessSandboxError("sandbox container removal failed")
         verify_code, verify_output = await self._runner(
             [
                 binary,
@@ -1737,19 +1742,22 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
         if any(_CONTAINER_ID_RE.fullmatch(item) is None for item in networks):
             raise TestHarnessSandboxError("sandbox cleanup returned an invalid network")
         for network_id in networks:
-            await self._verify_network(
-                binary=binary,
-                network_id=network_id,
-                run_id=run_id,
-                lease_id=lease_id,
-                lease_nonce=lease_nonce,
-            )
-            remove_code, _ = await self._runner(
+            try:
+                await self._verify_network(
+                    binary=binary,
+                    network_id=network_id,
+                    run_id=run_id,
+                    lease_id=lease_id,
+                    lease_nonce=lease_nonce,
+                )
+            except TestHarnessSandboxError:
+                # See the container case above.  If the network still exists,
+                # the final exact-label query fails closed.
+                continue
+            await self._runner(
                 [binary, "network", "rm", network_id],
                 30.0,
             )
-            if remove_code != 0:
-                raise TestHarnessSandboxError("sandbox network removal failed")
         network_verify_code, network_verify_output = await self._runner(
             [
                 binary,
@@ -1785,6 +1793,35 @@ class TestHarnessSandboxManager:
         self.runtime = runtime or test_harness_sandbox_runtime
         self.db_factory = db_factory
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    async def _lock_lease_writer(
+        db,
+        *,
+        lease_id: str | None = None,
+        run_id: str | None = None,
+    ) -> TestHarnessSandboxLease | None:
+        """Take a portable writer fence before reading mutable lease state."""
+
+        if (lease_id is None) == (run_id is None):
+            raise ValueError("exactly one sandbox lease identity is required")
+        predicate = (
+            TestHarnessSandboxLease.id == lease_id
+            if lease_id is not None
+            else TestHarnessSandboxLease.run_id == run_id
+        )
+        await db.execute(
+            update(TestHarnessSandboxLease)
+            .where(predicate)
+            .values(id=TestHarnessSandboxLease.id)
+        )
+        return (
+            await db.execute(
+                select(TestHarnessSandboxLease)
+                .where(predicate)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
 
     async def provision(self, run_id: str) -> TestHarnessSandboxLease:
         if _HEX_ID_RE.fullmatch(run_id) is None:
@@ -1900,14 +1937,17 @@ class TestHarnessSandboxManager:
         cleanup_error: str | None,
     ) -> None:
         async with self.db_factory() as db:
-            lease = await db.get(TestHarnessSandboxLease, lease_id)
+            lease = await self._lock_lease_writer(db, lease_id=lease_id)
             if lease is None:
                 return
             lease.status = "failed"
             lease.phase = "failed"
             lease.error = error
-            lease.cleanup_status = "failed" if cleanup_error else "completed"
-            lease.cleanup_error = cleanup_error
+            if lease.cleanup_status == "completed":
+                lease.cleanup_error = None
+            else:
+                lease.cleanup_status = "failed" if cleanup_error else "completed"
+                lease.cleanup_error = cleanup_error
             lease.completed_at = datetime.utcnow()
             await db.commit()
 
@@ -2154,10 +2194,9 @@ class TestHarnessSandboxManager:
     async def cleanup(self, run_id: str) -> TestHarnessSandboxLease | None:
         async with self._lock:
             async with self.db_factory() as db:
-                lease = await db.scalar(
-                    select(TestHarnessSandboxLease).where(
-                        TestHarnessSandboxLease.run_id == run_id
-                    )
+                lease = await self._lock_lease_writer(
+                    db,
+                    run_id=run_id,
                 )
                 if lease is None:
                     return None
@@ -2177,18 +2216,26 @@ class TestHarnessSandboxManager:
                 )
             except BaseException as exc:
                 async with self.db_factory() as db:
-                    lease = await db.get(TestHarnessSandboxLease, lease_id)
-                    if lease is not None:
+                    lease = await self._lock_lease_writer(
+                        db,
+                        lease_id=lease_id,
+                    )
+                    if lease is not None and lease.cleanup_status != "completed":
                         lease.status = "cleanup_failed"
                         lease.phase = "cleanup_failed"
                         lease.cleanup_status = "failed"
                         lease.cleanup_error = (str(exc) or type(exc).__name__)[:4000]
                         await db.commit()
+                    else:
+                        await db.rollback()
                 raise
             async with self.db_factory() as db:
-                lease = await db.get(TestHarnessSandboxLease, lease_id)
+                lease = await self._lock_lease_writer(db, lease_id=lease_id)
                 if lease is None:
                     return None
+                if lease.cleanup_status == "completed":
+                    await db.rollback()
+                    return lease
                 lease.status = "cleaned"
                 lease.phase = "cleaned"
                 lease.cleanup_status = "completed"

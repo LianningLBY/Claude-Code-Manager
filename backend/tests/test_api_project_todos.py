@@ -1,4 +1,5 @@
 """Tests for project todo API endpoints."""
+
 import pytest
 import pytest_asyncio
 from sqlalchemy import func, select
@@ -7,6 +8,14 @@ from backend.models.delivery import DeliveryRun
 from backend.models.project import Project
 from backend.models.project_todo import ProjectTodo
 from backend.models.task import Task
+from backend.tests.group_acl_test_helpers import (
+    grant_group_project_access,
+    revoke_group_membership_at_effect_fence,
+)
+from backend.tests.test_auth_ws_security import (
+    _create_user,
+    secured_client as secured_client,
+)
 
 
 @pytest_asyncio.fixture
@@ -17,6 +26,93 @@ async def project_id(session_factory):
         await session.commit()
         await session.refresh(project)
         return project.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["create", "update", "delete", "task"])
+async def test_todo_effect_reauthorizes_after_project_fence(
+    secured_client,
+    monkeypatch,
+    operation,
+):
+    """A group revocation that wins the final fence vetoes every Todo write."""
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email=f"todo-effect-{operation}@example.com",
+        role="member",
+    )
+    async with session_factory() as session:
+        project = Project(
+            name=f"todo-effect-{operation}",
+            has_remote=False,
+            status="ready",
+        )
+        session.add(project)
+        await session.commit()
+        project_id = project.id
+    await grant_group_project_access(
+        session_factory,
+        project_id=project_id,
+        user_id=member_id,
+    )
+
+    todo_id = None
+    if operation != "create":
+        async with session_factory() as session:
+            todo = ProjectTodo(
+                project_id=project_id,
+                title="authority race",
+                prompt="must remain unchanged",
+                status="open",
+                sort_order=100,
+            )
+            session.add(todo)
+            await session.commit()
+            todo_id = todo.id
+
+    fence = revoke_group_membership_at_effect_fence(monkeypatch)
+    headers = {"Authorization": f"Bearer {member_token}"}
+
+    if operation == "create":
+        response = await client.post(
+            f"/api/projects/{project_id}/todos",
+            headers=headers,
+            json={"title": "denied", "prompt": "must not be created"},
+        )
+    elif operation == "update":
+        response = await client.patch(
+            f"/api/projects/{project_id}/todos/{todo_id}",
+            headers=headers,
+            json={"title": "mutated"},
+        )
+    elif operation == "delete":
+        response = await client.delete(
+            f"/api/projects/{project_id}/todos/{todo_id}",
+            headers=headers,
+        )
+    else:
+        response = await client.post(
+            f"/api/projects/{project_id}/todos/{todo_id}/task",
+            headers=headers,
+            json={"title": "denied", "prompt": "must not materialize"},
+        )
+
+    assert response.status_code == 403, response.text
+    assert fence == {"calls": 1, "revoked": True}
+    async with session_factory() as session:
+        todos = list((await session.execute(
+            select(ProjectTodo).where(ProjectTodo.project_id == project_id)
+        )).scalars())
+        tasks = list((await session.execute(select(Task))).scalars())
+    if operation == "create":
+        assert todos == []
+    else:
+        assert len(todos) == 1
+        assert todos[0].title == "authority race"
+        assert todos[0].status == "open"
+    assert tasks == []
 
 
 @pytest.mark.asyncio

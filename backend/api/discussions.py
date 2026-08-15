@@ -61,30 +61,6 @@ async def _require_discussion_owner(request: Request, discussion: Discussion):
     raise HTTPException(403, "Only the discussion creator or admin can perform this action")
 
 
-async def _can_create_discussion(request: Request, db: AsyncSession) -> bool:
-    """Admin or user with Worker/Project access can create discussions."""
-    role = get_current_user_role(request)
-    if role in ("admin", "super_admin"):
-        return True
-    user_id = get_current_user_id(request)
-    if not user_id:
-        return False
-    from backend.models.worker import Worker
-    from backend.models.team_share import TeamProjectShare
-    has_worker = (await db.execute(
-        select(Worker.id).where(Worker.owner_user_id == user_id).limit(1)
-    )).scalar_one_or_none()
-    if has_worker:
-        return True
-    has_project = (await db.execute(
-        select(TeamProjectShare.id).where(
-            TeamProjectShare.target_type == "user",
-            TeamProjectShare.target_id == user_id,
-        ).limit(1)
-    )).scalar_one_or_none()
-    return has_project is not None
-
-
 @router.get("")
 async def list_discussions(request: Request, db: AsyncSession = Depends(get_db)):
     user_id = get_current_user_id(request)
@@ -117,9 +93,10 @@ async def list_discussions(request: Request, db: AsyncSession = Depends(get_db))
 async def create_discussion(
     data: DiscussionCreate, request: Request, db: AsyncSession = Depends(get_db)
 ):
+    # Discussions launch independent provider workloads.  Worker ownership is
+    # infrastructure allocation, and TeamProjectShare is only a Project ACL;
+    # neither is authority to create this Manager-level workload.
     require_admin(request)
-    if not await _can_create_discussion(request, db):
-        raise HTTPException(403, "You need a Worker or Project access to create Discussions")
     if data.project_id is not None:
         await require_project_access(request, data.project_id, db)
         # Access checks are read-only.  End that snapshot before taking the

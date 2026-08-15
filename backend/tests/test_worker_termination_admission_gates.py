@@ -527,6 +527,11 @@ async def test_lease_takeover_after_queue_abort_blocks_later_plan_stop(
             },
             "manager_handoff": None,
         }
+        # Worker receipt admission deliberately starts from a fresh
+        # transaction. Persist the Worker-local Task before exercising that
+        # boundary; an uncommitted fixture row is correctly discarded by the
+        # admission rollback.
+        await db.commit()
         receipt = await termination.stage_worker_receipt(
             db,
             task_id=task.id,
@@ -1040,6 +1045,10 @@ async def test_active_receipt_blocks_live_injection_before_transport(
         status="executing",
         session_id="receipt-inject-session",
         provider="claude",
+        execution_user_id=None,
+        execution_user_role="super_admin",
+        execution_mode="unrestricted",
+        execution_principal_kind="deployment_token",
     )
     await _persist_receipt(session_factory, task.id)
     instance_manager = MagicMock()
@@ -1291,19 +1300,50 @@ async def test_destroy_coordinator_resumes_terminal_matching_stop_receipt(
 ):
     import backend.api.tasks as tasks_api
     import backend.api.workers as workers_api
+    from backend.services.worker_drain_proof import (
+        worker_node_drain_proof_signature,
+    )
+    from backend.services.worker_provisioner import (
+        worker_create_client_token_digest,
+    )
     from backend.services.worker_proxy import (
         capture_worker_destroy_lifecycle_claim,
+        worker_destroy_provision_spec_digest,
     )
+
+    cloud_scope = {
+        "provider": "aws",
+        "partition": "aws",
+        "account_id": "123456789012",
+        "region": "us-east-1",
+    }
 
     async with session_factory() as db:
         worker = Worker(
             name="claimed receipt destroy",
             status="destroying",
+            cloud_instance_id="i-0123456789abcdef0",
             private_ip="10.0.0.45",
             auth_token="worker-token",
+            destroy_lifecycle_nonce="d" * 32,
         )
         db.add(worker)
         await db.flush()
+        client_token_digest = worker_create_client_token_digest(
+            worker.id,
+            worker.auth_token,
+        )
+        worker.provision_spec = {
+            "version": 1,
+            "name": worker.name,
+            "has_fixed_overrides": False,
+            "overrides": {},
+            "cloud_scope": cloud_scope,
+            "client_token_digest": client_token_digest,
+        }
+        provision_spec_digest = worker_destroy_provision_spec_digest(
+            worker.provision_spec
+        )
         task = Task(
             title="terminal receipt must be resumed",
             description="d",
@@ -1363,8 +1403,77 @@ async def test_destroy_coordinator_resumes_terminal_matching_stop_receipt(
     migrator.migrate.side_effect = detach_after_receipt
     relay = AsyncMock()
     provisioner = AsyncMock()
+    provisioner.require_worker_cloud_identity.return_value = {
+        "cloud_scope": cloud_scope,
+        "client_token_digest": client_token_digest,
+        "provision_spec_digest": provision_spec_digest,
+    }
     monkeypatch.setattr(main_module, "task_migrator", migrator)
     monkeypatch.setattr(main_module, "worker_relay", relay)
+
+    async def begin_clean_drain(_self, claim):
+        return {
+            "protocol_version": 3,
+            "node_role": "worker",
+            "drain_claim": claim.node_drain_claim,
+            "draining": True,
+        }
+
+    async def seal_clean_runtime(_self, claim):
+        return {
+            "protocol_version": 3,
+            "node_role": "worker",
+            "drain_claim": claim.node_drain_claim,
+            "runtime_sealed": True,
+            "safe_to_seal": True,
+            "blockers": [],
+            "blocker_count": 0,
+            "task_count": 0,
+        }
+
+    async def complete_log_backfill(_self, _claim, _task_ids):
+        return None
+
+    async def clean_drain_proof(_self, claim):
+        payload = {
+            "protocol_version": 3,
+            "nonce": "0" * 32,
+            "node_role": "worker",
+            "drain_claim": claim.node_drain_claim,
+            "runtime_sealed": True,
+            "safe_to_destroy": True,
+            "blockers": [],
+            "blocker_count": 0,
+            "task_count": 0,
+        }
+        return {
+            **payload,
+            "signature": worker_node_drain_proof_signature(
+                payload,
+                auth_token=claim.auth_token,
+            ),
+        }
+
+    monkeypatch.setattr(
+        WorkerProxy,
+        "begin_claimed_destroy_drain",
+        begin_clean_drain,
+    )
+    monkeypatch.setattr(
+        WorkerProxy,
+        "seal_claimed_destroy_runtime",
+        seal_clean_runtime,
+    )
+    monkeypatch.setattr(
+        WorkerProxy,
+        "require_claimed_destroy_log_backfill",
+        complete_log_backfill,
+    )
+    monkeypatch.setattr(
+        WorkerProxy,
+        "require_claimed_destroy_drain_proof",
+        clean_drain_proof,
+    )
 
     await workers_api._migrate_back_then_destroy(
         provisioner,
@@ -1376,7 +1485,10 @@ async def test_destroy_coordinator_resumes_terminal_matching_stop_receipt(
     stop_for_destroy.assert_awaited_once()
     migrator.migrate.assert_awaited_once_with(task_id, None)
     relay.stop_worker.assert_awaited_once_with(worker_id)
-    provisioner.destroy_worker.assert_awaited_once_with(worker_id)
+    provisioner.destroy_worker.assert_awaited_once_with(
+        worker_id,
+        destroy_claim=destroy_claim,
+    )
 
 
 def _dispatcher(db_factory) -> GlobalDispatcher:
@@ -1624,27 +1736,49 @@ async def test_pending_worker_target_repo_fill_yields_to_new_manager_receipt(
 
     proxy = AsyncMock()
     monkeypatch.setattr(main_module, "worker_proxy", proxy)
-    factory_calls = 0
+    original_execute = AsyncSession.execute
+    receipt_injected = False
 
-    @asynccontextmanager
-    async def receipt_winning_db_factory():
-        nonlocal factory_calls
-        factory_calls += 1
-        if factory_calls == 5:
+    async def execute_with_receipt_winner(
+        session,
+        statement,
+        *args,
+        **kwargs,
+    ):
+        nonlocal receipt_injected
+        table = getattr(statement, "table", None)
+        value_keys = {
+            getattr(column, "key", None)
+            for column in (getattr(statement, "_values", None) or {})
+        }
+        if (
+            not receipt_injected
+            and getattr(table, "name", None) == "tasks"
+            and "target_repo" in value_keys
+        ):
+            receipt_injected = True
+            # End the dispatcher's Project read snapshot before the independent
+            # receipt writer commits, then execute the already-built exact
+            # target_repo CAS against that durable owner.
+            await session.rollback()
             await _persist_receipt(
                 session_factory,
                 task.id,
                 manager_worker_id=worker.id,
             )
-        async with session_factory() as db:
-            yield db
+        return await original_execute(session, statement, *args, **kwargs)
 
-    dispatcher = _dispatcher(receipt_winning_db_factory)
+    dispatcher = _dispatcher(session_factory)
 
-    await dispatcher._dispatch_worker_tasks()
+    with patch.object(
+        AsyncSession,
+        "execute",
+        new=execute_with_receipt_winner,
+    ):
+        await dispatcher._dispatch_worker_tasks()
     await asyncio.sleep(0)
 
-    assert factory_calls >= 5
+    assert receipt_injected is True
     async with session_factory() as db:
         current = await db.get(Task, task.id)
         receipt = await termination.active_worker_task_termination_receipt(
@@ -1862,6 +1996,10 @@ async def _seed_exact_admitted_turn(session_factory) -> tuple[int, int, int]:
             description="d",
             status="executing",
             session_id="receipt-recovery-session",
+            execution_user_id=None,
+            execution_user_role="member",
+            execution_mode="sandbox",
+            execution_principal_kind="system",
             retry_count=0,
             turn_generation=1,
             instance_id=instance.id,
@@ -1879,6 +2017,10 @@ async def _seed_exact_admitted_turn(session_factory) -> tuple[int, int, int]:
             role="user",
             content="exact queued request",
             is_error=False,
+            raw_json=(
+                '{"execution_principal":{"user_id":null,'
+                '"role":"member","mode":"sandbox","kind":"system"}}'
+            ),
         )
         db.add(source)
         await db.flush()

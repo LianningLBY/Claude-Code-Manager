@@ -347,11 +347,25 @@ async def test_public_task_create_cannot_clone_delivery_session(
 
 
 @pytest.mark.asyncio
-async def test_migration_import_rejects_incoming_delivery_mode(client):
+async def test_migration_import_rejects_incoming_delivery_mode(
+    client,
+    monkeypatch,
+    worker_control_plane_auth,
+):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
     response = await client.post(
         "/api/tasks/migration-import",
         json={
             "id": 987601,
+            "source_incarnation_id": "a" * 32,
+            "migration_operation_id": "b" * 32,
+            "migration_operation_sequence": 1,
+            "execution_user_id": None,
+            "execution_user_role": "member",
+            "execution_mode": "sandbox",
+            "execution_principal_kind": "system",
             "description": "forged delivery import",
             "mode": "delivery_loop",
             "source_status": "cancelled",
@@ -366,13 +380,27 @@ async def test_migration_import_rejects_incoming_delivery_mode(client):
 async def test_migration_import_cannot_replace_existing_delivery_task(
     client,
     session_factory,
+    monkeypatch,
+    worker_control_plane_auth,
 ):
+    from backend.config import settings
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
     task_id = await _delivery_task(session_factory)
+    async with session_factory() as db:
+        source_incarnation_id = (await db.get(Task, task_id)).incarnation_id
 
     response = await client.post(
         "/api/tasks/migration-import",
         json={
             "id": task_id,
+            "source_incarnation_id": source_incarnation_id,
+            "migration_operation_id": "c" * 32,
+            "migration_operation_sequence": 1,
+            "execution_user_id": None,
+            "execution_user_role": "member",
+            "execution_mode": "sandbox",
+            "execution_principal_kind": "system",
             "description": "replace controller task",
             "mode": "auto",
             "source_status": "cancelled",

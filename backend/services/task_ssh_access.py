@@ -364,24 +364,16 @@ async def task_ssh_sharing_invalid_reason(
 ) -> str | None:
     """Return the first sharing boundary that makes Task SSH unsafe.
 
-    Team shares can let another user steer the same local Task, while outbound
-    shares expose a remote chat capability. Project shares are included because
-    new/current Tasks can be shared through that broader scope.
+    Only legacy outbound federation shares cross the CCM trust boundary.
+    Team shares are local ACL rows; the current caller role and exact Task SSH
+    grant remain the authorization boundary for those turns.
     """
 
     from backend.models.task_share import ProjectShare, TaskShare
-    from backend.models.team_share import TeamProjectShare, TeamTaskShare
 
     checks = []
     if task_id is not None:
-        checks.extend((
-            (
-                "team_task_shared",
-                select(TeamTaskShare.id)
-                .where(TeamTaskShare.task_id == task_id)
-                .limit(1),
-            ),
-            (
+        checks.extend(((
                 "task_shared_outbound",
                 select(TaskShare.id)
                 .where(
@@ -389,17 +381,9 @@ async def task_ssh_sharing_invalid_reason(
                     TaskShare.status == "active",
                 )
                 .limit(1),
-            ),
-        ))
+            ),))
     if project_id is not None:
-        checks.extend((
-            (
-                "team_project_shared",
-                select(TeamProjectShare.id)
-                .where(TeamProjectShare.project_id == project_id)
-                .limit(1),
-            ),
-            (
+        checks.extend(((
                 "project_shared_outbound",
                 select(ProjectShare.id)
                 .where(
@@ -407,8 +391,7 @@ async def task_ssh_sharing_invalid_reason(
                     ProjectShare.status == "active",
                 )
                 .limit(1),
-            ),
-        ))
+            ),))
     for reason, query in checks:
         if await db.scalar(query) is not None:
             return reason

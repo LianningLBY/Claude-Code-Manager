@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import stat
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -48,20 +49,81 @@ from backend.services.ssh_executor import SSHExecutor, worker_known_hosts_path
 from backend.services.task_artifact_contract import (
     TASK_ARTIFACT_SCOPE_VERSION,
 )
-from backend.services.worker_relay import worker_task_generation
+from backend.services.task_creation import (
+    SOURCE_TASK_INCARNATION_METADATA_KEY,
+    delegated_task_execution_principal_values,
+)
+from backend.services.task_id_namespace import (
+    TASK_ID_NAMESPACE_PROTOCOL,
+    TaskIdNamespaceProtocolError,
+    validate_manager_allocated_task_id,
+    validate_worker_task_id_namespace_config,
+)
+from backend.services.upload_references import is_managed_upload_basename
+from backend.services.cloud_provider import canonical_cloud_termination_scope
+from backend.services.worker_relay import (
+    WORKER_MANUAL_RETRY_PROTOCOL,
+    mark_worker_task_materialized,
+    worker_manual_retry_is_prepared,
+    worker_manual_retry_receipt,
+    worker_task_generation,
+)
+from backend.services.worker_launch_admission import (
+    WORKER_DELEGATED_LAUNCH_ADMISSION_PROTOCOL,
+)
+from backend.services.worker_routing_config import (
+    WORKER_MIGRATION_IMPORT_PROTOCOL,
+)
+from backend.services.worker_drain_proof import (
+    WORKER_NODE_DRAIN_PROOF_PROTOCOL,
+    verify_worker_node_drain_proof_signature,
+)
 from backend.services.worker_task_termination import (
+    WORKER_DESTROY_DRAIN_CLAIM_HEADER,
+    WORKER_DESTROY_TASK_INCARCATION_HEADER,
+    WORKER_DESTROY_TASK_RETRY_HEADER,
+    WORKER_DESTROY_TASK_TURN_HEADER,
     active_worker_task_termination_receipt,
     no_active_worker_task_termination_predicate,
+)
+from backend.services.worker_plan_decision import (
+    worker_plan_decision_gate_receipt,
+    worker_plan_decision_is_prepared,
+    worker_plan_decision_request_matches,
 )
 
 logger = logging.getLogger(__name__)
 
 
 _WORKER_DESTROY_CLAIM_SEAL = object()
+WORKER_DESTROY_TERMINATION_RECEIPT_VERSION = 2
+WORKER_DESTROY_TERMINATION_ACTION = "terminate_instance"
+
+
+def worker_managed_upload_paths(paths: list[str]) -> list[str]:
+    """Map validated Manager uploads into the Worker's own upload root."""
+
+    remote_root = os.path.normpath(
+        os.path.join(settings.worker_remote_dir, "uploads")
+    )
+    if not os.path.isabs(remote_root):
+        raise RuntimeError("Worker remote upload root must be absolute")
+    mapped: list[str] = []
+    for path in paths:
+        basename = os.path.basename(path)
+        if not is_managed_upload_basename(basename):
+            raise RuntimeError("Worker attachment is not a CCM-managed upload")
+        remote_path = os.path.normpath(os.path.join(remote_root, basename))
+        if os.path.dirname(remote_path) != remote_root:
+            raise RuntimeError("Worker attachment escaped its upload root")
+        mapped.append(remote_path)
+    return mapped
 
 
 WORKER_PLAN_RECONCILIATION_PROTOCOL = 1
 WORKER_PLAN_EXACT_CANCEL_PROTOCOL = 1
+WORKER_DELEGATED_PRINCIPAL_PROTOCOL = 1
+WORKER_INITIAL_GENERATION_PROTOCOL = 1
 
 
 class WorkerPlanRemoteAbsent(RuntimeError):
@@ -93,11 +155,349 @@ class WorkerDestroyLifecycleClaim:
     _seal: object = field(repr=False, compare=False)
     worker_id: int
     created_at: datetime | None
-    updated_at: datetime | None
+    destroy_lifecycle_nonce: str
     cloud_instance_id: str | None
     private_ip: str | None
     ccm_port: int
+    node_drain_claim: str
     auth_token: str | None = field(repr=False)
+
+
+def _worker_node_drain_claim(worker: Worker) -> str:
+    """Derive one stable claim for retries of this exact cloud Worker row."""
+
+    identity = json.dumps(
+        {
+            "protocol": WORKER_NODE_DRAIN_PROOF_PROTOCOL,
+            "worker_id": worker.id,
+            "created_at": (
+                worker.created_at.isoformat() if worker.created_at else None
+            ),
+            "cloud_instance_id": worker.cloud_instance_id,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(b"ccm-worker-node-drain\0" + identity).hexdigest()
+
+
+def _canonical_destroy_receipt_payload(payload: dict) -> bytes:
+    return json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def _valid_lower_hex(value: object, length: int) -> bool:
+    return bool(
+        type(value) is str
+        and len(value) == length
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
+def _valid_nonempty_text(value: object) -> bool:
+    return bool(
+        type(value) is str
+        and value
+        and value == value.strip()
+    )
+
+
+def worker_destroy_provision_spec_digest(provision_spec: object) -> str:
+    """Digest one exact JSON-safe RunInstances request journal."""
+
+    if type(provision_spec) is not dict:
+        raise ValueError("Worker destroy provision spec must be a JSON object")
+    try:
+        encoded = _canonical_destroy_receipt_payload(provision_spec)
+        detached = json.loads(encoded)
+    except (TypeError, ValueError, UnicodeError, OverflowError) as exc:
+        raise ValueError(
+            "Worker destroy provision spec is not canonical JSON"
+        ) from exc
+    if detached != provision_spec:
+        raise ValueError(
+            "Worker destroy provision spec changes during JSON serialization"
+        )
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def worker_destroy_client_token_digest(client_token: object) -> str:
+    """Hash the EC2 idempotency token without persisting that token itself."""
+
+    if not _valid_nonempty_text(client_token):
+        raise ValueError("Worker destroy ClientToken is missing or invalid")
+    return hashlib.sha256(client_token.encode("utf-8")).hexdigest()
+
+
+def _validated_signed_destroy_proof_copy(
+    proof: object,
+    *,
+    drain_claim: str,
+    auth_token: str,
+    require_clean: bool,
+) -> tuple[dict, str]:
+    """Return a detached payload/signature after exact HMAC validation."""
+
+    payload_keys = {
+        "protocol_version",
+        "nonce",
+        "node_role",
+        "drain_claim",
+        "runtime_sealed",
+        "safe_to_destroy",
+        "blockers",
+        "blocker_count",
+        "task_count",
+    }
+    expected_keys = payload_keys | {"signature"}
+    if (
+        type(proof) is not dict
+        or set(proof) != expected_keys
+        or not _valid_nonempty_text(auth_token)
+        or not _valid_lower_hex(drain_claim, 64)
+    ):
+        raise ValueError(
+            "Worker destroy termination proof envelope is invalid"
+        )
+    payload = dict(proof)
+    signature = payload.pop("signature")
+    blockers = payload.get("blockers")
+    if (
+        type(payload.get("protocol_version")) is not int
+        or payload["protocol_version"] != WORKER_NODE_DRAIN_PROOF_PROTOCOL
+        or not _valid_lower_hex(payload.get("nonce"), 32)
+        or payload.get("node_role") != "worker"
+        or payload.get("drain_claim") != drain_claim
+        or payload.get("runtime_sealed") is not True
+        or type(payload.get("safe_to_destroy")) is not bool
+        or type(blockers) is not list
+        or type(payload.get("blocker_count")) is not int
+        or payload["blocker_count"] < 0
+        # The Worker deliberately caps the serialized blocker details while
+        # preserving the full count, so only the impossible inverse is bad.
+        or payload["blocker_count"] < len(blockers)
+        or type(payload.get("task_count")) is not int
+        or payload["task_count"] < 0
+        or not _valid_lower_hex(signature, 64)
+        or not verify_worker_node_drain_proof_signature(
+            payload,
+            auth_token=auth_token,
+            signature=signature,
+        )
+        or (
+            require_clean
+            and (
+                payload["safe_to_destroy"] is not True
+                or blockers != []
+                or payload["blocker_count"] != 0
+            )
+        )
+    ):
+        raise ValueError(
+            "Worker destroy termination proof is not a valid signed snapshot"
+        )
+    try:
+        detached = json.loads(_canonical_destroy_receipt_payload(payload))
+    except (TypeError, ValueError, UnicodeError, OverflowError) as exc:
+        raise ValueError(
+            "Worker destroy termination proof is not canonical JSON"
+        ) from exc
+    if detached != payload:
+        raise ValueError(
+            "Worker destroy termination proof changes during JSON serialization"
+        )
+    return detached, signature
+
+
+def build_worker_destroy_termination_receipt(
+    claim: WorkerDestroyLifecycleClaim,
+    signed_proof: object,
+    *,
+    cloud_scope: object,
+    provision_spec_digest: str,
+    client_token_digest: str,
+    authorized_at: datetime | None = None,
+) -> dict:
+    """Bind final signed drain evidence to one exact cloud destroy lifecycle."""
+
+    if (
+        not isinstance(claim, WorkerDestroyLifecycleClaim)
+        or claim._seal is not _WORKER_DESTROY_CLAIM_SEAL
+        or type(claim.worker_id) is not int
+        or claim.worker_id <= 0
+        or not _valid_lower_hex(claim.destroy_lifecycle_nonce, 32)
+        or not _valid_lower_hex(claim.node_drain_claim, 64)
+        or not _valid_nonempty_text(claim.cloud_instance_id)
+        or not _valid_nonempty_text(claim.private_ip)
+        or not _valid_nonempty_text(claim.auth_token)
+        or type(claim.ccm_port) is not int
+        or claim.ccm_port < 1
+        or claim.ccm_port > 65535
+    ):
+        raise ValueError("Worker destroy lifecycle claim is invalid")
+    try:
+        clean_scope = canonical_cloud_termination_scope(cloud_scope)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Worker destroy cloud scope is invalid") from exc
+    if (
+        not _valid_lower_hex(provision_spec_digest, 64)
+        or not _valid_lower_hex(client_token_digest, 64)
+    ):
+        raise ValueError("Worker destroy cloud identity digests are invalid")
+    clean_proof, proof_signature = _validated_signed_destroy_proof_copy(
+        signed_proof,
+        drain_claim=claim.node_drain_claim,
+        auth_token=claim.auth_token,
+        require_clean=True,
+    )
+    stamp = authorized_at or datetime.utcnow()
+    if (
+        not isinstance(stamp, datetime)
+        or stamp.tzinfo is not None
+        or stamp.year < 2000
+    ):
+        raise ValueError("Worker destroy authorization timestamp is invalid")
+    payload = {
+        "version": WORKER_DESTROY_TERMINATION_RECEIPT_VERSION,
+        "action": WORKER_DESTROY_TERMINATION_ACTION,
+        "worker_id": claim.worker_id,
+        "destroy_lifecycle_nonce": claim.destroy_lifecycle_nonce,
+        "cloud_instance_id": claim.cloud_instance_id,
+        "private_ip": claim.private_ip,
+        "node_drain_claim": claim.node_drain_claim,
+        "cloud_scope": clean_scope,
+        "provision_spec_digest": provision_spec_digest,
+        "client_token_digest": client_token_digest,
+        "authorized_at": stamp.isoformat(timespec="microseconds"),
+        "proof": clean_proof,
+        "proof_signature": proof_signature,
+    }
+    payload["receipt_digest"] = hashlib.sha256(
+        _canonical_destroy_receipt_payload(payload)
+    ).hexdigest()
+    return payload
+
+
+def worker_destroy_termination_receipt_matches(
+    worker: Worker,
+    *,
+    cloud_scope: object,
+    client_token_digest: str,
+) -> bool:
+    """Validate restart authority without trusting a dead remote Worker."""
+
+    receipt = worker.destroy_termination_receipt
+    expected_keys = {
+        "version",
+        "action",
+        "worker_id",
+        "destroy_lifecycle_nonce",
+        "cloud_instance_id",
+        "private_ip",
+        "node_drain_claim",
+        "cloud_scope",
+        "provision_spec_digest",
+        "client_token_digest",
+        "authorized_at",
+        "proof",
+        "proof_signature",
+        "receipt_digest",
+    }
+    valid_status = worker.status == "destroying" or (
+        worker.status in {"ready", "error"}
+        and worker.bootstrap_step == "destroy"
+    )
+    try:
+        expected_scope = canonical_cloud_termination_scope(cloud_scope)
+        expected_provision_spec_digest = (
+            worker_destroy_provision_spec_digest(worker.provision_spec)
+        )
+        provision_scope = canonical_cloud_termination_scope(
+            worker.provision_spec.get("cloud_scope")
+        )
+        provision_client_token_digest = worker.provision_spec.get(
+            "client_token_digest"
+        )
+    except (TypeError, ValueError, UnicodeError, OverflowError):
+        return False
+    if (
+        not valid_status
+        or type(worker.id) is not int
+        or worker.id <= 0
+        or not _valid_lower_hex(worker.destroy_lifecycle_nonce, 32)
+        or not _valid_nonempty_text(worker.cloud_instance_id)
+        or not _valid_nonempty_text(worker.private_ip)
+        or not _valid_nonempty_text(worker.auth_token)
+        or not _valid_lower_hex(client_token_digest, 64)
+        or provision_scope != expected_scope
+        or not _valid_lower_hex(provision_client_token_digest, 64)
+        or not secrets.compare_digest(
+            provision_client_token_digest,
+            client_token_digest,
+        )
+        or type(receipt) is not dict
+        or set(receipt) != expected_keys
+        or type(receipt.get("version")) is not int
+        or receipt["version"] != WORKER_DESTROY_TERMINATION_RECEIPT_VERSION
+        or receipt.get("action") != WORKER_DESTROY_TERMINATION_ACTION
+        or type(receipt.get("worker_id")) is not int
+        or receipt["worker_id"] != worker.id
+        or receipt.get("destroy_lifecycle_nonce")
+        != worker.destroy_lifecycle_nonce
+        or receipt.get("cloud_instance_id") != worker.cloud_instance_id
+        or receipt.get("private_ip") != worker.private_ip
+        or receipt.get("node_drain_claim") != _worker_node_drain_claim(worker)
+        or receipt.get("cloud_scope") != expected_scope
+        or receipt.get("provision_spec_digest")
+        != expected_provision_spec_digest
+        or receipt.get("client_token_digest") != client_token_digest
+        or not _valid_lower_hex(receipt.get("provision_spec_digest"), 64)
+        or not _valid_lower_hex(receipt.get("client_token_digest"), 64)
+        or not _valid_lower_hex(receipt.get("proof_signature"), 64)
+        or not _valid_lower_hex(receipt.get("receipt_digest"), 64)
+    ):
+        return False
+    try:
+        if canonical_cloud_termination_scope(receipt["cloud_scope"]) != receipt[
+            "cloud_scope"
+        ]:
+            return False
+        if type(receipt["authorized_at"]) is not str:
+            return False
+        authorized_at = datetime.fromisoformat(receipt["authorized_at"])
+        if (
+            authorized_at.tzinfo is not None
+            or authorized_at.year < 2000
+            or authorized_at.isoformat(timespec="microseconds")
+            != receipt["authorized_at"]
+        ):
+            return False
+        signed_proof = dict(receipt["proof"])
+        signed_proof["signature"] = receipt["proof_signature"]
+        proof, proof_signature = _validated_signed_destroy_proof_copy(
+            signed_proof,
+            drain_claim=receipt["node_drain_claim"],
+            auth_token=worker.auth_token,
+            require_clean=True,
+        )
+        if (
+            proof != receipt["proof"]
+            or proof_signature != receipt["proof_signature"]
+        ):
+            return False
+        unsigned = dict(receipt)
+        digest = unsigned.pop("receipt_digest")
+        expected_digest = hashlib.sha256(
+            _canonical_destroy_receipt_payload(unsigned)
+        ).hexdigest()
+    except (KeyError, TypeError, ValueError, UnicodeError, OverflowError):
+        return False
+    return secrets.compare_digest(digest, expected_digest)
 
 
 def capture_worker_destroy_lifecycle_claim(
@@ -107,14 +507,22 @@ def capture_worker_destroy_lifecycle_claim(
 
     if worker.status != "destroying":
         raise ValueError("Worker destroy claim requires destroying status")
+    nonce = worker.destroy_lifecycle_nonce
+    if (
+        not isinstance(nonce, str)
+        or len(nonce) != 32
+        or any(char not in "0123456789abcdef" for char in nonce)
+    ):
+        raise ValueError("Worker destroy lifecycle nonce is missing or invalid")
     return WorkerDestroyLifecycleClaim(
         _seal=_WORKER_DESTROY_CLAIM_SEAL,
         worker_id=worker.id,
         created_at=worker.created_at,
-        updated_at=worker.updated_at,
+        destroy_lifecycle_nonce=nonce,
         cloud_instance_id=worker.cloud_instance_id,
         private_ip=worker.private_ip,
         ccm_port=worker.ccm_port,
+        node_drain_claim=_worker_node_drain_claim(worker),
         auth_token=worker.auth_token,
     )
 
@@ -137,11 +545,7 @@ def _worker_destroy_lifecycle_predicates(
             if claim.created_at is None
             else Worker.created_at == claim.created_at
         ),
-        (
-            Worker.updated_at.is_(None)
-            if claim.updated_at is None
-            else Worker.updated_at == claim.updated_at
-        ),
+        Worker.destroy_lifecycle_nonce == claim.destroy_lifecycle_nonce,
         (
             Worker.cloud_instance_id.is_(None)
             if claim.cloud_instance_id is None
@@ -291,10 +695,11 @@ class WorkerProxy:
         worker = await self.get_worker(worker_id)
         if not worker:
             raise HTTPException(404, f"Worker {worker_id} 不存在")
-        if worker.status != "ready":
+        if worker.status != "ready" or worker.bootstrap_step is not None:
             raise HTTPException(
                 503,
-                f"Worker {worker.name} 当前状态 {worker.status}，无法执行操作。"
+                f"Worker {worker.name} 当前状态 {worker.status}"
+                f"/{worker.bootstrap_step or 'normal'}，无法执行操作。"
                 "请等待 Worker 恢复或将 task 切回本机执行。",
             )
         return worker
@@ -314,9 +719,9 @@ class WorkerProxy:
                 )
             ).scalar_one_or_none()
         # Keep the internal credential out of SQL parameters: driver errors are
-        # routinely logged and may render bound values. ``updated_at`` already
-        # fences every supported credential mutation; compare the token again
-        # in memory before it can authorize a request.
+        # routinely logged and may render bound values. Endpoint identity plus
+        # the dedicated destroy nonce fences lifecycle replacement; compare the
+        # credential again in memory before it can authorize a request.
         if worker is None or worker.auth_token != claim.auth_token:
             raise HTTPException(
                 409,
@@ -324,6 +729,234 @@ class WorkerProxy:
                 "remote Task mutation was refused",
             )
         return worker
+
+    async def require_claimed_destroy_drain_proof(
+        self,
+        claim: WorkerDestroyLifecycleClaim,
+    ) -> dict:
+        """Require a fresh authenticated proof that the remote node is idle."""
+
+        worker = await self._require_destroy_lifecycle_claim(claim)
+        self._require_authenticated_control_plane(worker)
+        nonce = secrets.token_hex(16)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    self._api(worker, "/api/system/worker-drain-proof"),
+                    headers=self._headers(worker),
+                    json={
+                        "protocol_version": WORKER_NODE_DRAIN_PROOF_PROTOCOL,
+                        "nonce": nonce,
+                        "drain_claim": claim.node_drain_claim,
+                    },
+                )
+                response.raise_for_status()
+            remote = response.json()
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                "Unable to obtain the authenticated Worker node drain proof",
+            ) from exc
+        try:
+            proof, signature = _validated_signed_destroy_proof_copy(
+                remote,
+                drain_claim=claim.node_drain_claim,
+                auth_token=claim.auth_token or "",
+                require_clean=False,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                409,
+                "Worker node drain proof failed identity/signature validation",
+            ) from exc
+        if proof["nonce"] != nonce:
+            raise HTTPException(
+                409,
+                "Worker node drain proof failed nonce validation",
+            )
+        if not proof["safe_to_destroy"] or proof["blocker_count"] != 0:
+            descriptions = []
+            for blocker in proof["blockers"][:20]:
+                if isinstance(blocker, dict):
+                    descriptions.append(
+                        f"{blocker.get('kind')}:{blocker.get('id')} "
+                        f"({blocker.get('detail')})"
+                    )
+            detail = "; ".join(descriptions) or "unknown durable blocker"
+            raise HTTPException(
+                409,
+                "Worker node drain proof refused cloud termination: " + detail,
+            )
+        return {**proof, "signature": signature}
+
+    async def require_claimed_destroy_log_backfill(
+        self,
+        claim: WorkerDestroyLifecycleClaim,
+        task_ids: set[int],
+    ) -> None:
+        """Prove every stopped Worker mirror's current log tail is local.
+
+        Live relay delivery is not durable acknowledgement: the socket may
+        disconnect after the Worker commits its final assistant/tool rows.
+        The relay's history backfill validates the exact Manager generation,
+        imports the complete current-generation non-user tail under the Task
+        writer fence, and returns an id only after that transaction commits.
+        Cloud destruction therefore requires exact set equality here.
+        """
+
+        expected: set[int] = set()
+        for task_id in task_ids:
+            try:
+                expected.add(validate_manager_allocated_task_id(task_id))
+            except Exception as exc:
+                raise HTTPException(
+                    409,
+                    "Worker destroy log backfill received an invalid Task id",
+                ) from exc
+        if not expected:
+            return
+        worker = await self._require_destroy_lifecycle_claim(claim)
+        if self.relay is None or not hasattr(
+            self.relay,
+            "_backfill_missing_logs",
+        ):
+            raise HTTPException(
+                503,
+                "Worker relay is unavailable for exact log backfill",
+            )
+        try:
+            synced = await self.relay._backfill_missing_logs(
+                worker,
+                expected,
+                sync_status=True,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                "Worker exact-generation log backfill failed",
+            ) from exc
+        if not isinstance(synced, set) or synced != expected:
+            observed = synced if isinstance(synced, set) else set()
+            missing = sorted(expected - observed)
+            raise HTTPException(
+                409,
+                "Worker exact-generation log backfill is incomplete for "
+                "Task(s): " + ", ".join(str(task_id) for task_id in missing),
+            )
+
+    async def begin_claimed_destroy_drain(
+        self,
+        claim: WorkerDestroyLifecycleClaim,
+    ) -> dict:
+        """Install the Worker's irreversible mutation-admission fence."""
+
+        worker = await self._require_destroy_lifecycle_claim(claim)
+        self._require_authenticated_control_plane(worker)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    self._api(worker, "/api/system/worker-drain/begin"),
+                    headers=self._headers(worker),
+                    json={
+                        "protocol_version": WORKER_NODE_DRAIN_PROOF_PROTOCOL,
+                        "drain_claim": claim.node_drain_claim,
+                    },
+                )
+                response.raise_for_status()
+            remote = response.json()
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                "Unable to install the authenticated Worker node drain fence",
+            ) from exc
+        if not isinstance(remote, dict):
+            raise HTTPException(409, "Worker node drain response is malformed")
+        signed = dict(remote)
+        signature = signed.pop("signature", None)
+        if (
+            signed.get("protocol_version")
+            != WORKER_NODE_DRAIN_PROOF_PROTOCOL
+            or signed.get("node_role") != "worker"
+            or signed.get("drain_claim") != claim.node_drain_claim
+            or signed.get("draining") is not True
+            or not verify_worker_node_drain_proof_signature(
+                signed,
+                auth_token=claim.auth_token or "",
+                signature=signature,
+            )
+        ):
+            raise HTTPException(
+                409,
+                "Worker node drain response failed identity/signature validation",
+            )
+        return remote
+
+    async def seal_claimed_destroy_runtime(
+        self,
+        claim: WorkerDestroyLifecycleClaim,
+    ) -> dict:
+        """Drain callbacks and install the exact phase-two runtime seal."""
+
+        worker = await self._require_destroy_lifecycle_claim(claim)
+        self._require_authenticated_control_plane(worker)
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(
+                    self._api(worker, "/api/system/worker-drain/seal"),
+                    headers=self._headers(worker),
+                    json={
+                        "protocol_version": WORKER_NODE_DRAIN_PROOF_PROTOCOL,
+                        "drain_claim": claim.node_drain_claim,
+                    },
+                )
+                response.raise_for_status()
+            remote = response.json()
+        except Exception as exc:
+            raise HTTPException(
+                503,
+                "Unable to install the authenticated Worker runtime seal",
+            ) from exc
+        if not isinstance(remote, dict):
+            raise HTTPException(409, "Worker runtime seal response is malformed")
+        signed = dict(remote)
+        signature = signed.pop("signature", None)
+        if (
+            signed.get("protocol_version")
+            != WORKER_NODE_DRAIN_PROOF_PROTOCOL
+            or signed.get("node_role") != "worker"
+            or signed.get("drain_claim") != claim.node_drain_claim
+            or type(signed.get("runtime_sealed")) is not bool
+            or type(signed.get("safe_to_seal")) is not bool
+            or not isinstance(signed.get("blockers"), list)
+            or type(signed.get("blocker_count")) is not int
+            or not verify_worker_node_drain_proof_signature(
+                signed,
+                auth_token=claim.auth_token or "",
+                signature=signature,
+            )
+        ):
+            raise HTTPException(
+                409,
+                "Worker runtime seal response failed identity/signature validation",
+            )
+        if (
+            signed["runtime_sealed"] is not True
+            or signed["safe_to_seal"] is not True
+            or signed["blocker_count"] != 0
+        ):
+            descriptions = []
+            for blocker in signed["blockers"][:20]:
+                if isinstance(blocker, dict):
+                    descriptions.append(
+                        f"{blocker.get('kind')}:{blocker.get('id')} "
+                        f"({blocker.get('detail')})"
+                    )
+            detail = "; ".join(descriptions) or "unknown runtime blocker"
+            raise HTTPException(
+                409,
+                "Worker runtime seal refused log backfill: " + detail,
+            )
+        return remote
 
     async def _require_versioned_plan_protocol(self, worker: Worker) -> None:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -576,14 +1209,17 @@ class WorkerProxy:
         worker: Worker,
         task_id: int,
         handoff_id: str,
+        incarnation_id: str,
     ) -> dict | None:
+        headers = self._headers(worker)
+        headers["X-CCM-Task-Incarnation"] = incarnation_id
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.get(
                 self._api(
                     worker,
                     f"/api/tasks/{task_id}/worker-turn-handoffs/{handoff_id}",
                 ),
-                headers=self._headers(worker),
+                headers=headers,
             )
         if response.status_code == 404:
             return None
@@ -593,6 +1229,7 @@ class WorkerProxy:
             not isinstance(payload, dict)
             or payload.get("handoff_id") != handoff_id
             or payload.get("task_id") != task_id
+            or payload.get("incarnation_id") != incarnation_id
         ):
             raise RuntimeError(
                 "Worker returned an invalid turn handoff receipt"
@@ -604,7 +1241,10 @@ class WorkerProxy:
         worker: Worker,
         task_id: int,
         handoff_id: str,
+        incarnation_id: str,
     ) -> dict:
+        headers = self._headers(worker)
+        headers["X-CCM-Task-Incarnation"] = incarnation_id
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(
                 self._api(
@@ -612,7 +1252,7 @@ class WorkerProxy:
                     f"/api/tasks/{task_id}/worker-turn-handoffs/"
                     f"{handoff_id}/resume",
                 ),
-                headers=self._headers(worker),
+                headers=headers,
             )
         response.raise_for_status()
         payload = response.json()
@@ -620,6 +1260,7 @@ class WorkerProxy:
             not isinstance(payload, dict)
             or payload.get("handoff_id") != handoff_id
             or payload.get("task_id") != task_id
+            or payload.get("incarnation_id") != incarnation_id
         ):
             raise RuntimeError(
                 "Worker returned an invalid turn handoff resume receipt"
@@ -657,12 +1298,24 @@ class WorkerProxy:
         return payload
 
     @staticmethod
-    def _attachment_manifest(paths: list[str]) -> list[dict]:
+    def _attachment_manifest(
+        paths: list[str],
+        *,
+        receipt_paths: list[str] | None = None,
+    ) -> list[dict]:
+        """Hash local files while naming their Worker-side upload paths."""
+
+        reported_paths = paths if receipt_paths is None else receipt_paths
+        if len(reported_paths) != len(paths):
+            raise RuntimeError("Plan attachment receipt paths do not match uploads")
         manifest = []
-        for path in paths:
+        for path, receipt_path in zip(paths, reported_paths, strict=True):
             absolute = os.path.abspath(path)
             if path != absolute:
                 raise RuntimeError("Plan attachment path must be absolute")
+            absolute_receipt = os.path.abspath(receipt_path)
+            if receipt_path != absolute_receipt:
+                raise RuntimeError("Plan attachment receipt path must be absolute")
             flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
             flags |= getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(absolute, flags)
@@ -678,7 +1331,7 @@ class WorkerProxy:
                     size += len(chunk)
                     digest.update(chunk)
             manifest.append({
-                "path": absolute,
+                "path": absolute_receipt,
                 "size": size,
                 "sha256": digest.hexdigest(),
             })
@@ -774,11 +1427,7 @@ class WorkerProxy:
             run.attachments
         )
         paths = list(dict.fromkeys([*plan_paths, *run_paths]))
-        image_paths = [
-            path
-            for path in paths
-            if path in {*plan_images, *run_images}
-        ]
+        image_path_set = {*plan_images, *run_images}
         attachment_by_path = {
             path: attachment
             for path, attachment in [
@@ -787,9 +1436,23 @@ class WorkerProxy:
             ]
         }
         attachments = [attachment_by_path[path] for path in paths]
-        attachment_manifest = self._attachment_manifest(paths)
+        remote_paths = worker_managed_upload_paths(paths)
+        remote_image_paths = [
+            remote_path
+            for path, remote_path in zip(paths, remote_paths, strict=True)
+            if path in image_path_set
+        ]
         if paths:
-            await self.push_files(worker, paths)
+            await self.push_files(worker, paths, remote_paths=remote_paths)
+        # ``push_files`` re-proves every persisted source against the current
+        # Manager upload root before the first cross-host effect.  Hash only
+        # after that proof so a corrupted Plan row cannot make the manifest
+        # builder open an arbitrary Manager file even though the later copy
+        # would have failed closed.
+        attachment_manifest = self._attachment_manifest(
+            paths,
+            receipt_paths=remote_paths,
+        )
 
         base_version = None
         if run.base_version_id is not None:
@@ -833,8 +1496,8 @@ class WorkerProxy:
             "repo_revision": run.repo_revision,
             "max_interactions": run.max_interactions,
             "base_version": base_seed,
-            "file_paths": paths or None,
-            "image_paths": image_paths or None,
+            "file_paths": remote_paths or None,
+            "image_paths": remote_image_paths or None,
             "attachments": attachments or None,
             "attachment_manifest": attachment_manifest or None,
         }
@@ -911,9 +1574,27 @@ class WorkerProxy:
                 answer_paths, answer_images, answer_attachments = (
                     self._plan_attachment_payload(answer.attachments)
                 )
+                remote_answer_paths = worker_managed_upload_paths(answer_paths)
+                answer_image_set = set(answer_images)
+                remote_answer_images = [
+                    remote_path
+                    for path, remote_path in zip(
+                        answer_paths,
+                        remote_answer_paths,
+                        strict=True,
+                    )
+                    if path in answer_image_set
+                ]
                 if answer_paths:
-                    await self.push_files(worker, answer_paths)
-                answer_manifest = self._attachment_manifest(answer_paths)
+                    await self.push_files(
+                        worker,
+                        answer_paths,
+                        remote_paths=remote_answer_paths,
+                    )
+                answer_manifest = self._attachment_manifest(
+                    answer_paths,
+                    receipt_paths=remote_answer_paths,
+                )
                 async with httpx.AsyncClient(timeout=30) as client:
                     response = await client.post(
                         self._api(
@@ -926,8 +1607,8 @@ class WorkerProxy:
                             "idempotency_key": answer.answer_idempotency_key,
                             "answers": answer.answers or [],
                             "response_text": answer.response_text,
-                            "file_paths": answer_paths or None,
-                            "image_paths": answer_images or None,
+                            "file_paths": remote_answer_paths or None,
+                            "image_paths": remote_answer_images or None,
                             "attachments": answer_attachments or None,
                             "attachment_manifest": answer_manifest or None,
                         },
@@ -1174,9 +1855,27 @@ class WorkerProxy:
                 answer_paths, answer_images, answer_attachments = (
                     self._plan_attachment_payload(answer.attachments)
                 )
+                remote_answer_paths = worker_managed_upload_paths(answer_paths)
+                answer_image_set = set(answer_images)
+                remote_answer_images = [
+                    remote_path
+                    for path, remote_path in zip(
+                        answer_paths,
+                        remote_answer_paths,
+                        strict=True,
+                    )
+                    if path in answer_image_set
+                ]
                 if answer_paths:
-                    await self.push_files(worker, answer_paths)
-                answer_manifest = self._attachment_manifest(answer_paths)
+                    await self.push_files(
+                        worker,
+                        answer_paths,
+                        remote_paths=remote_answer_paths,
+                    )
+                answer_manifest = self._attachment_manifest(
+                    answer_paths,
+                    receipt_paths=remote_answer_paths,
+                )
                 async with httpx.AsyncClient(timeout=30) as client:
                     response = await client.post(
                         self._api(
@@ -1190,8 +1889,8 @@ class WorkerProxy:
                             "idempotency_key": answer.answer_idempotency_key,
                             "answers": answer.answers or [],
                             "response_text": answer.response_text,
-                            "file_paths": answer_paths or None,
-                            "image_paths": answer_images or None,
+                            "file_paths": remote_answer_paths or None,
+                            "image_paths": remote_answer_images or None,
                             "attachments": answer_attachments or None,
                             "attachment_manifest": answer_manifest or None,
                         },
@@ -1305,7 +2004,7 @@ class WorkerProxy:
         if (
             not isinstance(receipt, dict)
             or receipt.get("protocol") != WORKER_PLAN_EXACT_CANCEL_PROTOCOL
-            or receipt.get("state") not in {"absent", "cancelled", "terminal"}
+            or receipt.get("state") not in {"absent", "terminal"}
             or type(receipt.get("plan_id")) is not int
             or receipt.get("plan_id") != plan_id
             or type(receipt.get("run_id")) is not int
@@ -1313,17 +2012,11 @@ class WorkerProxy:
             or receipt.get("payload_digest") != payload_digest
             or (
                 receipt.get("state") == "absent"
-                and receipt.get("run") is not None
-            )
-            or (
-                receipt.get("state") == "cancelled"
                 and (
-                    not isinstance(receipt.get("run"), dict)
-                    or type(receipt["run"].get("id")) is not int
-                    or receipt["run"].get("id") != run_id
-                    or type(receipt["run"].get("plan_id")) is not int
-                    or receipt["run"].get("plan_id") != plan_id
-                    or receipt["run"].get("status") != "cancelled"
+                    receipt.get("run") is not None
+                    or "base_worker_version_id" not in receipt
+                    or receipt.get("base_worker_version_id") is not None
+                    or receipt.get("versions") != []
                 )
             )
             or (
@@ -1334,7 +2027,8 @@ class WorkerProxy:
                     or receipt["run"].get("id") != run_id
                     or type(receipt["run"].get("plan_id")) is not int
                     or receipt["run"].get("plan_id") != plan_id
-                    or receipt["run"].get("status") not in {"completed", "failed"}
+                    or receipt["run"].get("status")
+                    not in {"completed", "failed", "cancelled"}
                     or not isinstance(receipt.get("versions"), list)
                     or isinstance(receipt.get("base_worker_version_id"), bool)
                     or (
@@ -1394,33 +2088,105 @@ class WorkerProxy:
             async with self.db_factory() as db:
                 w = await db.get(Worker, worker.id)
                 mapping = dict(w.project_mapping or {})
-            if str(task.project_id) in mapping:
-                return mapping[str(task.project_id)]
-
-            async with self.db_factory() as db:
                 project = await db.get(Project, task.project_id)
             if not project:
                 raise RuntimeError(f"项目 {task.project_id} 不存在")
-            if not project.git_url:
-                # 纯本地项目：先把整个项目目录（含 .git 和未提交改动）rsync 到
-                # worker 同路径，worker 的 _init_local_repo 见 .git 存在即跳过 init
-                import os as _os
-                path = _os.path.expanduser(project.local_path).rstrip("/")
-                if not _os.path.isdir(path):
-                    raise RuntimeError(f"项目目录不存在: {path}")
-                ssh = self._ssh(worker)
-                await ssh.run(f"mkdir -p {path}")
-                await ssh.rsync_to(path + "/", path + "/", excludes=[], timeout=1200)
+
+            def require_exact_project_identity(remote: object) -> dict:
+                """Reject name/id reuse that points at another checkout."""
+
+                if not isinstance(remote, dict):
+                    raise RuntimeError("Worker 返回了无效的 Project 记录")
+                expected_git = (project.git_url or "").strip() or None
+                remote_git = (remote.get("git_url") or "").strip() or None
+                expected_branch = project.default_branch or "main"
+                remote_branch = remote.get("default_branch") or "main"
+                mismatch = (
+                    remote.get("name") != project.name
+                    or remote_git != expected_git
+                    or remote_branch != expected_branch
+                )
+                if expected_git is None:
+                    expected_path = os.path.normpath(
+                        os.path.expanduser(project.local_path or "")
+                    )
+                    remote_path = os.path.normpath(
+                        os.path.expanduser(str(remote.get("local_path") or ""))
+                    )
+                    mismatch = mismatch or remote_path != expected_path
+                if mismatch:
+                    # Do not silently bind a recreated Manager Project to a
+                    # stale same-name/mapped Worker checkout.  That can execute
+                    # a Task against an entirely different repository and can
+                    # also reuse the former Project's credentials.
+                    raise RuntimeError(
+                        "Worker 上的同名或已映射 Project 与 Manager 的源身份不一致；"
+                        "已拒绝复用旧 checkout"
+                    )
+                remote_id = remote.get("id")
+                if isinstance(remote_id, bool) or not isinstance(remote_id, int):
+                    raise RuntimeError("Worker 返回了无效的 Project id")
+                return remote
 
             async with httpx.AsyncClient(timeout=30) as c:
-                # 同名项目可能已存在（之前转发过/手工建过）
-                r = await c.get(self._api(worker, "/api/projects"), headers=self._headers(worker))
-                r.raise_for_status()
-                items = r.json()
-                if isinstance(items, dict):
-                    items = items.get("projects", [])
-                remote = next((p for p in items if p.get("name") == project.name), None)
+                remote = None
+                mapped_remote_id = mapping.get(str(task.project_id))
+                if (
+                    isinstance(mapped_remote_id, int)
+                    and not isinstance(mapped_remote_id, bool)
+                ):
+                    # A Worker Project id is not immutable across deletion or
+                    # replacement.  Validate the mapped row on every routing
+                    # admission instead of treating the Manager-side JSON cache
+                    # as repository identity.
+                    r = await c.get(
+                        self._api(worker, f"/api/projects/{mapped_remote_id}"),
+                        headers=self._headers(worker),
+                    )
+                    if r.status_code != 404:
+                        r.raise_for_status()
+                        remote = require_exact_project_identity(r.json())
+
                 if remote is None:
+                    # 同名项目可能已存在（之前转发过/手工建过），但名字本身
+                    # 从来不是源身份；只有完整 checkout 身份一致才允许复用。
+                    r = await c.get(
+                        self._api(worker, "/api/projects"),
+                        headers=self._headers(worker),
+                    )
+                    r.raise_for_status()
+                    items = r.json()
+                    if isinstance(items, dict):
+                        items = items.get("projects", [])
+                    if not isinstance(items, list):
+                        raise RuntimeError("Worker 返回了无效的 Project 列表")
+                    candidate = next(
+                        (
+                            p
+                            for p in items
+                            if isinstance(p, dict)
+                            and p.get("name") == project.name
+                        ),
+                        None,
+                    )
+                    if candidate is not None:
+                        remote = require_exact_project_identity(candidate)
+
+                if remote is None:
+                    if not project.git_url:
+                        # 纯本地项目：先把整个项目目录（含 .git 和未提交改动）
+                        # rsync 到 Worker 同路径；Worker 见 .git 后跳过 init。
+                        path = os.path.expanduser(project.local_path).rstrip("/")
+                        if not os.path.isdir(path):
+                            raise RuntimeError(f"项目目录不存在: {path}")
+                        ssh = self._ssh(worker)
+                        await ssh.run(f"mkdir -p {path}")
+                        await ssh.rsync_to(
+                            path + "/",
+                            path + "/",
+                            excludes=[],
+                            timeout=1200,
+                        )
                     r = await c.post(
                         self._api(worker, "/api/projects"),
                         headers=self._headers(worker),
@@ -1436,7 +2202,7 @@ class WorkerProxy:
                         },
                     )
                     r.raise_for_status()
-                    remote = r.json()
+                    remote = require_exact_project_identity(r.json())
                 remote_id = remote["id"]
 
                 # clone 是后台任务，等 status=ready（worker dispatch 需要 local_path 就绪）
@@ -1529,6 +2295,177 @@ class WorkerProxy:
                 "支持 Codex Fast，任务未转发"
             )
 
+    async def require_worker_delegated_principal_support(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Reject mixed-version Workers before the Task creation boundary.
+
+        Pydantic versions used by older Workers may ignore unknown principal
+        fields and immediately dispatch a Task under a different authority.
+        A response-time ACK is therefore too late: capability negotiation must
+        succeed before Manager sends the mutating create request.
+        """
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    self._api(worker, "/api/system/config"),
+                    headers=self._headers(worker),
+                )
+                response.raise_for_status()
+            config = response.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Worker {worker.name} 无法确认 delegated principal 协议，"
+                "任务未转发"
+            ) from exc
+        if (
+            not isinstance(config, dict)
+            or config.get("worker_delegated_principal_protocol")
+            != WORKER_DELEGATED_PRINCIPAL_PROTOCOL
+            or config.get("worker_delegated_launch_admission_protocol")
+            != WORKER_DELEGATED_LAUNCH_ADMISSION_PROTOCOL
+        ):
+            raise RuntimeError(
+                f"Worker {worker.name} 未声明 delegated principal 协议 v"
+                f"{WORKER_DELEGATED_PRINCIPAL_PROTOCOL} 与 provider launch "
+                f"admission 协议 v"
+                f"{WORKER_DELEGATED_LAUNCH_ADMISSION_PROTOCOL}，任务未转发"
+            )
+        try:
+            validate_worker_task_id_namespace_config(config)
+        except TaskIdNamespaceProtocolError as exc:
+            raise RuntimeError(
+                f"Worker {worker.name} 未声明 Task ID namespace 协议 v"
+                f"{TASK_ID_NAMESPACE_PROTOCOL}，任务未转发"
+            ) from exc
+
+    async def require_worker_initial_generation_support(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Reject Workers that cannot seed retry/turn before first dequeue."""
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    self._api(worker, "/api/system/config"),
+                    headers=self._headers(worker),
+                )
+                response.raise_for_status()
+            config = response.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Worker {worker.name} 无法确认 initial generation 协议，"
+                "任务未转发"
+            ) from exc
+        if (
+            not isinstance(config, dict)
+            or config.get("worker_initial_generation_protocol")
+            != WORKER_INITIAL_GENERATION_PROTOCOL
+        ):
+            raise RuntimeError(
+                f"Worker {worker.name} 未声明 initial generation 协议 v"
+                f"{WORKER_INITIAL_GENERATION_PROTOCOL}，任务未转发"
+            )
+
+    async def require_worker_task_incarnation_support(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Preflight exact Task-id ABA fencing before any handoff effect."""
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    self._api(worker, "/api/system/config"),
+                    headers=self._headers(worker),
+                )
+                response.raise_for_status()
+            config = response.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Worker {worker.name} 无法确认 Task incarnation 协议，"
+                "任务未转发"
+            ) from exc
+        if (
+            not isinstance(config, dict)
+            or config.get("worker_task_incarnation_proxy_version") != 1
+        ):
+            raise RuntimeError(
+                f"Worker {worker.name} 未声明 Task incarnation 协议 v1，"
+                "任务未转发"
+            )
+
+    async def require_worker_migration_import_support(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Preflight exact prepare/commit/rollback before remote import."""
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    self._api(worker, "/api/system/config"),
+                    headers=self._headers(worker),
+                )
+                response.raise_for_status()
+            config = response.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Worker {worker.name} 无法确认 migration import 协议"
+            ) from exc
+        if (
+            not isinstance(config, dict)
+            or config.get("worker_migration_import_protocol")
+            != WORKER_MIGRATION_IMPORT_PROTOCOL
+        ):
+            raise RuntimeError(
+                f"Worker {worker.name} 未声明 migration import 协议 v"
+                f"{WORKER_MIGRATION_IMPORT_PROTOCOL}，任务未迁移"
+            )
+
+    async def require_worker_manual_retry_support(
+        self,
+        worker: Worker,
+    ) -> None:
+        """Reject legacy Workers before a retry outbox or mutation is staged."""
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.get(
+                    self._api(worker, "/api/system/config"),
+                    headers=self._headers(worker),
+                )
+                response.raise_for_status()
+            config = response.json()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(
+                f"Worker {worker.name} 无法确认 manual retry 协议"
+            ) from exc
+        if (
+            not isinstance(config, dict)
+            or config.get("worker_manual_retry_protocol")
+            != WORKER_MANUAL_RETRY_PROTOCOL
+            or config.get("worker_delegated_principal_protocol")
+            != WORKER_DELEGATED_PRINCIPAL_PROTOCOL
+        ):
+            raise RuntimeError(
+                f"Worker {worker.name} 未声明 manual retry 协议 v"
+                f"{WORKER_MANUAL_RETRY_PROTOCOL}"
+            )
+
     async def require_terminal_pr_review_chat_support(
         self,
         worker: Worker,
@@ -1572,7 +2509,13 @@ class WorkerProxy:
             return await self._forward_task_to_worker_locked(current)
 
     async def _authoritative_forward_task(self, task: Task) -> Task:
-        """Fence one claimed generation immediately before Worker effects."""
+        """Fence one claimed generation and its native Manager principal.
+
+        A Task may wait for Worker capacity after its HTTP admission.  Recheck
+        the durable User row and exact role while holding the same writer fence
+        that precedes the remote POST, so a disabled or demoted administrator
+        cannot retain stale unrestricted authority on the Worker.
+        """
 
         if self.db_factory is None:
             return task
@@ -1626,18 +2569,101 @@ class WorkerProxy:
                 raise RuntimeError(
                     "Task Worker generation changed before initial forwarding"
                 )
+            from backend.models.user import User
+            from backend.services.task_creation import (
+                TASK_EXECUTION_DELEGATED_PRINCIPAL_KINDS,
+                task_execution_principal_values,
+            )
+
+            persisted_principal = {
+                "execution_user_id": current.execution_user_id,
+                "execution_user_role": current.execution_user_role,
+                "execution_mode": current.execution_mode,
+                "execution_principal_kind": current.execution_principal_kind,
+            }
+            try:
+                canonical_principal = task_execution_principal_values(
+                    user_id=current.execution_user_id,
+                    role=current.execution_user_role,
+                    principal_kind=current.execution_principal_kind,
+                )
+            except (TypeError, ValueError) as exc:
+                await db.rollback()
+                raise RuntimeError(
+                    "Task has an invalid execution principal before Worker "
+                    "forwarding"
+                ) from exc
+            if persisted_principal != canonical_principal:
+                await db.rollback()
+                raise RuntimeError(
+                    "Task execution principal changed before Worker forwarding"
+                )
+            if (
+                current.execution_principal_kind
+                in TASK_EXECUTION_DELEGATED_PRINCIPAL_KINDS
+            ):
+                await db.rollback()
+                raise RuntimeError(
+                    "Manager Task cannot carry an already-delegated principal"
+                )
+            if current.execution_principal_kind == "user":
+                # A plain SELECT leaves a TOCTOU window: an administrator can
+                # disable/demote this User after the read but before this
+                # transaction commits the forwarding admission.  The exact
+                # no-op UPDATE is the portable User writer fence (including
+                # SQLite), ordered after the Task fence like every other Task
+                # effect.  Whichever transaction wins therefore determines
+                # whether this native principal may be delegated.
+                principal_fence = await db.execute(
+                    update(User)
+                    .where(
+                        User.id == current.execution_user_id,
+                        User.is_active.is_(True),
+                        User.role == current.execution_user_role,
+                    )
+                    .values(role=User.role)
+                    .execution_options(synchronize_session=False)
+                )
+                if principal_fence.rowcount != 1:
+                    await db.rollback()
+                    raise RuntimeError(
+                        "Task initiator role changed or is no longer active "
+                        "before Worker forwarding"
+                    )
             await db.commit()
             return current
 
     async def _forward_task_to_worker_locked(self, task: Task):
+        validate_manager_allocated_task_id(task.id)
+        if (
+            task.status != "in_progress"
+            or type(task.retry_count) is not int
+            or task.retry_count < 0
+            or type(task.turn_generation) is not int
+            or task.turn_generation < 1
+        ):
+            raise RuntimeError(
+                "Initial Worker forwarding requires an exact claimed "
+                "retry/turn generation"
+            )
         worker = await self.get_worker(task.worker_id)
-        if not worker or worker.status != "ready":
+        if (
+            not worker
+            or worker.status != "ready"
+            or worker.bootstrap_step is not None
+        ):
             raise RuntimeError(
                 f"Worker {worker.name if worker else task.worker_id} 不可用"
-                f"（{worker.status if worker else 'not found'}）"
+                "（"
+                f"{worker.status if worker else 'not found'}/"
+                f"{worker.bootstrap_step if worker and worker.bootstrap_step else 'normal'}"
+                "）"
             )
         self._require_authenticated_control_plane(worker)
 
+        await self.require_worker_delegated_principal_support(worker)
+        await self.require_worker_initial_generation_support(worker)
+        await self.require_worker_task_incarnation_support(worker)
         await self.require_worker_fast_support(worker, task)
         # PR reviews use only the remote GitHub snapshot named in their prompt.
         # Mapping the Manager's synthetic PR-Monitor project would either fail
@@ -1668,11 +2694,16 @@ class WorkerProxy:
             if has_related_plan_uploads
             else []
         )
+        remote_attachment_paths = worker_managed_upload_paths(attachment_paths)
         if attachment_paths:
-            await self.push_files(worker, attachment_paths)
+            await self.push_files(
+                worker,
+                attachment_paths,
+                remote_paths=remote_attachment_paths,
+            )
         image_paths = [
-            path
-            for index, path in enumerate(attachment_paths)
+            remote_path
+            for index, remote_path in enumerate(remote_attachment_paths)
             if (
                 index < len(attachment_records)
                 and isinstance(attachment_records[index], dict)
@@ -1684,10 +2715,17 @@ class WorkerProxy:
         # The authentication gate above must precede this WebSocket effect.
         await self.relay.subscribe_task(worker, task.id)
         user_skill_snapshots = await self._user_skill_snapshots(task)
+        delegated_principal = delegated_task_execution_principal_values(
+            user_id=task.execution_user_id,
+            role=task.execution_user_role,
+            principal_kind=task.execution_principal_kind,
+        )
 
         payload = {
             "id": task.id,  # 关键：Manager 分配的全局 ID
             "source_incarnation_id": task.incarnation_id,
+            "source_retry_count": task.retry_count,
+            "source_turn_generation": task.turn_generation,
             "title": task.title,
             "description": task.description or "",
             "project_id": worker_project_id,
@@ -1719,10 +2757,11 @@ class WorkerProxy:
             "selected_user_skills": task.selected_user_skills,
             "user_skill_snapshots": user_skill_snapshots,
             "tags": list(task.tags) if task.tags else None,
-            "file_paths": attachment_paths or None,
+            "file_paths": remote_attachment_paths or None,
             "image_paths": image_paths or None,
             "attachments": attachment_records or None,
             "attention_tag": task.attention_tag,
+            **delegated_principal,
         }
         headers = self._headers(worker)
         post_started = False
@@ -1739,20 +2778,53 @@ class WorkerProxy:
                 # dispatcher.  Surface a distinct uncertainty contract so the
                 # Manager never blindly resends the create request.
                 r.raise_for_status()
-                if (task.codex_service_tier or "default") == "priority":
-                    try:
-                        created = r.json()
-                    except Exception as exc:
-                        raise RuntimeError(
-                            f"Worker {worker.name} 未确认 Codex Fast 任务配置"
-                        ) from exc
-                    if (
-                        not isinstance(created, dict)
-                        or created.get("codex_service_tier") != "priority"
-                    ):
-                        raise RuntimeError(
-                            f"Worker {worker.name} 未确认 Codex Fast 任务配置"
-                        )
+                try:
+                    created = r.json()
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Worker {worker.name} 未返回有效 Task ACK"
+                    ) from exc
+                if not isinstance(created, dict) or created.get("id") != task.id:
+                    raise RuntimeError(
+                        f"Worker {worker.name} 未确认 exact Task identity"
+                    )
+                created_metadata = created.get("metadata_")
+                if (
+                    not isinstance(created_metadata, dict)
+                    or created_metadata.get(SOURCE_TASK_INCARNATION_METADATA_KEY)
+                    != task.incarnation_id
+                ):
+                    raise RuntimeError(
+                        f"Worker {worker.name} 未确认 exact Task incarnation"
+                    )
+                if created.get("incarnation_id") != task.incarnation_id:
+                    raise RuntimeError(
+                        f"Worker {worker.name} 未确认 exact Task incarnation"
+                    )
+                acknowledged_principal = {
+                    field: created.get(field)
+                    for field in delegated_principal
+                }
+                if acknowledged_principal != delegated_principal:
+                    raise RuntimeError(
+                        f"Worker {worker.name} 未确认 exact delegated principal"
+                    )
+                if (
+                    created.get("status") != "pending"
+                    or created.get("retry_count") != task.retry_count
+                    or created.get("turn_generation")
+                    != task.turn_generation - 1
+                ):
+                    raise RuntimeError(
+                        f"Worker {worker.name} 未确认 exact initial generation"
+                    )
+                if (
+                    (task.codex_service_tier or "default") == "priority"
+                    and created.get("codex_service_tier") != "priority"
+                ):
+                    raise RuntimeError(
+                        f"Worker {worker.name} 未确认 Codex Fast 任务配置"
+                    )
         except asyncio.CancelledError as exc:
             if not post_started:
                 raise
@@ -1767,6 +2839,19 @@ class WorkerProxy:
             raise WorkerTaskForwardOutcomeUncertainError(
                 f"Worker {worker.name} initial Task POST outcome is uncertain: {exc}"
             ) from exc
+        observed = worker_task_generation(task, expected_worker_id=worker.id)
+        if observed is None:
+            raise WorkerTaskForwardOutcomeUncertainError(
+                "Manager Worker generation disappeared after initial Task ACK"
+            )
+        if self.db_factory is not None:
+            async with self.db_factory() as db:
+                materialized = await mark_worker_task_materialized(db, observed)
+            if not materialized:
+                raise WorkerTaskForwardOutcomeUncertainError(
+                    "Worker created the Task but Manager could not persist the "
+                    "remote-materialized fence"
+                )
         logger.info("task %s forwarded to worker %s", task.id, worker.id)
 
     async def _user_skill_snapshots(self, task: Task) -> list[dict]:
@@ -1853,11 +2938,42 @@ class WorkerProxy:
                 "execution was blocked",
             )
 
-    async def push_files(self, worker: Worker, paths: list[str]):
-        """chat 附件推到 worker 同一绝对路径（worker 上 Claude 用 Read 读）。"""
+    async def push_files(
+        self,
+        worker: Worker,
+        paths: list[str],
+        *,
+        remote_paths: list[str] | None = None,
+    ):
+        """Copy managed uploads into the Worker's own upload namespace."""
+
+        expected_targets = worker_managed_upload_paths(paths)
+        targets = expected_targets if remote_paths is None else remote_paths
+        if len(targets) != len(paths):
+            raise ValueError("Remote attachment paths must match local paths")
+        if targets != expected_targets:
+            raise ValueError("Remote attachments must stay in the Worker upload root")
+        # Persistent Plan/Task metadata can outlive the request that first
+        # validated it. Re-prove the source at the actual cross-host effect
+        # boundary so a stale/tampered row cannot turn rsync into an arbitrary
+        # Manager-file read. This also refreshes the upload cleanup TTL while
+        # holding the upload store's lock.
+        from backend.api.uploads import (
+            UploadAttachmentValidationError,
+            validate_upload_attachments,
+        )
+
+        try:
+            validated = validate_upload_attachments(file_paths=paths)
+        except UploadAttachmentValidationError as exc:
+            raise RuntimeError(
+                "Worker attachment source is no longer a managed upload"
+            ) from exc
+        if [upload.path for upload in validated] != paths:
+            raise RuntimeError("Worker attachment source path is not canonical")
         ssh = self._ssh(worker)
-        for path in paths:
-            await ssh.copy_file(path, path)
+        for path, remote_path in zip(paths, targets, strict=True):
+            await ssh.copy_file(path, remote_path)
 
     async def require_task_artifact_scope_support(
         self,
@@ -2062,6 +3178,104 @@ class WorkerProxy:
                     "Manager Task incarnation or Worker assignment changed",
                 )
             task = current
+        if worker_plan_decision_is_prepared(task.metadata_):
+            marker = worker_plan_decision_gate_receipt(task.metadata_)
+            request = marker.get("request") if isinstance(marker, dict) else None
+            operation_id = (
+                marker.get("operation_id") if isinstance(marker, dict) else None
+            )
+            request_digest = (
+                marker.get("request_digest") if isinstance(marker, dict) else None
+            )
+            receipt_path = (
+                f"/api/tasks/{task.id}/internal/worker-plan-decisions/"
+                f"{operation_id}"
+            )
+            routing = request.get("routing") if isinstance(request, dict) else None
+            routing_status = f"/api/tasks/{task.id}/routing-config/status"
+            routing_mutation = bool(
+                method == "POST"
+                and path
+                in {
+                    f"/api/tasks/{task.id}/routing-config/ack",
+                    f"/api/tasks/{task.id}/routing-config/reconcile",
+                }
+                and isinstance(body, dict)
+                and isinstance(routing, dict)
+                and body.get("provider") == routing.get("provider")
+                and body.get("model") == routing.get("model")
+                and body.get("codex_service_tier")
+                == routing.get("codex_service_tier")
+                and isinstance(body.get("op_id"), str)
+                and bool(body.get("op_id"))
+            )
+            exact_request = bool(
+                isinstance(request, dict)
+                and isinstance(operation_id, str)
+                and isinstance(request_digest, str)
+                and worker_plan_decision_request_matches(
+                    request,
+                    operation_id=operation_id,
+                    request_digest=request_digest,
+                )
+            )
+            allowed_plan_decision_request = bool(
+                exact_request
+                and (
+                    (
+                        method == "GET"
+                        and body is None
+                        and path
+                        in {
+                            receipt_path,
+                            routing_status,
+                            f"/api/tasks/{task.id}",
+                        }
+                    )
+                    or (
+                        method == "PUT"
+                        and path == receipt_path
+                        and body == request
+                    )
+                    or routing_mutation
+                )
+            )
+            if not allowed_plan_decision_request:
+                raise HTTPException(
+                    409,
+                    "Task has a prepared Worker Plan decision awaiting exact "
+                    "receipt reconciliation",
+                )
+        if worker_manual_retry_is_prepared(task.metadata_):
+            retry_receipt = worker_manual_retry_receipt(task.metadata_)
+            operation_id = (
+                retry_receipt.get("operation_id")
+                if retry_receipt is not None
+                else None
+            )
+            exact_retry_post = bool(
+                method == "POST"
+                and path == f"/api/tasks/{task.id}/internal/worker-retry"
+                and isinstance(body, dict)
+                and body.get("operation_id") == operation_id
+                and body.get("request_digest")
+                == retry_receipt.get("request_digest")
+            )
+            exact_retry_readback = bool(
+                method == "GET"
+                and path
+                == (
+                    f"/api/tasks/{task.id}/internal/worker-retry-receipts/"
+                    f"{operation_id}"
+                )
+                and body is None
+            )
+            if not (exact_retry_post or exact_retry_readback):
+                raise HTTPException(
+                    409,
+                    "Task has a prepared Worker retry awaiting exact receipt "
+                    "reconciliation",
+                )
         # A durable Manager receipt owns every remote mutation until its exact
         # result is ACKed. The reconciliation loop itself traverses this common
         # proxy, so admit only that receipt's identity-bound GET/PUT/ACK paths;
@@ -2217,6 +3431,28 @@ class WorkerProxy:
                 "Task moved away from the claimed destroying Worker",
             )
         worker = await self._require_destroy_lifecycle_claim(destroy_claim)
+        destroy_cleanup_headers = None
+        if receipt_put:
+            if (
+                not isinstance(task.incarnation_id, str)
+                or not task.incarnation_id
+                or type(task.retry_count) is not int
+                or type(task.turn_generation) is not int
+            ):
+                raise HTTPException(
+                    409,
+                    "Task lacks the exact generation required for Worker "
+                    "destroy cleanup",
+                )
+            destroy_cleanup_headers = {
+                WORKER_DESTROY_DRAIN_CLAIM_HEADER:
+                    destroy_claim.node_drain_claim,
+                WORKER_DESTROY_TASK_INCARCATION_HEADER:
+                    task.incarnation_id,
+                WORKER_DESTROY_TASK_RETRY_HEADER: str(task.retry_count),
+                WORKER_DESTROY_TASK_TURN_HEADER:
+                    str(task.turn_generation),
+            }
         return await self._proxy_to_authorized_worker_locked(
             worker,
             task,
@@ -2231,6 +3467,7 @@ class WorkerProxy:
                 quarantine_on_transport_uncertainty
             ),
             task_incarnation_fenced=False,
+            destroy_cleanup_headers=destroy_cleanup_headers,
         )
 
     async def _proxy_to_authorized_worker_locked(
@@ -2247,10 +3484,25 @@ class WorkerProxy:
         pr_review_terminal_chat: bool,
         quarantine_on_transport_uncertainty: bool,
         task_incarnation_fenced: bool,
+        destroy_cleanup_headers: dict[str, str] | None = None,
     ):
         self._require_authenticated_control_plane(worker)
         await self.relay.subscribe_task(worker, task.id)
         headers = self._headers(worker)
+        if destroy_cleanup_headers is not None:
+            if method != "PUT":
+                raise ValueError(
+                    "Worker destroy cleanup headers are valid only for PUT"
+                )
+            expected_header_names = {
+                WORKER_DESTROY_DRAIN_CLAIM_HEADER,
+                WORKER_DESTROY_TASK_INCARCATION_HEADER,
+                WORKER_DESTROY_TASK_RETRY_HEADER,
+                WORKER_DESTROY_TASK_TURN_HEADER,
+            }
+            if set(destroy_cleanup_headers) != expected_header_names:
+                raise ValueError("Worker destroy cleanup headers are incomplete")
+            headers.update(destroy_cleanup_headers)
         if task_incarnation_fenced:
             if not task.incarnation_id:
                 raise HTTPException(409, "Task has no stable incarnation identity")

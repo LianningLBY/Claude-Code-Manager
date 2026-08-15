@@ -17,6 +17,119 @@ from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
 
 
 @pytest.mark.asyncio
+async def test_finish_despite_cancellation_consumes_request_while_settling():
+    """Python 3.14 must not spin on successively cancelled shield futures."""
+
+    import backend.services.task_termination as termination
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancellation_counts: list[int] = []
+    protected: asyncio.Task | None = None
+
+    async def finite_cleanup() -> str:
+        started.set()
+        await release.wait()
+        assert protected is not None
+        cancellation_counts.append(protected.cancelling())
+        return "settled"
+
+    protected = asyncio.create_task(
+        termination._finish_despite_cancellation(finite_cleanup())
+    )
+    await started.wait()
+    protected.cancel()
+    await asyncio.sleep(0)
+    assert not protected.done()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(asyncio.shield(protected), timeout=1)
+    assert cancellation_counts == [0]
+
+
+@pytest.mark.asyncio
+async def test_finish_awaitable_passively_settles_under_anyio_level_cancellation():
+    """A cancelled AnyIO scope must not repeatedly spin asyncio shields."""
+
+    from anyio import CancelScope
+
+    import backend.services.cancellation as cancellation
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    shield_calls = 0
+    real_shield = asyncio.shield
+
+    async def finite_cleanup() -> str:
+        started.set()
+        await release.wait()
+        return "settled"
+
+    async def release_cleanup() -> None:
+        await started.wait()
+        await asyncio.sleep(0)
+        release.set()
+
+    def counting_shield(awaitable):
+        nonlocal shield_calls
+        shield_calls += 1
+        return real_shield(awaitable)
+
+    releaser = asyncio.create_task(release_cleanup())
+    try:
+        with patch.object(cancellation.asyncio, "shield", counting_shield):
+            with CancelScope() as scope:
+                scope.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await cancellation.finish_awaitable(finite_cleanup())
+        await releaser
+    finally:
+        if not releaser.done():
+            releaser.cancel()
+            await asyncio.gather(releaser, return_exceptions=True)
+
+    assert shield_calls <= 2
+
+
+@pytest.mark.asyncio
+async def test_finish_awaitable_preserves_inner_cancellation_result():
+    """An operation's own cancellation is not mistaken for caller cancel."""
+
+    from backend.services.cancellation import finish_awaitable
+
+    async def cancelled_operation() -> None:
+        raise asyncio.CancelledError("inner operation cancelled")
+
+    with pytest.raises(asyncio.CancelledError, match="inner operation cancelled"):
+        await finish_awaitable(cancelled_operation())
+
+
+@pytest.mark.asyncio
+async def test_finish_awaitable_operation_failure_precedes_caller_cancellation():
+    """The settled operation outcome remains authoritative after cancellation."""
+
+    from backend.services.cancellation import finish_awaitable
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def failing_cleanup() -> None:
+        started.set()
+        await release.wait()
+        raise RuntimeError("authoritative cleanup failure")
+
+    wrapper = asyncio.create_task(finish_awaitable(failing_cleanup()))
+    await started.wait()
+    wrapper.cancel()
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(RuntimeError, match="authoritative cleanup failure"):
+        await wrapper
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("entrypoint", ("local", "authoritative"))
 async def test_internal_termination_yields_to_active_worker_receipt(
     db_factory,
@@ -2365,7 +2478,11 @@ async def test_superseded_manager_mirror_cannot_be_migrated(db_factory):
 
     migrator = TaskMigrator(db_factory, AsyncMock())
     with pytest.raises(MigrationError):
-        await migrator._claim_migration(migration_task_generation(task))
+        await migrator._claim_migration(
+            migration_task_generation(task),
+            target_worker_id=None,
+            operation_id="f" * 32,
+        )
 
     async with db_factory() as db:
         task = await db.get(Task, task_id)

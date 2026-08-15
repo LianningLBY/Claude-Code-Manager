@@ -5,7 +5,8 @@ import base64
 from copy import deepcopy
 import hashlib
 import json
-from datetime import datetime, timedelta
+import logging
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -24,11 +25,15 @@ from backend.models.pr_monitor import (
 )
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.models.team_share import TeamProjectShare
 from backend.models.worker import Worker
 from backend.services import pr_review_service
 from backend.services.delivery_service import value_hash
 from backend.services.pr_review_service import (
     GhError,
+    PR_MONITOR_INTERNAL_PROJECT_TAG,
+    PR_MONITOR_PROJECT_NAME,
+    _get_or_create_pr_monitor_project,
     build_review_prompt,
     check_and_update_review,
     create_pr_review_task,
@@ -49,7 +54,6 @@ PR_DATA = {
 }
 TREE_SHA = "c" * 40
 CLAUDE_BLOB_SHA = "d" * 40
-PROGRESS_BLOB_SHA = "e" * 40
 ACTION_NONCE = "f" * 48
 PUBLISHING_STARTED_AT = datetime(2026, 7, 31, 0, 0, 0)
 ACTOR = "ccm-bot"
@@ -67,6 +71,96 @@ def _make_repo(**overrides) -> MonitoredRepo:
     }
     values.update(overrides)
     return MonitoredRepo(**values)
+
+
+async def _link_legacy_review_task(
+    db,
+    *,
+    project: Project,
+    repo_name: str,
+) -> Task:
+    task = Task(
+        title="legacy reviewer",
+        description="internal review protocol",
+        project_id=project.id,
+        tags=[],
+    )
+    repo = _make_repo(repo_full_name=repo_name)
+    db.add_all([task, repo])
+    await db.flush()
+    db.add(PRReview(
+        repo_id=repo.id,
+        pr_number=7,
+        base_ref="main",
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        pr_title="Legacy review",
+        pr_author="alice",
+        pr_url=f"https://github.com/{repo_name}/pull/7",
+        task_id=task.id,
+        status="reviewing",
+    ))
+    await db.flush()
+    return task
+
+
+@pytest.mark.asyncio
+async def test_legacy_pr_monitor_project_is_adopted_only_with_internal_evidence(
+    db_session,
+):
+    project = Project(name=PR_MONITOR_PROJECT_NAME)
+    db_session.add(project)
+    await db_session.flush()
+    await _link_legacy_review_task(
+        db_session,
+        project=project,
+        repo_name="owner/exclusive-legacy-monitor",
+    )
+
+    project_id = await _get_or_create_pr_monitor_project(db_session)
+
+    assert project_id == project.id
+    assert PR_MONITOR_INTERNAL_PROJECT_TAG in (project.tags or [])
+    assert project.show_in_selector is False
+
+
+@pytest.mark.asyncio
+async def test_legacy_name_collision_with_ordinary_state_gets_fallback_project(
+    db_session,
+):
+    project = Project(
+        name=PR_MONITOR_PROJECT_NAME,
+        local_path="/tmp/real-pr-monitor-project",
+        status="ready",
+    )
+    db_session.add(project)
+    await db_session.flush()
+    db_session.add_all([
+        Task(
+            title="ordinary project task",
+            description="member work",
+            project_id=project.id,
+        ),
+        TeamProjectShare(
+            project_id=project.id,
+            target_type="user",
+            target_id=101,
+            shared_by=1,
+        ),
+    ])
+    await _link_legacy_review_task(
+        db_session,
+        project=project,
+        repo_name="owner/colliding-legacy-monitor",
+    )
+
+    project_id = await _get_or_create_pr_monitor_project(db_session)
+    internal = await db_session.get(Project, project_id)
+
+    assert project_id != project.id
+    assert PR_MONITOR_INTERNAL_PROJECT_TAG not in (project.tags or [])
+    assert PR_MONITOR_INTERNAL_PROJECT_TAG in (internal.tags or [])
+    assert internal.show_in_selector is False
 
 
 def _snapshot(
@@ -169,7 +263,6 @@ def _blob_payload(sha: str, content: bytes) -> dict:
 
 def _guidance_api_side_effect(
     claude: bytes = b"# Rules\nUse tests.",
-    progress: bytes = b"# Lessons\nPin snapshots.",
 ):
     entries = [
         {
@@ -179,24 +272,16 @@ def _guidance_api_side_effect(
             "sha": CLAUDE_BLOB_SHA,
             "size": len(claude),
         },
-        {
-            "path": "PROGRESS.md",
-            "type": "blob",
-            "mode": "100755",
-            "sha": PROGRESS_BLOB_SHA,
-            "size": len(progress),
-        },
     ]
     return [
         {"sha": PR_DATA["base_sha"], "tree": {"sha": TREE_SHA}},
         {"sha": TREE_SHA, "truncated": False, "tree": entries},
         _blob_payload(CLAUDE_BLOB_SHA, claude),
-        _blob_payload(PROGRESS_BLOB_SHA, progress),
     ]
 
 
 def _prepared_context(
-    guidance: dict[str, str | None] | None = None,
+    guidance: dict[str, object] | None = None,
 ) -> dict:
     return {
         "repo_name": "owner/repo",
@@ -206,7 +291,6 @@ def _prepared_context(
         "head_sha": PR_DATA["head_sha"],
         "guidance": guidance or {
             "CLAUDE.md": None,
-            "PROGRESS.md": None,
         },
         "material": {
             "number": PR_DATA["number"],
@@ -490,6 +574,9 @@ def test_build_review_prompt_injects_verified_documents_as_json():
     documents = {
         "CLAUDE.md": "Rule: use tests.\n`$(never-run)`",
         "PROGRESS.md": "Lesson: keep snapshots pinned.",
+        pr_review_service._GUIDANCE_ROLE_MAP_KEY: {
+            "PROGRESS.md": ["principal_engineer"],
+        },
     }
     prompt = build_review_prompt(
         _make_repo(auto_merge=False),
@@ -528,8 +615,73 @@ def test_build_review_prompt_records_optional_documents_as_absent():
         guidance_documents={"CLAUDE.md": None, "PROGRESS.md": None},
     )
     assert '{"name":"CLAUDE.md","present":false}' in prompt
-    assert '{"name":"PROGRESS.md","present":false}' in prompt
+    injected = prompt.split(
+        "<ccm_verified_base_guidance>\n", 1
+    )[1].split("\n</ccm_verified_base_guidance>", 1)[0]
+    assert [json.loads(line)["name"] for line in injected.splitlines()] == [
+        "CLAUDE.md",
+    ]
     assert "PR_REVIEW_RESULT: approved_merged" in prompt
+
+
+def test_review_prompt_budget_is_utf8_bounded_and_provider_specific():
+    assert (
+        pr_review_service._CODEX_PR_REVIEW_PROMPT_MAX_CHARS
+        + pr_review_service._CODEX_PR_REVIEW_RUNTIME_RESERVE_CHARS
+        == pr_review_service._CODEX_INPUT_MAX_CHARS
+    )
+    within_budget = (
+        "界" * pr_review_service._CODEX_PR_REVIEW_PROMPT_MAX_CHARS
+    )
+    pr_review_service.validate_review_prompt_budget(
+        within_budget,
+        provider="codex",
+        label="single reviewer",
+    )
+
+    with pytest.raises(
+        pr_review_service.PRReviewInputTooLarge,
+        match=r"unsupported_input_size: single reviewer.*codex",
+    ):
+        pr_review_service.validate_review_prompt_budget(
+            within_budget + "界",
+            provider="codex",
+            label="single reviewer",
+        )
+
+    with pytest.raises(
+        pr_review_service.PRReviewInputTooLarge,
+        match=r"unsupported_input_size: single reviewer.*claude",
+    ):
+        pr_review_service.validate_review_prompt_budget(
+            "界" * (
+                pr_review_service._CLAUDE_PR_REVIEW_PROMPT_MAX_BYTES // 3 + 1
+            ),
+            provider="claude",
+            label="single reviewer",
+        )
+
+
+def test_single_prompt_keeps_the_complete_patch_within_budget():
+    exact_patch = "PATCH_BEGIN\n" + ("changed line\n" * 2_000) + "PATCH_END"
+    material = _prepared_context()["material"]
+    material["patch"] = exact_patch
+
+    prompt = build_review_prompt(
+        _make_repo(provider="codex"),
+        PR_DATA,
+        guidance_documents={"CLAUDE.md": None},
+        pr_material=material,
+    )
+    pr_review_service.validate_review_prompt_budget(
+        prompt,
+        provider="codex",
+        label="single reviewer",
+    )
+    rendered = prompt.split(
+        "<ccm_verified_pr_material>\n", 1
+    )[1].split("\n</ccm_verified_pr_material>", 1)[0]
+    assert json.loads(rendered)["patch"] == exact_patch
 
 
 def test_build_review_prompt_uses_three_lens_evidence_harness():
@@ -592,15 +744,11 @@ async def test_fetch_base_guidance_reads_exact_commit_root_and_blobs():
             PR_DATA["base_sha"],
         )
 
-    assert result == {
-        "CLAUDE.md": "# Rules\nUse tests.",
-        "PROGRESS.md": "# Lessons\nPin snapshots.",
-    }
+    assert result == {"CLAUDE.md": "# Rules\nUse tests."}
     assert [call.args[0] for call in api.await_args_list] == [
         f"repos/owner/repo/git/commits/{PR_DATA['base_sha']}",
         f"repos/owner/repo/git/trees/{TREE_SHA}",
         f"repos/owner/repo/git/blobs/{CLAUDE_BLOB_SHA}",
-        f"repos/owner/repo/git/blobs/{PROGRESS_BLOB_SHA}",
     ]
     assert api.await_args_list[1].kwargs["max_output_bytes"] == (
         pr_review_service._MAX_GH_TREE_RESPONSE_BYTES
@@ -622,7 +770,7 @@ async def test_fetch_base_guidance_accepts_proven_root_absence():
             "owner/repo",
             PR_DATA["base_sha"],
         )
-    assert result == {"CLAUDE.md": None, "PROGRESS.md": None}
+    assert result == {"CLAUDE.md": None}
     assert api.await_count == 2
 
 
@@ -737,16 +885,16 @@ def test_decode_guidance_blob_fails_closed(
         )
 
 
-@pytest.mark.asyncio
-async def test_fetch_base_guidance_enforces_combined_limit():
-    each = b"x" * (200 * 1024)
-    api = AsyncMock(side_effect=_guidance_api_side_effect(each, each))
-    with patch.object(pr_review_service, "_gh_api_json", api):
-        with pytest.raises(GhError, match="combined"):
-            await pr_review_service._fetch_base_guidance(
-                "owner/repo",
-                PR_DATA["base_sha"],
-            )
+def test_render_guidance_documents_enforces_combined_limit():
+    each = "x" * (200 * 1024)
+    with pytest.raises(ValueError, match="combined"):
+        pr_review_service._render_guidance_documents({
+            "CLAUDE.md": each,
+            "docs/review-history.md": each,
+            pr_review_service._GUIDANCE_ROLE_MAP_KEY: {
+                "docs/review-history.md": ["senior_engineer"],
+            },
+        }, role="senior_engineer")
 
 
 def _compare_identity(
@@ -870,6 +1018,55 @@ async def test_fetch_patch_rejects_patch_for_a_different_head():
             )
 
 
+@pytest.mark.asyncio
+async def test_fetch_pr_material_does_not_fetch_or_store_full_file_copies():
+    metadata = {
+        **_snapshot(),
+        "number": PR_DATA["number"],
+        "title": PR_DATA["title"],
+        "body": "Description",
+        "author": {"login": PR_DATA["author"]},
+        "headRefName": "feature",
+        "changedFiles": 1,
+    }
+    files = [{
+        "path": "backend/app.py",
+        "additions": 2,
+        "deletions": 1,
+    }]
+    exact_patch = "diff --git a/backend/app.py b/backend/app.py\n"
+    runner = AsyncMock(return_value=(0, json.dumps(metadata).encode(), b""))
+    fetch_files = AsyncMock(return_value=files)
+    fetch_patch = AsyncMock(return_value=exact_patch)
+    with (
+        patch.object(pr_review_service, "_run_gh", runner),
+        patch.object(pr_review_service, "_fetch_pr_files", fetch_files),
+        patch.object(
+            pr_review_service,
+            "_fetch_immutable_compare_patch",
+            fetch_patch,
+        ),
+        patch.object(
+            pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot()),
+        ),
+    ):
+        material = await pr_review_service._fetch_pr_material(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            base_ref="main",
+            base_sha=PR_DATA["base_sha"],
+            head_sha=PR_DATA["head_sha"],
+        )
+
+    assert material["files"] == files
+    assert material["patch"] == exact_patch
+    assert "changed_file_contents" not in material
+    fetch_files.assert_awaited_once()
+    fetch_patch.assert_awaited_once()
+
+
 # ---------------------------------------------------------------------------
 # Task creation: prefetch first, inject exact docs, freeze nonce/policy
 # ---------------------------------------------------------------------------
@@ -883,6 +1080,9 @@ async def test_create_pr_review_task_prefetches_guidance_and_freezes_nonce(
     documents = {
         "CLAUDE.md": "Always test.",
         "PROGRESS.md": "Never trust head docs.",
+        pr_review_service._GUIDANCE_ROLE_MAP_KEY: {
+            "PROGRESS.md": ["senior_engineer"],
+        },
     }
     prepared = _prepared_context(documents)
     broadcaster = MagicMock(broadcast=AsyncMock())
@@ -909,6 +1109,12 @@ async def test_create_pr_review_task_prefetches_guidance_and_freezes_nonce(
     assert review.head_sha == PR_DATA["head_sha"]
     assert review.action_nonce == ACTION_NONCE
     assert task.tags == ["pr-review"]
+    assert task.status == "pending"
+    assert task.archived is True
+    assert task.execution_user_id is None
+    assert task.execution_user_role == "member"
+    assert task.execution_mode == "sandbox"
+    assert task.execution_principal_kind == "system"
     assert task.metadata_ == {
         "pr_review_id": review.id,
         "pr_base_ref": "main",
@@ -941,6 +1147,35 @@ async def test_create_pr_review_task_fetch_failure_stages_nothing(
 
     assert (await db_session.execute(select(PRReview))).scalars().all() == []
     assert (await db_session.execute(select(Task))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_create_pr_review_task_oversize_stages_nothing(
+    db_session,
+):
+    repo = _make_repo(provider="codex")
+    db_session.add(repo)
+    await db_session.commit()
+    prepared = _prepared_context()
+    prepared["material"]["patch"] = "x" * (
+        pr_review_service._CODEX_PR_REVIEW_PROMPT_MAX_CHARS + 1
+    )
+
+    with pytest.raises(
+        pr_review_service.PRReviewInputTooLarge,
+        match="unsupported_input_size",
+    ):
+        await create_pr_review_task(
+            db_session,
+            repo,
+            PR_DATA,
+            prepared_context=prepared,
+        )
+
+    assert not db_session.new
+    assert (await db_session.execute(select(PRReview))).scalars().all() == []
+    assert (await db_session.execute(select(Task))).scalars().all() == []
+    assert (await db_session.execute(select(Project))).scalars().all() == []
 
 
 @pytest.mark.asyncio
@@ -3083,14 +3318,142 @@ async def test_check_review_reads_exact_terminal_body_and_publishes(
     assert review.status == "approved"
     assert review.action_taken == "lgtm_comment"
     assert review.completed_at is not None
+    assert review.review_summary == "No blocking findings."
+    assert "PR_REVIEW_BODY_BEGIN" not in review.review_summary
+    assert "PR_REVIEW_BODY_END" not in review.review_summary
+    assert "PR_REVIEW_RESULT:" not in review.review_summary
     assert review.pending_action is None
     assert review.pending_review_body is None
     assert review.publishing_actor is None
+    assert review.publishing_retry_count is None
+    assert review.publishing_task_started_at is None
+    assert review.publishing_started_at is None
+    assert review.publishing_lease_token is None
+    assert review.publishing_lease_expires_at is None
     publish.assert_awaited_once()
     assert publish.await_args.kwargs["review_body"] == "No blocking findings."
     assert publish.await_args.kwargs["actor"] == ACTOR
     assert callable(publish.await_args.kwargs["ensure_current"])
     assert no_broadcast.broadcast.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_check_review_changes_requested_persists_clean_agent_body(
+    db_session,
+    repo,
+    no_broadcast,
+):
+    review, task = await _make_review(db_session, repo, retry_count=5)
+    body = (
+        "Authorization can be bypassed.\n\n"
+        "Require the project ACL check before dispatching the task."
+    )
+    await _add_terminal_log(
+        db_session,
+        task,
+        result="review_comments",
+        body=body,
+        retry_count=5,
+    )
+    publish = AsyncMock(return_value=("commented", "review_comments"))
+    publish_findings = AsyncMock()
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            AsyncMock(return_value=ACTOR),
+        ),
+        patch.object(
+            pr_review_service,
+            "_publish_review_action",
+            publish,
+        ),
+        patch.object(
+            pr_review_service,
+            "_publish_blocking_finding_threads",
+            publish_findings,
+        ),
+    ):
+        await check_and_update_review(
+            db_session,
+            review.id,
+            repo.repo_full_name,
+            terminal_task_id=task.id,
+            terminal_task_retry_count=5,
+        )
+
+    await db_session.refresh(review)
+    assert review.status == "commented"
+    assert review.action_taken == "review_comments"
+    assert review.review_summary == body
+    assert "PR_REVIEW_BODY_BEGIN" not in review.review_summary
+    assert "PR_REVIEW_BODY_END" not in review.review_summary
+    assert "PR_REVIEW_RESULT:" not in review.review_summary
+    assert review.pending_action is None
+    assert review.pending_review_body is None
+    assert review.publishing_actor is None
+    assert review.publishing_retry_count is None
+    assert review.publishing_task_started_at is None
+    assert review.publishing_started_at is None
+    assert review.publishing_lease_token is None
+    assert review.publishing_lease_expires_at is None
+    publish.assert_awaited_once()
+    assert publish.await_args.kwargs["review_body"] == body
+    publish_findings.assert_awaited_once()
+    assert no_broadcast.broadcast.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_background_terminal_arms_review_without_publishing_effect(
+    db_session,
+    repo,
+    no_broadcast,
+):
+    """An exact PTY marker may stage the outbox but not write GitHub yet."""
+
+    review, task = await _make_review(db_session, repo, retry_count=4)
+    generation = "review-background-generation"
+    task.pty_background_generation = generation
+    db_session.add(LogEntry(
+        task_id=task.id,
+        task_retry_count=4,
+        event_type="result",
+        content=_terminal_output("lgtm_comment", "No blocking findings."),
+        timestamp=task.started_at + timedelta(seconds=1),
+    ))
+    await db_session.commit()
+
+    resume = AsyncMock()
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            AsyncMock(return_value=ACTOR),
+        ),
+        patch.object(
+            pr_review_service,
+            "_resume_publishing_review",
+            resume,
+        ),
+    ):
+        await check_and_update_review(
+            db_session,
+            review.id,
+            repo.repo_full_name,
+            terminal_task_id=task.id,
+            terminal_task_retry_count=4,
+            expected_background_generation=generation,
+        )
+
+    await db_session.refresh(review)
+    await db_session.refresh(task)
+    assert review.status == "publishing"
+    assert review.pending_action == "lgtm_comment"
+    assert task.pty_background_generation == generation
+    resume.assert_not_awaited()
+    # Only the durable publishing transition is announced. The actual GitHub
+    # completion event belongs to marker-free recovery.
+    assert no_broadcast.broadcast.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -3965,8 +4328,18 @@ async def test_recover_publishing_pr_reviews_reuses_nonce_without_write(
         stored = await db.get(PRReview, review_id)
         assert stored.status == "approved"
         assert stored.action_taken == "lgtm_comment"
+        assert stored.review_summary == "Looks good."
+        assert "PR_REVIEW_BODY_BEGIN" not in stored.review_summary
+        assert "PR_REVIEW_BODY_END" not in stored.review_summary
+        assert "PR_REVIEW_RESULT:" not in stored.review_summary
         assert stored.pending_action is None
+        assert stored.pending_review_body is None
         assert stored.publishing_actor is None
+        assert stored.publishing_retry_count is None
+        assert stored.publishing_task_started_at is None
+        assert stored.publishing_started_at is None
+        assert stored.publishing_lease_token is None
+        assert stored.publishing_lease_expires_at is None
     find_review.assert_awaited_once()
     api.assert_not_awaited()
     gh_view.assert_awaited_once()
@@ -4517,23 +4890,64 @@ async def test_periodic_pr_recovery_invokes_finding_action_recovery(
 
 
 @pytest.mark.asyncio
+async def test_periodic_pr_recovery_reconciles_cancelled_panel_reviewers(
+    session_factory,
+    no_broadcast,
+    monkeypatch,
+):
+    from backend.services import pr_review_panel
+
+    reconcile_cancelled = AsyncMock(return_value=2)
+    monkeypatch.setattr(
+        pr_review_panel,
+        "reconcile_cancelled_reviewer_tasks",
+        reconcile_cancelled,
+    )
+
+    recovered = await pr_review_service.recover_incomplete_pr_reviews(
+        session_factory
+    )
+
+    assert recovered == 2
+    reconcile_cancelled.assert_awaited_once_with(session_factory)
+
+
+@pytest.mark.asyncio
 async def test_recover_incomplete_worker_review_defers_missing_history(
     session_factory,
     no_broadcast,
+    caplog,
 ):
+    database_now = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
     async with session_factory() as db:
         repo = _make_repo()
-        db.add(repo)
+        worker = Worker(name="recent-review-history", status="ready")
+        db.add_all((repo, worker))
+        await db.flush()
+        review, task = await _make_review(db, repo)
+        task.worker_id = worker.id
+        task.started_at = database_now.replace(tzinfo=None) - timedelta(
+            seconds=4
+        )
+        task.completed_at = database_now.replace(tzinfo=None) - timedelta(
+            seconds=2
+        )
         await db.commit()
-        await db.refresh(repo)
-        review, _task = await _make_review(db, repo)
         review_id = review.id
 
     publish = AsyncMock()
-    with patch.object(
-        pr_review_service,
-        "_publish_review_action",
-        publish,
+    with (
+        caplog.at_level(logging.INFO),
+        patch.object(
+            pr_review_service,
+            "_database_now",
+            AsyncMock(return_value=database_now),
+        ),
+        patch.object(
+            pr_review_service,
+            "_publish_review_action",
+            publish,
+        ),
     ):
         recovered = await pr_review_service.recover_incomplete_pr_reviews(
             session_factory
@@ -4541,9 +4955,12 @@ async def test_recover_incomplete_worker_review_defers_missing_history(
 
     assert recovered == 0
     publish.assert_not_awaited()
+    assert "Recovered 0 of 1 incomplete PR review action(s)" not in caplog.text
+    no_broadcast.broadcast.assert_not_awaited()
     async with session_factory() as db:
         stored = await db.get(PRReview, review_id)
         assert stored.status == "reviewing"
+        assert stored.completed_at is None
 
 
 @pytest.mark.asyncio
@@ -4584,6 +5001,199 @@ async def test_recover_worker_review_defers_early_assistant_chatter(
     async with session_factory() as db:
         stored = await db.get(PRReview, review_id)
         assert stored.status == "reviewing"
+
+
+@pytest.mark.asyncio
+async def test_expired_legacy_worker_review_is_quarantined_once_without_github(
+    session_factory,
+    no_broadcast,
+    caplog,
+):
+    """Unscoped legacy output is preserved but never replayed as authority."""
+
+    database_now = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
+    completed_at = database_now.replace(tzinfo=None) - timedelta(minutes=6)
+    started_at = completed_at - timedelta(seconds=2)
+    legacy_content = _terminal_output(
+        "lgtm_comment",
+        "This legacy result must not be published.",
+    )
+    async with session_factory() as db:
+        repo = _make_repo()
+        worker = Worker(name="expired-review-history", status="ready")
+        db.add_all((repo, worker))
+        await db.flush()
+        review, task = await _make_review(db, repo, retry_count=7)
+        task.worker_id = worker.id
+        task.started_at = started_at
+        task.completed_at = completed_at
+        monitor = PRMonitorRun(
+            repo_id=repo.id,
+            pr_number=review.pr_number,
+            current_base_sha=review.base_sha,
+            current_head_sha=review.head_sha,
+            status="reviewing",
+        )
+        db.add(monitor)
+        await db.flush()
+        review.monitor_run_id = monitor.id
+        monitor.current_review_id = review.id
+        legacy_log = LogEntry(
+            task_id=task.id,
+            task_retry_count=None,
+            event_type="result",
+            content=legacy_content,
+            timestamp=started_at + timedelta(seconds=1),
+        )
+        db.add(legacy_log)
+        await db.commit()
+        review_id = review.id
+        task_id = task.id
+        monitor_id = monitor.id
+        legacy_log_id = legacy_log.id
+        task_incarnation = task.incarnation_id
+        turn_generation = task.turn_generation
+
+    database_clock = AsyncMock(return_value=database_now)
+    authenticated_login = AsyncMock()
+    gh_api = AsyncMock()
+    gh_view = AsyncMock()
+    find_evidence = AsyncMock()
+    publish = AsyncMock()
+    with (
+        caplog.at_level(logging.INFO),
+        patch.object(
+            pr_review_service,
+            "_database_now",
+            database_clock,
+        ),
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            authenticated_login,
+        ),
+        patch.object(pr_review_service, "_gh_api_json", gh_api),
+        patch.object(pr_review_service, "_gh_pr_view", gh_view),
+        patch.object(
+            pr_review_service,
+            "_find_review_evidence",
+            find_evidence,
+        ),
+        patch.object(
+            pr_review_service,
+            "_publish_review_action",
+            publish,
+        ),
+    ):
+        first = await pr_review_service.recover_incomplete_pr_reviews(
+            session_factory
+        )
+        second = await pr_review_service.recover_incomplete_pr_reviews(
+            session_factory
+        )
+
+    assert first == 1
+    assert second == 0
+    assert database_clock.await_count >= 1
+    authenticated_login.assert_not_awaited()
+    gh_api.assert_not_awaited()
+    gh_view.assert_not_awaited()
+    find_evidence.assert_not_awaited()
+    publish.assert_not_awaited()
+    assert "Recovered 0 of 1 incomplete PR review action(s)" not in caplog.text
+    no_broadcast.broadcast.assert_awaited_once()
+
+    async with session_factory() as db:
+        stored_review = await db.get(PRReview, review_id)
+        stored_task = await db.get(Task, task_id)
+        stored_monitor = await db.get(PRMonitorRun, monitor_id)
+        stored_log = await db.get(LogEntry, legacy_log_id)
+        assert stored_review.status == "error"
+        assert stored_review.action_taken == "error"
+        assert "infrastructure quarantine" in stored_review.review_summary
+        assert "no GitHub action was attempted" in stored_review.review_summary
+        assert stored_review.completed_at == database_now.replace(tzinfo=None)
+        assert stored_monitor.status == "paused"
+        assert stored_monitor.state_version == 2
+        assert stored_monitor.pause_reason.startswith(
+            f"review_error:{review_id}:PR review infrastructure quarantine"
+        )
+        assert stored_task.status == "completed"
+        assert stored_task.retry_count == 7
+        assert stored_task.incarnation_id == task_incarnation
+        assert stored_task.turn_generation == turn_generation
+        assert stored_task.started_at == started_at
+        assert stored_task.completed_at == completed_at
+        assert stored_log.task_retry_count is None
+        assert stored_log.content == legacy_content
+
+
+@pytest.mark.asyncio
+async def test_expired_missing_history_yields_to_new_task_generation(
+    session_factory,
+    no_broadcast,
+):
+    """The quarantine CAS cannot consume a generation that changed mid-scan."""
+
+    database_now = datetime(2026, 8, 15, 12, 0, tzinfo=timezone.utc)
+    async with session_factory() as db:
+        repo = _make_repo()
+        db.add(repo)
+        await db.flush()
+        review, task = await _make_review(db, repo, retry_count=7)
+        task.started_at = (
+            database_now.replace(tzinfo=None) - timedelta(minutes=7)
+        )
+        task.completed_at = (
+            database_now.replace(tzinfo=None) - timedelta(minutes=6)
+        )
+        await db.commit()
+        review_id = review.id
+        task_id = task.id
+        original_turn_generation = task.turn_generation
+
+    mutated = False
+
+    async def mutate_before_quarantine(_db):
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            async with session_factory() as concurrent_db:
+                current = await concurrent_db.get(Task, task_id)
+                current.retry_count += 1
+                current.turn_generation += 1
+                await concurrent_db.commit()
+        return database_now
+
+    publish = AsyncMock()
+    with (
+        patch.object(
+            pr_review_service,
+            "_database_now",
+            side_effect=mutate_before_quarantine,
+        ),
+        patch.object(
+            pr_review_service,
+            "_publish_review_action",
+            publish,
+        ),
+    ):
+        recovered = await pr_review_service.recover_incomplete_pr_reviews(
+            session_factory
+        )
+
+    assert mutated is True
+    assert recovered == 0
+    publish.assert_not_awaited()
+    no_broadcast.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        stored_review = await db.get(PRReview, review_id)
+        stored_task = await db.get(Task, task_id)
+        assert stored_review.status == "reviewing"
+        assert stored_review.action_taken is None
+        assert stored_review.completed_at is None
+        assert stored_task.retry_count == 8
+        assert stored_task.turn_generation == original_turn_generation + 1
 
 
 @pytest.mark.asyncio

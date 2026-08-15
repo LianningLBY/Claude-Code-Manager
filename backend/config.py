@@ -1,3 +1,6 @@
+from typing import Literal
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -13,15 +16,6 @@ class Settings(BaseSettings):
     # Startup/protocol failures automatically fall back to `codex exec`.
     codex_app_server_enabled: bool = True
     codex_app_server_request_timeout: float = 30.0
-    # Boot default for the operator-owned emergency escape hatch. The admin
-    # runtime-settings page persists an optional DB override. When effective,
-    # CCM does not install its request-local filesystem/network permission
-    # profiles for Codex and Claude Delivery turns. When enabled, all Delivery
-    # roles (Plan, Coding, Reviewer, and Browser) receive the full provider tool
-    # inventory and host/network access without CCM permission prompts. The
-    # persisted runtime switch can turn this back off immediately for future
-    # turns. This deployment intentionally defaults to unrestricted operation.
-    agent_sandbox_unrestricted_enabled: bool = True
     # Inject task-scoped required ccm_skills into Codex main tasks on both
     # app-server and the MCP-equivalent exec fallback.  Keep the environment
     # override as an emergency rollback switch.
@@ -47,6 +41,14 @@ class Settings(BaseSettings):
     # used to display the GitHub webhook URL on the PR Monitor page.
     public_base_url: str = ""
     workspace_dir: str = "~/Projects"
+    # Persistent chat attachments share one Manager-owned directory. Bound its
+    # aggregate regular-file footprint so repeated valid uploads cannot fill
+    # the host disk between age-based cleanup passes.
+    upload_max_total_bytes: int = Field(
+        default=2 * 1024 * 1024 * 1024,
+        gt=0,
+    )
+    upload_max_total_files: int = Field(default=10_000, gt=0)
     auto_start_dispatcher: bool = True
     merge_push_retries: int = 3
     auto_push_to_origin: bool = True
@@ -125,6 +127,11 @@ class Settings(BaseSettings):
     task_runtime_secret_dir: str = "~/.ccm/task-runtime-secrets"
 
     # --- Distributed workers (docs/plans/elastic-worker-design.md) ---
+    # This is a durable database identity, not a runtime feature toggle.
+    # Manager databases own the low Task-id namespace; provisioned Workers
+    # are bootstrapped with ``worker`` and allocate local derived Tasks only
+    # from the disjoint high namespace.
+    ccm_node_role: Literal["manager", "worker"] = "manager"
     worker_enabled: bool = True
     worker_cloud_provider: str = "aws"  # 目前仅 aws
     worker_ssh_key_path: str = ""       # Manager 自己密钥对的私钥 .pem 路径
@@ -259,6 +266,16 @@ class Settings(BaseSettings):
     service_scope: str = "auto"        # auto | user | system
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
+    @model_validator(mode="after")
+    def require_worker_control_credential(self):
+        """A headless Worker must never fall back to legacy open auth."""
+
+        if self.ccm_node_role == "worker" and not self.auth_token.strip():
+            raise ValueError(
+                "CCM_NODE_ROLE=worker requires a non-empty AUTH_TOKEN"
+            )
+        return self
 
 
 settings = Settings()

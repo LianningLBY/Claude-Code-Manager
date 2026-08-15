@@ -428,6 +428,10 @@ async def test_reserved_browser_child_is_not_claimable_until_activation(db_facto
     )
 
     assert child.status == "pending_activation"
+    assert child.execution_user_id is None
+    assert child.execution_user_role == "member"
+    assert child.execution_mode == "sandbox"
+    assert child.execution_principal_kind == "system"
     async with db_factory() as db:
         assert await TaskQueue(db).dequeue() is None
 
@@ -469,8 +473,9 @@ async def test_isolated_pending_task_without_binding_is_never_claimed(db_factory
         )
         db.add(orphan)
         await db.commit()
+        orphan_id = orphan.id
         assert await TaskQueue(db).dequeue() is None
-        persisted = await db.get(Task, orphan.id)
+        persisted = await db.get(Task, orphan_id)
         assert persisted.status == "pending"
 
 
@@ -487,6 +492,15 @@ async def test_isolated_pending_task_without_binding_is_never_claimed(db_factory
         ("capability_policy", {"plan": {"max_invocations": 1}}),
         ("worker_id", 41),
         ("shared_from_id", 42),
+        (
+            "execution_principal",
+            {
+                "execution_user_id": None,
+                "execution_user_role": "super_admin",
+                "execution_mode": "unrestricted",
+                "execution_principal_kind": "deployment_token",
+            },
+        ),
         ("tags", {"pr-review": True}),
         ("session_id", "must-not-resume"),
         ("last_cwd", "/tmp/must-not-resume"),
@@ -517,7 +531,11 @@ async def test_dequeue_rejects_any_browser_launch_binding_drift(
             durable_binding.launch_config_digest = drift_value
         else:
             durable_child = await db.get(Task, child.id)
-            setattr(durable_child, drift_target, drift_value)
+            if drift_target == "execution_principal":
+                for field, value in drift_value.items():
+                    setattr(durable_child, field, value)
+            else:
+                setattr(durable_child, drift_target, drift_value)
         await db.commit()
 
     async with db_factory() as db:
@@ -1008,6 +1026,117 @@ async def test_concurrent_stop_is_idempotent_and_proves_terminal_child(db_factor
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_finishes_first", [True, False])
+@pytest.mark.parametrize("claimed", [True, False])
+async def test_cross_service_stop_success_absorbs_concurrent_failure(
+    db_factory,
+    monkeypatch,
+    failure_finishes_first,
+    claimed,
+):
+    owner_id, run_id = await _owner_and_run(db_factory)
+    setup_service = ChildService(db_factory=db_factory)
+    child, binding = await setup_service.reserve_child(
+        owner_task_id=owner_id,
+        browser_review_job_id=(
+            "job-cross-service-stop-"
+            f"{int(failure_finishes_first)}-{int(claimed)}"
+        ),
+        harness_run_id=run_id,
+        child_values=_child_values(
+            "job-cross-service-stop-"
+            f"{int(failure_finishes_first)}-{int(claimed)}"
+        ),
+    )
+    await setup_service.activate(binding.id)
+    if claimed:
+        async with db_factory() as db:
+            instance = Instance(name="Cross-service Browser stop", status="idle")
+            db.add(instance)
+            await db.commit()
+            instance_id = instance.id
+        async with db_factory() as db:
+            claimed_task = await TaskQueue(db).dequeue(instance_id=instance_id)
+            assert claimed_task is not None and claimed_task.id == child.id
+            instance = await db.get(Instance, instance_id)
+            assert instance is not None
+            instance.status = "running"
+            instance.current_task_id = child.id
+            instance.started_at = claimed_task.started_at
+            await db.commit()
+
+    class FakeBrowserJobManager:
+        async def mark_cancelling(self, _job_id):
+            return None
+
+        async def cancel(self, _job_id):
+            return None
+
+    from backend.services import browser_review_jobs
+
+    monkeypatch.setattr(
+        browser_review_jobs,
+        "browser_review_job_manager",
+        FakeBrowserJobManager(),
+    )
+    success_started = asyncio.Event()
+    failure_started = asyncio.Event()
+    release_success = asyncio.Event()
+    release_failure = asyncio.Event()
+    finish_success = _cancelling_stopper(db_factory)
+
+    async def successful_stopper(task_id: int) -> None:
+        success_started.set()
+        await release_success.wait()
+        await finish_success(task_id)
+
+    async def failing_stopper(_task_id: int) -> None:
+        failure_started.set()
+        await release_failure.wait()
+        raise RuntimeError("concurrent child cleanup failed")
+
+    winner = ChildService(
+        db_factory=db_factory,
+        task_stopper=successful_stopper,
+    )
+    loser = ChildService(
+        db_factory=db_factory,
+        task_stopper=failing_stopper,
+    )
+    winning_stop = asyncio.create_task(
+        winner.stop_binding(binding.id, reason="winning stop")
+    )
+    await asyncio.wait_for(success_started.wait(), timeout=1)
+    losing_stop = asyncio.create_task(
+        loser.stop_binding(binding.id, reason="losing stop")
+    )
+    await asyncio.wait_for(failure_started.wait(), timeout=1)
+
+    if failure_finishes_first:
+        release_failure.set()
+        with pytest.raises(ChildError, match="concurrent child cleanup failed"):
+            await asyncio.wait_for(losing_stop, timeout=2)
+        async with db_factory() as db:
+            failed = await db.get(ChildBindingModel, binding.id)
+            assert failed is not None and failed.state == CHILD_STOP_FAILED
+        release_success.set()
+        await asyncio.wait_for(winning_stop, timeout=2)
+    else:
+        release_success.set()
+        await asyncio.wait_for(winning_stop, timeout=2)
+        release_failure.set()
+        # The durable terminal success absorbs this executor's late failure.
+        await asyncio.wait_for(losing_stop, timeout=2)
+
+    async with db_factory() as db:
+        durable = await db.get(ChildBindingModel, binding.id)
+        stopped = await db.get(Task, child.id)
+        assert durable is not None and durable.state == CHILD_STOPPED
+        assert durable.error is None
+        assert stopped is not None and stopped.status == "cancelled"
+
+
+@pytest.mark.asyncio
 async def test_stop_failure_is_durable_and_not_reported_as_clean(db_factory):
     owner_id, run_id = await _owner_and_run(db_factory)
 
@@ -1183,8 +1312,9 @@ async def test_wal_delete_winner_prevents_late_harness_run_materialization(
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,
@@ -1251,8 +1381,9 @@ async def test_wal_delete_winner_prevents_late_browser_child_publication(
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,

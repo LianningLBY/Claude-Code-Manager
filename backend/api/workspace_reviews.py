@@ -8,10 +8,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import (
+    is_admin,
+    lock_task_effect_access,
     require_admin,
     require_internal_service,
     require_internal_task_incarnation,
-    require_task_access,
     require_task_control,
 )
 from backend.config import settings
@@ -21,6 +22,7 @@ from backend.models.task import Task
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.workspace_review import (
     PreviewConfigurationError,
+    public_workspace_review_capability,
     WorkspaceReviewBusyError,
     WorkspaceReviewError,
     refresh_workspace_review_staleness,
@@ -42,6 +44,7 @@ from backend.services.test_harness_contracts import (
 from backend.services.test_harness_owner_fence import (
     TestHarnessOwnerIdentity,
     test_harness_owner_identity,
+    test_harness_owner_locality_error,
 )
 
 
@@ -127,9 +130,15 @@ async def get_workspace_review_capabilities(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     task = await _task_or_404(task_id, db)
-    await require_task_access(request, task, db)
+    # Capability/config and run resources expose the trusted host checkout,
+    # preview argv/environment and loopback preview route.  Keep them outside
+    # a conversation-only Task share.
+    await require_task_control(request, task, db)
     project = await db.get(Project, task.project_id) if task.project_id else None
-    return workspace_review_capability(task, project)
+    return public_workspace_review_capability(
+        workspace_review_capability(task, project),
+        include_suggestion=is_admin(request),
+    )
 
 
 @router.put("/{task_id}/workspace-reviews/preview-config")
@@ -166,7 +175,10 @@ async def approve_workspace_preview_config(
         "profiles": normalized["profiles"],
     }
     await db.commit()
-    return workspace_review_capability(task, project)
+    return public_workspace_review_capability(
+        workspace_review_capability(task, project),
+        include_suggestion=True,
+    )
 
 
 @router.post(
@@ -180,16 +192,31 @@ async def start_workspace_review(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     task = await _task_or_404(task_id, db)
-    await require_task_control(request, task, db)
+    task = await lock_task_effect_access(
+        request,
+        task,
+        db,
+        allow_chat_share=False,
+        fence_worker_node=True,
+    )
     if task.status not in {"completed", "failed", "cancelled", "conflict"}:
         raise HTTPException(
             status_code=409,
             detail="等待当前 Task 回合结束后再从界面启动测试；执行中的 Agent 可直接调用测试工具",
         )
+    locality_error = test_harness_owner_locality_error(task)
+    if locality_error is not None:
+        raise HTTPException(status_code=409, detail=locality_error)
+    owner_identity = test_harness_owner_identity(task)
+    # The adapter delegates Run/Workspace/Browser-child materialization to
+    # services that use their own Node-control -> owner Task transactions.
+    # This commit is the public ACL/role admission point and releases those
+    # rows before the service's exact-generation owner CAS.
+    await db.commit()
     return await _start_review(
         task_id,
         body,
-        owner_identity=test_harness_owner_identity(task),
+        owner_identity=owner_identity,
     )
 
 
@@ -241,7 +268,7 @@ async def list_workspace_reviews(
     db: AsyncSession = Depends(get_db),
 ) -> list[dict[str, Any]]:
     task = await _task_or_404(task_id, db)
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     try:
         await refresh_workspace_review_staleness(task_id)
     except WorkspaceReviewError:
@@ -270,7 +297,7 @@ async def get_workspace_review(
     db: AsyncSession = Depends(get_db),
 ) -> dict[str, Any]:
     task = await _task_or_404(task_id, db)
-    await require_task_access(request, task, db)
+    await require_task_control(request, task, db)
     run = await db.get(WorkspaceReviewRun, run_id)
     if run is None or run.task_id != task_id:
         raise HTTPException(status_code=404, detail="Workspace Review not found")

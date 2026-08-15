@@ -37,13 +37,13 @@ from backend.models.test_harness import (
 from backend.schemas.delivery import (
     DeliveryAgentActivity,
     DeliveryFrontendReviewProgress,
+    DeliveryPlanInputRequestProjection,
     DeliveryPlanInputProjection,
+    DeliveryPlanRunProjection,
     DeliveryProgressResponse,
     DeliveryStageProgress,
     DeliveryTimelineEvent,
 )
-from backend.schemas.plan_resource import PlanRunResource
-from backend.services.plan_service import input_request_resource
 
 
 _STAGE_ORDER = (
@@ -189,13 +189,12 @@ async def _plan_projection(
             and input_request.run_id == plan_run.id
             and input_request.status == "open"
         ):
-            resource = PlanRunResource.model_validate(plan_run).model_copy(
-                update={"steps": [], "input_requests": []}
-            )
             input_projection = DeliveryPlanInputProjection(
                 plan_id=plan_run.plan_id,
-                run=resource,
-                request=input_request_resource(input_request),
+                run=DeliveryPlanRunProjection.model_validate(plan_run),
+                request=DeliveryPlanInputRequestProjection.model_validate(
+                    input_request
+                ),
             )
     return _PlanProjection(
         plan_run=plan_run,
@@ -260,8 +259,6 @@ def _task_agent(
     task: Task,
     logs: list[LogEntry],
     status: str,
-    source_kind: str,
-    source_id: str,
     headline: str,
 ) -> DeliveryAgentActivity:
     output_logs = [
@@ -297,9 +294,6 @@ def _task_agent(
         activity_kind=activity_kind,
         headline=headline,
         detail=detail,
-        task_id=task.id,
-        source_kind=source_kind,
-        source_id=source_id,
         started_at=task.started_at,
         first_output_at=output_logs[0].timestamp if output_logs else None,
         last_activity_at=(latest.timestamp if latest is not None else task.started_at),
@@ -345,8 +339,6 @@ def _plan_agent(projection: _PlanProjection) -> DeliveryAgentActivity | None:
         activity_kind=activity_kind,
         headline=headline,
         detail=(step.error if step is not None else plan_run.error),
-        source_kind="plan_run",
-        source_id=str(plan_run.id),
         started_at=step.started_at if step is not None else plan_run.created_at,
         # Plan transports only persist a delta timestamp, not the first delta.
         # A completed output is the earliest independently durable proof.
@@ -677,8 +669,6 @@ async def build_delivery_progress(
             task=task,
             logs=task_logs,
             status=task.status,
-            source_kind="delivery_turn",
-            source_id=str(current_turn.id if current_turn else task.id),
             headline="Developer is implementing the plan",
         )
     elif run.phase == "pre_review" and cycle is not None:
@@ -705,8 +695,6 @@ async def build_delivery_progress(
                 task=reviewer,
                 logs=review_logs,
                 status=review_run.status,
-                source_kind="code_review_run",
-                source_id=str(review_run.id),
                 headline="Code reviewer is checking the exact commit range",
             )
     elif run.phase == "frontend_review" and harness is not None:
@@ -733,9 +721,6 @@ async def build_delivery_progress(
             ),
             headline="Browser reviewer is validating the user-visible flow",
             detail=latest_event.title if latest_event is not None else harness.stage,
-            task_id=harness.agent_task_id,
-            source_kind="test_harness_run",
-            source_id=harness.id,
             started_at=harness.started_at or harness.created_at,
             first_output_at=first_public,
             last_activity_at=(

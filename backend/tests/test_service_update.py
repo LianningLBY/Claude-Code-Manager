@@ -104,6 +104,31 @@ def _make_gate_dispatcher(db_factory):
 # ---- update safety and version detection ----
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
+@pytest.mark.asyncio
+async def test_run_cmd_timeout_kills_grandchild_process_group(tmp_path):
+    service = _make_service(tmp_path)
+    pid_file = tmp_path / "child.pid"
+    code = (
+        "import os,time\n"
+        "pid=os.fork()\n"
+        "if pid == 0:\n"
+        " open(%r,'w').write(str(os.getpid()))\n"
+        " time.sleep(60)\n"
+        "else:\n"
+        " time.sleep(60)\n"
+    ) % str(pid_file)
+
+    result = await service._run_cmd(
+        [sys.executable, "-c", code], timeout=1
+    )
+
+    assert result["returncode"] == -1
+    child_pid = int(pid_file.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)
+
+
 def test_helper_missing_at_process_start_cannot_be_captured_late(tmp_path):
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()

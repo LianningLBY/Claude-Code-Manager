@@ -110,7 +110,7 @@ export function SettingsPage() {
   const updateRuntime = useCallback(async (
     update: Partial<Pick<
       RuntimeSettings,
-      'use_pty_mode' | 'agent_sandbox_unrestricted_enabled' | 'auto_sort_on_access' | 'context_compact_threshold'
+      'use_pty_mode' | 'auto_sort_on_access' | 'context_compact_threshold'
     >>,
   ) => {
     if (!runtime || runtimeSaving) return;
@@ -133,20 +133,6 @@ export function SettingsPage() {
     }
     await updateRuntime({ use_pty_mode: !runtime.use_pty_mode });
   }, [runtime, runtimeSaving, updateRuntime]);
-
-  const toggleAgentSandbox = useCallback(async () => {
-    if (!runtime || runtimeSaving) return;
-    const next = runtime.agent_sandbox_unrestricted_enabled !== true;
-    if (next) {
-      const confirmed = window.confirm(
-        '开启后，Delivery 的 Plan、Coding、Reviewer 和 Browser 回合都会获得完整工具、宿主文件系统与网络权限，并跳过 CCM 权限确认。确定开启？',
-      );
-      if (!confirmed) return;
-    }
-    await updateRuntime({ agent_sandbox_unrestricted_enabled: next });
-  }, [runtime, runtimeSaving, updateRuntime]);
-
-  const agentSandboxUnrestricted = runtime?.agent_sandbox_unrestricted_enabled === true;
 
   const handleThemeChange = (next: Theme) => {
     persistTheme(next);
@@ -423,37 +409,6 @@ export function SettingsPage() {
                 >
                   <span className={toggleKnobClassName(runtime.use_pty_mode)} />
                 </button>
-              </div>
-
-              <div
-                data-testid="agent-sandbox-unrestricted-setting"
-                className={`rounded-lg border px-4 py-3 ${agentSandboxUnrestricted
-                  ? 'border-red-500/60 bg-red-950/50'
-                  : 'border-gray-800 bg-gray-950/50'}`}
-              >
-                <div className="flex items-center justify-between gap-4">
-                  <div>
-                    <p className={`text-sm font-medium ${agentSandboxUnrestricted ? 'text-red-300' : 'text-gray-200'}`}>
-                      Delivery 全角色无限制权限
-                    </p>
-                    <p className="mt-0.5 text-xs text-gray-500">仅用于受监督的本地调试。</p>
-                  </div>
-                  <button
-                    type="button"
-                    aria-label="Delivery 全角色无限制权限"
-                    aria-pressed={agentSandboxUnrestricted}
-                    onClick={() => void toggleAgentSandbox()}
-                    disabled={runtimeSaving}
-                    className={toggleClassName(agentSandboxUnrestricted)}
-                  >
-                    <span className={toggleKnobClassName(agentSandboxUnrestricted)} />
-                  </button>
-                </div>
-                {agentSandboxUnrestricted && (
-                  <p role="alert" className="mt-2 text-xs leading-5 text-red-300">
-                    高危：Plan、Coding、Reviewer 和 Browser 后续回合都可直接访问宿主文件系统与网络，不再弹出 CCM 权限确认。关闭开关即可恢复原有隔离边界。
-                  </p>
-                )}
               </div>
 
               <div className="grid gap-4 sm:grid-cols-2">

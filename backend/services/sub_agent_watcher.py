@@ -126,6 +126,16 @@ class SubAgentWatcher:
 
                 if summary:
                     async with self.db_factory() as db:
+                        from backend.services.worker_node_control import (
+                            WorkerNodeDrainingConflict,
+                            fence_worker_node_mutation,
+                        )
+
+                        try:
+                            await fence_worker_node_mutation(db)
+                        except WorkerNodeDrainingConflict:
+                            await db.rollback()
+                            continue
                         sa_obj = await db.get(SubAgentSession, sid)
                         if not sa_obj or sa_obj.status != "running":
                             continue
@@ -334,6 +344,16 @@ class SubAgentWatcher:
         final_summary = self._read_latest_summary(tracked["jsonl_path"], 0)
 
         async with self.db_factory() as db:
+            from backend.services.worker_node_control import (
+                WorkerNodeDrainingConflict,
+                fence_worker_node_mutation,
+            )
+
+            try:
+                await fence_worker_node_mutation(db)
+            except WorkerNodeDrainingConflict:
+                await db.rollback()
+                return
             sa = await db.get(SubAgentSession, sid)
             if not sa or sa.status != "running":
                 return

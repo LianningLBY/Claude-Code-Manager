@@ -1472,11 +1472,6 @@ export function BrowserReviewPanel({
                 <div className="truncate" title={workspaceRun.workspace_fingerprint}>
                   工作区指纹 {workspaceRun.workspace_fingerprint.slice(0, 10)}
                 </div>
-                {workspaceRun.preview_url && (
-                  <div className="mt-1 truncate" title={workspaceRun.preview_url}>
-                    隔离预览：{workspaceRun.preview_url}
-                  </div>
-                )}
                 {(workspaceRun.error || workspaceRun.cleanup_error)
                   && (workspaceRun.error || workspaceRun.cleanup_error) !== (displayedRun.error || displayedRun.cleanup_error) && (
                   <div className="mt-1 whitespace-pre-wrap break-words text-red-300">
@@ -1644,7 +1639,9 @@ export function BrowserReviewPanel({
             <section className="rounded-lg border border-gray-600/60 bg-gray-900/55 p-3">
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0">
-                  <div className="truncate text-xs font-medium text-gray-100" title={job.url}>{job.url}</div>
+                  <div className="truncate text-xs font-medium text-gray-100" title={job.url ?? undefined}>
+                    {job.url ?? '受管隔离预览'}
+                  </div>
                   {showBrowserGoal && (
                     <div className="mt-1 line-clamp-2 text-[11px] text-gray-500">{job.goal}</div>
                   )}

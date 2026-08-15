@@ -57,8 +57,8 @@ Gate 事实。
 
 | `review_mode` | Reviewer | exact-head CI / Repair | direct `auto_merge` | Merge Queue |
 |---|---|---|---|---|
-| `single` | 一个独立 tool-free Reviewer | 关闭；不支持自动 Repair | 支持 | 仅 `manual` |
-| `panel` | Principal / Senior / QA 三个独立 Reviewer | 可选；Delivery 自动采用仓库声明的 required checks | 支持 | CI 开启时可用 `shadow/auto`，但与 direct auto-merge 互斥 |
+| `single`（默认） | 一个独立 tool-free Reviewer，在同一 Task 内执行三种检查视角 | 关闭；不支持自动 Repair | 支持 | 仅 `manual` |
+| `panel`（显式选择） | Principal / Senior / QA 三个独立 Reviewer，约三倍模型工作量 | 可选；Delivery 自动采用仓库声明的 required checks | 支持 | CI 开启时可用 `shadow/auto`，但与 direct auto-merge 互斥 |
 
 Delivery Loop 只接受 `panel + manual Merge Queue`，并要求 `wait_for_ci` 与非空
 `required_checks` 成对出现。Project 导入/quick-start 自动建立内部 Monitor：仓库声明
@@ -73,7 +73,7 @@ required CI；普通 PR Monitor 的 single/panel 继续使用 repo 级开关。
 | 声明 CI 时先 CI，再 AI Review | exact-head required-check Gate；无 required checks 时直接进入必经 Panel | 真实 CI failure/pass 均已验证，失败 head 为零 Reviewer |
 | 等待期间不占 Agent | webhook + Reconciler；等待态不保留模型进程 | 已实现 |
 | Principal/Senior/QA 分工 | 三个独立 tool-free Task | 真实三角色并行与阻断/通过均已验证 |
-| Senior 阅读完整受影响文件 | Manager 按 exact base/head blob 注入 changed-file 全文 | 已实现并有 blob/超限/不可用回归 |
+| Senior 完整审查变更 | Manager 注入 exact base/head 的完整 patch 与紧凑文件清单，不重复注入整文件 | 已实现并有 identity/预算/超限回归 |
 | 每个问题公开可追踪 | 一个 blocking Finding 对应一个 inline Thread；无法锚定时降级独立 comment | 真实 inline publication/resolve 已验证 |
 | 每项必须 Fix 或 Rebut | 新 head 全量重审；Rebut 由独立 Adjudicator 裁决 | 真实 rejected Rebut 已验证；accepted 路径有自动化回归 |
 | 问题清零才放行 | zero Finding/unknown/unresolved/adjudicating Gate | 真实 11/11 Thread 清零后才 ready_to_merge |
@@ -89,7 +89,7 @@ required CI；普通 PR Monitor 的 single/panel 继续使用 repo 级开关。
 | PR Monitor Controller | 保存事实、推进纯状态机、创建 durable effect | 不凭自然语言放行，不写业务代码 |
 | Reconciler | 对齐数据库与 GitHub/Worker 事实，恢复漏事件和重启 | 不是 Agent，不做模型推理 |
 | Principal | 系统边界、架构、状态所有权、并发与安全 | 不修改代码、不访问仓库工具、不 merge |
-| Senior | 完整 changed-file、实现正确性、异常和安全路径 | 不读取未注入 checkout，不 push |
+| Senior | 完整 patch、实现正确性、异常和安全路径 | 不读取未注入 checkout，不 push |
 | QA | intent、用户行为、测试证明、回归与生产陷阱 | 不因“存在测试文件”就通过 |
 | Developer | 在原 PR 分支诊断、修改、测试、commit、push | 不自行关闭 Gate，不 merge |
 | Adjudicator | 仅根据固定 subject 与证据接受/拒绝 Rebut | 不修改代码，不接受“CI过了”等无关证据 |
@@ -107,7 +107,19 @@ required CI；普通 PR Monitor 的 single/panel 继续使用 repo 级开关。
 - repo 级 required-check identity policy，按 `kind + name + app_slug` 精确匹配当前 head。
 - Principal/Senior/QA 三个独立、tool-free Reviewer Task。
 - 三个角色共享七条 Engineering Design Standard，并分别执行 system/implementation/QA litmus。
-- exact-base Guide Pack、exact base/head changed-file 内容包、strict JSON、`PRReviewerRun` 和 `PRFinding`。
+- exact-base、按角色显式授权的 Guide Pack，完整 patch、紧凑文件清单、strict JSON、`PRReviewerRun` 和 `PRFinding`。
+- Direct Reviewer prompt 在任何 Review/Run/Task 入库前统一做 provider admission 预算；`waiting_ci` 只先保存
+  无模型输入的 Review，CI PASS 后在 Run/Task 前预算，确定性超限一次性收口为 infrastructure error。完整 patch
+  不截断，也不留下半创建 ReviewerRun/Task。
+- Reviewer Task 属于内部执行记录：创建即归档，普通 Tasks/Chat 列表与 Dashboard Task 统计不展示；Single
+  成功终态把去除协议 marker 的 Reviewer 正文保存为可读摘要。PR Monitor 列表只返回有界预览，detail 返回
+  完整摘要，并展示结构化状态、角色摘要、Finding 与高级诊断。
+- Reviewer、Panel、AI Fix 与 Rebut Adjudicator Task 的内部身份以四类 durable owner link 为权威；member
+  不能凭 creator、同名 Project share 或 Task share 读取 prompt/patch、续聊、订阅 WS 或启动 Harness。
+  Synthetic Project 使用内部 marker 且不可分享；legacy 同名普通 Project 只有保持完整默认形状且没有普通
+  Task/Team share 时才可采用，否则新审核使用独立 fallback，旧 reviewer 仍由 durable Task ACL 保护。
+- Panel 任一 required role 失败会原子取消其余未完成 role；队列不再领取 pending sibling，周期 Reconciler 在
+  Review 锁外按 exact local/Worker generation 主动终止已经 launch 的 sibling。
 - blocking Finding Gate、GitHub publication outbox、逐 Finding nonce inline comment（不能定位时降级为独立
   PR comment，blocker 不消失）和 Panel UI。
 - Finding 的幂等审计操作：忽略、人工建议，以及 tool-free AI 候选补丁；三类操作都不直接改变 Panel Gate。
@@ -235,24 +247,28 @@ GitHub head SHA 是二者之间的代码事实边界。
 
 ### 3.1 Reviewer 输入包
 
-Reviewer 不读取 Worker 本地 checkout。Manager 对同一 captured subject 注入：PR title/body、完整 patch、
-exact-base `CLAUDE.md`/`PROGRESS.md`/Guide Pack，以及每个 changed file 的完整 exact base/head blob：
+Reviewer 不读取 Worker 本地 checkout。Manager 对同一 captured subject 只注入：冻结 SHA、PR title/body、
+紧凑 changed-file 清单、完整 exact-SHA patch，以及 exact-base Guide Pack。默认 Guide Pack 只有
+`CLAUDE.md`；`PROGRESS.md` 和其他文档必须由 exact-base `.ccm/review-guides.json` 显式按角色授权。
+不会默认抓取或重复注入 changed file 的 base/head 全文：
 
 ```json
 {
-  "path": "backend/example.py",
-  "status": "modified",
-  "source": "head",
-  "source_sha": "<exact blob sha>",
-  "size": 12345,
-  "content": "<complete UTF-8 file>"
+  "files": [{
+    "path": "backend/example.py",
+    "additions": 12,
+    "deletions": 3
+  }],
+  "patch": "<complete immutable compare patch>"
 }
 ```
 
-modified/added/renamed 从 exact head 读取，deleted 从 exact base 读取。commit、tree、mode、blob SHA、size、
-base64、UTF-8 和 NUL 都要验证。symlink、submodule、binary、GitHub truncation 或容量超限必须记录明确的
-`unavailable_reason`，不能回退到本地 checkout 或当前 main。关键材料不足时角色返回 unknown/blocking
-missing-proof Finding，而不是猜测 PASS。
+Manager 校验 compare identity、末端 head、分页文件计数、路径、UTF-8、NUL 和完整预算；patch 在预算内
+原样保留，绝不静默截断。Codex prompt 最多 786,432 字符并为 runtime envelope 预留 262,144 字符；
+Claude prompt 最多 786,432 UTF-8 bytes。Direct admission 超限在任何 Review/ReviewerRun/Task 物化前返回
+HTTP 422 `unsupported_input_size`；`waiting_ci` 在 CI PASS 后超限则关闭该 Review 并暂停 exact Monitor，不能
+周期性重试，也不能回退到本地 checkout、当前 main 或删减后的假“完整审查”。`synchronize` 在 supersede
+intent 和终止旧 Reviewer 前，还会按锁定后的最新 provider/mode 重验同一完整 prompt。
 
 ### 3.2 所有 Reviewer 的共享 Contract
 
@@ -282,7 +298,7 @@ missing-proof Finding，而不是猜测 PASS。
 事务、幂等、取消、恢复、ACL 和 Worker/Manager 权威边界。Litmus：是否因为住错位置、复制 capability 或
 引入第二种既有问题解法而必须退回？若没有具体系统风险，返回空 Finding。
 
-**Senior Engineer** 完整阅读 patch 和所有可用 changed-file 全文，逐条 trace 控制流、状态转换、异常、取消、
+**Senior Engineer** 完整阅读 patch，逐条 trace 控制流、状态转换、异常、取消、
 重试、资源释放、输入类型/边界、数据库与外部副作用窗口，以及关键测试。Litmus：能否指出具体 failing
 input/code path、不可测试 seam 或 security mistake？仅维护偏好不能阻断。
 
@@ -317,7 +333,8 @@ input/code path、不可测试 seam 或 security mistake？仅维护偏好不能
 ```
 
 `critical/high/medium` 阻断，`low` 不阻断；required Reviewer 的解析失败、subject 不匹配、Task error 或冲突
-结果均为 unknown 并 fail closed。Finding fingerprint 使用角色、category、规范化 path 与 root cause，行号
+结果均为 unknown 并 fail closed；一个 required role 失败时，其余未完成角色立即进入 `cancelled`，不能在
+父 Review 已终态后继续显示 `pending`。Finding fingerprint 使用角色、category、规范化 path 与 root cause，行号
 不是身份。后端而非 Reviewer 负责发布、去重、回复和解决 Thread。
 
 ## 4. 生命周期模型
@@ -786,19 +803,19 @@ UI detail 以 REST snapshot 为事实来源，WebSocket 只提示刷新。至少
 - Finding Gate。
 - GitHub Review 发布。
 - 新 head supersede 和重新审核。
-- Prompt policy v3：共享七条 Engineering Design Standard 和三个角色的独立 litmus。
+- Prompt policy v4：共享七条 Engineering Design Standard、三个角色的独立 litmus，以及不重复注入整文件的最小上下文契约。
 
 状态：已实现并通过 exact subject、三角色、Finding Gate、publication 和 supersede 回归。
 
 ### Phase R2：AI Review 公开问题闭环
 
-- 注入 exact base/head 的完整 changed-file content，并显式处理不可用材料。
+- 注入 exact-SHA 完整 patch、紧凑 changed-file manifest 与显式 Guide Pack；默认不注入 changed-file 全文或 `PROGRESS.md`。
 - repo policy 固定 required Guardrails/Lint/Type/Unit/Visual/Security/Boot check identity。
 - 每条 blocking Finding 通过 durable outbox 发布 inline Thread；无效行安全降级但仍保持 blocker。
 - 支持 evidence-based Rebut 和独立 adjudication。
 - Gate 要求 zero blocking Findings、zero unknown Reviewer、zero unresolved CCM Thread。
 
-当前实现进度（2026-08-04）：exact changed-file content、required-check identity、blocking Finding
+当前实现进度（2026-08-15）：最小且有 admission 预算的 exact patch context、required-check identity、blocking Finding
 的 nonce/outbox inline comment、降级 comment、Rebut adjudication、GraphQL thread resolve 和
 zero-unresolved-thread Gate 均已编码并通过假 GitHub 回归测试。
 

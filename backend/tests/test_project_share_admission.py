@@ -1,4 +1,4 @@
-"""Project sharing must never expose an already-running bare local Agent."""
+"""Local Team ACLs stay distinct from legacy cross-CCM sharing."""
 
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -66,7 +66,7 @@ async def _seed_project_task(
 
 
 @pytest.mark.asyncio
-async def test_first_project_share_rejects_active_local_agent(
+async def test_team_project_share_does_not_interrupt_active_local_agent(
     client,
     session_factory,
 ):
@@ -81,19 +81,49 @@ async def test_first_project_share_rejects_active_local_agent(
         json={"target_type": "user", "target_id": target_id},
     )
 
-    assert response.status_code == 409
-    assert "local Agent" in response.json()["detail"]
+    assert response.status_code == 200
     async with session_factory() as db:
         assert await db.scalar(
             select(func.count())
             .select_from(TeamProjectShare)
             .where(TeamProjectShare.project_id == project_id)
-        ) == 0
+        ) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "expected_status"),
+    [
+        (ProjectShareAdmissionError("share writer fence busy"), 409),
+        (ValueError("project deleted during share"), 404),
+    ],
+)
+async def test_team_project_share_maps_authority_fence_failures(
+    client,
+    session_factory,
+    failure,
+    expected_status,
+):
+    project_id, _task_id, _instance_id, target_id = await _seed_project_task(
+        session_factory,
+    )
+
+    with patch(
+        "backend.api.team_sharing.lock_project_share_authority",
+        new=AsyncMock(side_effect=failure),
+    ):
+        response = await client.post(
+            f"/api/team/projects/{project_id}/share",
+            json={"target_type": "user", "target_id": target_id},
+        )
+
+    assert response.status_code == expected_status
+    assert "NameError" not in response.text
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("discussion_status", ["active", "closing"])
-async def test_first_project_share_rejects_durable_discussion_lease(
+async def test_team_project_share_does_not_interrupt_discussion_lease(
     client,
     session_factory,
     discussion_status,
@@ -114,14 +144,13 @@ async def test_first_project_share_rejects_durable_discussion_lease(
         json={"target_type": "user", "target_id": target_id},
     )
 
-    assert response.status_code == 409
-    assert "Discussion" in response.json()["detail"]
+    assert response.status_code == 200
     async with session_factory() as db:
         assert await db.scalar(
             select(func.count())
             .select_from(TeamProjectShare)
             .where(TeamProjectShare.project_id == project_id)
-        ) == 0
+        ) == 1
 
 
 @pytest.mark.asyncio
@@ -139,7 +168,7 @@ async def test_first_project_share_rejects_durable_discussion_lease(
         ),
     ],
 )
-async def test_first_project_share_rejects_auxiliary_provider_lease(
+async def test_team_project_share_does_not_interrupt_auxiliary_provider_lease(
     client,
     session_factory,
     session_status,
@@ -165,10 +194,7 @@ async def test_first_project_share_rejects_auxiliary_provider_lease(
         json={"target_type": "user", "target_id": target_id},
     )
 
-    assert response.status_code == 409
-    assert "Monitor/Sub-Agent" in response.json()["detail"] or (
-        "auxiliary Agent runtime" in response.json()["detail"]
-    )
+    assert response.status_code == 200
 
 
 async def _seed_first_class_plan(
@@ -240,7 +266,7 @@ async def _seed_first_class_plan(
 
 
 @pytest.mark.asyncio
-async def test_plan_claim_winning_race_vetoes_first_project_share(
+async def test_plan_claim_does_not_veto_team_project_share(
     client,
     session_factory,
 ):
@@ -251,20 +277,21 @@ async def test_plan_claim_winning_race_vetoes_first_project_share(
     dispatcher.db_factory = session_factory
     dispatcher._request_plan_runtime_recovery = MagicMock()
     async with session_factory() as db:
-        instance = await db.get(Instance, seeded["instance_id"])
-        claim = await dispatcher._claim_plan_run(db, instance=instance)
+        claim = await dispatcher._claim_plan_run(
+            db,
+            instance_id=seeded["instance_id"],
+        )
 
     assert claim == (seeded["run_id"], 1)
     response = await client.post(
         f"/api/team/projects/{seeded['project_id']}/share",
         json={"target_type": "user", "target_id": seeded["target_id"]},
     )
-    assert response.status_code == 409
-    assert "Plan" in response.json()["detail"]
+    assert response.status_code == 200
 
 
 @pytest.mark.asyncio
-async def test_existing_share_wins_plan_claim_and_owner_converges(
+async def test_existing_team_share_allows_plan_claim(
     session_factory,
 ):
     seeded = await _seed_first_class_plan(session_factory)
@@ -283,18 +310,20 @@ async def test_existing_share_wins_plan_claim_and_owner_converges(
     dispatcher.db_factory = session_factory
     dispatcher._request_plan_runtime_recovery = MagicMock()
     async with session_factory() as db:
-        instance = await db.get(Instance, seeded["instance_id"])
-        assert await dispatcher._claim_plan_run(db, instance=instance) is None
+        assert await dispatcher._claim_plan_run(
+            db,
+            instance_id=seeded["instance_id"],
+        ) == (seeded["run_id"], 1)
 
     async with session_factory() as db:
         run = await db.get(PlanAgentRun, seeded["run_id"])
         plan = await db.get(Plan, seeded["plan_id"])
         instance = await db.get(Instance, seeded["instance_id"])
-    assert run.status == "failed"
-    assert run.instance_id is None
-    assert plan.active_run_id is None
-    assert instance.status == "idle"
-    assert instance.current_plan_run_id is None
+    assert run.status == "running"
+    assert run.instance_id == seeded["instance_id"]
+    assert plan.active_run_id == seeded["run_id"]
+    assert instance.status == "running"
+    assert instance.current_plan_run_id == seeded["run_id"]
 
 
 @pytest.mark.asyncio
@@ -321,14 +350,16 @@ async def test_plan_claim_cleanup_settles_before_delivering_cancellation(
         side_effect=ProjectShareAdmissionError("forced share race")
     )
     async with session_factory() as db:
-        instance = await db.get(Instance, seeded["instance_id"])
         with patch(
             "backend.services.project_share_admission."
             "require_unshared_project_plan_claim",
             admission,
         ):
             claim = asyncio.create_task(
-                dispatcher._claim_plan_run(db, instance=instance)
+                dispatcher._claim_plan_run(
+                    db,
+                    instance_id=seeded["instance_id"],
+                )
             )
             await asyncio.wait_for(cleanup_started.wait(), timeout=5)
             claim.cancel()
@@ -348,7 +379,7 @@ async def test_plan_claim_cleanup_settles_before_delivering_cancellation(
 
 
 @pytest.mark.asyncio
-async def test_terminal_plan_with_unclean_receipt_vetoes_project_share(
+async def test_terminal_plan_receipt_does_not_veto_team_project_share(
     client,
     session_factory,
 ):
@@ -376,12 +407,11 @@ async def test_terminal_plan_with_unclean_receipt_vetoes_project_share(
         f"/api/team/projects/{seeded['project_id']}/share",
         json={"target_type": "user", "target_id": seeded["target_id"]},
     )
-    assert response.status_code == 409
-    assert "durably reaped" in response.json()["detail"]
+    assert response.status_code == 200
 
 
 @pytest.mark.asyncio
-async def test_plan_target_project_drift_vetoes_project_share(
+async def test_plan_target_project_drift_does_not_veto_team_share(
     client,
     session_factory,
 ):
@@ -395,8 +425,7 @@ async def test_plan_target_project_drift_vetoes_project_share(
         f"/api/team/projects/{seeded['project_id']}/share",
         json={"target_type": "user", "target_id": seeded["target_id"]},
     )
-    assert response.status_code == 409
-    assert "inconsistent target Task ownership" in response.json()["detail"]
+    assert response.status_code == 200
 
 
 @pytest.mark.asyncio
@@ -414,8 +443,10 @@ async def test_plan_target_project_drift_is_rejected_at_claim_gate(
     dispatcher.db_factory = session_factory
     dispatcher._request_plan_runtime_recovery = MagicMock()
     async with session_factory() as db:
-        instance = await db.get(Instance, seeded["instance_id"])
-        assert await dispatcher._claim_plan_run(db, instance=instance) is None
+        assert await dispatcher._claim_plan_run(
+            db,
+            instance_id=seeded["instance_id"],
+        ) is None
 
     async with session_factory() as db:
         run = await db.get(PlanAgentRun, seeded["run_id"])
@@ -443,8 +474,10 @@ async def test_projectless_plan_target_claim_is_admitted(session_factory):
     dispatcher.db_factory = session_factory
     dispatcher._request_plan_runtime_recovery = MagicMock()
     async with session_factory() as db:
-        instance = await db.get(Instance, seeded["instance_id"])
-        claim = await dispatcher._claim_plan_run(db, instance=instance)
+        claim = await dispatcher._claim_plan_run(
+            db,
+            instance_id=seeded["instance_id"],
+        )
 
     assert claim == (seeded["run_id"], 1)
     async with session_factory() as db:

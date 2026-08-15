@@ -41,6 +41,7 @@ os.environ.update({
     ),
     "WORKSPACE_DIR": str(_GLOBAL_TEST_DB_DIR / "workspace"),
     "WORKER_ENABLED": "false",
+    "CCM_NODE_ROLE": "manager",
     "POOL_ENABLED": "false",
     "CODEX_POOL_ENABLED": "false",
     # Rollout-enabled paths are exercised explicitly.  Keep unrelated tests
@@ -73,7 +74,10 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from backend.database import Base
 
 # Import all models so Base.metadata knows about them for create_all
+import backend.models.user  # noqa: F401
 import backend.models.task  # noqa: F401
+import backend.models.task_id_allocator  # noqa: F401
+import backend.models.task_migration  # noqa: F401
 import backend.models.instance  # noqa: F401
 import backend.models.project  # noqa: F401
 import backend.models.project_todo  # noqa: F401

@@ -7,6 +7,7 @@ from datetime import datetime
 import hashlib
 import json
 import os
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
@@ -17,14 +18,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from backend.api.deps import (
     get_current_user_id,
     has_project_access,
-    has_worker_access,
     is_admin,
+    lock_request_user_authority,
+    lock_task_effect_access,
     require_admin,
     require_project_access,
     require_internal_service,
-    require_task_access,
     require_task_control,
     require_worker_target_access,
+    task_execution_principal_from_request,
 )
 from backend.api.uploads import (
     UploadAttachmentValidationError,
@@ -47,7 +49,7 @@ from backend.models.plan_agent import (
 from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.models.project import Project
-from backend.models.team_share import TeamProjectShare, TeamTaskShare
+from backend.models.team_share import TeamProjectShare
 from backend.models.user_group import UserGroupMember
 from backend.models.worker import Worker
 from backend.schemas.plan import resolve_plan_pipeline_config
@@ -90,6 +92,7 @@ from backend.services.plan_service import (
     reject_capability_owned_plan_mutation,
     resolve_legacy_task,
     run_resource,
+    serialize_related_plan_creation,
     version_resource,
 )
 from backend.services.plan_tasks import (
@@ -99,7 +102,9 @@ from backend.services.plan_tasks import (
 )
 from backend.services.plan_staleness import version_staleness
 from backend.services.plan_events import broadcast_plan_event
+from backend.services.cancellation import await_task_completion
 from backend.services.plan_input_safety import contains_high_confidence_secret
+from backend.services.worker_node_control import fence_worker_node_mutation
 
 
 router = APIRouter(tags=["plan-resources"])
@@ -120,15 +125,7 @@ async def _settle_plan_cancel_task(
 ) -> asyncio.CancelledError | None:
     """Delay repeated caller cancellation until one finite barrier settles."""
 
-    delayed_cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            delayed_cancellation = delayed_cancellation or exc
-        except BaseException:
-            break
-    return delayed_cancellation
+    return await await_task_completion(operation)
 
 
 async def _finish_plan_cancel_mutation(
@@ -439,21 +436,89 @@ async def _has_plan_access(
         if target is None:
             return False
         try:
-            if control:
-                await require_task_control(request, target, db)
-            else:
-                await require_task_access(request, target, db)
+            # The rich first-class Plan resource contains raw attachment
+            # metadata, repository revisions, native session/instance ids and
+            # application receipts.  A TeamTaskShare(permission="chat") may
+            # converse with the target Task, but it is not authorization to
+            # read this control-plane/audit model.  Chat clients use the
+            # narrow request-aware related-Task projection instead.
+            await require_task_control(request, target, db)
             return True
         except HTTPException:
             return False
     user_id = get_current_user_id(request)
     if user_id is not None and plan.created_by == user_id:
         return True
-    if plan.worker_id is not None and await has_worker_access(request, plan.worker_id, db):
-        return True
     if plan.project_id is not None and await has_project_access(request, plan.project_id, db):
         return True
     return False
+
+
+async def _lock_standalone_plan_effect_access(
+    request: Request,
+    db: AsyncSession,
+    *,
+    project_id: int | None,
+    plan_created_by: int | None,
+    worker_id: int | None = None,
+    fence_worker_assignment: bool = False,
+) -> Project | None:
+    """Fence a standalone Plan effect without narrowing Plan ownership.
+
+    A standalone Plan creator remains an independent controller even when it
+    is not currently a Project-share recipient.  Group-derived callers use
+    the canonical Project ACL helper; creator/admin/no-auth callers still take
+    the same Project row boundary so deletion and share writers retain one
+    global Worker-node -> Project -> Worker -> membership -> User order when
+    the effect creates new durable Worker ownership.
+    """
+
+    await fence_worker_node_mutation(db)
+    if project_id is None:
+        if fence_worker_assignment:
+            from backend.services.worker_assignment import (
+                fence_ready_worker_assignment,
+            )
+
+            await fence_ready_worker_assignment(db, worker_id)
+        await lock_request_user_authority(request, db)
+        return None
+    from backend.services.project_share_admission import (
+        ProjectShareAdmissionError,
+        lock_project_share_authority,
+    )
+
+    try:
+        project = await lock_project_share_authority(db, project_id)
+    except ProjectShareAdmissionError as exc:
+        await db.rollback()
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        await db.rollback()
+        raise HTTPException(409, "Plan Project is no longer available") from exc
+    if fence_worker_assignment:
+        from backend.services.worker_assignment import (
+            fence_ready_worker_assignment,
+        )
+
+        await fence_ready_worker_assignment(db, project.worker_id)
+    creator_or_admin = (
+        not settings.auth_token
+        or is_admin(request)
+        or (
+            get_current_user_id(request) is not None
+            and get_current_user_id(request) == plan_created_by
+        )
+    )
+    if not creator_or_admin and not await has_project_access(
+        request,
+        project_id,
+        db,
+        effect_fence=True,
+    ):
+        raise HTTPException(403, "No access to this project")
+    await lock_request_user_authority(request, db)
+    return project
 
 
 def _plan_list_acl(request: Request):
@@ -467,7 +532,6 @@ def _plan_list_acl(request: Request):
     group_ids = select(UserGroupMember.group_id).where(
         UserGroupMember.user_id == user_id
     )
-    worker_ids = select(Worker.id).where(Worker.owner_user_id == user_id)
     project_share = exists(
         select(TeamProjectShare.id).where(
             TeamProjectShare.project_id == Project.id,
@@ -483,31 +547,11 @@ def _plan_list_acl(request: Request):
             ),
         )
     )
-    project_ids = select(Project.id).where(
-        or_(Project.worker_id.in_(worker_ids), project_share)
-    )
-    task_share = exists(
-        select(TeamTaskShare.id).where(
-            TeamTaskShare.task_id == Task.id,
-            TeamTaskShare.permission == "chat",
-            or_(
-                and_(
-                    TeamTaskShare.target_type == "user",
-                    TeamTaskShare.target_id == user_id,
-                ),
-                and_(
-                    TeamTaskShare.target_type == "group",
-                    TeamTaskShare.target_id.in_(group_ids),
-                ),
-            ),
-        )
-    )
+    project_ids = select(Project.id).where(project_share)
     task_ids = select(Task.id).where(
         or_(
             Task.created_by == user_id,
-            Task.worker_id.in_(worker_ids),
             Task.project_id.in_(project_ids),
-            task_share,
         )
     )
     return or_(
@@ -519,7 +563,6 @@ def _plan_list_acl(request: Request):
             Plan.target_task_id.is_(None),
             or_(
                 Plan.created_by == user_id,
-                Plan.worker_id.in_(worker_ids),
                 Plan.project_id.in_(project_ids),
             ),
         ),
@@ -825,6 +868,7 @@ async def resolve_worker_application_receipt(
 
 
 @router.post("/api/plans", response_model=PlanResource, status_code=201)
+@serialize_related_plan_creation
 async def create_plan(
     body: PlanCreateRequest,
     request: Request,
@@ -879,6 +923,9 @@ async def create_plan(
             if project_id is not None:
                 await require_project_access(request, project_id, db)
             else:
+                # Worker ownership is node-management authority, not a data
+                # scope. Projectless standalone Plans are administrator-only.
+                require_admin(request)
                 await require_worker_target_access(request, worker_id, db)
 
     uploads = _validated_uploads(body)
@@ -900,42 +947,44 @@ async def create_plan(
     target_task_id = target.id if target is not None else None
     target_incarnation_id = target.incarnation_id if target is not None else None
     target_session_id = target.session_id if target is not None else None
+    target_effect_probe = (
+        SimpleNamespace(id=target_task_id, project_id=project_id)
+        if target_task_id is not None
+        else None
+    )
 
-    async def authorize_locked_creation(locked_db: AsyncSession) -> None:
-        """Re-authorize the exact routing snapshot in the commit transaction."""
+    def target_snapshot_changed(locked_target: Task | None) -> bool:
+        return bool(
+            locked_target is None
+            or locked_target.incarnation_id != target_incarnation_id
+            or locked_target.session_id != target_session_id
+            or not locked_target.session_id
+            or locked_target.shared_from_id is not None
+            or locked_target.status == "migrating"
+            or locked_target.project_id != project_id
+            or (locked_target.last_cwd or locked_target.target_repo)
+            != target_repo
+            or locked_target.target_branch != target_branch
+            or locked_target.worker_id != worker_id
+            or locked_target.priority != priority
+            or locked_target.timeout_hours != timeout_hours
+        )
 
-        if target_task_id is not None:
-            locked_target = await locked_db.get(
-                Task,
-                target_task_id,
-                with_for_update=True,
-                populate_existing=True,
-            )
-            if locked_target is None:
-                raise HTTPException(
-                    409,
-                    "Plan target changed while creating the Plan",
-                )
-            await _refresh_plan_acl_dependencies(
+    async def authorize_effect_boundary(locked_db: AsyncSession) -> None:
+        """Fence the final ACL and routing snapshot in commit lock order."""
+
+        if target_effect_probe is not None:
+            await fence_worker_node_mutation(locked_db)
+            locked_target = await lock_task_effect_access(
+                request,
+                target_effect_probe,
                 locked_db,
-                worker_id=locked_target.worker_id,
-                project_id=locked_target.project_id,
+                allow_chat_share=False,
+                fence_worker_node=True,
+                worker_node_fence_held=True,
+                fence_worker_assignment=True,
             )
-            await require_task_control(request, locked_target, locked_db)
-            if (
-                locked_target.incarnation_id != target_incarnation_id
-                or locked_target.session_id != target_session_id
-                or not locked_target.session_id
-                or locked_target.shared_from_id is not None
-                or locked_target.status == "migrating"
-                or locked_target.project_id != project_id
-                or (locked_target.last_cwd or locked_target.target_repo)
-                != target_repo
-                or locked_target.target_branch != target_branch
-                or locked_target.worker_id != worker_id
-                or locked_target.priority != priority
-                or locked_target.timeout_hours != timeout_hours
-            ):
+            if target_snapshot_changed(locked_target):
                 raise HTTPException(
                     409,
                     "Plan target changed while creating the Plan",
@@ -943,43 +992,20 @@ async def create_plan(
             return
 
         if project_id is not None:
-            # A Project may be the only mutable routing/ACL boundary for a
-            # local standalone Plan.  Use a portable no-op UPDATE because
-            # SELECT FOR UPDATE is not a writer fence on SQLite.
-            fenced_project = await locked_db.execute(
-                update(Project)
-                .where(
-                    Project.id == project_id,
-                    Project.worker_id == worker_id,
-                    Project.local_path == target_repo,
-                )
-                .values(local_path=Project.local_path)
-            )
-            if fenced_project.rowcount != 1:
-                raise HTTPException(
-                    409,
-                    "Plan Project changed while creating the Plan",
-                )
-            locked_project = await locked_db.get(
-                Project,
-                project_id,
-                with_for_update=True,
-                populate_existing=True,
-            )
-            if locked_project is None:
-                raise HTTPException(
-                    409,
-                    "Plan Project changed while creating the Plan",
-                )
-            await _refresh_plan_acl_dependencies(
+            # This Plan does not exist yet, so its future creator is not an
+            # independent ACL. Members must still hold the selected Project;
+            # administrators bypass that ACL but lock the same Project row.
+            locked_project = await _lock_standalone_plan_effect_access(
+                request,
                 locked_db,
-                worker_id=locked_project.worker_id,
-                project_id=locked_project.id,
+                project_id=project_id,
+                plan_created_by=None,
+                worker_id=worker_id,
+                fence_worker_assignment=True,
             )
-            if settings.auth_token:
-                await require_project_access(request, project_id, locked_db)
             if (
-                locked_project.worker_id != worker_id
+                locked_project is None
+                or locked_project.worker_id != worker_id
                 or locked_project.local_path != target_repo
             ):
                 raise HTTPException(
@@ -988,13 +1014,38 @@ async def create_plan(
                 )
             return
 
+        # Projectless Plans are an administrator-only data scope. A JWT admin
+        # must retain its exact active role through the commit; deployment
+        # tokens have no mutable User row and retain legacy compatibility.
         if settings.auth_token:
-            await _refresh_plan_acl_dependencies(
-                locked_db,
-                worker_id=worker_id,
-                project_id=None,
-            )
+            require_admin(request)
+        await _lock_standalone_plan_effect_access(
+            request,
+            locked_db,
+            project_id=None,
+            plan_created_by=None,
+            worker_id=worker_id,
+            fence_worker_assignment=True,
+        )
+        if settings.auth_token:
             await require_worker_target_access(request, worker_id, locked_db)
+
+    async def authorize_locked_creation(locked_db: AsyncSession) -> None:
+        """Re-read the already-fenced target after Worker admission."""
+
+        if target_task_id is None:
+            return
+        locked_target = await locked_db.get(
+            Task,
+            target_task_id,
+            with_for_update=True,
+            populate_existing=True,
+        )
+        if target_snapshot_changed(locked_target):
+            raise HTTPException(
+                409,
+                "Plan target changed while creating the Plan",
+            )
 
     plan, _run = await create_plan_with_run(
         db,
@@ -1014,6 +1065,7 @@ async def create_plan(
         context_log_id=context[1],
         context_snapshot=context[2],
         repo_revision=context[3],
+        authorize_effect_boundary=authorize_effect_boundary,
         authorize_locked_creation=authorize_locked_creation,
     )
     await _wake_dispatcher()
@@ -1060,6 +1112,11 @@ async def _import_worker_plan_run_locked(
     import_digest: str,
 ):
     """Import one Worker mirror while holding its Plan operation lock."""
+
+    # The imported Run is immediately dispatchable on this headless node.
+    # Serialize the entire mirror transaction with the irreversible node drain
+    # before taking any Task/Plan database writer locks.
+    await fence_worker_node_mutation(db)
 
     target = await _fence_worker_mirror_target(db, body.target_task_id)
     project = (
@@ -1405,6 +1462,7 @@ async def materialize_worker_plan_version(
     """Materialize exact approved content before a Worker chat application."""
 
     require_internal_service(request)
+    await fence_worker_node_mutation(db)
     target = await _fence_worker_mirror_target(db, body.target_task_id)
     project = (
         await db.get(Project, body.project_id)
@@ -1741,6 +1799,49 @@ async def create_run(
             target.incarnation_id if target is not None else None
         )
         target_session_id = target.session_id if target is not None else None
+        target_effect_probe = (
+            SimpleNamespace(id=target.id, project_id=target.project_id)
+            if target is not None
+            else None
+        )
+        plan_created_by = plan.created_by
+
+        async def authorize_effect_boundary(
+            locked_db: AsyncSession,
+        ) -> None:
+            if target is None:
+                await _lock_standalone_plan_effect_access(
+                    request,
+                    locked_db,
+                    project_id=run_project_id,
+                    plan_created_by=plan_created_by,
+                    worker_id=run_worker_id,
+                    fence_worker_assignment=True,
+                )
+                return
+            assert target_effect_probe is not None
+            admitted_target = await lock_task_effect_access(
+                request,
+                target_effect_probe,
+                locked_db,
+                allow_chat_share=False,
+                fence_worker_node=True,
+                fence_worker_assignment=True,
+            )
+            if (
+                admitted_target.incarnation_id != target_incarnation_id
+                or admitted_target.session_id != target_session_id
+                or admitted_target.status == "migrating"
+                or admitted_target.project_id != run_project_id
+                or (admitted_target.last_cwd or admitted_target.target_repo)
+                != run_target_repo
+                or admitted_target.target_branch != run_target_branch
+                or admitted_target.worker_id != run_worker_id
+            ):
+                raise HTTPException(
+                    409,
+                    "Plan target changed before Run effect admission",
+                )
 
         async def authorize_locked_plan(
             locked_db: AsyncSession,
@@ -1804,6 +1905,7 @@ async def create_run(
             target_branch=run_target_branch,
             worker_id=run_worker_id,
             source_run_id=source_run.id if source_run is not None else None,
+            authorize_effect_boundary=authorize_effect_boundary,
             authorize_locked_plan=authorize_locked_plan,
         )
     await _wake_dispatcher()
@@ -1877,8 +1979,56 @@ async def fork_plan(
         source_worker_id = source.worker_id
         source_priority = source.priority
         source_timeout_hours = source.timeout_hours
+        source_created_by = source.created_by
         source_version_number = version.version_number
         source_version_content = version.content
+        fork_target_probe = (
+            SimpleNamespace(id=target.id, project_id=target.project_id)
+            if target is not None
+            else None
+        )
+
+        async def authorize_fork_effect_boundary(
+            locked_db: AsyncSession,
+        ) -> None:
+            """Fence Task/Worker before mutable ACL authority for the fork."""
+
+            if fork_target_probe is not None:
+                admitted_target = await lock_task_effect_access(
+                    request,
+                    fork_target_probe,
+                    locked_db,
+                    allow_chat_share=False,
+                    fence_worker_node=True,
+                    fence_worker_assignment=True,
+                )
+                if (
+                    admitted_target.incarnation_id
+                    != fork_target_incarnation_id
+                    or admitted_target.session_id != fork_target_session_id
+                    or admitted_target.status == "migrating"
+                    or admitted_target.project_id != fork_project_id
+                    or (
+                        admitted_target.last_cwd
+                        or admitted_target.target_repo
+                    )
+                    != fork_target_repo
+                    or admitted_target.target_branch != fork_target_branch
+                    or admitted_target.worker_id != fork_worker_id
+                ):
+                    raise HTTPException(
+                        409,
+                        "Source Plan target changed while creating the fork",
+                    )
+                return
+            await _lock_standalone_plan_effect_access(
+                request,
+                locked_db,
+                project_id=fork_project_id,
+                plan_created_by=source_created_by,
+                worker_id=fork_worker_id,
+                fence_worker_assignment=True,
+            )
 
         async def authorize_locked_fork(locked_db: AsyncSession) -> None:
             # Lock the source aggregate itself.  The new fork's Task/Worker
@@ -2003,6 +2153,7 @@ async def fork_plan(
             forked_from_version_id=version.id,
             base_version_id=version.id,
             run_type="fork",
+            authorize_effect_boundary=authorize_fork_effect_boundary,
             authorize_locked_creation=authorize_locked_fork,
         )
         resource = await plan_resource(db, fork, include_audit=True)
@@ -2051,7 +2202,71 @@ async def _decide(
 ) -> PlanVersionResource:
     plan, _ = await _require_version(request, db, version_id, control=True)
     async with plan_operation_lock(plan.id):
-        plan, version = await _require_version(request, db, version_id, control=True)
+        plan, version = await _require_version(
+            request,
+            db,
+            version_id,
+            control=True,
+        )
+        routing_identity = {
+            "plan_id": plan.id,
+            "target_task_id": plan.target_task_id,
+            "project_id": plan.project_id,
+            "created_by": plan.created_by,
+        }
+        if plan.target_task_id is not None:
+            target = await db.get(Task, plan.target_task_id)
+            if target is None:
+                # A deleted target is a repository/context hard conflict, not
+                # an authorization-shaped error.  Preserve the structured
+                # staleness contract so callers can distinguish a missing
+                # execution target from a revoked ACL without attempting a
+                # decision write.
+                stale = await _version_staleness(db, plan, version)
+                if stale["hard_conflict"]:
+                    raise HTTPException(
+                        409,
+                        {
+                            "code": "plan_hard_conflict",
+                            "message": "Plan Version cannot be decided",
+                            **stale,
+                        },
+                    )
+                raise HTTPException(409, "Plan target Task is unavailable")
+            await lock_task_effect_access(
+                request,
+                target,
+                db,
+                allow_chat_share=False,
+                fence_worker_node=True,
+            )
+        else:
+            # End the preliminary ACL/staleness snapshot before taking the
+            # portable Worker-node -> Project -> User writer sequence.
+            await db.rollback()
+            await _lock_standalone_plan_effect_access(
+                request,
+                db,
+                project_id=routing_identity["project_id"],
+                plan_created_by=routing_identity["created_by"],
+            )
+        plan, version = await _require_version(
+            request,
+            db,
+            version_id,
+            control=True,
+        )
+        if routing_identity != {
+            "plan_id": plan.id,
+            "target_task_id": plan.target_task_id,
+            "project_id": plan.project_id,
+            "created_by": plan.created_by,
+        }:
+            await db.rollback()
+            raise HTTPException(
+                409,
+                "Plan routing changed while authorizing the decision",
+            )
         await reject_capability_owned_plan_mutation(db, plan_ids=(plan.id,))
         stale = await _version_staleness(db, plan, version)
         if stale["hard_conflict"]:
@@ -2232,6 +2447,12 @@ async def cancel_worker_imported_plan_run(
     require_internal_service(request)
     payload_digest = body.payload_digest
     async with plan_operation_lock(body.plan_id):
+        # Exact cancellation is itself a Worker-local graph mutation: it may
+        # create a permanent pre-import tombstone or publish a terminal
+        # Run/Step/Input graph.  Serialize it with the irreversible node drain
+        # before taking the import-receipt or Plan writers so a completed drain
+        # proof cannot be invalidated by a late Manager cancellation RPC.
+        await fence_worker_node_mutation(db)
         import_receipt = await _load_worker_import_receipt(
             db,
             run_id=run_id,
@@ -2282,7 +2503,9 @@ async def cancel_worker_imported_plan_run(
                     "plan_id": body.plan_id,
                     "run_id": run_id,
                     "payload_digest": payload_digest,
+                    "base_worker_version_id": None,
                     "run": None,
+                    "versions": [],
                 }
 
         _require_worker_import_receipt_identity(
@@ -2299,7 +2522,9 @@ async def cancel_worker_imported_plan_run(
                 "plan_id": body.plan_id,
                 "run_id": run_id,
                 "payload_digest": payload_digest,
+                "base_worker_version_id": None,
                 "run": None,
+                "versions": [],
             }
 
         run = await db.get(
@@ -2319,7 +2544,9 @@ async def cancel_worker_imported_plan_run(
                 "plan_id": body.plan_id,
                 "run_id": run_id,
                 "payload_digest": payload_digest,
+                "base_worker_version_id": None,
                 "run": None,
+                "versions": [],
             }
         plan = await db.get(
             Plan,
@@ -2341,14 +2568,28 @@ async def cancel_worker_imported_plan_run(
                 "Worker Plan Run id belongs to another immutable import identity",
             )
         if run.status == "cancelled":
+            versions = list(
+                (
+                    await db.execute(
+                        select(PlanVersion)
+                        .where(PlanVersion.produced_by_run_id == run.id)
+                        .order_by(PlanVersion.version_number, PlanVersion.id)
+                    )
+                ).scalars()
+            )
             await db.commit()
             return {
                 "protocol": 1,
-                "state": "cancelled",
+                "state": "terminal",
                 "plan_id": plan.id,
                 "run_id": run.id,
                 "payload_digest": payload_digest,
+                "base_worker_version_id": run.base_version_id,
                 "run": (await run_resource(db, run)).model_dump(mode="json"),
+                "versions": [
+                    (await version_resource(db, version)).model_dump(mode="json")
+                    for version in versions
+                ],
             }
         if run.status in {"completed", "failed"}:
             versions = list(
@@ -2394,11 +2635,22 @@ async def cancel_worker_imported_plan_run(
     )
     return {
         "protocol": 1,
-        "state": "cancelled",
+        "state": "terminal",
         "plan_id": plan.id,
         "run_id": run.id,
         "payload_digest": payload_digest,
+        "base_worker_version_id": run.base_version_id,
         "run": (await run_resource(db, run)).model_dump(mode="json"),
+        "versions": [
+            (await version_resource(db, version)).model_dump(mode="json")
+            for version in (
+                await db.execute(
+                    select(PlanVersion)
+                    .where(PlanVersion.produced_by_run_id == run.id)
+                    .order_by(PlanVersion.version_number, PlanVersion.id)
+                )
+            ).scalars()
+        ],
     }
 
 
@@ -2616,12 +2868,47 @@ async def cancel_plan_run(
                     if (
                         remote.get("protocol") != 1
                         or remote.get("state")
-                        not in {"absent", "cancelled", "terminal"}
+                        not in {"absent", "terminal"}
                         or type(remote.get("plan_id")) is not int
                         or remote.get("plan_id") != expected_plan_id
                         or type(remote.get("run_id")) is not int
                         or remote.get("run_id") != run_id
                         or remote.get("payload_digest") != payload_digest
+                        or (
+                            remote.get("state") == "absent"
+                            and (
+                                remote.get("run") is not None
+                                or "base_worker_version_id" not in remote
+                                or remote.get("base_worker_version_id") is not None
+                                or remote.get("versions") != []
+                            )
+                        )
+                        or (
+                            remote.get("state") == "terminal"
+                            and (
+                                not isinstance(remote.get("run"), dict)
+                                or type(remote["run"].get("id")) is not int
+                                or remote["run"].get("id") != run_id
+                                or type(remote["run"].get("plan_id")) is not int
+                                or remote["run"].get("plan_id")
+                                != expected_plan_id
+                                or remote["run"].get("status")
+                                not in {"completed", "failed", "cancelled"}
+                                or not isinstance(remote.get("versions"), list)
+                                or isinstance(
+                                    remote.get("base_worker_version_id"),
+                                    bool,
+                                )
+                                or (
+                                    remote.get("base_worker_version_id")
+                                    is not None
+                                    and not isinstance(
+                                        remote.get("base_worker_version_id"),
+                                        int,
+                                    )
+                                )
+                            )
+                        )
                     ):
                         raise RuntimeError(
                             "Worker returned an invalid exact Plan cancellation receipt"
@@ -2747,6 +3034,19 @@ async def create_execution_task(
     db: AsyncSession = Depends(get_db),
 ):
     plan, _ = await _require_version(request, db, version_id, control=True)
+    plan_project_id = plan.project_id
+    plan_created_by = plan.created_by
+    plan_worker_id = plan.worker_id
+
+    async def authorize_effect_boundary(locked_db: AsyncSession) -> None:
+        await _lock_standalone_plan_effect_access(
+            request,
+            locked_db,
+            project_id=plan_project_id,
+            plan_created_by=plan_created_by,
+            worker_id=plan_worker_id,
+            fence_worker_assignment=True,
+        )
 
     async def authorize_locked_plan(locked_db: AsyncSession, locked_plan: Plan):
         await _refresh_plan_acl_dependencies(
@@ -2770,6 +3070,11 @@ async def create_execution_task(
         confirm_stale=body.confirm_stale,
         approve_if_pending=body.approve_if_pending,
         actor_id=get_current_user_id(request),
+        # Applying an approved Plan creates an ordinary implementation Task.
+        # Preserve the caller's Manager principal even when the repository is
+        # hosted on a Worker; WorkerProxy delegates it at the node boundary.
+        execution_principal=task_execution_principal_from_request(request),
+        authorize_effect_boundary=authorize_effect_boundary,
         authorize_locked_plan=authorize_locked_plan,
     )
     execution_id = result.task.id

@@ -1,5 +1,6 @@
 import re
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -251,8 +252,24 @@ class PRReviewResponse(BaseModel):
     pr_author: str
     pr_url: str
     task_id: int | None
+    # ``task_id`` is retained for old clients.  Panel reviews have one Task
+    # per role, so new clients must use this complete, deterministic list
+    # instead of treating the legacy first Task as the whole review.
+    task_ids: list[int] = Field(default_factory=list)
     status: str
     review_summary: str | None
+    display_status: str | None = None
+    display_summary: str | None = None
+    outcome_kind: Literal[
+        "in_progress",
+        "review_result",
+        "infrastructure_error",
+        "lifecycle",
+    ] = "in_progress"
+    aggregate_verdict: Literal["pass", "changes_required"] | None = None
+    reviewer_count: int = 0
+    reviewer_status_counts: dict[str, int] = Field(default_factory=dict)
+    reviewer_verdict_counts: dict[str, int] = Field(default_factory=dict)
     action_taken: str | None
     merge_method: str | None = None
     ci_status: str | None = None
@@ -395,6 +412,15 @@ class PRReviewerRunResponse(BaseModel):
     effort: str | None
     status: str
     verdict: str | None
+    # A bounded, human-readable role summary.  The strict machine payload in
+    # ``PRReviewerRun.result_json`` is intentionally never part of the API.
+    result_body: str | None = None
+    outcome_kind: Literal[
+        "in_progress",
+        "review_result",
+        "infrastructure_error",
+        "lifecycle",
+    ] = "in_progress"
     error_message: str | None
     created_at: datetime
     completed_at: datetime | None

@@ -489,9 +489,31 @@ async def create_delivery_run(
     legacy_request.pop("frontend_review", None)
     legacy_request_hash = value_hash(legacy_request)
 
-    # A real write is the portable project-scoped admission mutex. SELECT FOR
-    # UPDATE is a no-op on SQLite, while this same-column write serializes on
-    # SQLite and locks only the project row on PostgreSQL/MySQL.
+    # Global topology lock order is MonitoredRepo -> Project.  PR Monitor
+    # mutation paths already hold the repository row before reauthorizing
+    # through its Project, so Delivery admission must take the same order or
+    # PostgreSQL/MySQL can deadlock on concurrent create/update operations.
+    # The no-op writes are portable writer fences because SQLite ignores
+    # SELECT ... FOR UPDATE.
+    guarded_repo = await db.execute(
+        update(MonitoredRepo)
+        .where(MonitoredRepo.id == spec.monitored_repo_id)
+        .values(updated_at=MonitoredRepo.updated_at)
+        .execution_options(synchronize_session=False)
+    )
+    if guarded_repo.rowcount != 1:
+        raise DeliveryNotFoundError("Monitored repository not found")
+    repo = (
+        await db.execute(
+            select(MonitoredRepo)
+            .where(MonitoredRepo.id == spec.monitored_repo_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if repo is None:
+        raise DeliveryNotFoundError("Monitored repository not found")
+
     await db.execute(
         update(Project)
         .where(Project.id == spec.project_id)
@@ -568,20 +590,9 @@ async def create_delivery_run(
             "strict_branch_protection must be a boolean"
         )
 
-    # Admission serializes with Project/PR Monitor identity mutations.  The
-    # API mutation paths take the same rows before checking for an active Run,
-    # so either the mutation wins and this validation observes its new state,
-    # or this Run commits first and the mutation is rejected with 409.
-    repo = (
-        await db.execute(
-            select(MonitoredRepo)
-            .where(MonitoredRepo.id == spec.monitored_repo_id)
-            .with_for_update()
-            .execution_options(populate_existing=True)
-        )
-    ).scalar_one_or_none()
-    if repo is None:
-        raise DeliveryNotFoundError("Monitored repository not found")
+    # Admission now holds both topology rows in the same order as PR Monitor
+    # mutation paths. Either the mutation wins and this validation observes
+    # its new state, or this Run commits first and the mutation returns 409.
     repo_provider = (repo.provider or "").strip().lower()
     if repo_provider not in _DELIVERY_PROVIDERS:
         raise DeliveryValidationError(
@@ -780,6 +791,10 @@ async def create_delivery_run(
             "delivery_role": "developer",
             "worker_id": None,
             "created_by": spec.created_by,
+            "execution_user_id": None,
+            "execution_user_role": "member",
+            "execution_mode": "sandbox",
+            "execution_principal_kind": "system",
             "provider": resolved_provider,
             "model": resolved_model,
             "codex_service_tier": spec.codex_service_tier,

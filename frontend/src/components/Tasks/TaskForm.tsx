@@ -106,7 +106,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [projects, setProjects] = useState<Project[]>([]);
-  const [hasWorker, setHasWorker] = useState(isAdmin);
   const [tagItems, setTagItems] = useState<TagItem[]>([]);
   const fileUpload = useFileUpload();
   const clearFileUploads = fileUpload.clear;
@@ -161,7 +160,6 @@ export function TaskForm({ onCreated }: TaskFormProps) {
 
   useEffect(() => {
     loadProjects();
-    if (!isAdmin) api.listWorkers().then(w => setHasWorker(w.length > 0)).catch(() => {});
     // Restore persisted user choices independently of the server request.
     // A slow or unavailable backend must not make local defaults disappear.
     applyStoredDefaults(readStoredTaskDefaults(), 'codex');
@@ -242,7 +240,9 @@ export function TaskForm({ onCreated }: TaskFormProps) {
       return;
     }
     api.listTasks(undefined, true, projectId as number, undefined, 100)
-      .then((tasks) => setContextTasks(tasks.filter((t) => t.session_id)))
+      .then((tasks) => setContextTasks(tasks.filter((t) => (
+        t.has_session ?? Boolean((t as Task & { session_id?: string | null }).session_id)
+      ))))
       .catch(() => setContextTasks([]));
   }, [projectId]);
 
@@ -829,7 +829,7 @@ export function TaskForm({ onCreated }: TaskFormProps) {
           value={isNewProject ? NEW_PROJECT_VALUE : projectId || undefined}
           onChange={handleProjectChange}
           placeholder="Select project..."
-          extraOptions={hasWorker ? [{ value: NEW_PROJECT_VALUE, label: '+ New project' }] : []}
+          extraOptions={isAdmin ? [{ value: NEW_PROJECT_VALUE, label: '+ New project' }] : []}
           className="w-full"
           showStatus
           tagColorMap={Object.fromEntries(tagItems.map((t) => [t.name, t.color]))}

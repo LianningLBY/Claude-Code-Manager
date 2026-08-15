@@ -120,15 +120,20 @@ async def run_plan_terminal_transition(
     plan_task_id: int,
     terminal_status: str,
     mutate: Callable[[], Awaitable[_T]],
+    *,
+    authorize_effect_boundary: Callable[[], Awaitable[None]] | None = None,
 ) -> _T:
     """Commit and publish one Plan terminal decision under queue quiescence.
 
-    ``mutate`` must stage (but not commit) the exact Plan transition and any
-    successor row. The helper commits those writes together with cancellation
-    of every running CCM auxiliary producer. Once that commit succeeds, all
-    process cleanup, a second queue drain, and the exact status publication are
-    completed before the admission lease is released, even if the HTTP caller
-    is cancelled meanwhile.
+    ``authorize_effect_boundary`` may establish the global Worker-node ->
+    Project -> Task -> Worker -> membership -> User fence after all queue
+    cleanup rollbacks and before this helper re-enters the Plan Task row.
+    ``mutate`` must then stage (but not commit) the exact Plan transition and
+    any successor row. The helper commits those writes together with
+    cancellation of every running CCM auxiliary producer. Once that commit
+    succeeds, all process cleanup, a second queue drain, and the exact status
+    publication are completed before the admission lease is released, even if
+    the HTTP caller is cancelled meanwhile.
     """
 
     async def operation() -> _T:
@@ -172,6 +177,8 @@ async def run_plan_terminal_transition(
                 )
 
             try:
+                if authorize_effect_boundary is not None:
+                    await authorize_effect_boundary()
                 # The read above is only an early diagnostic. This no-op CAS is
                 # the transaction-local authority: it serializes a detached PTY
                 # publication with the Plan decision on every supported DB and

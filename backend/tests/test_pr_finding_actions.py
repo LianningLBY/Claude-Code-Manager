@@ -511,8 +511,11 @@ async def test_capture_failure_cleans_reservation_after_concurrent_wal_writer(
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql(
+                "PRAGMA journal_mode=WAL"
+            )
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,
@@ -614,6 +617,10 @@ async def test_create_fix_task_captures_route_and_uses_tool_free_tag(db_session)
     assert action.result["head_ref"] == "feature/fix"
     assert task.tags == ["pr-review-fix"]
     assert task.metadata_["pr_finding_action_id"] == action.id
+    assert task.execution_user_id is None
+    assert task.execution_user_role == "member"
+    assert task.execution_mode == "sandbox"
+    assert task.execution_principal_kind == "system"
     assert "backend/example.py" in task.description
 
 
@@ -839,6 +846,7 @@ async def test_cancel_running_worker_fix_uses_exact_termination_protocol(
     assert current_task.metadata_ == {
         "pr_finding_action_id": action_id,
         "pr_review_superseded": True,
+        "ccm_worker_remote_materialized_v1": True,
     }
 
 
@@ -854,6 +862,7 @@ async def test_fix_completion_stages_hash_bound_confirmation(db_session):
         retry_count=2,
         started_at=datetime.utcnow() - timedelta(seconds=5),
         completed_at=datetime.utcnow(),
+        pty_background_generation="fix-background-generation",
         metadata_={
             "pr_finding_action_id": 1,
             "expected_head_sha": HEAD_SHA,
@@ -901,12 +910,15 @@ async def test_fix_completion_stages_hash_bound_confirmation(db_session):
             action_id=action.id,
             task_id=task.id,
             retry_count=2,
+            expected_background_generation="fix-background-generation",
         )
 
     await db_session.refresh(action)
     assert action.status == "awaiting_confirmation"
     assert action.patch_sha256 == hashlib.sha256(_patch_text().encode()).hexdigest()
     assert action.result["confirmation_token"]
+    await db_session.refresh(task)
+    assert task.pty_background_generation == "fix-background-generation"
     assert (
         await db_session.get(PRFinding, finding_id, populate_existing=True)
     ).status == "open"
@@ -1070,8 +1082,11 @@ async def test_fix_completion_final_cas_yields_to_receipt_race(
     )
     try:
         async with engine.begin() as connection:
+            journal_mode = await connection.exec_driver_sql(
+                "PRAGMA journal_mode=WAL"
+            )
+            assert journal_mode.scalar_one().lower() == "wal"
             await connection.run_sync(Base.metadata.create_all)
-            await connection.exec_driver_sql("PRAGMA journal_mode=WAL")
         sessions = async_sessionmaker(
             engine,
             class_=AsyncSession,

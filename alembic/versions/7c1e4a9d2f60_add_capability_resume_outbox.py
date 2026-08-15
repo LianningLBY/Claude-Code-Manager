@@ -21,6 +21,7 @@ depends_on: Union[str, Sequence[str], None] = None
 _OUTBOX_TABLE = "capability_resume_outbox"
 _MYSQL_CAPABILITY_GATE = "ck_cap_inv_no_resume_outbox_downgrade"
 _MYSQL_OUTBOX_GATE = "ck_cap_resume_outbox_no_downgrade_rows"
+_MYSQL_OUTBOX_CHECK_PROBE = "_ccm_cap_resume_outbox_check_probe"
 
 _OLD_AGENT_REQUEST_IDENTITY = (
     "source <> 'agent_request' OR ("
@@ -808,6 +809,33 @@ def _mysql_outbox_indexes() -> dict[str, tuple[str, ...]]:
     return indexes
 
 
+def _mysql_canonical_outbox_checks() -> dict[str, object]:
+    """Have MySQL canonicalize expected CHECK expressions for comparison."""
+
+    bind = op.get_bind()
+    probe = sa.Table(
+        _MYSQL_OUTBOX_CHECK_PROBE,
+        sa.MetaData(),
+        *_outbox_columns(),
+        *(
+            sa.CheckConstraint(sql, name=name)
+            for name, sql in _OUTBOX_CHECKS.items()
+        ),
+        prefixes=["TEMPORARY"],
+        mysql_engine="InnoDB",
+    )
+    bind.execute(sa.schema.CreateTable(probe))
+    try:
+        return {
+            str(item.get("name") or "").lower(): item.get("sqltext")
+            for item in sa.inspect(bind).get_check_constraints(
+                _MYSQL_OUTBOX_CHECK_PROBE
+            )
+        }
+    finally:
+        bind.execute(sa.schema.DropTable(probe))
+
+
 def _mysql_outbox_state(
     *,
     allow_gate: bool = False,
@@ -896,7 +924,12 @@ def _mysql_outbox_state(
         raise RuntimeError(
             "capability resume outbox MySQL CHECK set is malformed"
         )
-    for name, expected in _OUTBOX_CHECKS.items():
+    canonical_checks = _mysql_canonical_outbox_checks()
+    if set(canonical_checks) != expected_names:
+        raise RuntimeError(
+            "capability resume outbox MySQL canonical CHECK probe is malformed"
+        )
+    for name, expected in canonical_checks.items():
         if _check_shape(checks[name]) != _check_shape(expected):
             raise RuntimeError(
                 f"capability resume outbox MySQL CHECK {name} is malformed"

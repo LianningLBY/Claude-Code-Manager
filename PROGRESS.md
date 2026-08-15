@@ -1116,12 +1116,12 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - 防回归：新增 opt-in 真实 claude-pty 测试，刻意把当前 Key 指纹写入 `rejected` 后验证首轮返回固定文本。
 - 实现提交：`e0ea9e04`。
 
-## 2026-08-15 — Delivery 全角色权限默认开放（commit c3e951f4）
+## 2026-08-15 — 撤回 Delivery 全角色扩权，改用逐回合 principal
 
-- **问题**：原 `AGENT_SANDBOX_UNRESTRICTED_ENABLED` 只放开 Coding、普通 Codex turn 和 Claude Plan 的宿主沙箱；Plan 仍是只读工具，PR Reviewer 保持 tool-free，Browser Agent 保持 MCP-only，导致 Delivery 自动流程仍可能被隐藏权限边界阻断。
-- **解决**：复用同一个管理员运行时开关并把启动默认值改为开启。开启时 Plan、Coding、Reviewer、PR Review 与 Browser 全部获得完整 provider 工具、宿主文件系统及网络权限；Codex 统一使用 `danger-full-access`，Claude 使用完整 allowlist 与 `--dangerously-skip-permissions`。Browser 必需 MCP 继续挂载，但不再限制为唯一工具面。Settings 可随时关闭，关闭后后续 turn 恢复原 read-only、tool-free、MCP-only 和网络隔离边界。
-- **避免复发**：权限提示、Settings 文案、配置默认值、Claude structured pipeline、InstanceManager 和 Codex app-server 必须共享同一开关语义；新增/调整测试同时覆盖开启态扩权与关闭态恢复隔离，禁止只改前端文案或只放开 Coding。
-- **验证**：Plan/Reviewer 43 项、Codex capability 29 项、InstanceManager Reviewer/Browser/PR Review 55 项通过；前端 Delivery/Task/Settings 59 项通过，Vite production build 成功，`git diff --check` 通过。运行时开关已持久设为开启，CCM 本机与外网健康检查均为 200。
+- **撤回**：`c3e951f4` 的全局 unrestricted 开关会让 Plan、Reviewer、PR Review 与 Browser 越过各自 capability contract，因此不再是当前运行契约；相关配置、Settings 入口和 provider 扩权已移除。
+- **当前边界**：每个用户回合冻结并在 provider boundary 复验真实 principal。管理员发起的普通 Task 可使用 unrestricted profile；member 保持 sandbox。Plan/Reviewer 固定只读、PR Review 固定 tool-free、Browser 固定 MCP-only，Delivery 继续使用专用隔离协议，后台 retry、账号切换与 Worker handoff 均继承原 principal。
+- **兼容保留**：只保留 Codex aggregate MCP identity 的精确映射；仅当解析后的 `(server, tool)` 已在冻结 allowlist 中才放行，不能借聚合 server 名扩权。
+- **避免复发**：权限必须来自逐回合 durable principal 与专用 capability contract，禁止再用全局布尔开关同时改变多个角色或工作流的工具、文件系统和网络边界。
 
 ## 2026-08-15 — Delivery 可信多 Preview Profile（commit feb285e4）
 

@@ -675,6 +675,56 @@ async def test_aws_adopts_instance_by_client_token_before_run_instances(tmp_path
     assert ec2.create_group_calls == []
 
 
+async def test_aws_termination_scope_uses_same_session_account_and_region():
+    class FakeSTS:
+        def get_caller_identity(self):
+            return {
+                "Account": "123456789012",
+                "Arn": "arn:aws-us-gov:iam::123456789012:role/ccm-manager",
+            }
+
+    class FakeSession:
+        def client(self, service, *, region_name):
+            assert service == "sts"
+            assert region_name == "us-gov-west-1"
+            return FakeSTS()
+
+    provider = AWSProvider(region="us-gov-west-1")
+    provider._client = _FakeEC2()
+    provider._boto_session = FakeSession()
+
+    assert await provider.termination_scope() == {
+        "provider": "aws",
+        "partition": "aws-us-gov",
+        "account_id": "123456789012",
+        "region": "us-gov-west-1",
+    }
+
+
+async def test_aws_client_token_lookup_can_prove_exact_terminated_identity():
+    class TerminatedEC2(_FakeEC2):
+        def describe_instances(self, *, Filters):
+            assert Filters == [{
+                "Name": "client-token",
+                "Values": ["ccm-terminated-worker"],
+            }]
+            return {"Reservations": [{"Instances": [{
+                "InstanceId": "i-terminated-worker",
+                "State": {"Name": "terminated"},
+            }]}]}
+
+    provider = _provider(TerminatedEC2())
+
+    with pytest.raises(RuntimeError, match="already terminating/terminated"):
+        await provider.find_instance_by_create_token(
+            "ccm-terminated-worker"
+        )
+    assert await provider.find_instance_by_create_token(
+        "ccm-terminated-worker",
+        include_terminated=True,
+    ) == "i-terminated-worker"
+
+
 async def test_aws_ingress_duplicate_is_individually_idempotent(tmp_path):
     public_key = derive_openssh_public_key(_private_key_file(tmp_path))
     ec2 = _FakeEC2()
@@ -812,14 +862,26 @@ async def test_aws_rejects_unsafe_client_token_before_instance_create(tmp_path):
     assert ec2.run_params is None
 
 
-async def test_aws_terminate_treats_already_absent_instance_as_success():
+async def test_aws_terminate_treats_already_absent_instance_as_success_only_with_scope_proof():
     class MissingInstanceEC2(_FakeEC2):
         def terminate_instances(self, *, InstanceIds):
             raise _FakeAwsError("InvalidInstanceID.NotFound")
 
     provider = _provider(MissingInstanceEC2())
 
-    await provider.terminate_instance("i-already-gone")
+    with pytest.raises(_FakeAwsError, match="InvalidInstanceID.NotFound"):
+        await provider.terminate_instance("i-already-gone")
+
+    await provider.terminate_instance(
+        "i-already-gone",
+        allow_not_found=True,
+    )
+
+    with pytest.raises(ValueError, match="exact boolean"):
+        await provider.terminate_instance(
+            "i-already-gone",
+            allow_not_found="yes",
+        )
 
 
 async def test_aws_terminate_submits_exact_instance_id():

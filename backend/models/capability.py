@@ -376,6 +376,33 @@ class CapabilityResumeOutbox(Base):
             name="ck_cap_resume_outbox_request_identity",
         ),
         CheckConstraint(
+            "request_execution_user_role IN ('member', 'admin', 'super_admin') "
+            "AND request_execution_mode IN ('sandbox', 'unrestricted') "
+            "AND request_execution_principal_kind IN "
+            "('user', 'deployment_token', 'system', 'delegated_user', "
+            "'delegated_deployment_token') "
+            "AND ((request_execution_principal_kind IN "
+            "('user', 'delegated_user') "
+            "AND request_execution_user_id IS NOT NULL) OR "
+            "(request_execution_principal_kind NOT IN "
+            "('user', 'delegated_user') "
+            "AND request_execution_user_id IS NULL)) "
+            "AND ((request_execution_principal_kind = 'system' "
+            "AND request_execution_user_role = 'member' "
+            "AND request_execution_mode = 'sandbox') OR "
+            "(request_execution_principal_kind IN "
+            "('deployment_token', 'delegated_deployment_token') "
+            "AND request_execution_user_role = 'super_admin' "
+            "AND request_execution_mode = 'unrestricted') OR "
+            "(request_execution_principal_kind IN "
+            "('user', 'delegated_user') AND "
+            "((request_execution_user_role IN ('admin', 'super_admin') "
+            "AND request_execution_mode = 'unrestricted') OR "
+            "(request_execution_user_role = 'member' "
+            "AND request_execution_mode = 'sandbox'))))",
+            name="ck_cap_resume_outbox_execution_principal",
+        ),
+        CheckConstraint(
             "(status IN ("
             f"{_sql_values(ACTIVE_RESUME_OUTBOX_STATUSES)}"
             ") AND active_task_id IS NOT NULL "
@@ -561,6 +588,20 @@ class CapabilityResumeOutbox(Base):
     request_terminal_log_id: Mapped[int] = mapped_column(Integer, nullable=False)
     request_native_turn_id: Mapped[str | None] = mapped_column(
         String(200), nullable=True
+    )
+    # Immutable authority of the exact model turn that requested the
+    # capability. Resume must inherit it rather than run as a system message.
+    request_execution_user_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    request_execution_user_role: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="member", server_default="member"
+    )
+    request_execution_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="sandbox", server_default="sandbox"
+    )
+    request_execution_principal_kind: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="system", server_default="system"
     )
 
     # Frozen Invocation terminal outcome. A non-success outcome is still a

@@ -29,7 +29,6 @@ const runtimeSettings = {
   codex_app_server_enabled: true,
   codex_main_mcp_enabled: true,
   codex_monitor_enabled: true,
-  agent_sandbox_unrestricted_enabled: false,
   auto_sort_on_access: true,
   context_compact_threshold: 0.8,
 };
@@ -143,34 +142,6 @@ describe('SettingsPage', () => {
 
     expect(localStorage.getItem('cc_theme')).toBe('light');
     expect(localStorage.getItem('cc_timezone')).toBe('UTC');
-  });
-
-  it('requires confirmation and enables unrestricted Agent permissions', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
-    render(<SettingsPage />);
-
-    await userEvent.click(await screen.findByRole('button', {
-      name: 'Delivery 全角色无限制权限',
-    }));
-
-    expect(confirmSpy).toHaveBeenCalledOnce();
-    expect(api.updateRuntimeSettings).toHaveBeenCalledWith({
-      agent_sandbox_unrestricted_enabled: true,
-    });
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'Plan、Coding、Reviewer 和 Browser 后续回合都可直接访问宿主文件系统与网络',
-    );
-  });
-
-  it('does not enable unrestricted Agent permissions when confirmation is cancelled', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(false);
-    render(<SettingsPage />);
-
-    await userEvent.click(await screen.findByRole('button', {
-      name: 'Delivery 全角色无限制权限',
-    }));
-
-    expect(api.updateRuntimeSettings).not.toHaveBeenCalled();
   });
 
   it('persists the global maximum Plan rounds', async () => {

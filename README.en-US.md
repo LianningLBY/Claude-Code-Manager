@@ -4,7 +4,7 @@
 
 Web-based tool for scheduling and managing multiple Claude Code instances to work in parallel. Inspired by Hu Yuanming's article "I Worked for 10 Claude Code Instances".
 
-> **⚠️ Important Security Notice:** This project runs Claude Code in `--dangerously-skip-permissions` mode, which means Claude Code will have **unrestricted file read/write, command execution, and network access**, and will automatically perform operations like `git push`. **Strongly recommended to deploy on a separate machine or virtual machine without important files** to avoid unintended impact on your personal data or work environment.
+> **⚠️ Important Security Notice:** Ordinary Tasks initiated by administrators, super administrators, or a single-token deployment run unrestricted (Claude Code uses `--dangerously-skip-permissions`) and may read/write files, execute commands, access the network, and run operations such as `git push`. Member turns and purpose-built Browser/PR Review/Delivery/Planner tasks use their respective restricted protocols. **Strongly recommended to deploy on a separate machine or virtual machine without important files.**
 
 ## Features
 
@@ -526,6 +526,15 @@ All APIs (except health, login, github webhook) require `Authorization: Bearer <
 
 New installs won't generate a fixed-password administrator: the first registered user to complete email verification becomes `super_admin`. When `AUTH_TOKEN` is configured and no active users exist, the registration form must include that Token in the optional "Bootstrap Token" field to prevent a public visitor from seizing the first administrator account. Upgrades automatically disable the shared default administrator created by older versions; single-token deployments can still enter with `AUTH_TOKEN`, while team deployments should configure `SMTP_*` and then register a real administrator. The verification-code service rate-limits by email and `Request.client.host`; multi-process or multi-replica deployments should also configure shared rate limiting at the reverse proxy or gateway because application-level state is isolated per process.
 
+Execution authority is frozen per turn from the actual caller: ordinary `admin`/`super_admin` and deployment-token turns run unrestricted, while `member` turns run in the fail-closed sandbox. Team Project/Task sharing is only a local ACL and does not change that principal. A Worker is a complete headless CCM compute node: the Manager validates ACLs and roles, then delegates the ordinary turn; the Worker Token authenticates only the control plane and never becomes the model's super-admin identity. Legacy cross-CCM shares and purpose-built Browser, PR Review, Delivery, Planner, and Reviewer tasks retain their own isolated protocols.
+
+Team authorization matrix:
+
+- `super_admin`/`admin` can create, configure, and assign Projects and manage every Project/Task.
+- A `member` initially sees no Project or Task and cannot create Tasks. A Project ACL lets the member view that Project and create/manage Tasks inside it.
+- A Task creator or administrator can share that Task with a user/group for chat access. A Task share is not a Project ACL and does not allow creation of another Task in that Project.
+- Worker ownership grants compute-node administration only, never visibility into Projects/Tasks placed on that node. Workers are headless; the Manager remains authoritative for tasks, logs, and ACLs.
+
 ### PTY Mode
 
 | Environment Variable | Default | Description |
@@ -599,6 +608,7 @@ Claude/Codex auto-login shares one Xvfb manager and login lock. Manager uses pri
 | `WORKER_SSH_KEY_PATH` | (Required) | SSH private key `.pem` file path |
 | `WORKER_SSH_USER` | `ubuntu` | Worker EC2 SSH username |
 | `WORKER_ENABLED` | `true` | Enable Worker function |
+| `CCM_NODE_ROLE` | `manager` | Durable database role; Worker bootstrap writes `worker` and a bound database cannot switch roles in place |
 | `WORKER_INSTANCE_TYPE` | (Inherit Manager) | Override Worker EC2 instance type |
 | `WORKER_IMAGE_ID` | (Inherit Manager) | Override Worker AMI ID |
 
@@ -748,7 +758,7 @@ cloudflared tunnel run <tunnel-name>
 - **Process Timeout Protection**: Auto-kill after `TASK_TIMEOUT_SECONDS` (default 30 mins) exceeds, prevents hung processes
 - **Multi-turn Conversations**: `session_id` bound to Task, follow-up uses `--resume <session_id>` to continue session
 - **Codex Shared Transport Stop**: `stop-session` only stops target turn. If precise interrupt temporarily unconfirmable, and same account app-server still serving other turns or already admitted requests, API returns 409 and keeps original task running evidence, can retry later; won't kill other tasks on same account to stop one task
-- **Codex Fast**: `Task.codex_service_tier` persistently saves `default|priority`. Standard explicitly clears session leftover Fast tier; Fast must simultaneously pass current account `model/list` capability check, app-server explicit priority admission, and CCM loopback Responses proxy actual response verification for upstream `response.created.response.service_tier=priority`. Successful SSE won't release until verification; missing fields, inconsistency, non-2xx, unknown lineage, or proxy unavailable explicitly fail, and Fast prohibits falling back to `codex exec`. Logs and chat events record `actual_service_tier_verified=true` and upstream response id. Fast Goal evaluator uses same model as task and goes through same actual tier proof chain; current Distill cannot provide equivalent proof, so Fast Tasks explicitly return 409 before Distill executes
+- **Codex Fast**: `Task.codex_service_tier` persistently saves `default|priority`. Standard explicitly clears any session-level Fast tier; Fast must pass the account model-catalog capability check, app-server priority admission, and the CCM loopback Responses proxy's verification that the exact thread/turn sent `service_tier=priority`. A successful `response.created` proves that the upstream accepted the request; the response's own `service_tier` is informational telemetry, so `auto`, `default`, or an omitted field does not disable the account. A conflicting request tier, non-2xx response, unknown lineage, or unavailable proxy still fails explicitly, and Fast never falls back to `codex exec`. Logs and chat events record `service_tier_request_verified=true`, the upstream-reported tier, and the response id without claiming that actual Fast execution was proven. The Fast Goal evaluator uses the Task's model and the same request-acceptance chain; current Distill cannot provide equivalent evidence, so Fast Tasks return 409 before Distill executes.
 - **Sub-Agent System**: Uniformly stored in `sub_agent_sessions` table, `agent_type` distinguishes categories (monitor / native-agent / native-monitor). CCM's own sub-agents have independent MCP server, communicate with system via HTTP API
 - **Transient Overload Retry**: Strictly distinguishes Anthropic infrastructure-side 429/overload from account quota exhaustion, former backoff retries same account, latter goes through pool rotation
 - **Process Management**: `asyncio.create_subprocess_exec` start, must unset `CLAUDECODE` env var to avoid nested detection
@@ -761,6 +771,7 @@ CCM supports distributing tasks to remote EC2 Worker nodes for execution, breaki
 **Core Capabilities:**
 - **One-Click Creation** — Click + on Workers page, auto-creates EC2, deploys code, installs dependencies, starts service (config inherits from Manager itself, no need to manually fill AMI/machine type/subnet)
 - **Task Forwarding** — Select execution Worker when creating task or modifying existing task, all Chat/Stop/Retry/Plan operations auto-proxied, frontend zero-perception
+- **Delegated Roles** — The Worker Token authenticates the Manager control plane only; each ordinary turn inherits the Manager-validated user role, and a Worker never resolves a Manager User ID against its own User table
 - **Real-time Migration** — Tasks can migrate between local and Worker anytime, session files and working directories auto-sync, `--resume` seamlessly connected
 - **WebSocket Relay** — One WS connection per Worker, logs relayed to Manager in real-time and stored copy, auto-reconnects + fills on disconnect
 - **Lifecycle Management** — Supports shutdown (preserves data) / startup / destroy (auto-migrates back all tasks), health check auto-recovers degraded Workers every 30s

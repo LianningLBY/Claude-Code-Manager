@@ -705,6 +705,98 @@ async def test_backend_rejects_invalid_or_stale_otp_without_writing_stdin():
     assert stdin.writes == []
 
 
+async def test_backend_closes_otp_gate_before_awaiting_stdin_ack():
+    attempt_id = "attempt-concurrent-otp"
+    challenge_id = "challenge-concurrent-otp"
+    email = "concurrent@example.com"
+    drain_entered = asyncio.Event()
+    release_drain = asyncio.Event()
+
+    class BlockingStdin(_OtpStdin):
+        async def drain(self):
+            drain_entered.set()
+            await release_drain.wait()
+
+    stdin = BlockingStdin()
+    proc = SimpleNamespace(returncode=None, stdin=stdin)
+    codex_pool_api._add_state.clear()
+    codex_pool_api._login_attempts.clear()
+    codex_pool_api._add_state[email] = {
+        "status": "awaiting_otp",
+        "attempt_id": attempt_id,
+    }
+    codex_pool_api._login_attempts[attempt_id] = {
+        "kind": "add",
+        "state_key": email,
+        "proc": proc,
+        "challenge_id": challenge_id,
+        "expires_at": codex_pool_api.time.time() + 60,
+    }
+    request = codex_pool_api.SubmitCodexOtpRequest(
+        challenge_id=challenge_id,
+        code="123456",
+    )
+    first = asyncio.create_task(
+        codex_pool_api.codex_submit_login_otp(
+            _admin_request(), attempt_id, request,
+        )
+    )
+    await asyncio.wait_for(drain_entered.wait(), timeout=1)
+
+    with pytest.raises(HTTPException) as duplicate:
+        await codex_pool_api.codex_submit_login_otp(
+            _admin_request(), attempt_id, request,
+        )
+    assert duplicate.value.status_code == 409
+    assert codex_pool_api._add_state[email]["status"] == "verifying_otp"
+
+    release_drain.set()
+    assert await first == {"ok": True, "status": "verifying_otp"}
+    assert len(stdin.writes) == 1
+
+
+async def test_backend_does_not_reopen_otp_gate_after_ambiguous_pipe_failure():
+    attempt_id = "attempt-uncertain-otp"
+    challenge_id = "challenge-uncertain-otp"
+    email = "uncertain@example.com"
+
+    class FailingStdin(_OtpStdin):
+        async def drain(self):
+            raise ConnectionError("ack lost")
+
+    stdin = FailingStdin()
+    codex_pool_api._add_state.clear()
+    codex_pool_api._login_attempts.clear()
+    codex_pool_api._add_state[email] = {
+        "status": "awaiting_otp",
+        "attempt_id": attempt_id,
+    }
+    codex_pool_api._login_attempts[attempt_id] = {
+        "kind": "add",
+        "state_key": email,
+        "proc": SimpleNamespace(returncode=None, stdin=stdin),
+        "challenge_id": challenge_id,
+        "expires_at": codex_pool_api.time.time() + 60,
+    }
+    body = codex_pool_api.SubmitCodexOtpRequest(
+        challenge_id=challenge_id,
+        code="123456",
+    )
+
+    with pytest.raises(HTTPException) as uncertain:
+        await codex_pool_api.codex_submit_login_otp(
+            _admin_request(), attempt_id, body,
+        )
+    assert uncertain.value.status_code == 409
+    assert codex_pool_api._add_state[email]["status"] == "verifying_otp"
+    with pytest.raises(HTTPException) as replay:
+        await codex_pool_api.codex_submit_login_otp(
+            _admin_request(), attempt_id, body,
+        )
+    assert replay.value.status_code == 409
+    assert len(stdin.writes) == 1
+
+
 def test_login_detail_redacts_oauth_authorize_url():
     detail = codex_pool_api._sanitize_login_detail(
         "open https://auth.openai.com/oauth/authorize?client_id=secret&state=private now"

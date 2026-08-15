@@ -447,7 +447,11 @@ async def test_destroying_worker_requires_exact_opaque_claim_for_new_receipt(
         capture_worker_destroy_lifecycle_claim,
     )
 
-    worker = Worker(name="destroy-claimed", status="destroying")
+    worker = Worker(
+        name="destroy-claimed",
+        status="destroying",
+        destroy_lifecycle_nonce="d" * 32,
+    )
     db_session.add(worker)
     await db_session.flush()
     task = Task(

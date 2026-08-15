@@ -20,6 +20,7 @@ from backend.services.workspace_review import (
     _safe_preview_env,
     PreviewConfigurationError,
     PreviewHandle,
+    public_workspace_review_capability,
     WorkspacePreviewManager,
     WorkspaceReviewBusyError,
     WorkspaceReviewError,
@@ -29,6 +30,7 @@ from backend.services.workspace_review import (
     resolve_preview_config,
     validate_preview_config,
     workspace_review_capability,
+    workspace_review_run_dict,
 )
 
 
@@ -229,6 +231,13 @@ def test_preview_config_is_shell_free_and_auto_detection_requires_confirmation(
     assert capability["available"] is False
     assert capability["configured"] is False
     assert capability["suggested_config"] == suggestion
+    assert public_workspace_review_capability(capability)["suggested_config"] is None
+    admin_projection = public_workspace_review_capability(
+        capability,
+        include_suggestion=True,
+    )
+    assert admin_projection["repo_path"] is None
+    assert admin_projection["suggested_config"] == suggestion
 
     unsafe = _http_preview_config()
     unsafe["processes"][0]["command"] = ["sh", "-c", "npm run dev"]
@@ -253,6 +262,7 @@ def test_workspace_review_capability_accepts_profiles_without_default(tmp_path):
             ],
         }
     )
+
     task = SimpleNamespace(
         worker_id=None,
         last_cwd=str(workspace),
@@ -260,15 +270,76 @@ def test_workspace_review_capability_accepts_profiles_without_default(tmp_path):
     )
 
     capability = workspace_review_capability(task, project)
-
     assert capability["available"] is True
     assert capability["configured"] is True
-    assert capability["config"]["id"] == "web"
+    assert capability["config"] is None
+    selected = resolve_preview_config(
+        project.preview_config,
+        workspace,
+        profile_ids=["web"],
+    )
+    assert [item["id"] for item in selected] == ["web"]
 
 
-def test_ccm_preview_detection_installs_locked_frontend_dependencies_before_build(
-    tmp_path,
-):
+def test_public_workspace_projections_hide_stored_preview_configuration(tmp_path):
+    workspace = _make_repo(tmp_path)
+    raw_config = _http_preview_config()
+    raw_config["processes"][0]["env"] = {
+        "CUSTOM_PREVIEW_TOKEN": "member-must-not-read-this"
+    }
+    config = validate_preview_config(raw_config, workspace)
+    project = SimpleNamespace(preview_config=config)
+    task = SimpleNamespace(
+        worker_id=None,
+        last_cwd=str(workspace),
+        target_repo=str(workspace),
+    )
+
+    capability = workspace_review_capability(task, project)
+    assert capability["available"] is True
+    assert capability["configured"] is True
+    assert capability["config"] is None
+    public_capability = public_workspace_review_capability(capability)
+    assert public_capability["repo_path"] is None
+    assert public_capability["config"] is None
+    assert public_capability["suggested_config"] is None
+
+    run = SimpleNamespace(
+        id="public-projection",
+        task_id=301,
+        project_id=1,
+        harness_run_id=None,
+        agent_task_id=None,
+        browser_review_job_id=None,
+        mode="review_only",
+        profile="standard",
+        goal="Check the preview",
+        status="completed",
+        stage="completed",
+        workspace_path=str(workspace),
+        git_head="a" * 40,
+        workspace_fingerprint="b" * 64,
+        preview_config=config,
+        preview_url="http://127.0.0.1:43123/",
+        stale=False,
+        report="Passed",
+        error=None,
+        cleanup_status="completed",
+        cleanup_error=None,
+        created_at=None,
+        started_at=None,
+        completed_at=None,
+    )
+    payload = workspace_review_run_dict(run)
+    assert payload["workspace_path"] is None
+    assert payload["preview_config"] is None
+    assert payload["preview_url"] is None
+    assert str(workspace) not in str(payload)
+    assert "127.0.0.1:43123" not in str(payload)
+    assert "member-must-not-read-this" not in str(payload)
+
+
+def test_ccm_preview_detection_installs_locked_frontend_dependencies_before_build(tmp_path):
     workspace = _make_repo(tmp_path)
     (workspace / "frontend").mkdir()
     (workspace / "frontend" / "package.json").write_text("{}", encoding="utf-8")
@@ -811,3 +882,49 @@ async def test_startup_recovery_fails_active_run_without_claiming_cleanup(
         assert recovered.stage == "interrupted"
         assert recovered.cleanup_status == "unconfirmed"
         assert recovered.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_cross_manager_workspace_cleanup_success_is_absorbing(
+    monkeypatch,
+    db_factory,
+):
+    run_id = "94" * 16
+    async with db_factory() as db:
+        db.add(
+            WorkspaceReviewRun(
+                id=run_id,
+                task_id=301,
+                mode="review_only",
+                profile="standard",
+                goal="Keep proven cleanup durable",
+                status="cancelled",
+                stage="cancelled",
+                workspace_path="/isolated/workspace",
+                git_head="a" * 40,
+                workspace_fingerprint="b" * 64,
+                preview_config={"version": 1},
+                cleanup_status="pending",
+            )
+        )
+        await db.commit()
+
+    monkeypatch.setattr(workspace_review_module, "async_session", db_factory)
+    winner = WorkspaceReviewManager()
+    late_failure = WorkspaceReviewManager()
+    await winner._update(
+        run_id,
+        cleanup_status="completed",
+        cleanup_error=None,
+    )
+    await late_failure._update(
+        run_id,
+        cleanup_status="failed",
+        cleanup_error="late preview cleanup failure",
+    )
+
+    async with db_factory() as db:
+        durable = await db.get(WorkspaceReviewRun, run_id)
+        assert durable is not None
+        assert durable.cleanup_status == "completed"
+        assert durable.cleanup_error is None

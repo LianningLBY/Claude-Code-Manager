@@ -27,7 +27,6 @@ export function PlanCreateForm({ onCreated, onNavigateSettings }: Props) {
   const [newProjectUrl, setNewProjectUrl] = useState('');
   const [priority, setPriority] = useState(0);
   const [timeoutHours, setTimeoutHours] = useState('');
-  const [hasWorker, setHasWorker] = useState(isAdmin);
   const [expanded, setExpanded] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -44,8 +43,7 @@ export function PlanCreateForm({ onCreated, onNavigateSettings }: Props) {
 
   useEffect(() => {
     loadProjects();
-    if (!isAdmin) void api.listWorkers().then((workers) => setHasWorker(workers.length > 0)).catch(() => {});
-  }, [isAdmin, loadProjects]);
+  }, [loadProjects]);
 
   useFileDrop({
     targetRef: formRef,
@@ -159,7 +157,7 @@ export function PlanCreateForm({ onCreated, onNavigateSettings }: Props) {
     </div>
     {uploads.uploads.length > 0 && <div className="flex flex-wrap gap-2">{uploads.uploads.map((item) => { const name = item.file?.name || item.result?.filename || 'file'; return <div key={item.id} className="flex items-center gap-2 rounded-lg border border-gray-700 bg-gray-900/50 px-2 py-1.5 text-xs text-gray-400">{item.preview && <img src={item.preview} alt="" className="h-8 w-8 rounded object-cover" />}<span className="max-w-48 truncate">{name}</span>{item.status === 'uploading' && <Loader2 size={12} className="animate-spin" />}{item.status === 'failed' && <AlertCircle size={12} className="text-red-400" />}<button type="button" onClick={() => uploads.removeFile(item.id)} aria-label={`Remove ${name}`}><X size={12} /></button></div>; })}</div>}
     <div className="grid gap-3 md:grid-cols-[minmax(220px,1fr)_auto] md:items-center">
-      <ProjectSelect projects={projects.filter((project) => project.show_in_selector)} value={isNewProject ? NEW_PROJECT_VALUE : projectId || undefined} onChange={handleProjectChange} placeholder="Select project…" extraOptions={hasWorker ? [{ value: NEW_PROJECT_VALUE, label: '+ New project' }] : []} showStatus tagColorMap={tagColorMap} />
+      <ProjectSelect projects={projects.filter((project) => project.show_in_selector)} value={isNewProject ? NEW_PROJECT_VALUE : projectId || undefined} onChange={handleProjectChange} placeholder="Select project…" extraOptions={isAdmin ? [{ value: NEW_PROJECT_VALUE, label: '+ New project' }] : []} showStatus tagColorMap={tagColorMap} />
       <div className="flex justify-end gap-2"><input ref={fileInputRef} type="file" multiple className="hidden" onChange={(event) => { addFiles(Array.from(event.target.files || []), setDropError); event.target.value = ''; }} /><button type="button" onClick={() => fileInputRef.current?.click()} className="rounded-lg border border-gray-600 p-2 text-gray-400 hover:text-gray-200" aria-label="Attach Plan files"><Paperclip size={14} /></button><button type="submit" disabled={!canSubmit} className="rounded-lg bg-indigo-600 px-4 py-2 text-xs font-semibold text-white hover:bg-indigo-500 disabled:opacity-40">{busy ? 'Creating…' : 'Create Plan'}</button></div>
     </div>
     {isNewProject && <div className="grid gap-2 sm:grid-cols-2"><input value={newProjectName} onChange={(event) => setNewProjectName(event.target.value)} required placeholder="Project name" className="rounded-lg border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100" /><input value={newProjectUrl} onChange={(event) => setNewProjectUrl(event.target.value)} placeholder="Git URL (optional)" className="rounded-lg border border-gray-600 bg-gray-700 px-3 py-2 text-sm text-gray-100" /></div>}

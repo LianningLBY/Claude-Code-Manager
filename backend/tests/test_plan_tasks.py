@@ -19,6 +19,7 @@ from backend.models.plan import (
 from backend.models.plan_agent import PlanAgentRun, PlanAgentStep
 from backend.models.sub_agent import SubAgentSession
 from backend.models.task import Task
+from backend.models.worker import Worker
 from backend.schemas.plan import default_plan_pipeline_config
 from backend.services.plan_tasks import capture_repo_revision
 
@@ -227,8 +228,8 @@ async def test_related_plan_preserves_validated_uploads(
 
     assert response.status_code == 201, response.text
     metadata = response.json()["metadata_"]
-    assert metadata["file_paths"] == [upload["path"]]
-    assert metadata["image_paths"] == []
+    assert "file_paths" not in metadata
+    assert "image_paths" not in metadata
     assert metadata["attachments"] == [{
         "url": upload["url"],
         "name": "design notes.txt",
@@ -248,7 +249,8 @@ async def test_related_plan_preserves_validated_uploads(
     )
     assert revision.status_code == 201, revision.text
     revised_metadata = revision.json()["metadata_"]
-    assert revised_metadata["file_paths"] == [upload["path"]]
+    assert "file_paths" not in revised_metadata
+    assert "image_paths" not in revised_metadata
     assert revised_metadata["attachments"] == metadata["attachments"]
 
 
@@ -526,6 +528,98 @@ async def test_generic_plan_create_supersedes_worker_side_source_atomically(
         source = await db.get(Task, source_id)
     assert source.status == "plan_review"
     assert not source.metadata_ or source.metadata_.get("plan_superseded_by_task_id") is None
+
+
+@pytest.mark.asyncio
+async def test_destroying_worker_blocks_legacy_related_plan_creation(
+    client,
+    session_factory,
+):
+    target_id, _ = await _target_with_session(client, session_factory)
+    async with session_factory() as db:
+        worker = Worker(name="legacy-related-plan-worker", status="destroying")
+        db.add(worker)
+        await db.flush()
+        target = await db.get(Task, target_id)
+        target.worker_id = worker.id
+        await db.commit()
+
+    response = await client.post(
+        f"/api/tasks/{target_id}/plans",
+        json={"input": "Must not cross Worker destruction"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "not ready for assignment" in response.json()["detail"]
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(func.count(Task.id)).where(
+                Task.plan_target_task_id == target_id,
+            )
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_destroying_worker_blocks_legacy_standalone_plan_revision(
+    client,
+    session_factory,
+):
+    async with session_factory() as db:
+        worker = Worker(name="legacy-plan-revision-worker", status="destroying")
+        db.add(worker)
+        await db.commit()
+        worker_id = worker.id
+    source_id = await _legacy_plan_task(
+        session_factory,
+        status="plan_review",
+        plan_content="Original Worker Plan",
+        worker_id=worker_id,
+    )
+
+    response = await client.post(
+        f"/api/tasks/{source_id}/plan/revise",
+        json={"feedback": "Must not cross Worker destruction"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert "not ready for assignment" in response.json()["detail"]
+    async with session_factory() as db:
+        source = await db.get(Task, source_id)
+        assert source.status == "plan_review"
+        assert await db.scalar(
+            select(func.count(Task.id)).where(
+                Task.supersedes_plan_task_id == source_id,
+            )
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_destroying_worker_blocks_legacy_plan_execution_materialization(
+    client,
+    session_factory,
+):
+    async with session_factory() as db:
+        worker = Worker(name="legacy-plan-execution-worker", status="destroying")
+        db.add(worker)
+        await db.commit()
+        worker_id = worker.id
+    plan_id = await _legacy_plan_task(
+        session_factory,
+        status="completed",
+        plan_content="Approved Worker Plan",
+        plan_approved=True,
+        worker_id=worker_id,
+    )
+
+    response = await client.post(
+        f"/api/tasks/{plan_id}/plan/create-execution-task",
+    )
+
+    assert response.status_code == 409, response.text
+    assert "not ready for assignment" in response.json()["detail"]
+    async with session_factory() as db:
+        plan = await db.get(Task, plan_id)
+        assert plan.plan_execution_task_id is None
 
 
 @pytest.mark.asyncio

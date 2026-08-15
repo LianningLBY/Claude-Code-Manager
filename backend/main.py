@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import secrets
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from backend.api.task_ssh import router as task_ssh_router
 from backend.api.task_artifacts import router as task_artifacts_router
 from backend.api.pool import router as pool_router
 from backend.api.codex_pool import (
+    pending_codex_login_transaction_ids,
     recover_pending_codex_login_transactions,
     router as codex_pool_router,
 )
@@ -59,7 +61,9 @@ from backend.api.plan_resources import router as plan_resources_router
 from backend.api.capabilities import router as capabilities_router
 from backend.api.delivery_runs import router as delivery_runs_router
 from backend.middleware.auth import TokenAuthMiddleware
+from backend.middleware.request_body_limit import RequestBodyLimitMiddleware
 from backend.services.ws_broadcaster import WebSocketBroadcaster
+from backend.services.cancellation import await_task_completion
 from backend.services.instance_manager import InstanceManager
 from backend.services.ralph_loop import RalphLoop
 from backend.services.dispatcher import GlobalDispatcher
@@ -179,14 +183,7 @@ async def _await_dispatcher_runtime_transition(
 ) -> None:
     """Delay caller cancellation until one paired runtime transition settles."""
 
-    cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-        except BaseException:
-            break
+    cancellation = await await_task_completion(operation)
     operation.result()
     if cancellation is not None:
         raise cancellation
@@ -410,7 +407,8 @@ if settings.worker_enabled and worker_control_plane_enabled():
         logger.exception("Worker provisioner init failed — workers disabled")
 elif settings.worker_enabled:
     logger.error(
-        "Worker control plane disabled because AUTH_TOKEN is not configured"
+        "Worker control plane disabled: requires CCM_NODE_ROLE=manager and a "
+        "non-empty AUTH_TOKEN"
     )
 
 # The same runtime also runs on a Worker where Manager-side Worker support may
@@ -591,7 +589,8 @@ async def _recover_worker_relays():
     """Manager 重启后为 ready worker 上的活跃 task 重建中继 + 补缺失日志。"""
     if not worker_control_plane_enabled():
         logger.warning(
-            "Worker relay recovery skipped because AUTH_TOKEN is not configured"
+            "Worker relay recovery skipped: control plane requires "
+            "CCM_NODE_ROLE=manager and a non-empty AUTH_TOKEN"
         )
         return
     from backend.models.worker import Worker
@@ -620,7 +619,8 @@ async def _recover_stale_worker_lifecycles():
     """
     if not worker_control_plane_enabled():
         logger.warning(
-            "Worker lifecycle recovery skipped because AUTH_TOKEN is not configured"
+            "Worker lifecycle recovery skipped: control plane requires "
+            "CCM_NODE_ROLE=manager and a non-empty AUTH_TOKEN"
         )
         return
 
@@ -635,16 +635,44 @@ async def _recover_stale_worker_lifecycles():
         )
         stale = result.scalars().all()
         for worker in stale:
-            previous = worker.status
+            previous_status = worker.status
+            previous_step = worker.bootstrap_step
             worker.status = "error"
-            worker.bootstrap_step = (
-                "destroy" if previous == "destroying" else "startup-recovery"
-            )
+            if previous_status == "destroying":
+                worker.bootstrap_step = "destroy"
+            elif (
+                previous_status in {"creating", "bootstrapping"}
+                and previous_step
+            ):
+                # Preserve the exact interrupted bootstrap boundary.  In
+                # particular, account-login may already have changed remote
+                # credentials, so retry admission must be able to distinguish
+                # that uncertain effect from an earlier, replayable step.
+                worker.bootstrap_step = previous_step
+            else:
+                worker.bootstrap_step = "startup-recovery"
             worker.bootstrap_error = (
-                f"Manager restarted while Worker was {previous}; "
+                f"Manager restarted while Worker was {previous_status}; "
                 "the interrupted lifecycle operation must be retried"
             )
-        if stale:
+            if previous_status == "destroying":
+                if not worker.destroy_lifecycle_nonce:
+                    worker.destroy_lifecycle_nonce = secrets.token_hex(16)
+            else:
+                worker.destroy_lifecycle_nonce = None
+                worker.destroy_termination_receipt = None
+        recoverable_destroy = (
+            await db.execute(
+                select(Worker).where(
+                    Worker.status.in_(("ready", "error")),
+                    Worker.bootstrap_step == "destroy",
+                    Worker.destroy_lifecycle_nonce.is_(None),
+                )
+            )
+        ).scalars().all()
+        for worker in recoverable_destroy:
+            worker.destroy_lifecycle_nonce = secrets.token_hex(16)
+        if stale or recoverable_destroy:
             await db.commit()
             logger.warning(
                 "Recovered %d interrupted Worker lifecycle operation(s) to error",
@@ -802,6 +830,13 @@ async def _shutdown_runtime_services(
 
     # Stop receipt reconciliation while both the Worker relay and Dispatcher
     # resources it may use for exact readback/reaping are still available.
+    if task_migrator is not None:
+        try:
+            await task_migrator.shutdown()
+        except BaseException as exc:
+            failures.append(exc)
+            logger.exception("Task migration recovery shutdown failed")
+
     try:
         await worker_task_termination_coordinator.shutdown()
     except BaseException as exc:
@@ -889,6 +924,13 @@ async def _start_execution_runtimes() -> None:
     await worker_task_termination_coordinator.recover_once(
         include_manager=False
     )
+    if task_migrator is not None:
+        recovered_migrations = await task_migrator.recover_once()
+        if recovered_migrations:
+            logger.warning(
+                "Recovered %d interrupted Task migration(s) before runtime startup",
+                recovered_migrations,
+            )
     if settings.auto_start_dispatcher:
         # Dispatcher and the durable resume producer form one public runtime.
         # Start them adjacently so a failed recovery scan can roll back the
@@ -896,13 +938,17 @@ async def _start_execution_runtimes() -> None:
         await start_dispatcher_runtime()
     if worker_relay is not None:
         await worker_relay.start()
+    if task_migrator is not None:
+        await task_migrator.start()
     await worker_task_termination_coordinator.start()
     # This remains active when capability admission is disabled: it must still
     # recover/cancel work that was already running before a feature rollback.
     await capability_coordinator.start()
-    # Admission is gated by both feature flags at the API boundary. Recovery
-    # stays active and starts after both downstream execution runtimes.
-    await delivery_controller.start()
+    if settings.ccm_node_role == "manager":
+        # Delivery owns Git publication and PR Monitor coordination.  A Worker
+        # executes delegated Tasks/Plans/Harness children but is never an
+        # independent Delivery control plane.
+        await delivery_controller.start()
 
 
 async def _recover_pending_pr_review_publications() -> bool:
@@ -1024,6 +1070,64 @@ async def _runtime_lifespan(app: FastAPI):
 
     if not deployment_start.skip_mutations:
         await init_db()
+    # Bind the database identity before recovery loops, Dispatcher, Worker
+    # relay or any other Task producer can run.  In particular, an upgraded
+    # Worker with a stale/missing CCM_NODE_ROLE must fail startup instead of
+    # lazily claiming the Manager namespace on its first derived Task.
+    from backend.services.task_id_namespace import (
+        bind_task_id_namespace_at_startup,
+    )
+
+    await bind_task_id_namespace_at_startup(
+        async_session,
+        node_role=settings.ccm_node_role,
+    )
+    # Import-time Codex journal recovery above has already reaped every
+    # process from a previous service incarnation. Clear its exact durable
+    # Worker login fence only when no unresolved journal with that identity
+    # remains; the irreversible drain claim itself is never cleared here.
+    from backend.services.worker_node_control import (
+        recover_worker_node_login_after_restart,
+    )
+
+    async with async_session() as db:
+        recovered_node_login = await recover_worker_node_login_after_restart(
+            db,
+            unresolved_attempt_ids=pending_codex_login_transaction_ids(),
+        )
+        if recovered_node_login:
+            await db.commit()
+            logger.warning(
+                "Recovered a crash-left Worker Codex login admission fence"
+            )
+    recovered_pty_publications, pending_pty_publications = (
+        await instance_manager.recover_pty_terminal_publications()
+    )
+    if recovered_pty_publications:
+        logger.warning(
+            "Recovered %d crash-left PTY terminal publication(s)",
+            recovered_pty_publications,
+        )
+    if pending_pty_publications:
+        # Startup may continue because the Task state is already committed;
+        # the durable rows remain visible to later recovery and block a Worker
+        # drain proof until their external publication effect is resolved.
+        logger.error(
+            "%d PTY terminal publication(s) remain pending after recovery",
+            pending_pty_publications,
+        )
+    from backend.services.project_materialization import (
+        recover_interrupted_worker_project_materializations,
+    )
+
+    recovered_projects = (
+        await recover_interrupted_worker_project_materializations()
+    )
+    if recovered_projects:
+        logger.warning(
+            "Marked %d interrupted Worker Project materialization(s) retryable",
+            recovered_projects,
+        )
     # A crash-left ``running`` SSH receipt is permanent unknown-outcome
     # evidence and, on SQLite, an active authorization trigger permit. Settle
     # it before *any* Task/Profile/share writer or Dispatcher runtime starts.
@@ -1049,20 +1153,16 @@ async def _runtime_lifespan(app: FastAPI):
     instance_manager._loop = asyncio.get_running_loop()
     # Apply persisted runtime-setting overrides before execution runtimes start.
     from backend.models.global_settings import GlobalSettings
-    from backend.services.runtime_settings import (
-        effective_agent_sandbox_unrestricted_enabled,
-    )
     async with async_session() as db:
         row = await db.get(GlobalSettings, 1)
         if row is not None and row.use_pty_mode is not None:
             instance_manager.set_pty_mode(row.use_pty_mode)
-        instance_manager.set_agent_sandbox_unrestricted_enabled(
-            effective_agent_sandbox_unrestricted_enabled(row)
-        )
         dispatcher.configure_capacity_override(
             row.max_concurrent_instances if row is not None else None
         )
-    await _reset_stale_discussion_agents()
+    manager_node = settings.ccm_node_role == "manager"
+    if manager_node:
+        await _reset_stale_discussion_agents()
     await _cleanup_stale_sub_agents()
     # Browser Agent Tasks are ordinary executable Tasks underneath, but their
     # launch authority comes from a durable Harness binding. Reap interrupted
@@ -1096,8 +1196,9 @@ async def _runtime_lifespan(app: FastAPI):
             "Marked %d interrupted test harness run(s) failed",
             interrupted_test_harness_runs,
         )
-    await _recover_stale_worker_lifecycles()
-    await _sync_tags()
+    if manager_node:
+        await _recover_stale_worker_lifecycles()
+        await _sync_tags()
     sub_agent_watcher.start()
     await _ensure_claude_warmup()
     await _start_execution_runtimes()
@@ -1108,6 +1209,15 @@ async def _runtime_lifespan(app: FastAPI):
     worker_health_task = None
     if worker_provisioner is not None:
         import asyncio as _asyncio
+        recovered_renames, pending_renames = (
+            await worker_provisioner.recover_worker_rename_tag_outboxes()
+        )
+        if recovered_renames or pending_renames:
+            logger.warning(
+                "Worker cloud Name tag recovery: recovered=%d pending=%d",
+                recovered_renames,
+                pending_renames,
+            )
         worker_health_task = _asyncio.create_task(worker_provisioner.health_check_loop())
         worker_relay_recovery_task = _asyncio.create_task(
             _recover_worker_relays()
@@ -1117,7 +1227,7 @@ async def _runtime_lifespan(app: FastAPI):
 
     # Start periodic database backup (optional — requires BACKUP_ENABLED=true in .env)
     backup_svc = None
-    if settings.backup_enabled:
+    if manager_node and settings.backup_enabled:
         from backend.services.backup_service import BackupService
         backup_svc = BackupService(
             db_path=settings.database_url,
@@ -1150,9 +1260,10 @@ async def _runtime_lifespan(app: FastAPI):
     # Recovery performs bounded GitHub I/O and must never delay ASGI startup.
     # Start it only after all fallible startup stages above have completed, so
     # an exception cannot leak an unowned producer before the shutdown guard.
-    pr_review_recovery_task = asyncio.create_task(
-        _pr_review_recovery_loop()
-    )
+    if manager_node:
+        pr_review_recovery_task = asyncio.create_task(
+            _pr_review_recovery_loop()
+        )
     try:
         yield
     finally:
@@ -1183,7 +1294,29 @@ async def lifespan(app: FastAPI):
             logger.exception("Trusted update runtime cleanup failed")
 
 
-app = FastAPI(title="Claude Code Manager", version="0.1.0", lifespan=lifespan)
+def _serve_interactive_frontend(node_role: str) -> bool:
+    """Only the authoritative Manager exposes human-facing web UIs."""
+
+    return node_role == "manager"
+
+
+_SERVE_INTERACTIVE_FRONTEND = _serve_interactive_frontend(
+    settings.ccm_node_role
+)
+
+app = FastAPI(
+    title="Claude Code Manager",
+    version="0.1.0",
+    lifespan=lifespan,
+    # A Worker is a headless execution node. Its authenticated control-plane
+    # API remains available to the Manager, but it must not expose either the
+    # CCM SPA or FastAPI's interactive API frontends as a second user entry.
+    docs_url="/docs" if _SERVE_INTERACTIVE_FRONTEND else None,
+    redoc_url="/redoc" if _SERVE_INTERACTIVE_FRONTEND else None,
+    openapi_url=(
+        "/openapi.json" if _SERVE_INTERACTIVE_FRONTEND else None
+    ),
+)
 
 
 @app.middleware("http")
@@ -1196,20 +1329,25 @@ async def remember_internal_api_endpoint(request: Request, call_next):
     observe_asgi_server(request.scope.get("server"))
     return await call_next(request)
 
+# Keep authentication outside the body limiter so an unauthenticated caller is
+# rejected without reading a body at all. Authenticated upload requests then
+# hit the receive-boundary limit before FastAPI/Starlette parses multipart data.
+app.add_middleware(RequestBodyLimitMiddleware)
 app.add_middleware(TokenAuthMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=[
-        "X-Refreshed-Token",
-        "Content-Disposition",
-        "X-CCM-PR-Fix-Receipt",
-        "X-CCM-PR-Fix-Token",
-    ],
-)
+if _SERVE_INTERACTIVE_FRONTEND:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=[
+            "X-Refreshed-Token",
+            "Content-Disposition",
+            "X-CCM-PR-Fix-Receipt",
+            "X-CCM-PR-Fix-Token",
+        ],
+    )
 
 app.include_router(tasks_router)
 app.include_router(instances_router)
@@ -1256,7 +1394,7 @@ app.include_router(delivery_runs_router)
 
 # Serve frontend static files in production
 FRONTEND_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
-if FRONTEND_DIST.is_dir():
+if _SERVE_INTERACTIVE_FRONTEND and FRONTEND_DIST.is_dir():
     app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="static")
 
     @app.get("/{full_path:path}")

@@ -21,6 +21,10 @@ from pydantic import BaseModel
 
 from backend.api.deps import require_admin
 from backend.services.codex_app_server import CodexAppServerBusyError
+from backend.services.cancellation import (
+    await_task_completion,
+    consume_current_task_cancellation,
+)
 from backend.services.cloudrouter_accounts import is_api_auth_kind
 from backend.services.login_runtime import (
     LoginRuntimeError,
@@ -206,6 +210,52 @@ def _reject_unresolved_login_transactions(pool=None) -> None:
                 f"恢复（pending={len(pending)}）"
             ),
         )
+
+
+def pending_codex_login_transaction_ids(pool=None) -> set[str]:
+    """Expose only opaque journal ids for Worker node-drain recovery."""
+
+    return {path.stem for path in _pending_login_transaction_paths(pool)}
+
+
+async def _admit_worker_node_login_attempt(attempt_id: str) -> bool:
+    """Persist background login ownership before the wrapper can be spawned."""
+
+    from backend.database import async_session
+    from backend.services.worker_node_control import (
+        admit_worker_node_login_attempt,
+    )
+
+    async with async_session() as db:
+        admitted = await admit_worker_node_login_attempt(
+            db,
+            attempt_id=attempt_id,
+        )
+        if admitted:
+            await db.commit()
+        return admitted
+
+
+async def _finish_worker_node_login_if_reconciled(attempt_id: str) -> bool:
+    """Release the node fence only after process/journal cleanup is proven."""
+
+    if attempt_id in _login_attempts:
+        return False
+    if attempt_id in pending_codex_login_transaction_ids():
+        return False
+    from backend.database import async_session
+    from backend.services.worker_node_control import (
+        finish_worker_node_login_attempt,
+    )
+
+    async with async_session() as db:
+        cleared = await finish_worker_node_login_attempt(
+            db,
+            attempt_id=attempt_id,
+        )
+        if cleared:
+            await db.commit()
+        return cleared
 
 
 def _begin_login_transaction(
@@ -800,6 +850,7 @@ async def _stop_unfinished_login_process(
         except asyncio.CancelledError:
             # Cleanup itself may be targeted during application shutdown. Keep
             # waiting; the persistent journal is the fallback for hard kill.
+            consume_current_task_cancellation()
             continue
         if not done:
             waiter.cancel()
@@ -830,17 +881,12 @@ async def _await_login_cleanup(coro):
     """Delay caller cancellation until the isolated cleanup task is complete."""
 
     cleanup_task = asyncio.create_task(coro)
-    cancelled = False
-    while not cleanup_task.done():
-        try:
-            await asyncio.shield(cleanup_task)
-        except asyncio.CancelledError:
-            # Do not let HTTP disconnect/app shutdown cancel process reaping or
-            # credential rollback. Repeated cancellation is handled by looping.
-            cancelled = True
+    # Do not let HTTP disconnect/app shutdown cancel process reaping or
+    # credential rollback.
+    cancellation = await await_task_completion(cleanup_task)
     result = cleanup_task.result()
-    if cancelled:
-        raise asyncio.CancelledError
+    if cancellation is not None:
+        raise cancellation
     return result
 
 
@@ -1010,6 +1056,14 @@ async def _finalize_login_transaction(
         pool._quota_cache = None
     except Exception:
         logger.exception("Failed to reload Codex pool after %s", operation)
+    try:
+        await _finish_worker_node_login_if_reconciled(attempt_id)
+    except Exception:
+        # Credential cleanup is already complete/isolated. Keep the durable
+        # node fence fail-closed if its exact release cannot be committed.
+        logger.exception(
+            "Failed to release Worker node login fence for %s", attempt_id,
+        )
     return {
         "committed": committed,
         "cleanup_safe": cleanup_safe,
@@ -1079,6 +1133,13 @@ async def _rollback_unspawned_login_transaction(
     finally:
         if login_lock.locked():
             login_lock.release()
+    try:
+        await _finish_worker_node_login_if_reconciled(attempt_id)
+    except Exception:
+        logger.exception(
+            "Failed to release unspawned Worker node login fence for %s",
+            attempt_id,
+        )
 
 
 _FAILED_LOGIN_REUSABLE_FILES = frozenset({"models_cache.json"})
@@ -1635,12 +1696,17 @@ async def codex_relogin(request: Request, account_id: str):
     instance_manager = _get_instance_manager()
     login_lock = _login_lock
     pool_path = _pool_config_path(pool)
+    attempt_id = uuid.uuid4().hex
     await login_lock.acquire()
     maintenance_started = False
     watcher_started = False
+    node_login_admitted = False
     proc: asyncio.subprocess.Process | None = None
     journal_path: Path | None = None
     try:
+        node_login_admitted = await _admit_worker_node_login_attempt(
+            attempt_id
+        )
         # Starting Xvfb does not touch CODEX_HOME, so reserve the account only
         # after the shared browser runtime is ready.
         await _ensure_xvfb()
@@ -1653,7 +1719,6 @@ async def codex_relogin(request: Request, account_id: str):
         maintenance_started = True
 
         script = root / "scripts" / "codex_login.py"
-        attempt_id = uuid.uuid4().hex
         journal_path = _begin_login_transaction(
             attempt_id=attempt_id,
             kind="relogin",
@@ -1750,6 +1815,15 @@ async def codex_relogin(request: Request, account_id: str):
                     finally:
                         if login_lock.locked():
                             login_lock.release()
+            if node_login_admitted and journal_path is None:
+                try:
+                    await _finish_worker_node_login_if_reconciled(attempt_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to release unstarted Worker node login fence "
+                        "for %s",
+                        attempt_id,
+                    )
 
 
 @router.get("/accounts/{account_id}/relogin")
@@ -1941,9 +2015,13 @@ async def codex_add_account(request: Request, body: AddCodexAccountRequest):
     await login_lock.acquire()
     maintenance_started = False
     watcher_started = False
+    node_login_admitted = False
     proc: asyncio.subprocess.Process | None = None
     journal_path: Path | None = None
     try:
+        node_login_admitted = await _admit_worker_node_login_attempt(
+            attempt_id
+        )
         # The browser/Xvfb runtime and account-id allocation are process-wide;
         # serialize the full login and reserve the destination CODEX_HOME so
         # credentials cannot change underneath an active exec/app-server turn.
@@ -2080,6 +2158,15 @@ async def codex_add_account(request: Request, body: AddCodexAccountRequest):
                     finally:
                         if login_lock.locked():
                             login_lock.release()
+            if node_login_admitted and journal_path is None:
+                try:
+                    await _finish_worker_node_login_if_reconciled(attempt_id)
+                except Exception:
+                    logger.exception(
+                        "Failed to release unstarted Worker node login fence "
+                        "for %s",
+                        attempt_id,
+                    )
 
 
 @router.get("/add/{email}")
@@ -2126,6 +2213,18 @@ async def codex_submit_login_otp(
     if proc is None or proc.returncode is not None or stdin is None:
         raise HTTPException(status_code=409, detail="登录进程已经结束")
 
+    # Close the one-time-effect gate before touching the pipe.  ``drain`` is
+    # an await point and an HTTP response can be lost after the child consumed
+    # the code; leaving ``awaiting_otp`` visible until afterwards allowed a
+    # concurrent/retried request to write the same challenge twice.  On an
+    # ambiguous pipe failure we deliberately remain ``verifying_otp`` and let
+    # the child emit success/expiry (or cancellation) rather than replaying an
+    # effect whose acceptance cannot be known.
+    state.update({
+        "status": "verifying_otp",
+        "attempt_id": attempt_id,
+        "challenge_id": body.challenge_id,
+    })
     payload = json.dumps({
         "challenge_id": body.challenge_id,
         "code": code,
@@ -2137,11 +2236,6 @@ async def codex_submit_login_otp(
         raise HTTPException(status_code=409, detail="登录进程已无法接收验证码") from exc
 
     # Never retain the OTP. Only the opaque challenge id remains in state.
-    state.update({
-        "status": "verifying_otp",
-        "attempt_id": attempt_id,
-        "challenge_id": body.challenge_id,
-    })
     return {"ok": True, "status": "verifying_otp"}
 
 

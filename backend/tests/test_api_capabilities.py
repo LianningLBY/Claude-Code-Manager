@@ -773,6 +773,35 @@ async def test_create_rechecks_task_control_inside_final_transaction(
 
 
 @pytest.mark.asyncio
+async def test_create_uses_durable_task_effect_fence_before_commit(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A final ACL/role fence failure cannot publish an Invocation."""
+
+    from backend.api import capabilities as api
+
+    task = await _task(session_factory)
+    denied = AsyncMock(
+        side_effect=HTTPException(409, "authority changed before admission")
+    )
+    monkeypatch.setattr(api, "lock_task_effect_access", denied)
+
+    response = await client.post(
+        f"/api/tasks/{task.id}/capability-invocations",
+        json=_body(idempotency_key="capability-final-effect-fence"),
+    )
+
+    assert response.status_code == 409
+    denied.assert_awaited_once()
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(func.count(CapabilityInvocation.id))
+        ) == 0
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["cancel", "consume"])
 async def test_public_transition_rechecks_control_inside_final_transaction(
     client,
@@ -850,7 +879,7 @@ async def test_cancel_and_consume_require_task_control(
 
 
 @pytest.mark.asyncio
-async def test_read_and_list_require_task_access(
+async def test_read_and_list_require_task_control(
     client,
     session_factory,
     monkeypatch,
@@ -864,7 +893,7 @@ async def test_read_and_list_require_task_access(
     )
     invocation_id = created.json()["invocation"]["id"]
     denied = AsyncMock(side_effect=HTTPException(403, "denied"))
-    monkeypatch.setattr(api, "require_task_access", denied)
+    monkeypatch.setattr(api, "require_task_control", denied)
 
     listed = await client.get(
         f"/api/tasks/{task.id}/capability-invocations"

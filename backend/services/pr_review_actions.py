@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 
 from sqlalchemy import select, update
@@ -17,6 +18,9 @@ from backend.models.pr_monitor import (
     PRReview,
 )
 from backend.services.delivery_pr_policy import legacy_pr_effect_is_forbidden
+
+
+PREffectAuthorizer = Callable[[AsyncSession, MonitoredRepo], Awaitable[None]]
 
 
 class FindingActionConflict(RuntimeError):
@@ -120,6 +124,7 @@ async def create_immediate_finding_action(
     idempotency_key: str,
     actor_user_id: int | None,
     human_advice: str | None = None,
+    effect_authorizer: PREffectAuthorizer | None = None,
 ) -> PRFindingAction:
     """Persist an ignore/advice decision without mutating the Panel gate."""
 
@@ -151,6 +156,8 @@ async def create_immediate_finding_action(
     # SQLITE_BUSY_SNAPSHOT and gives every backend the same ordering boundary.
     await db.rollback()
     repo = await lock_pr_repo_action_boundary(db, repo_id)
+    if effect_authorizer is not None:
+        await effect_authorizer(db, repo)
     review = (
         await db.execute(
             select(PRReview)

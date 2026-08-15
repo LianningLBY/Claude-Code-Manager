@@ -17,7 +17,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from backend.database import async_session
@@ -30,6 +30,7 @@ from backend.models.test_harness import (
 )
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.task_creation import stage_task_record
+from backend.services.cancellation import finish_awaitable
 from backend.services.test_harness_owner_fence import (
     TEST_HARNESS_TERMINAL_GATE_KEY,
     TestHarnessOwnerIdentity,
@@ -47,7 +48,7 @@ CHILD_STOPPING = "stopping"
 CHILD_STOPPED = "stopped"
 CHILD_COMPLETED = "completed"
 CHILD_STOP_FAILED = "stop_failed"
-BROWSER_LAUNCH_PROFILE_VERSION = 1
+BROWSER_LAUNCH_PROFILE_VERSION = 2
 
 # Isolated Browser Tasks are implementation details of a durable Harness /
 # Workspace owner.  Only these keys may influence their launch identity.  Pool
@@ -200,6 +201,10 @@ def browser_child_launch_digest(task: Task) -> str:
         "shared_from_id": task.shared_from_id,
         "delivery_run_id": task.delivery_run_id,
         "delivery_role": task.delivery_role,
+        "execution_user_id": task.execution_user_id,
+        "execution_user_role": task.execution_user_role,
+        "execution_mode": task.execution_mode,
+        "execution_principal_kind": task.execution_principal_kind,
         "tags": task.tags,
         "enable_workflows": task.enable_workflows,
         "enabled_skills": task.enabled_skills,
@@ -624,7 +629,15 @@ class TestHarnessChildService:
                 raise TestHarnessChildError(
                     "Workspace review ended, disappeared, or changed owner while reserving child"
                 )
-            child = await stage_task_record(db, **values)
+            from backend.services.task_creation import (
+                system_task_execution_principal_values,
+            )
+
+            child = await stage_task_record(
+                db,
+                **values,
+                **system_task_execution_principal_values(),
+            )
             # SQLAlchemy client defaults substitute the ordinary Task values
             # (``""`` / ``"main"``) even when callers provide ``None``.
             # Clear them after INSERT and before freezing the launch digest so
@@ -926,6 +939,14 @@ class TestHarnessChildService:
         child_incarnation_id: str
         expected_generation: Any
         async with self.db_factory() as db:
+            # ``FOR UPDATE`` does not reserve a SQLite WAL writer.  Make the
+            # binding the first portable writer so another Manager process
+            # cannot publish a success/failure receipt from a stale snapshot.
+            await db.execute(
+                update(TestHarnessChildBinding)
+                .where(TestHarnessChildBinding.id == binding_id)
+                .values(state=TestHarnessChildBinding.state)
+            )
             binding = (
                 await db.execute(
                     select(TestHarnessChildBinding)
@@ -956,8 +977,9 @@ class TestHarnessChildService:
                 binding.claimed_retry_count is not None
                 or binding.claimed_instance_id is not None
             )
-            if binding.state in {CHILD_RUNNING, CHILD_STOPPING} or (
-                binding.state == CHILD_STOP_FAILED and has_claim
+            if binding.state == CHILD_RUNNING or (
+                binding.state in {CHILD_STOPPING, CHILD_STOP_FAILED}
+                and has_claim
             ):
                 if (
                     binding.claimed_retry_count != child.retry_count
@@ -968,7 +990,8 @@ class TestHarnessChildService:
                         "Browser child claim changed before stop"
                     )
             elif binding.state in {CHILD_RESERVED, CHILD_READY} or (
-                binding.state == CHILD_STOP_FAILED and not has_claim
+                binding.state in {CHILD_STOPPING, CHILD_STOP_FAILED}
+                and not has_claim
             ):
                 if (
                     binding.claimed_retry_count is not None
@@ -1008,17 +1031,39 @@ class TestHarnessChildService:
             )
         except BaseException as exc:
             async with self.db_factory() as db:
-                binding = await db.get(TestHarnessChildBinding, binding_id)
-                if binding is not None and binding.state not in CHILD_TERMINAL_STATES:
-                    binding.state = CHILD_STOP_FAILED
-                    binding.error = _safe_error(exc)
-                    await db.commit()
+                # Failure is a one-way CAS from this operation's published
+                # ``stopping`` state.  It can never overwrite a terminal
+                # success committed by a concurrent cleanup executor.
+                result = await db.execute(
+                    update(TestHarnessChildBinding)
+                    .where(
+                        TestHarnessChildBinding.id == binding_id,
+                        TestHarnessChildBinding.state == CHILD_STOPPING,
+                    )
+                    .values(
+                        state=CHILD_STOP_FAILED,
+                        error=_safe_error(exc),
+                    )
+                )
+                await db.commit()
+                if result.rowcount == 0:
+                    binding = await db.get(TestHarnessChildBinding, binding_id)
+                    if (
+                        binding is not None
+                        and binding.state in CHILD_TERMINAL_STATES
+                    ):
+                        return
             raise TestHarnessChildError(
                 f"Browser child {child_task_id} cleanup could not be proven: "
                 f"{_safe_error(exc)}"
             ) from exc
 
         async with self.db_factory() as db:
+            await db.execute(
+                update(TestHarnessChildBinding)
+                .where(TestHarnessChildBinding.id == binding_id)
+                .values(state=TestHarnessChildBinding.state)
+            )
             binding = (
                 await db.execute(
                     select(TestHarnessChildBinding)
@@ -1045,9 +1090,9 @@ class TestHarnessChildService:
                 )
                 await db.commit()
                 return
-            if binding.state != CHILD_STOPPING:
+            if binding.state not in {CHILD_STOPPING, CHILD_STOP_FAILED}:
                 raise TestHarnessChildError(
-                    "Browser child stop receipt lost its stopping state"
+                    "Browser child stop receipt lost its recoverable state"
                 )
             child = await db.get(Task, child_task_id)
             if child is None or child.incarnation_id != child_incarnation_id:
@@ -1424,16 +1469,7 @@ async def finalize_reaped_browser_child_binding(
 
 
 async def _finish_despite_cancellation(awaitable: Awaitable[None]) -> None:
-    operation = asyncio.create_task(awaitable)
-    cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
-        try:
-            await asyncio.shield(operation)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-    operation.result()
-    if cancellation is not None:
-        raise cancellation
+    await finish_awaitable(awaitable)
 
 
 def _metadata_id(value: Any) -> str | None:

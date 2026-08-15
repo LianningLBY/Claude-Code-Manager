@@ -6,7 +6,7 @@ import { DeliveryRunDialog } from './DeliveryRunDialog';
 
 vi.mock('../../api/client', async (importOriginal) => { const actual = await importOriginal<typeof import('../../api/client')>(); return { ...actual, api: { ...actual.api, getDeliveryRun: vi.fn(), getDeliveryProgress: vi.fn(), getTask: vi.fn(), getPlanVersion: vi.fn(), getPRMonitorRun: vi.fn(), getTestRun: vi.fn(), getTestRunEvidence: vi.fn() } }; });
 vi.mock('../../hooks/useWebSocket', () => ({ useWebSocket: vi.fn() }));
-vi.mock('../Tasks/DeliveryRunPanel', () => ({ DeliveryRunPanel: ({ runId }: { runId: number }) => <div>Controls for {runId}</div> }));
+vi.mock('../Tasks/DeliveryRunPanel', () => ({ DeliveryRunPanel: ({ runId, compact }: { runId: number; compact?: boolean }) => <div>{compact ? 'Actions' : 'Full controls'} for {runId}</div> }));
 vi.mock('../PlanReview/PlanInputForm', () => ({ PlanInputForm: ({ request }: { request: { questions: Array<{ question: string }> } }) => <div>Inline plan input: {request.questions[0]?.question}</div> }));
 
 describe('DeliveryRunDialog', () => {
@@ -40,6 +40,9 @@ describe('DeliveryRunDialog', () => {
     vi.mocked(api.getPlanVersion).mockResolvedValue({ id: 31, plan_id: 21, version_number: 2, content: '# Real Plan' } as never);
     const onOpenTask = vi.fn(); const onOpenPlan = vi.fn();
     render(<DeliveryRunDialog runId={7} onClose={() => {}} onOpenTask={onOpenTask} onOpenPlan={onOpenPlan} onOpenPRMonitor={() => {}} />);
+    expect(await screen.findByText('Actions for 7')).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Delivery rounds' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Full controls for 7')).not.toBeInTheDocument();
     await userEvent.click(await screen.findByRole('tab', { name: /Plan/ }));
     expect(await screen.findByText('Real Plan')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: /Open in Plans/ }));
@@ -290,19 +293,15 @@ describe('DeliveryRunDialog', () => {
 
     render(<DeliveryRunDialog runId={10} onClose={() => {}} onOpenTask={() => {}} onOpenPlan={() => {}} onOpenPRMonitor={() => {}} />);
 
-    expect(await screen.findByRole('heading', { name: 'Current round' })).toBeInTheDocument();
-    expect(screen.getByText('Round 3 / 10')).toBeInTheDocument();
-    expect(screen.getByText(/3 blocking findings/)).toBeInTheDocument();
+    expect(await screen.findByRole('tablist', { name: 'Delivery round history' })).toBeInTheDocument();
     expect(screen.getByRole('tab', { name: 'View round 3: PR review requested fixes' })).toHaveAttribute('aria-current', 'step');
     expect(screen.getByText('Planning started')).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('tab', { name: 'View round 2: Code review requested fixes' }));
 
-    expect(screen.getByRole('heading', { name: 'Viewing round 2 history' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Round 2 timeline' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Activity' })).toBeInTheDocument();
     expect(screen.getByText('Code review requested changes')).toBeInTheDocument();
     expect(screen.queryByText('Planning started')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Back to current round' })).toBeInTheDocument();
   });
 
   it('keeps a successful terminal run compact and moves completed Browser evidence into the stage detail', async () => {
@@ -379,10 +378,9 @@ describe('DeliveryRunDialog', () => {
     expect(outcome).toHaveTextContent('Ready to merge');
     expect(outcome).toHaveTextContent('2 delivery rounds');
     expect(screen.getByRole('link', { name: /Open PR #8/ })).toHaveAttribute('href', 'https://github.com/example/repo/pull/8');
-    expect(screen.getByRole('heading', { name: 'Final round' })).toBeInTheDocument();
-    expect(screen.queryByRole('heading', { name: 'Current round' })).not.toBeInTheDocument();
+    expect(screen.getByRole('tablist', { name: 'Delivery round history' })).toBeInTheDocument();
     expect(screen.queryByText('Live')).not.toBeInTheDocument();
-    expect(screen.queryByText('Controls for 12')).not.toBeInTheDocument();
+    expect(screen.queryByText(/controls for 12/i)).not.toBeInTheDocument();
 
     expect(screen.queryByTestId('delivery-frontend-live-jump')).not.toBeInTheDocument();
 

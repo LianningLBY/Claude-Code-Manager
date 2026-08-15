@@ -87,6 +87,15 @@ describe('DeliveryRunPanel', () => {
     expect(screen.queryByRole('button', { name: 'Resume' })).not.toBeInTheDocument();
   });
 
+  it('renders only actions in compact mode', async () => {
+    render(<DeliveryRunPanel runId={7} compact />);
+
+    expect(await screen.findByRole('button', { name: 'Pause' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
+    expect(screen.queryByText('Delivery Run #7')).not.toBeInTheDocument();
+    expect(screen.queryByText('Round 2 of 10 · 2 developer turns')).not.toBeInTheDocument();
+  });
+
   it('requires an explicit reason and confirmation before pausing', async () => {
     render(<DeliveryRunPanel runId={7} />);
 

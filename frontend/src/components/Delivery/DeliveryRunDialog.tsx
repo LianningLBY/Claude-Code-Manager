@@ -25,10 +25,8 @@ import {
   ChevronLeft,
   ChevronRight,
   Circle,
-  Clock,
   Download,
   Eye,
-  GitBranch,
   GitPullRequest,
   Loader2,
   MessageCircle,
@@ -277,18 +275,6 @@ function historicalStageState(
   return 'pending';
 }
 
-function cycleDuration(cycle: DeliveryCycle): string {
-  const started = parseBackendTimestamp(cycle.created_at).getTime();
-  const finished = cycle.completed_at
-    ? parseBackendTimestamp(cycle.completed_at).getTime()
-    : Date.now();
-  if (Number.isNaN(started) || Number.isNaN(finished)) return 'Duration unavailable';
-  const seconds = Math.max(0, Math.floor((finished - started) / 1000));
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
-  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
-}
-
 export function DeliveryRunDialog({
   runId,
   project,
@@ -438,8 +424,6 @@ export function DeliveryRunDialog({
     )) || [],
     [progress, selectedCycle, selectedEvents, selectedIsCurrent],
   );
-  const activeProgress = displayedStages.find((stage) => stage.key === activeStage);
-
   const selectCycle = (cycle: DeliveryCycle) => {
     setSelectedCycleId(cycle.id);
     if (cycle.id === run?.current_cycle_id && progress) {
@@ -810,10 +794,11 @@ export function DeliveryRunDialog({
             <div className="flex flex-wrap items-center gap-2">
               <h2 className="truncate text-lg font-semibold text-gray-100">Delivery #{runId}</h2>
               {run && <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${runSucceeded ? 'bg-emerald-500/15 text-emerald-300' : runIsTerminal ? 'bg-red-500/15 text-red-300' : 'bg-indigo-500/15 text-indigo-300'}`}>{deliveryStatusLabel(run)}</span>}
-              {run && <span className="rounded-full border border-gray-700 bg-gray-800/70 px-2 py-0.5 text-[11px] font-medium text-gray-300">{runIsTerminal ? `${run.cycle_count} round${run.cycle_count === 1 ? '' : 's'}` : `Round ${run.cycle_count} · limit ${run.max_cycles}`}</span>}
-              {progress?.attention_required && <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] text-amber-300">Needs your attention</span>}
             </div>
-            <p className="mt-1 truncate text-xs text-gray-500">{run?.title || 'Loading…'}{project ? ` · ${project.name}` : ''}</p>
+            <p className="mt-1 truncate text-xs text-gray-500">
+              {run?.title || 'Loading…'}{project ? ` · ${project.name}` : ''}
+              {run ? ` · Round ${run.cycle_count}/${run.max_cycles} · ${run.turn_count} turn${run.turn_count === 1 ? '' : 's'} · ${run.delivery_branch}` : ''}
+            </p>
           </div>
           <div className="flex gap-1">
             <button type="button" onClick={() => void load()} className="rounded p-2 text-gray-500 hover:bg-gray-800 hover:text-gray-200" title="Refresh"><RefreshCw size={16} className={refreshing ? 'animate-spin' : ''} /></button>
@@ -844,23 +829,14 @@ export function DeliveryRunDialog({
               )}
             </div>
           </section>
-        ) : progress && (
+        ) : progress && run && (
           <div className={`shrink-0 border-b px-4 py-3 sm:px-5 ${progress.attention_required ? 'border-amber-500/25 bg-amber-500/5' : 'border-gray-800 bg-gray-950/25'}`}>
-            <div className="flex flex-wrap items-start gap-3">
-              <div className={`mt-0.5 rounded-lg p-2 ${progress.active_agent ? 'bg-indigo-500/15 text-indigo-300' : 'bg-gray-800 text-gray-500'}`}>
-                {progress.active_agent ? <Bot size={17} /> : <Activity size={17} />}
-              </div>
+            <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <p className="text-sm font-semibold text-gray-100">{progress.headline}</p>
-                  {progress.active_agent && <span className="rounded bg-gray-800 px-1.5 py-0.5 text-[10px] text-gray-400">{titleCase(progress.active_agent.role)} · {progress.active_agent.provider || 'provider'} {progress.active_agent.model || ''}</span>}
-                </div>
-                {progress.detail && <DetailText detail={progress.detail} />}
-                <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-gray-600">
-                  <span className="inline-flex items-center gap-1"><Clock size={11} /> Last public activity {relativeTime(progress.last_activity_at)}</span>
-                  {progress.active_agent && <span>{titleCase(progress.active_agent.activity_kind)} · {progress.active_agent.output_chars.toLocaleString()} public chars</span>}
-                </div>
+                {progress.detail ? <DetailText detail={progress.detail} /> : <p className="text-sm text-gray-300">{progress.headline}</p>}
+                {progress.active_agent && <p className="mt-1 text-[10px] text-gray-600">{titleCase(progress.active_agent.role)} · {progress.active_agent.provider || 'provider'} {progress.active_agent.model || ''} · updated {relativeTime(progress.last_activity_at)}</p>}
               </div>
+              <DeliveryRunPanel runId={run.id} compact />
             </div>
           </div>
         )}
@@ -903,38 +879,8 @@ export function DeliveryRunDialog({
           </button>
         )}
 
-        {run && selectedCycle && selectedContext && (
+        {run && run.cycles.length > 1 && selectedCycle && selectedContext && (
           <section aria-label="Delivery rounds" className="shrink-0 border-b border-gray-800 bg-gray-950/50 px-3 py-2.5 sm:px-5">
-            <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-              <div className="min-w-0">
-                <div className="flex flex-wrap items-center gap-2">
-                  <h3 className="text-sm font-semibold text-gray-100">
-                    {!selectedIsCurrent ? `Viewing round ${selectedCycle.cycle_number} history` : runIsTerminal ? 'Final round' : 'Current round'}
-                  </h3>
-                  <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${selectedIsCurrent && !runIsTerminal ? 'bg-indigo-500/20 text-indigo-200' : selectedIsCurrent ? 'bg-emerald-500/15 text-emerald-300' : 'bg-gray-800 text-gray-400'}`}>
-                    {runIsTerminal ? `Round ${selectedCycle.cycle_number}` : `Round ${selectedCycle.cycle_number} / ${run.max_cycles}`}
-                  </span>
-                  {selectedIsCurrent && !runIsTerminal && <span className="inline-flex items-center gap-1 text-[10px] text-indigo-300"><span className="h-1.5 w-1.5 animate-pulse rounded-full bg-indigo-400" />Live</span>}
-                  {selectedIsCurrent && runIsTerminal && <span className="inline-flex items-center gap-1 text-[10px] text-emerald-400"><CheckCircle2 size={11} />Completed</span>}
-                </div>
-                <p className="mt-1 max-w-4xl truncate text-xs text-gray-400" title={selectedContext.detail}><span className="font-medium text-gray-200">{selectedContext.label}</span><span className="text-gray-600"> · {selectedContext.detail}</span></p>
-              </div>
-              <div className="flex items-center gap-2 text-[10px] text-gray-600">
-                <span>{runIsTerminal && selectedIsCurrent ? `${run.cycle_count} round${run.cycle_count === 1 ? '' : 's'} completed` : cycleDuration(selectedCycle)}</span>
-                {!selectedIsCurrent && run.current_cycle_id != null && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      const current = run.cycles.find((cycle) => cycle.id === run.current_cycle_id);
-                      if (current) selectCycle(current);
-                    }}
-                    className="rounded border border-indigo-500/30 bg-indigo-500/10 px-2 py-1 font-medium text-indigo-300 hover:bg-indigo-500/20"
-                  >
-                    {runIsTerminal ? 'Back to final round' : 'Back to current round'}
-                  </button>
-                )}
-              </div>
-            </div>
             <div className="overflow-x-auto pb-1" role="tablist" aria-label="Delivery round history">
               <div className="flex min-w-max gap-1.5">
                 {run.cycles.map((cycle) => {
@@ -951,13 +897,12 @@ export function DeliveryRunDialog({
                       aria-current={isCurrent ? 'step' : undefined}
                       aria-label={`View round ${cycle.cycle_number}: ${context.label}`}
                       onClick={() => selectCycle(cycle)}
-                      className={`w-48 rounded-lg border px-2.5 py-2 text-left transition-colors ${isSelected ? isFinal ? 'border-emerald-400/40 bg-emerald-500/10' : 'border-indigo-400/50 bg-indigo-500/15 shadow-sm shadow-indigo-950/40' : 'border-gray-800 bg-gray-900/70 hover:border-gray-700 hover:bg-gray-800/80'}`}
+                      className={`rounded border px-2.5 py-1.5 text-left transition-colors ${isSelected ? isFinal ? 'border-emerald-400/40 bg-emerald-500/10' : 'border-indigo-400/50 bg-indigo-500/15' : 'border-gray-800 bg-gray-900/70 hover:border-gray-700 hover:bg-gray-800/80'}`}
                     >
                       <span className="flex items-center justify-between gap-2">
                         <span className={`text-xs font-semibold ${isSelected ? isFinal ? 'text-emerald-100' : 'text-indigo-100' : 'text-gray-300'}`}>Round {cycle.cycle_number}</span>
-                        {isFinal ? <span className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide text-emerald-300"><CheckCircle2 size={11} />Final</span> : isCurrent ? <span className="text-[9px] font-semibold uppercase tracking-wide text-indigo-300">Current</span> : <RoundIcon status={cycle.status} />}
+                        {!isCurrent && <RoundIcon status={cycle.status} />}
                       </span>
-                      <span className="mt-1 block truncate text-[10px] text-gray-500">{context.label}</span>
                     </button>
                   );
                 })}
@@ -995,19 +940,13 @@ export function DeliveryRunDialog({
               {error && <Notice tone="red" text={error} />}
               <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_320px]">
               <div className="min-w-0 space-y-4" role="tabpanel">
-                {!(runIsTerminal && run.outcome === 'success') && <DeliveryRunPanel runId={run.id} showStatusDetails={false} />}
                 <section className="rounded-xl border border-gray-800 bg-gray-950/30 p-4">
-                  <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
-                    <div><h3 className="text-sm font-semibold text-gray-100">Round {selectedCycle.cycle_number} · {STAGE_META[activeStage].label}</h3><p className="mt-1 text-xs text-gray-600">{STAGE_META[activeStage].description}</p></div>
-                    {activeProgress && <span className="rounded bg-gray-800 px-2 py-1 text-[10px] text-gray-400">{titleCase(activeProgress.state)}</span>}
-                  </div>
+                  <div className="mb-4"><h3 className="text-sm font-semibold text-gray-100">{STAGE_META[activeStage].label}</h3><p className="mt-1 text-xs text-gray-600">{STAGE_META[activeStage].description}</p></div>
                   {stageContent(activeStage)}
                 </section>
-                <div className="flex items-center gap-2 rounded-lg border border-gray-800 bg-gray-950/50 px-3 py-2 text-xs text-gray-500"><GitBranch size={14} />{run.delivery_branch}</div>
               </div>
               <aside className="min-w-0 rounded-xl border border-gray-800 bg-gray-950/30 p-4">
-                <div className="flex items-center justify-between"><h3 className="text-sm font-semibold text-gray-200">Round {selectedCycle.cycle_number} timeline</h3><span className="text-[10px] text-gray-600">Public events only</span></div>
-                <p className="mt-1 text-[10px] text-gray-600">{selectedContext.label}</p>
+                <h3 className="text-sm font-semibold text-gray-200">Activity</h3>
                 <div className="mt-4 space-y-0">
                   {selectedEvents.length === 0 ? <EmptyState text="No public lifecycle events were recorded for this round." /> : [...selectedEvents].reverse().map((event, index) => (
                     <div key={event.id} className="relative flex gap-3 pb-4">
@@ -1025,9 +964,6 @@ export function DeliveryRunDialog({
                     </div>
                   ))}
                 </div>
-                <p className="border-t border-gray-800 pt-3 text-[10px] text-gray-700">
-                  Round started {formatTime(selectedCycle.created_at)}{selectedCycle.completed_at ? ` · ended ${formatTime(selectedCycle.completed_at)}` : ' · still active'}
-                </p>
               </aside>
               </div>
             </div>

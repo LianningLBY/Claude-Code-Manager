@@ -17,6 +17,7 @@ interface DeliveryRunPanelProps {
   runId: number;
   className?: string;
   showStatusDetails?: boolean;
+  compact?: boolean;
 }
 
 function titleCase(value: string): string {
@@ -60,6 +61,7 @@ export function DeliveryRunPanel({
   runId,
   className = '',
   showStatusDetails = true,
+  compact = false,
 }: DeliveryRunPanelProps) {
   const [run, setRun] = useState<DeliveryRun | null>(null);
   const [loading, setLoading] = useState(true);
@@ -147,6 +149,34 @@ export function DeliveryRunPanel({
       setActing(false);
     }
   };
+
+  if (compact) {
+    return (
+      <div className={`min-w-0 ${className}`}>
+        {run && (
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {allowedActions.includes('pause') && <button type="button" onClick={() => chooseAction('pause')} className="inline-flex items-center gap-1 rounded bg-amber-600/20 px-2 py-1 text-xs font-medium text-amber-300 hover:bg-amber-600/30"><StopCircle size={13} /> Pause</button>}
+            {allowedActions.includes('resume') && <button type="button" onClick={() => chooseAction('resume')} className="inline-flex items-center gap-1 rounded bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-500"><Play size={13} /> Resume</button>}
+            {allowedActions.includes('cancel') && <button type="button" onClick={() => chooseAction('cancel')} className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-medium text-red-300 hover:bg-red-500/10"><XCircle size={13} /> Cancel</button>}
+            {allowedActions.includes('retry') && <button type="button" onClick={() => chooseAction('retry')} className="inline-flex items-center gap-1 rounded bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-500"><RefreshCw size={13} /> Retry</button>}
+          </div>
+        )}
+        {pendingAction && (
+          <div className="mt-2 w-full rounded border border-gray-700 bg-gray-950/70 p-2">
+            <label className="block text-xs text-gray-300">
+              {actionLabels[pendingAction]} reason{actionRequiresReason(pendingAction) ? '' : ' (optional)'}
+              <textarea aria-label={`${actionLabels[pendingAction]} reason`} value={reason} onChange={(event) => setReason(event.target.value)} maxLength={2000} rows={2} className="mt-1 w-full resize-none rounded border border-gray-700 bg-gray-800 px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500" />
+            </label>
+            <div className="mt-2 flex justify-end gap-2">
+              <button type="button" onClick={() => { setPendingAction(null); setReason(''); setError(''); }} disabled={acting} className="rounded px-2 py-1 text-xs text-gray-400 hover:bg-gray-800">Back</button>
+              <button type="button" onClick={() => void submitAction()} disabled={acting || (actionRequiresReason(pendingAction) && !reason.trim())} className={`rounded px-2 py-1 text-xs font-medium text-white disabled:opacity-40 ${pendingAction === 'cancel' ? 'bg-red-600 hover:bg-red-500' : 'bg-indigo-600 hover:bg-indigo-500'}`}>{acting ? 'Applying…' : `Confirm ${actionLabels[pendingAction]}`}</button>
+            </div>
+          </div>
+        )}
+        {error && <p role="alert" className="mt-2 text-xs text-red-300">{error}</p>}
+      </div>
+    );
+  }
 
   return (
     <section

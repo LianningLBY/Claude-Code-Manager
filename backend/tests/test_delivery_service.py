@@ -394,6 +394,7 @@ async def test_idempotent_replay_accepts_pre_frontend_policy_hash(db_session):
     legacy_policy = dict(first.policy_snapshot)
     legacy_policy["schema_version"] = 1
     legacy_policy.pop("frontend_review", None)
+    legacy_policy.pop("strict_branch_protection", None)
     first.request_hash = value_hash(legacy_request)
     first.policy_snapshot = legacy_policy
     first.policy_hash = value_hash(legacy_policy)

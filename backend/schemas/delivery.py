@@ -31,6 +31,7 @@ class DeliveryRunCreate(BaseModel):
     # Omitted callers retain the selected Monitor's legacy repository policy.
     # First-party quick-start always freezes an explicit per-Run choice.
     auto_merge: bool | None = None
+    strict_branch_protection: bool = False
     frontend_review: Literal["auto", "required", "off"] = "auto"
 
     model_config = ConfigDict(extra="forbid")
@@ -64,6 +65,7 @@ class DeliveryQuickStartCreate(BaseModel):
     max_cycles: int = Field(default=10, ge=1, le=100)
     max_no_progress: int = Field(default=3, ge=1, le=20)
     auto_merge: bool = False
+    strict_branch_protection: bool = False
     frontend_review: Literal["auto", "required", "off"] = "auto"
 
     model_config = ConfigDict(extra="forbid")

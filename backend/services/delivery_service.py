@@ -168,6 +168,7 @@ class DeliveryCreateSpec:
     # ``None`` preserves the legacy explicit-Monitor API behavior. The
     # one-message entry point always sends a concrete per-Run choice.
     auto_merge: bool | None = None
+    strict_branch_protection: bool = False
     # Direct service callers predate the Browser gate and retain the legacy
     # flow unless they opt in. Public API schemas explicitly default to auto.
     frontend_review: str = "off"
@@ -223,6 +224,7 @@ def _admission_request(
         "timeout_hours": spec.timeout_hours,
         "max_cycles": spec.max_cycles,
         "max_no_progress": spec.max_no_progress,
+        "strict_branch_protection": spec.strict_branch_protection,
     }
     if spec.auto_merge is not None:
         request["auto_merge"] = spec.auto_merge
@@ -555,6 +557,10 @@ async def create_delivery_run(
         raise DeliveryValidationError(
             "max_no_progress must be between 1 and 20"
         )
+    if type(spec.strict_branch_protection) is not bool:
+        raise DeliveryValidationError(
+            "strict_branch_protection must be a boolean"
+        )
 
     # Admission serializes with Project/PR Monitor identity mutations.  The
     # API mutation paths take the same rows before checking for an active Run,
@@ -702,6 +708,7 @@ async def create_delivery_run(
         "schema_version": 2,
         "terminal": "merged" if auto_merge else "ready_to_merge",
         "auto_merge": auto_merge,
+        "strict_branch_protection": spec.strict_branch_protection,
         "max_cycles": spec.max_cycles,
         "max_no_progress": spec.max_no_progress,
         "provider": resolved_provider,

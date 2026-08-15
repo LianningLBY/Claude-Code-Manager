@@ -1632,6 +1632,7 @@ export interface DeliveryRunCreate {
   max_cycles?: number;
   max_no_progress?: number;
   auto_merge?: boolean | null;
+  strict_branch_protection?: boolean;
   frontend_review?: 'auto' | 'required' | 'off';
 }
 
@@ -1644,6 +1645,7 @@ export interface DeliveryQuickStartCreate {
   max_cycles?: number;
   max_no_progress?: number;
   auto_merge?: boolean;
+  strict_branch_protection?: boolean;
   frontend_review?: 'auto' | 'required' | 'off';
 }
 

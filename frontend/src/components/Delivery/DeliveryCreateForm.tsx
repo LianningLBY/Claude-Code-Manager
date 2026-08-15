@@ -20,6 +20,7 @@ export function DeliveryCreateForm({ projects, repos, config, onCreated, onNavig
   const [title, setTitle] = useState('');
   const [requirements, setRequirements] = useState('');
   const [autoMerge, setAutoMerge] = useState(false);
+  const [strictBranchProtection, setStrictBranchProtection] = useState(false);
   const [frontendReview, setFrontendReview] = useState<'auto' | 'required' | 'off'>('auto');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
@@ -42,6 +43,7 @@ export function DeliveryCreateForm({ projects, repos, config, onCreated, onNavig
       project_id: project.id,
       requirements: requirements.trim(),
       auto_merge: autoMerge,
+      strict_branch_protection: strictBranchProtection,
       frontend_review: frontendReview,
       ...(title.trim() ? { title: title.trim() } : {}),
     };
@@ -55,6 +57,7 @@ export function DeliveryCreateForm({ projects, repos, config, onCreated, onNavig
       setTitle('');
       setRequirements('');
       setAutoMerge(false);
+      setStrictBranchProtection(false);
       setFrontendReview('auto');
       onCreated();
     } catch (reason) {
@@ -104,8 +107,14 @@ export function DeliveryCreateForm({ projects, repos, config, onCreated, onNavig
       {willAutoConfigure && <div className="mt-3 rounded-lg border border-indigo-500/25 bg-indigo-500/10 px-3 py-2 text-xs leading-5 text-indigo-200">PR Monitor is created and bound automatically on first start. Panel review is always enabled; exact-head CI is added when GitHub exposes a required set, otherwise CCM continues with Panel review without asking you to configure Monitor fields.</div>}
       <label className="mt-3 flex items-start gap-2 rounded-lg border border-gray-800 bg-gray-950/40 px-3 py-2 text-xs text-gray-300">
         <input type="checkbox" checked={autoMerge} disabled={autoMergeUnavailable} onChange={(event) => setAutoMerge(event.target.checked)} className="mt-0.5 accent-indigo-500" />
-        <span><b>Merge automatically after all gates pass</b><span className="mt-0.5 block text-gray-500">Off by default. When enabled, exact required CI, Panel findings, GitHub write permission and branch protection must all pass.</span>{autoMergeUnavailable && <span className="mt-0.5 block text-amber-400">This repository has no exact required CI policy, so automatic merge is unavailable.</span>}</span>
+        <span><b>Merge automatically after all gates pass</b><span className="mt-0.5 block text-gray-500">Off by default. When enabled, exact required CI, Panel findings and GitHub write permission must all pass.</span>{autoMergeUnavailable && <span className="mt-0.5 block text-amber-400">This repository has no exact required CI policy, so automatic merge is unavailable.</span>}</span>
       </label>
+      {autoMerge && (
+        <label className="mt-3 flex items-start gap-2 rounded-lg border border-gray-800 bg-gray-950/40 px-3 py-2 text-xs text-gray-300">
+          <input type="checkbox" checked={strictBranchProtection} onChange={(event) => setStrictBranchProtection(event.target.checked)} className="mt-0.5 accent-indigo-500" />
+          <span><b>Strict branch-protection mode</b><span className="mt-0.5 block text-gray-500">Off by default. Enable it only when GitHub Branch Protection and repository rules must also be proved before merging.</span></span>
+        </label>
+      )}
       <label className="mt-3 block rounded-lg border border-gray-800 bg-gray-950/40 px-3 py-2 text-xs text-gray-300">
         <span className="font-semibold">Frontend review gate</span>
         <select

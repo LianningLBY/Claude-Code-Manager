@@ -996,6 +996,18 @@ async def _to_coding_pending(controller, run_id):
     assert await controller.reconcile_run(run_id)  # dispatch Developer turn
 
 
+def test_plan_prompt_preserves_explicit_report_only_requirements():
+    context = MagicMock(requirements="Inspect the stress tests; do not write anything")
+
+    prompt = DeliveryController._plan_prompt(context, {"kind": "operator_retry"})
+
+    assert "report-only plan" in prompt
+    assert "GIT_OPTIONAL_LOCKS=0" in prompt
+    assert "final repository-state audit" in prompt
+    assert "Do not invent implementation or test work" in prompt
+    assert context.requirements in prompt
+
+
 async def _complete_code(db_factory, workspace, run_id, head, tree):
     workspace.advance(head, tree)
     now = datetime.utcnow()

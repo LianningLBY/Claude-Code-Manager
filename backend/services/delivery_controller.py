@@ -1454,8 +1454,16 @@ class DeliveryController:
         trigger = canonical_json(trigger_payload)
         return (
             "Create a concrete implementation plan for this Delivery Loop cycle. "
-            "The plan must address every item in the trigger evidence, include "
-            "tests, and remain scoped to the requested repository.\n\n"
+            "The plan must address every item in the trigger evidence and remain "
+            "scoped to the requested repository. Include tests when the Requirements "
+            "permit repository or runtime writes. When the Requirements explicitly "
+            "prohibit writes or request inspection only, produce a report-only plan: "
+            "use reproducible evidence from the fixed Git revision, avoid commands "
+            "that can refresh the index or create caches, use GIT_OPTIONAL_LOCKS=0 for "
+            "Git worktree inspection when unavoidable, rely on the Delivery Controller "
+            "for the final repository-state audit, and satisfy repository instructions "
+            "through read-only fixed-revision sources. Do not invent implementation or "
+            "test work that contradicts the Requirements.\n\n"
             f"Requirements:\n{context.requirements}\n\n"
             f"Cycle trigger (JSON):\n{trigger}"
         )

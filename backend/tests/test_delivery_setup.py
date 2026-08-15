@@ -72,7 +72,7 @@ async def test_ci_discovery_prefers_exact_branch_protection(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ci_discovery_does_not_invent_gate_from_unprotected_checks(
+async def test_ci_discovery_uses_observed_checks_in_trusted_mode(
     monkeypatch,
 ):
     async def fake_gh(endpoint: str):
@@ -87,12 +87,23 @@ async def test_ci_discovery_does_not_invent_gate_from_unprotected_checks(
         "main",
     )
 
-    assert policies == []
-    assert source == "no_declared_required_checks"
+    assert policies == [
+        {
+            "kind": "check_run",
+            "name": "lint",
+            "app_slug": "github-actions",
+        },
+        {
+            "kind": "check_run",
+            "name": "tests",
+            "app_slug": "github-actions",
+        },
+    ]
+    assert source == "trusted_observed_checks"
 
 
 @pytest.mark.asyncio
-async def test_ci_discovery_does_not_guess_a_single_observed_check(monkeypatch):
+async def test_ci_discovery_uses_single_observed_check_in_trusted_mode(monkeypatch):
     async def fake_gh(endpoint: str):
         if "/protection" in endpoint:
             raise delivery_setup.GhError("HTTP 404: Not Found")
@@ -111,8 +122,14 @@ async def test_ci_discovery_does_not_guess_a_single_observed_check(monkeypatch):
         "main",
     )
 
-    assert policies == []
-    assert source == "no_declared_required_checks"
+    assert policies == [
+        {
+            "kind": "check_run",
+            "name": "tests",
+            "app_slug": "github-actions",
+        }
+    ]
+    assert source == "trusted_observed_checks"
 
 
 @pytest.mark.asyncio
@@ -155,8 +172,19 @@ async def test_ci_discovery_allows_plan_gate_in_trusted_mode(monkeypatch):
         strict_branch_protection=False,
     )
 
-    assert policies == []
-    assert source == "branch_protection_plan_unavailable"
+    assert policies == [
+        {
+            "kind": "check_run",
+            "name": "lint",
+            "app_slug": "github-actions",
+        },
+        {
+            "kind": "check_run",
+            "name": "tests",
+            "app_slug": "github-actions",
+        },
+    ]
+    assert source == "trusted_observed_checks"
 
 
 @pytest.mark.asyncio
@@ -233,11 +261,16 @@ async def test_monitor_bootstrap_is_conservative_and_idempotent(
     async def fake_discovery(repo: str, branch: str):
         assert repo == "acme/delivery-setup-idempotent"
         assert branch == "main"
-        return ([{
-            "kind": "check_run",
-            "name": "tests",
-            "app_slug": "github-actions",
-        }], "branch_protection")
+        return (
+            [
+                {
+                    "kind": "check_run",
+                    "name": "tests",
+                    "app_slug": "github-actions",
+                }
+            ],
+            "branch_protection",
+        )
 
     monkeypatch.setattr(
         delivery_setup,
@@ -263,25 +296,84 @@ async def test_monitor_bootstrap_is_conservative_and_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_monitor_bootstrap_adds_trusted_ci_to_existing_empty_monitor(
+    session_factory,
+    monkeypatch,
+):
+    project = await _project(session_factory, suffix="existing-empty")
+    async with session_factory() as db:
+        db.add(
+            MonitoredRepo(
+                repo_full_name="acme/delivery-setup-existing-empty",
+                project_id=project.id,
+                webhook_secret="existing",
+                review_mode="panel",
+                wait_for_ci=False,
+                required_checks=[],
+                merge_queue_mode="manual",
+                default_branch="main",
+            )
+        )
+        await db.commit()
+
+    async def fake_discovery(repo: str, branch: str):
+        assert repo == "acme/delivery-setup-existing-empty"
+        assert branch == "main"
+        return (
+            [
+                {
+                    "kind": "check_run",
+                    "name": "tests",
+                    "app_slug": "github-actions",
+                }
+            ],
+            "trusted_observed_checks",
+        )
+
+    monkeypatch.setattr(
+        delivery_setup,
+        "discover_delivery_required_checks",
+        fake_discovery,
+    )
+
+    async with session_factory() as db:
+        setup = await ensure_default_delivery_monitor(db, project.id)
+
+    assert setup.created is False
+    assert setup.repo.wait_for_ci is True
+    assert setup.repo.required_checks == [
+        {
+            "kind": "check_run",
+            "name": "tests",
+            "app_slug": "github-actions",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_monitor_bootstrap_does_not_hijack_existing_repo(
     session_factory,
 ):
     project = await _project(session_factory, suffix="conflict")
     async with session_factory() as db:
-        db.add(MonitoredRepo(
-            repo_full_name="acme/delivery-setup-conflict",
-            project_id=None,
-            webhook_secret="existing",
-            review_mode="panel",
-            wait_for_ci=True,
-            required_checks=[{
-                "kind": "check_run",
-                "name": "tests",
-                "app_slug": "github-actions",
-            }],
-            merge_queue_mode="manual",
-            default_branch="main",
-        ))
+        db.add(
+            MonitoredRepo(
+                repo_full_name="acme/delivery-setup-conflict",
+                project_id=None,
+                webhook_secret="existing",
+                review_mode="panel",
+                wait_for_ci=True,
+                required_checks=[
+                    {
+                        "kind": "check_run",
+                        "name": "tests",
+                        "app_slug": "github-actions",
+                    }
+                ],
+                merge_queue_mode="manual",
+                default_branch="main",
+            )
+        )
         await db.commit()
 
     async with session_factory() as db:
@@ -301,11 +393,16 @@ async def test_quick_start_creates_monitor_and_delivery_from_one_message(
     monkeypatch.setattr(delivery_api, "_wake_controller", lambda: None)
 
     async def fake_discovery(repo: str, branch: str):
-        return ([{
-            "kind": "check_run",
-            "name": "tests",
-            "app_slug": "github-actions",
-        }], "branch_protection")
+        return (
+            [
+                {
+                    "kind": "check_run",
+                    "name": "tests",
+                    "app_slug": "github-actions",
+                }
+            ],
+            "branch_protection",
+        )
 
     monkeypatch.setattr(
         delivery_setup,
@@ -338,11 +435,13 @@ async def test_quick_start_creates_monitor_and_delivery_from_one_message(
         assert run is not None
         assert run.monitored_repo_id == repo.id
         assert await db.scalar(select(func.count(DeliveryRun.id))) == 1
-        assert repo.required_checks == [{
-            "kind": "check_run",
-            "name": "tests",
-            "app_slug": "github-actions",
-        }]
+        assert repo.required_checks == [
+            {
+                "kind": "check_run",
+                "name": "tests",
+                "app_slug": "github-actions",
+            }
+        ]
 
 
 @pytest.mark.asyncio

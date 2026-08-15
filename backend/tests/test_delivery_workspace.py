@@ -76,6 +76,37 @@ async def test_prepare_is_idempotent_and_adopts_exact_workspace(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_prepare_allows_safe_controller_worktree_config(tmp_path):
+    repo, _remote = _repository(tmp_path)
+    worktree_config = repo / ".git" / "config.worktree"
+    _git(repo, "config", "--file", str(worktree_config), "user.name", "Local User")
+
+    result = await DeliveryWorkspaceManager(allow_local_remotes=True).prepare(
+        repo_path=str(repo),
+        run_id=176,
+        branch="ccm/delivery/176-safe-worktree-config",
+        base_branch="main",
+    )
+
+    assert Path(result.worktree_path).is_dir()
+
+
+@pytest.mark.asyncio
+async def test_prepare_rejects_unsafe_controller_worktree_config(tmp_path):
+    repo, _remote = _repository(tmp_path)
+    worktree_config = repo / ".git" / "config.worktree"
+    _git(repo, "config", "--file", str(worktree_config), "core.hooksPath", "/tmp/hooks")
+
+    with pytest.raises(DeliveryWorkspaceConflict, match="core.hookspath"):
+        await DeliveryWorkspaceManager(allow_local_remotes=True).prepare(
+            repo_path=str(repo),
+            run_id=177,
+            branch="ccm/delivery/177-unsafe-worktree-config",
+            base_branch="main",
+        )
+
+
+@pytest.mark.asyncio
 async def test_production_manager_rejects_local_remote_without_explicit_test_flag(
     tmp_path,
 ):
@@ -342,7 +373,9 @@ async def test_controller_commit_removes_only_empty_untracked_isolation_placehol
     )
 
     assert committed.head_sha != initial.head_sha
-    assert _git(workspace, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").splitlines() == [
+    assert _git(
+        workspace, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"
+    ).splitlines() == [
         ".npmrc",
         "feature.txt",
     ]

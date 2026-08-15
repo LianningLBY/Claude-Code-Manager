@@ -437,20 +437,22 @@ def _unsafe_git_config_key(key: str, value: str) -> bool:
     }
     if key in exact:
         return True
-    if key.startswith((
-        "alias.",
-        "credential.",
-        "filter.",
-        "gpg.",
-        "http.",
-        "https.",
-        "include.",
-        "includeif.",
-        "difftool.",
-        "mergetool.",
-        "protocol.",
-        "url.",
-    )):
+    if key.startswith(
+        (
+            "alias.",
+            "credential.",
+            "filter.",
+            "gpg.",
+            "http.",
+            "https.",
+            "include.",
+            "includeif.",
+            "difftool.",
+            "mergetool.",
+            "protocol.",
+            "url.",
+        )
+    ):
         return True
     if key.startswith("diff.") and key.endswith((".command", ".textconv")):
         return True
@@ -470,6 +472,49 @@ def _unsafe_git_config_key(key: str, value: str) -> bool:
     if key.startswith("submodule.") and key.endswith(".update"):
         return value.lstrip().startswith("!")
     return key.startswith("tar.") and key.endswith(".command")
+
+
+async def _read_safe_git_config(config_path: Path) -> list[tuple[str, str]]:
+    """Parse one repository-owned config file without executing includes."""
+
+    if (
+        config_path.is_symlink()
+        or not config_path.is_file()
+        or config_path.stat().st_size > _MAX_GIT_CONFIG_BYTES
+    ):
+        raise DeliveryWorkspaceConflict("Repository Git configuration is unsafe")
+    raw = await _git(
+        Path(os.path.abspath(os.sep)),
+        [
+            "config",
+            "--no-includes",
+            "--null",
+            "--file",
+            str(config_path),
+            "--list",
+        ],
+    )
+    entries: list[tuple[str, str]] = []
+    try:
+        fields = raw.decode("utf-8", errors="strict").split("\0")
+    except UnicodeDecodeError as exc:
+        raise DeliveryWorkspaceConflict(
+            "Repository Git configuration is not valid UTF-8"
+        ) from exc
+    for field in fields:
+        if not field:
+            continue
+        key, separator, value = field.partition("\n")
+        key = key.lower()
+        if not separator or not key:
+            raise DeliveryWorkspaceConflict("Repository Git configuration is malformed")
+        if _unsafe_git_config_key(key, value):
+            category = "external Git filters" if key.startswith("filter.") else key
+            raise DeliveryWorkspaceConflict(
+                f"Repository contains unsafe Git configuration: {category} ({key})"
+            )
+        entries.append((key, value))
+    return entries
 
 
 def _validate_remote_endpoint(
@@ -540,42 +585,12 @@ async def _validate_controller_git_repository(
         or config_path.stat().st_size > _MAX_GIT_CONFIG_BYTES
     ):
         raise DeliveryWorkspaceConflict("Repository Git configuration is unsafe")
-    if os.path.lexists(git_dir / "config.worktree"):
-        raise DeliveryWorkspaceConflict(
-            "Repository contains unsafe Git configuration override"
-        )
-
-    raw = await _git(
-        Path(os.path.abspath(os.sep)),
-        [
-            "config",
-            "--no-includes",
-            "--null",
-            "--file",
-            str(config_path),
-            "--list",
-        ],
-    )
-    entries: list[tuple[str, str]] = []
-    try:
-        fields = raw.decode("utf-8", errors="strict").split("\0")
-    except UnicodeDecodeError as exc:
-        raise DeliveryWorkspaceConflict(
-            "Repository Git configuration is not valid UTF-8"
-        ) from exc
-    for field in fields:
-        if not field:
-            continue
-        key, separator, value = field.partition("\n")
-        key = key.lower()
-        if not separator or not key:
-            raise DeliveryWorkspaceConflict("Repository Git configuration is malformed")
-        if _unsafe_git_config_key(key, value):
-            category = "external Git filters" if key.startswith("filter.") else key
-            raise DeliveryWorkspaceConflict(
-                f"Repository contains unsafe Git configuration: {category} ({key})"
-            )
-        entries.append((key, value))
+    entries = await _read_safe_git_config(config_path)
+    worktree_config = git_dir / "config.worktree"
+    if os.path.lexists(worktree_config):
+        # Worktree-specific settings are legitimate, but receive the same
+        # executable/credential/transport safety validation as common config.
+        await _read_safe_git_config(worktree_config)
 
     fetch_values = [value for key, value in entries if key == "remote.origin.url"]
     push_values = [value for key, value in entries if key == "remote.origin.pushurl"]
@@ -715,7 +730,7 @@ def _restore_missing_worktree_pointer(
         ) from exc
 
 
-def _validate_linked_worktree_control(repo: Path, workspace: Path) -> Path:
+async def _validate_linked_worktree_control(repo: Path, workspace: Path) -> Path:
     """Prove the writable worktree still points at this repository's Git dir.
 
     A workspace-write Developer can edit the in-worktree ``.git`` pointer but
@@ -763,13 +778,9 @@ def _validate_linked_worktree_control(repo: Path, workspace: Path) -> Path:
         ) from exc
     if common_target != common or backlink_target != (workspace / ".git").resolve():
         raise DeliveryWorkspaceConflict("Delivery Git ownership changed")
-    # A model with access to the whole linked gitdir could otherwise install a
-    # per-worktree hooksPath/fsmonitor/credential override.  V1 never creates
-    # this file, so its presence is an ownership violation.
-    if os.path.lexists(git_dir / "config.worktree"):
-        raise DeliveryWorkspaceConflict(
-            "Delivery worktree contains an unexpected Git config override"
-        )
+    worktree_config = git_dir / "config.worktree"
+    if os.path.lexists(worktree_config):
+        await _read_safe_git_config(worktree_config)
     return git_dir
 
 
@@ -1009,17 +1020,23 @@ class DeliveryWorkspaceManager:
             timeout=self.fetch_timeout,
         )
         base_sha = (
-            await _git(repo, ["rev-parse", "--verify", f"{remote_ref}^{{commit}}"])
-        ).decode().strip()
+            (await _git(repo, ["rev-parse", "--verify", f"{remote_ref}^{{commit}}"]))
+            .decode()
+            .strip()
+        )
         if _SHA_RE.fullmatch(base_sha) is None:
             raise DeliveryWorkspaceError("Remote base did not resolve to a commit")
         existing_branch = (
-            await _git(
-                repo,
-                ["rev-parse", "--verify", "--quiet", f"{branch_ref}^{{commit}}"],
-                allowed_returncodes=frozenset({0, 1}),
+            (
+                await _git(
+                    repo,
+                    ["rev-parse", "--verify", "--quiet", f"{branch_ref}^{{commit}}"],
+                    allowed_returncodes=frozenset({0, 1}),
+                )
             )
-        ).decode().strip()
+            .decode()
+            .strip()
+        )
         if existing_branch and (
             _SHA_RE.fullmatch(existing_branch) is None or existing_branch != base_sha
         ):
@@ -1078,33 +1095,51 @@ class DeliveryWorkspaceManager:
             raise DeliveryWorkspaceConflict(
                 "Delivery workspace is outside the managed project directory"
             ) from exc
-        _validate_linked_worktree_control(repo, workspace)
+        await _validate_linked_worktree_control(repo, workspace)
         top_level = Path(
             (await _git(workspace, ["rev-parse", "--show-toplevel"])).decode().strip()
         )
         if Path(os.path.abspath(top_level)) != workspace:
             raise DeliveryWorkspaceConflict("Delivery workspace root changed")
         current_branch = (
-            await _git(workspace, ["symbolic-ref", "--short", "HEAD"])
-        ).decode().strip()
+            (await _git(workspace, ["symbolic-ref", "--short", "HEAD"]))
+            .decode()
+            .strip()
+        )
         if current_branch != branch:
             raise DeliveryWorkspaceConflict(
                 f"Delivery workspace is on {current_branch!r}, expected {branch!r}"
             )
         head_sha = (
-            await _git(workspace, ["rev-parse", "--verify", "HEAD^{commit}"])
-        ).decode().strip()
+            (await _git(workspace, ["rev-parse", "--verify", "HEAD^{commit}"]))
+            .decode()
+            .strip()
+        )
         tree_sha = (
-            await _git(workspace, ["rev-parse", "--verify", "HEAD^{tree}"])
-        ).decode().strip()
+            (await _git(workspace, ["rev-parse", "--verify", "HEAD^{tree}"]))
+            .decode()
+            .strip()
+        )
         base_sha = (
-            await _git(
-                workspace,
-                ["rev-parse", "--verify", f"refs/remotes/origin/{base_branch}^{{commit}}"],
+            (
+                await _git(
+                    workspace,
+                    [
+                        "rev-parse",
+                        "--verify",
+                        f"refs/remotes/origin/{base_branch}^{{commit}}",
+                    ],
+                )
             )
-        ).decode().strip()
-        if not all(_SHA_RE.fullmatch(value) for value in (head_sha, tree_sha, base_sha)):
-            raise DeliveryWorkspaceError("Delivery workspace returned an invalid object ID")
+            .decode()
+            .strip()
+        )
+        if not all(
+            _SHA_RE.fullmatch(value) for value in (head_sha, tree_sha, base_sha)
+        ):
+            raise DeliveryWorkspaceError(
+                "Delivery workspace returned an invalid object ID"
+            )
         status = await _git(
             workspace,
             ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
@@ -1193,42 +1228,52 @@ class DeliveryWorkspaceManager:
             raise DeliveryWorkspaceConflict(
                 "Delivery workspace path does not match its owning Run"
             )
-        _validate_linked_worktree_control(repo, workspace)
+        await _validate_linked_worktree_control(repo, workspace)
 
         current_branch = (
-            await _git(workspace, ["symbolic-ref", "--short", "HEAD"])
-        ).decode().strip()
+            (await _git(workspace, ["symbolic-ref", "--short", "HEAD"]))
+            .decode()
+            .strip()
+        )
         if current_branch != branch:
             raise DeliveryWorkspaceConflict(
                 f"Delivery workspace is on {current_branch!r}, expected {branch!r}"
             )
         current_head = (
-            await _git(workspace, ["rev-parse", "--verify", "HEAD^{commit}"])
-        ).decode().strip()
-        marker = (
-            f"CCM-Delivery-Run: {run_id}\n"
-            f"CCM-Delivery-Turn: {turn_generation}"
+            (await _git(workspace, ["rev-parse", "--verify", "HEAD^{commit}"]))
+            .decode()
+            .strip()
         )
+        marker = f"CCM-Delivery-Run: {run_id}\nCCM-Delivery-Turn: {turn_generation}"
 
         if current_head != expected_head_sha:
             # Recovery is accepted only for the exact single commit this method
             # could have created for the old head.  Any other advance remains a
             # subject violation, even if its tree happens to look plausible.
             parents = (
-                await _git(workspace, ["show", "-s", "--format=%P", "HEAD"])
-            ).decode().strip().split()
+                (await _git(workspace, ["show", "-s", "--format=%P", "HEAD"]))
+                .decode()
+                .strip()
+                .split()
+            )
             body = (
                 await _git(workspace, ["show", "-s", "--format=%B", "HEAD"])
             ).decode("utf-8", errors="strict")
             current_tree = (
-                await _git(workspace, ["rev-parse", "--verify", "HEAD^{tree}"])
-            ).decode().strip()
+                (await _git(workspace, ["rev-parse", "--verify", "HEAD^{tree}"]))
+                .decode()
+                .strip()
+            )
             previous_tree = (
-                await _git(
-                    workspace,
-                    ["rev-parse", "--verify", f"{expected_head_sha}^{{tree}}"],
+                (
+                    await _git(
+                        workspace,
+                        ["rev-parse", "--verify", f"{expected_head_sha}^{{tree}}"],
+                    )
                 )
-            ).decode().strip()
+                .decode()
+                .strip()
+            )
             if (
                 parents != [expected_head_sha]
                 or current_tree == previous_tree
@@ -1299,20 +1344,21 @@ class DeliveryWorkspaceManager:
 
         await _git(workspace, [*_SAFE_GIT_CONFIG, "add", "--all"])
         staged_tree = (
-            await _git(workspace, [*_SAFE_GIT_CONFIG, "write-tree"])
-        ).decode().strip()
+            (await _git(workspace, [*_SAFE_GIT_CONFIG, "write-tree"])).decode().strip()
+        )
         previous_tree = (
-            await _git(
-                workspace,
-                ["rev-parse", "--verify", f"{expected_head_sha}^{{tree}}"],
+            (
+                await _git(
+                    workspace,
+                    ["rev-parse", "--verify", f"{expected_head_sha}^{{tree}}"],
+                )
             )
-        ).decode().strip()
+            .decode()
+            .strip()
+        )
         if staged_tree != previous_tree:
             normalized_title = " ".join((title or "Delivery update").split())[:160]
-            message = (
-                f"{normalized_title or 'Delivery update'}\n\n"
-                f"{marker}\n"
-            )
+            message = f"{normalized_title or 'Delivery update'}\n\n{marker}\n"
             env = _git_env()
             env.update(
                 {

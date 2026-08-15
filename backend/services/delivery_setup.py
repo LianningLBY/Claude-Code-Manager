@@ -164,8 +164,7 @@ async def _existing_monitor(
     lock: bool,
 ) -> MonitoredRepo | None:
     statement = select(MonitoredRepo).where(
-        func.lower(MonitoredRepo.repo_full_name)
-        == identity.repo_full_name.lower()
+        func.lower(MonitoredRepo.repo_full_name) == identity.repo_full_name.lower()
     )
     if lock:
         statement = statement.with_for_update()
@@ -290,10 +289,7 @@ def _protected_policies(
         if (
             not isinstance(name, str)
             or not name.strip()
-            or (
-                app_id is not None
-                and (type(app_id) is not int or app_id < -1)
-            )
+            or (app_id is not None and (type(app_id) is not int or app_id < -1))
         ):
             return None
         normalized = name.strip()
@@ -318,10 +314,7 @@ def _protected_policies(
             if candidate["name"] == name
             and (
                 app_id is None
-                or (
-                    candidate["kind"] == "check_run"
-                    and candidate["app_id"] == app_id
-                )
+                or (candidate["kind"] == "check_run" and candidate["app_id"] == app_id)
             )
         ]
         if len(matches) != 1:
@@ -366,10 +359,7 @@ def _is_branch_protection_plan_error(exc: GhError) -> bool:
     return (
         "upgrade to github pro" in detail
         or "upgrade to github team" in detail
-        or (
-            "make this repository public" in detail
-            and "enable this feature" in detail
-        )
+        or ("make this repository public" in detail and "enable this feature" in detail)
     )
 
 
@@ -408,14 +398,12 @@ async def discover_delivery_required_checks(
         # checks exist and must therefore fail closed.
         if _is_unprotected_branch_error(exc):
             protection = None
-        elif (
-            not strict_branch_protection
-            and _is_branch_protection_plan_error(exc)
-        ):
+        elif not strict_branch_protection and _is_branch_protection_plan_error(exc):
             # GitHub Free private repositories cannot expose/enforce this
-            # policy. Trusted Delivery keeps Panel review available, but does
-            # not invent a required CI gate from merely observed checks.
-            return [], "branch_protection_plan_unavailable"
+            # policy. Trusted Delivery falls back to the exact producer
+            # identities observed on the current default-branch commit; the
+            # merge gate will require those identities again on the PR head.
+            protection = None
         else:
             raise DeliverySetupUnavailableError(
                 "Could not prove the GitHub branch-protection policy with "
@@ -437,9 +425,13 @@ async def discover_delivery_required_checks(
             candidates=[_public_policy(item) for item in candidates],
             code="required_checks_unresolved",
         )
-    # Without a repository rule, observed checks may be optional, push-only,
-    # deployment, or maintenance workflows. Keep the mandatory Panel monitor
-    # but do not invent a CI gate that the user never declared.
+    if not strict_branch_protection and candidates:
+        return [
+            _public_policy(candidate) for candidate in candidates
+        ], "trusted_observed_checks"
+    # A repository with no observed CI still receives Panel review, but direct
+    # auto-merge remains disabled because there is no exact check identity to
+    # prove on the PR head.
     return [], "no_declared_required_checks"
 
 
@@ -461,10 +453,13 @@ async def ensure_default_delivery_monitor(
                 f"Cannot configure Delivery automatically because {problem}. "
                 "An administrator must resolve the conflicting legacy binding."
             )
-        await db.commit()
-        return DeliveryMonitorSetup(existing, False, None)
+        if not strict_branch_protection and (
+            existing.required_checks or not allow_create
+        ):
+            await db.commit()
+            return DeliveryMonitorSetup(existing, False, None)
 
-    if not allow_create:
+    if existing is None and not allow_create:
         await db.rollback()
         raise DeliverySetupPermissionError(
             "A CCM administrator must configure this Project's PR Monitor once"
@@ -489,9 +484,7 @@ async def ensure_default_delivery_monitor(
     # Serialize against Project identity edits and re-prove the exact snapshot
     # used for the external discovery before creating a durable Monitor.
     await db.execute(
-        update(Project)
-        .where(Project.id == project_id)
-        .values(id=Project.id)
+        update(Project).where(Project.id == project_id).values(id=Project.id)
     )
     current = _project_identity(
         await db.get(Project, project_id, populate_existing=True)
@@ -511,8 +504,12 @@ async def ensure_default_delivery_monitor(
                 f"Cannot configure Delivery automatically because {problem}. "
                 "An administrator must resolve the conflicting legacy binding."
             )
+        if policies:
+            existing.wait_for_ci = True
+            existing.required_checks = policies
         await db.commit()
-        return DeliveryMonitorSetup(existing, False, None)
+        await db.refresh(existing)
+        return DeliveryMonitorSetup(existing, False, source)
 
     repo = MonitoredRepo(
         repo_full_name=current.repo_full_name,

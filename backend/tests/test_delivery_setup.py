@@ -138,6 +138,51 @@ async def test_ci_discovery_fails_closed_when_protection_cannot_be_read(
 
 
 @pytest.mark.asyncio
+async def test_ci_discovery_allows_plan_gate_in_trusted_mode(monkeypatch):
+    async def fake_gh(endpoint: str):
+        if "/protection" in endpoint:
+            raise delivery_setup.GhError(
+                "HTTP 403: Upgrade to GitHub Pro or make this repository "
+                "public to enable this feature"
+            )
+        return _github_responses(endpoint)
+
+    monkeypatch.setattr(delivery_setup, "_gh_api_json", fake_gh)
+
+    policies, source = await discover_delivery_required_checks(
+        "acme/widgets",
+        "main",
+        strict_branch_protection=False,
+    )
+
+    assert policies == []
+    assert source == "branch_protection_plan_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_ci_discovery_keeps_plan_gate_strict_when_requested(monkeypatch):
+    async def fake_gh(endpoint: str):
+        if "/protection" in endpoint:
+            raise delivery_setup.GhError(
+                "HTTP 403: Upgrade to GitHub Pro or make this repository "
+                "public to enable this feature"
+            )
+        return _github_responses(endpoint)
+
+    monkeypatch.setattr(delivery_setup, "_gh_api_json", fake_gh)
+
+    with pytest.raises(
+        DeliverySetupUnavailableError,
+        match="Could not prove the GitHub branch-protection policy",
+    ):
+        await discover_delivery_required_checks(
+            "acme/widgets",
+            "main",
+            strict_branch_protection=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_ci_discovery_fails_when_declared_identity_cannot_be_resolved(
     monkeypatch,
 ):

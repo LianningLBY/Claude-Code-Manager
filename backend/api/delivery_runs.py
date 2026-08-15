@@ -423,6 +423,7 @@ async def quick_start_run(
             db,
             body.project_id,
             allow_create=(admission_disabled_reason is None and is_admin(request)),
+            strict_branch_protection=body.strict_branch_protection,
         )
     except DeliverySetupPermissionError as exc:
         await db.rollback()

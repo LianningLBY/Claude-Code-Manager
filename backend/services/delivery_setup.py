@@ -359,9 +359,25 @@ def _is_unprotected_branch_error(exc: GhError) -> bool:
     )
 
 
+def _is_branch_protection_plan_error(exc: GhError) -> bool:
+    """Recognize GitHub plan gating, not generic authorization failures."""
+
+    detail = str(exc).strip().lower()
+    return (
+        "upgrade to github pro" in detail
+        or "upgrade to github team" in detail
+        or (
+            "make this repository public" in detail
+            and "enable this feature" in detail
+        )
+    )
+
+
 async def discover_delivery_required_checks(
     repo_full_name: str,
     default_branch: str,
+    *,
+    strict_branch_protection: bool = True,
 ) -> tuple[list[dict[str, str]], str]:
     """Resolve GitHub-declared exact-head CI policies, or return no CI gate."""
 
@@ -390,7 +406,17 @@ async def discover_delivery_required_checks(
         # metadata. An explicit 404 means no classic protection; auth,
         # transport and malformed responses are not proof that no required
         # checks exist and must therefore fail closed.
-        if not _is_unprotected_branch_error(exc):
+        if _is_unprotected_branch_error(exc):
+            protection = None
+        elif (
+            not strict_branch_protection
+            and _is_branch_protection_plan_error(exc)
+        ):
+            # GitHub Free private repositories cannot expose/enforce this
+            # policy. Trusted Delivery keeps Panel review available, but does
+            # not invent a required CI gate from merely observed checks.
+            return [], "branch_protection_plan_unavailable"
+        else:
             raise DeliverySetupUnavailableError(
                 "Could not prove the GitHub branch-protection policy with "
                 "the server's gh login",
@@ -398,7 +424,6 @@ async def discover_delivery_required_checks(
                 candidates=[_public_policy(item) for item in candidates],
                 code="branch_protection_unavailable",
             ) from exc
-        protection = None
 
     protected = _protected_policies(protection, candidates)
     if protected:
@@ -423,6 +448,7 @@ async def ensure_default_delivery_monitor(
     project_id: int,
     *,
     allow_create: bool = True,
+    strict_branch_protection: bool = False,
 ) -> DeliveryMonitorSetup:
     """Return a compatible Monitor or create its conservative default."""
 
@@ -449,6 +475,7 @@ async def ensure_default_delivery_monitor(
     policies, source = await discover_delivery_required_checks(
         identity.repo_full_name,
         identity.default_branch,
+        strict_branch_protection=strict_branch_protection,
     )
 
     # Serialize against Project identity edits and re-prove the exact snapshot

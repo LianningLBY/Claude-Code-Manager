@@ -377,7 +377,7 @@ async def discover_delivery_required_checks(
     repo_full_name: str,
     default_branch: str,
     *,
-    strict_branch_protection: bool = True,
+    strict_branch_protection: bool = False,
 ) -> tuple[list[dict[str, str]], str]:
     """Resolve GitHub-declared exact-head CI policies, or return no CI gate."""
 
@@ -472,11 +472,19 @@ async def ensure_default_delivery_monitor(
 
     # Do not hold a database transaction while invoking GitHub.
     await db.rollback()
-    policies, source = await discover_delivery_required_checks(
-        identity.repo_full_name,
-        identity.default_branch,
-        strict_branch_protection=strict_branch_protection,
-    )
+    if strict_branch_protection:
+        policies, source = await discover_delivery_required_checks(
+            identity.repo_full_name,
+            identity.default_branch,
+            strict_branch_protection=True,
+        )
+    else:
+        # Preserve the historical two-argument extension seam for tests and
+        # deployments that replace the discovery helper.
+        policies, source = await discover_delivery_required_checks(
+            identity.repo_full_name,
+            identity.default_branch,
+        )
 
     # Serialize against Project identity edits and re-prove the exact snapshot
     # used for the external discovery before creating a durable Monitor.

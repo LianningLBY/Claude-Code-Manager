@@ -667,6 +667,7 @@ async def test_progress_projects_open_plan_input_into_the_delivery_run(
         await db.commit()
 
     response = await client.get(f"/api/delivery-runs/{run_id}/progress")
+    plan_response = await client.get(f"/api/plans/{plan.id}")
     attention = await client.get("/api/delivery-runs/attention-count")
 
     assert response.status_code == 200, response.text
@@ -678,6 +679,8 @@ async def test_progress_projects_open_plan_input_into_the_delivery_run(
     assert body["plan_input"]["plan_id"] == plan.id
     assert body["plan_input"]["request"]["questions"][0]["id"] == "scope"
     assert body["plan_input"]["run"]["steps"] == []
+    assert plan_response.status_code == 200, plan_response.text
+    assert plan_response.json()["delivery_run_id"] == run_id
     assert attention.json() == {"total": 1}
 
     # A historical Plan may remain waiting while a newer cycle is current.

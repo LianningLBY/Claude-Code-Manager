@@ -377,7 +377,7 @@ class PlanResource(BaseModel):
     legacy: bool = False
     ownership: Literal["standard", "capability"] = "standard"
     read_only: bool = False
-    # Read-only projection resolved from DeliveryCycle -> PlanVersion -> Plan.
+    # Read-only projection resolved from the Delivery Task or an applied cycle.
     # DeliveryRun remains the sole owner of orchestration state.
     delivery_run_id: int | None = None
     latest_run_status: str | None = None

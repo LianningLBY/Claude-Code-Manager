@@ -3224,6 +3224,30 @@ async def plan_resources(
     delivery_run_by_plan: dict[int, int] = {}
     for delivery_run_id, plan_id in delivery_rows:
         delivery_run_by_plan.setdefault(plan_id, delivery_run_id)
+    target_task_ids = {
+        plan.target_task_id for plan in plans if plan.target_task_id is not None
+    }
+    if target_task_ids:
+        task_delivery_rows = list(
+            (
+                await db.execute(
+                    select(Task.id, Task.delivery_run_id).where(
+                        Task.id.in_(target_task_ids),
+                        Task.delivery_run_id.is_not(None),
+                    )
+                )
+            ).all()
+        )
+        delivery_run_by_task = {
+            task_id: delivery_run_id
+            for task_id, delivery_run_id in task_delivery_rows
+            if delivery_run_id is not None
+        }
+        for plan in plans:
+            if plan.target_task_id is not None:
+                delivery_run_id = delivery_run_by_task.get(plan.target_task_id)
+                if delivery_run_id is not None:
+                    delivery_run_by_plan.setdefault(plan.id, delivery_run_id)
     version_ids = {
         plan.current_version_id for plan in plans if plan.current_version_id is not None
     }

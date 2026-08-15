@@ -2307,6 +2307,17 @@ class CodexAppServer:
         context = self._contexts_by_thread.get(thread_id)
         return bool(context and context.process.returncode is None)
 
+    def live_task_ids(self) -> frozenset[int]:
+        """Return CCM Tasks with an exact live turn on this transport."""
+
+        return frozenset(
+            context.task_id
+            for context in self._contexts_by_thread.values()
+            if type(context.task_id) is int
+            and context.task_id > 0
+            and context.process.returncode is None
+        )
+
     def owns_live_turn_process(self, process: CodexTurnProcess) -> bool:
         """Return whether this server owns the exact live adapter generation."""
 
@@ -8654,6 +8665,15 @@ class CodexAppServerRegistry:
         # decisions per home so two cleanup attempts cannot independently
         # conclude that shutting down the same server generation is safe.
         self._abort_locks: dict[str, asyncio.Lock] = {}
+
+    def live_task_ids(self) -> frozenset[int]:
+        """Return CCM Tasks with exact live turns across managed homes."""
+
+        return frozenset(
+            task_id
+            for server in self._servers.values()
+            for task_id in server.live_task_ids()
+        )
 
     def _new_server(self, home: str) -> CodexAppServer:
         server_kwargs: dict[str, Any] = {}

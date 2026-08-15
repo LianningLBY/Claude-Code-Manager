@@ -4754,6 +4754,14 @@ class InstanceManager:
             )
         return self._codex_app_server
 
+    def active_codex_task_ids(self) -> frozenset[int]:
+        """Return Tasks durably represented by live app-server turns."""
+
+        registry = self._codex_app_server
+        if registry is None:
+            return frozenset()
+        return registry.live_task_ids()
+
     def _codex_actual_tier_route_for_home(self, codex_home: str):
         """Resolve a non-secret upstream route for the per-home proof proxy."""
 

@@ -64,6 +64,7 @@ def _make_dispatcher(db_factory):
     instance_manager.pty_rate_limit_seen = MagicMock(return_value=False)
     instance_manager._try_proactive_pool_switch = AsyncMock()
     instance_manager._pty_rate_limit_seen = set()
+    instance_manager.active_codex_task_ids = MagicMock(return_value=frozenset())
 
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()
@@ -729,6 +730,47 @@ async def test_cleanup_preserves_manager_owned_live_generation(db_factory):
         assert inst.status == "running"
         assert inst.pid == 43210
         task = await db.get(Task, task_id)
+        assert task.status == "executing"
+        assert task.instance_id == inst_id
+
+
+@pytest.mark.asyncio
+async def test_cleanup_preserves_live_codex_registry_task_generation(db_factory):
+    """A live native Codex turn owns its shared-transport Instance row."""
+    d = _make_dispatcher(db_factory)
+
+    async with db_factory() as db:
+        task = Task(
+            title="live-codex-task",
+            description="test",
+            status="executing",
+            provider="codex",
+        )
+        db.add(task)
+        await db.flush()
+        inst = Instance(
+            name="codex-worker",
+            status="running",
+            pid=os.getpid(),
+            current_task_id=task.id,
+        )
+        db.add(inst)
+        await db.flush()
+        task.instance_id = inst.id
+        await db.commit()
+        inst_id = inst.id
+        task_id = task.id
+
+    d.instance_manager.active_codex_task_ids.return_value = frozenset({task_id})
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        inst = await db.get(Instance, inst_id)
+        task = await db.get(Task, task_id)
+        assert inst.status == "running"
+        assert inst.pid == os.getpid()
+        assert inst.current_task_id == task_id
         assert task.status == "executing"
         assert task.instance_id == inst_id
 

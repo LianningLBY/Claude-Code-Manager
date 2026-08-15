@@ -2950,6 +2950,14 @@ class GlobalDispatcher:
                 )
             )
             persisted_instances = list(result.scalars().all())
+            active_codex_task_ids = set()
+            codex_task_ids = getattr(
+                self.instance_manager,
+                "active_codex_task_ids",
+                None,
+            )
+            if callable(codex_task_ids):
+                active_codex_task_ids.update(codex_task_ids())
             observed_instance_owners = {
                 inst.id: inst.current_task_id for inst in persisted_instances
             }
@@ -2968,6 +2976,14 @@ class GlobalDispatcher:
                 if inst.id in manager_owned_instance_ids:
                     if inst.current_task_id is not None:
                         live_task_ids.add(inst.current_task_id)
+                    continue
+                if inst.current_task_id in active_codex_task_ids:
+                    # A CodexTurnProcess exposes the shared app-server PID,
+                    # not a task-exclusive child PID. The native registry's
+                    # exact live task context is therefore stronger ownership
+                    # evidence than a transient gap in InstanceManager maps.
+                    manager_owned_instance_ids.add(inst.id)
+                    live_task_ids.add(inst.current_task_id)
                     continue
                 if inst.current_task_id in termination_task_ids:
                     # Receipt recovery, not generic startup cleanup, owns both

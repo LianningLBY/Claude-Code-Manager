@@ -185,7 +185,7 @@ describe('PlanDetail', () => {
     expect(screen.getByText(/Reviewer: claude \/ claude-opus-4-6 \/ high/).parentElement)
       .toHaveTextContent('Fallback: codex / gpt-5.6-terra / high');
     expect(screen.queryByText(/Application history/)).not.toBeInTheDocument();
-    expect(within(screen.getByText('Debug information').closest('details')!)
+    expect(within(screen.getByText('Technical details').closest('details')!)
       .getByText('Applications (1)')).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('button', { name: 'Open v1 execution Task #91' }));
@@ -304,7 +304,7 @@ describe('PlanDetail', () => {
 
     render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
 
-    await userEvent.click(await screen.findByText('Debug information'));
+    await userEvent.click(await screen.findByText('Technical details'));
     expect(screen.getByText('Delivery history (1)')).toBeInTheDocument();
     expect(screen.getByText(/receipt-released.*release_for_retry/)).toBeInTheDocument();
     expect(screen.getByText('Resolution note: No exact native turn exists')).toBeInTheDocument();
@@ -337,7 +337,7 @@ describe('PlanDetail', () => {
       .toBeInTheDocument();
   });
 
-  it('shows live planning feedback and keeps internal Run identifiers inside Debug information', async () => {
+  it('shows live planning feedback and keeps internal Run identifiers inside Technical details', async () => {
     const prior = version({ id: 11, version_number: 1 });
     const current = version({});
     const activeRun = {
@@ -384,7 +384,7 @@ describe('PlanDetail', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('Creating v1 draft');
     expect(screen.queryByRole('region', { name: 'Plan activity' })).not.toBeInTheDocument();
 
-    const debug = screen.getByText('Debug information').closest('details');
+    const debug = screen.getByText('Technical details').closest('details');
     expect(debug).not.toHaveAttribute('open');
     expect(within(debug!).getByText(/Run #15 · initial · running · round 1/))
       .toBeInTheDocument();
@@ -438,6 +438,9 @@ describe('PlanDetail', () => {
 
     expect(await screen.findByRole('status')).toHaveTextContent('Cancelling v1 generation');
     expect(screen.queryByRole('button', { name: 'Cancel planning' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Planning request')).not.toBeInTheDocument();
+    expect(screen.queryByText('Technical details')).not.toBeInTheDocument();
+    expect(screen.getByText('No Version yet.')).toBeInTheDocument();
   });
 
   it('keeps Capability input writable while all ordinary Plan controls stay read-only', async () => {
@@ -750,7 +753,7 @@ describe('PlanDetail', () => {
     expect(alert).toHaveTextContent('Latest planning attempt failed');
     expect(alert).not.toHaveTextContent(rawError);
     expect(screen.queryByRole('region', { name: 'Plan activity' })).not.toBeInTheDocument();
-    const debug = screen.getByText('Debug information').closest('details');
+    const debug = screen.getByText('Technical details').closest('details');
     expect(within(debug!).getByText(rawError)).toBeInTheDocument();
     expect(within(debug!).getByText(/streamed chars: 381/)).toBeInTheDocument();
     expect(within(debug!).getByText(/last event: item\.agent_message\.delta/))

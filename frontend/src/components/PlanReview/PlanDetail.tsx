@@ -11,7 +11,7 @@ import {
   type UploadResult,
 } from '../../api/client';
 import { useFileUpload } from '../../hooks/useFileUpload';
-import { AlertCircle, Archive, ArchiveRestore, Check, Loader2, Paperclip, Play, RefreshCw, X } from '../icons';
+import { AlertCircle, Archive, ArchiveRestore, Check, ChevronLeft, Loader2, Paperclip, Play, RefreshCw, X } from '../icons';
 import { MarkdownContent } from '../MarkdownContent';
 import { CollapsiblePlanningRequest } from './CollapsiblePlanningRequest';
 import { PlanInputForm } from './PlanInputForm';
@@ -31,6 +31,7 @@ interface Props {
   onToggleVersion?: (versionId: number) => void;
   onAttachVersion?: (versionId: number) => void;
   onNavigateTask?: (taskId: number) => void;
+  embedded?: boolean;
 }
 
 function uploadPayload(results: UploadResult[]) {
@@ -84,7 +85,7 @@ function uniqueRunError(run: PlanRun) {
   return normalized;
 }
 
-export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], onToggleVersion, onAttachVersion, onNavigateTask }: Props) {
+export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], onToggleVersion, onAttachVersion, onNavigateTask, embedded = false }: Props) {
   const [versions, setVersions] = useState<PlanVersion[]>([]);
   const [runs, setRuns] = useState<PlanRun[]>([]);
   const [versionId, setVersionId] = useState<number | null>(plan.current_version_id);
@@ -270,14 +271,14 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
           {showStaleness && staleness?.hard_conflict && <span className="rounded-full bg-red-500/15 px-2 py-0.5 text-red-300">target conflict</span>}
         </div>
       </div>
-      {onClose && <button type="button" onClick={onClose} aria-label="Close Plan" className="rounded-lg p-1.5 text-gray-500 transition-colors hover:bg-gray-800 hover:text-gray-200"><X size={16} /></button>}
+      {onClose && <button type="button" onClick={onClose} aria-label={embedded ? 'Back to Plans' : 'Close Plan'} className="inline-flex items-center gap-1 rounded-lg px-2 py-1.5 text-xs text-gray-500 transition-colors hover:bg-gray-800 hover:text-gray-200">{embedded ? <><ChevronLeft size={16} /> Back</> : <X size={16} />}</button>}
     </header>
 
     <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto p-4 sm:p-6">
       {error && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
       {busyLabel && <div role="status" aria-live="polite" className="mb-4 flex items-center gap-2 rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-xs text-indigo-300"><Loader2 size={13} className="animate-spin" /> {busyLabel}…</div>}
       {plan.read_only && <div data-testid="capability-plan-read-only" className="mb-4 rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-xs text-indigo-200"><span className="font-semibold">Capability-owned Plan.</span> You can inspect it and answer an open input request here; lifecycle, approval, delivery, and cancellation remain controlled by Capability Core.</div>}
-      {plan.latest_run_status === 'failed' && plan.latest_run_error && <div role="alert" className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"><span className="font-semibold">Latest planning attempt failed.</span> {plan.read_only ? 'Capability Core controls retry and terminal handling.' : 'You can retry it;'} Technical details are available in Debug information.</div>}
+      {plan.latest_run_status === 'failed' && plan.latest_run_error && <div role="alert" className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"><span className="font-semibold">Latest planning attempt failed.</span> {plan.read_only ? 'Capability Core controls retry and terminal handling.' : 'You can retry it; technical details are available below.'}</div>}
       {uncertainApplications.map((application) => <div key={application.application_receipt_key} role="alert" className="mb-4 rounded-lg border border-red-500/40 bg-red-500/10 px-3.5 py-3 text-sm text-red-100">
         <div className="flex items-start gap-2.5">
           <AlertCircle size={18} className="mt-0.5 shrink-0 text-red-300" />
@@ -301,7 +302,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
         </div>
       </div>}
       {showStaleness && staleness?.hard_conflict && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"><span className="font-semibold">This action is blocked.</span> {hardConflictMessages.join(' ')}</div>}
-      <CollapsiblePlanningRequest content={plan.initial_request} />
+      {!plan.read_only && <CollapsiblePlanningRequest content={plan.initial_request} />}
 
       {activeRun?.status === 'waiting_user' && plan.open_input_request && <div className="mt-4"><PlanInputForm key={plan.open_input_request.id} run={activeRun} request={plan.open_input_request} onAnswered={answered} /></div>}
       {activeRun && <PlanRunInputAudit run={activeRun} title={`v${candidateVersionNumber} ${activeRun.run_type === 'user_revision' ? 'revision & input history' : 'input history'}`} defaultOpen />}
@@ -325,10 +326,10 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
         </div>
         {shown.review_feedback && <div className="mt-3 rounded-xl border border-gray-700 bg-gray-800/60 p-3 text-sm text-gray-300"><div className="mb-1 text-xs font-semibold text-gray-500">Reviewer feedback</div>{shown.review_feedback}</div>}
         <PlanRunInputAudit runs={runs} version={shown} />
-      </> : <div className="mt-4 rounded-xl border border-gray-800 px-4 py-8 text-center text-sm text-gray-500">No Version has been produced yet.</div>}
+      </> : <p className="mt-4 text-sm text-gray-500">No Version yet.</p>}
 
-      <details className="mt-4 rounded-xl border border-dashed border-gray-700 bg-gray-900/40 p-3 text-xs text-gray-400">
-        <summary className="cursor-pointer font-semibold text-gray-400">Debug information</summary>
+      {!plan.read_only && <details className="mt-4 rounded-lg border border-gray-800 bg-gray-950/30 px-3 py-2 text-xs text-gray-400">
+        <summary className="cursor-pointer font-medium text-gray-500">Technical details</summary>
         <div className="mt-3 space-y-4">
           <section>
             <div className="mb-1 font-semibold text-gray-300">Pipeline routes</div>
@@ -364,7 +365,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
             })}</div>
           </section>}
         </div>
-      </details>
+      </details>}
 
       {shown && !plan.active_run_id && !plan.read_only && <div className="mt-5 space-y-2 border-t border-gray-800 pt-4">
         <textarea value={revision} onChange={(event) => setRevision(event.target.value)} rows={3} maxLength={50000} placeholder={`Revise from v${shown.version_number}…`} disabled={busy} className="w-full resize-y rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500 disabled:opacity-60" />

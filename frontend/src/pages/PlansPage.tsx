@@ -8,7 +8,6 @@ import { PlanNeedsInputPanel } from '../components/PlanReview/PlanNeedsInputPane
 import { usePlanEvents } from '../components/PlanReview/usePlanEvents';
 import { VersionedPlanPanel } from '../components/PlanReview/VersionedPlanPanel';
 import { ProjectSelect } from '../components/ProjectSelect';
-import { useDialogA11y } from '../hooks/useDialogA11y';
 import { Archive, ChevronLeft, ChevronRight, Search, X } from '../components/icons';
 
 const PAGE_SIZE = 20;
@@ -70,18 +69,15 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask
   const [statusCounts, setStatusCounts] = useState(EMPTY_STATUS_COUNTS);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState(false);
   const [needsInputVisible, setNeedsInputVisible] = useState(false);
   const [reviewVisible, setReviewVisible] = useState(false);
   const loadedOnceRef = useRef(false);
   const refreshRequestRef = useRef(0);
   const close = useCallback(() => {
     refreshRequestRef.current += 1;
-    setExpanded(false);
     setSelectedPlan(null);
     onSelectedPlanChange(null);
   }, [onSelectedPlanChange]);
-  const dialogRef = useDialogA11y(selectedPlanId != null, close);
 
   const baseQuery = useMemo(() => ({
     ...(kind !== 'all' ? { kind } : {}),
@@ -174,6 +170,11 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask
   };
 
   return <div className="space-y-6">
+    {selectedPlan ? (
+      <section aria-label={`Plan #${selectedPlan.id}`} className="min-h-[calc(100dvh-8rem)] overflow-hidden rounded-lg border border-gray-800 bg-gray-900/60">
+        <PlanDetail key={selectedPlan.id} plan={selectedPlan} onRefresh={() => refresh()} onClose={close} onNavigateTask={onNavigateTask} embedded />
+      </section>
+    ) : <>
     <PlanCreateForm onCreated={created} onNavigateSettings={onNavigateSettings} />
 
     <section className={needsInputVisible || reviewVisible ? 'space-y-4' : ''} aria-label={needsInputVisible || reviewVisible ? 'Plans requiring action' : undefined}>
@@ -199,6 +200,6 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask
       {totalPages > 1 && <div className="flex items-center justify-center gap-3 py-2"><button type="button" onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={page <= 1} className="rounded p-1.5 text-gray-400 disabled:opacity-30" aria-label="Previous Plans page"><ChevronLeft size={17} /></button><span className="text-xs text-gray-500">{page} / {totalPages} · {total} Plans</span><button type="button" onClick={() => setPage((value) => Math.min(totalPages, value + 1))} disabled={page >= totalPages} className="rounded p-1.5 text-gray-400 disabled:opacity-30" aria-label="Next Plans page"><ChevronRight size={17} /></button></div>}
     </section>
 
-    {selectedPlan && <div className="fixed inset-0 z-[80] flex items-end justify-center bg-black/65 sm:items-center sm:p-5" onMouseDown={(event) => event.target === event.currentTarget && close()}><div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`Plan #${selectedPlan.id}`} className={`min-w-0 w-full overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl transition-[height] sm:h-[min(88vh,860px)] sm:max-w-5xl sm:rounded-2xl ${expanded ? 'h-[100dvh]' : 'h-[70dvh]'}`}><button type="button" onClick={() => setExpanded((value) => !value)} className="absolute left-1/2 top-2 z-10 h-1.5 w-12 -translate-x-1/2 rounded-full bg-gray-600 transition-colors hover:bg-gray-500 sm:hidden" aria-label={expanded ? 'Collapse Plan detail' : 'Expand Plan detail'} /><PlanDetail key={selectedPlan.id} plan={selectedPlan} onRefresh={() => refresh()} onClose={close} onNavigateTask={onNavigateTask} /></div></div>}
+    </>}
   </div>;
 }

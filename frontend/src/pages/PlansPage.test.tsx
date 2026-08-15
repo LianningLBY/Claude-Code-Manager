@@ -213,7 +213,7 @@ describe('PlansPage', () => {
     expect(screen.getByRole('button', { name: 'All 61' })).toBeInTheDocument();
   });
 
-  it('keeps the existing catalog visible while Plan detail opens and closes', async () => {
+  it('uses a page-native Plan detail and restores the catalog when closed', async () => {
     let resolveRefresh!: (rows: PlanResource[]) => void;
     const pendingRefresh = new Promise<PlanResource[]>((resolve) => { resolveRefresh = resolve; });
     vi.mocked(api.listPlans)
@@ -226,7 +226,8 @@ describe('PlansPage', () => {
 
     await userEvent.click(screen.getByRole('button', { name: plan.title }));
     expect(screen.getByText(`Detail for ${plan.title}`)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: plan.title })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: plan.title })).not.toBeInTheDocument();
+    expect(screen.getByRole('region', { name: `Plan #${plan.id}` })).toBeInTheDocument();
     expect(screen.queryByText('Loading Plans…')).not.toBeInTheDocument();
 
     resolveRefresh([plan]);

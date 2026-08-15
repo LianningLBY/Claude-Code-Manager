@@ -25,6 +25,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 _TABLE = "global_settings"
 _COLUMN = "agent_sandbox_unrestricted_enabled"
+_PREVIEW_PROFILE_SIBLING_REVISION = "b8e4d2f6a1c9"
 
 
 def _is_offline() -> bool:
@@ -34,13 +35,19 @@ def _is_offline() -> bool:
 def _acquire_sqlite_writer_fence(*, downgrade: bool) -> None:
     if op.get_bind().dialect.name != "sqlite" or _is_offline():
         return
-    expected_revision = revision if downgrade else down_revision
+    expected_revisions = (
+        (revision,)
+        if downgrade
+        else (down_revision, _PREVIEW_PROFILE_SIBLING_REVISION)
+    )
     fenced = op.get_bind().execute(
         sa.text(
             "UPDATE alembic_version SET version_num = version_num "
-            "WHERE version_num = :expected_revision"
+            "WHERE version_num IN :expected_revisions"
+        ).bindparams(
+            sa.bindparam("expected_revisions", expanding=True)
         ),
-        {"expected_revision": expected_revision},
+        {"expected_revisions": expected_revisions},
     )
     if fenced.rowcount != 1:
         raise RuntimeError(

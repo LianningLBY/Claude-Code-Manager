@@ -611,6 +611,43 @@ class TestUniqueUserGroupMembershipMigration:
 
 
 class TestRoleAndShareMigrationReplay:
+    def test_remove_setting_upgrade_fence_accepts_only_published_sibling(self):
+        module = _load_revision_migration(
+            "a7d3f9c2e610_remove_agent_sandbox_unrestricted_setting.py",
+            "published_sibling_writer_fence",
+        )
+        bind = MagicMock()
+        bind.dialect.name = "sqlite"
+        bind.execute.return_value.rowcount = 1
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module.op, "get_bind", return_value=bind),
+        ):
+            module._acquire_sqlite_writer_fence(downgrade=False)
+
+        params = bind.execute.call_args.args[1]
+        assert params == {
+            "expected_revisions": (
+                module.down_revision,
+                DELIVERY_PREVIEW_PROFILES_REVISION,
+            )
+        }
+
+    def test_remove_setting_upgrade_fence_rejects_ambiguous_rows(self):
+        module = _load_revision_migration(
+            "a7d3f9c2e610_remove_agent_sandbox_unrestricted_setting.py",
+            "ambiguous_sibling_writer_fence",
+        )
+        bind = MagicMock()
+        bind.dialect.name = "sqlite"
+        bind.execute.return_value.rowcount = 2
+        with (
+            patch.object(module, "_is_offline", return_value=False),
+            patch.object(module.op, "get_bind", return_value=bind),
+            pytest.raises(RuntimeError, match="writer fence"),
+        ):
+            module._acquire_sqlite_writer_fence(downgrade=False)
+
     @pytest.mark.parametrize("direction", ("upgrade", "downgrade"))
     def test_remove_setting_sqlite_offline_is_refused(self, direction):
         module = _load_revision_migration(

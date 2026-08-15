@@ -88,7 +88,6 @@ describe('DeliveryRunPanel', () => {
   });
 
   it('requires an explicit reason and confirmation before pausing', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     render(<DeliveryRunPanel runId={7} />);
 
     await userEvent.click(await screen.findByRole('button', { name: 'Pause' }));
@@ -100,11 +99,36 @@ describe('DeliveryRunPanel', () => {
     await waitFor(() => {
       expect(api.pauseDeliveryRun).toHaveBeenCalledWith(7, 'Investigate flaky CI');
     });
-    expect(window.confirm).toHaveBeenCalledWith(
-      'Confirm pause for Delivery Run #7?',
-    );
     expect(await screen.findByText('Pre Review · Paused')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Resume' })).toBeInTheDocument();
+  });
+
+  it('resumes after the in-app confirmation without a browser dialog', async () => {
+    const paused = makeRun({
+      activity: 'paused',
+      pause_reason: 'Workspace validation recovered',
+      allowed_actions: ['resume', 'cancel'],
+    });
+    const resumed = makeRun({
+      phase: 'planning',
+      activity: 'ready',
+      pause_reason: null,
+      allowed_actions: ['pause', 'cancel'],
+    });
+    vi.mocked(api.getDeliveryRun).mockResolvedValue(paused);
+    vi.mocked(api.resumeDeliveryRun).mockResolvedValue(resumed);
+    const browserConfirm = vi.spyOn(window, 'confirm');
+
+    render(<DeliveryRunPanel runId={7} />);
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Resume' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Confirm Resume' }));
+
+    await waitFor(() => {
+      expect(api.resumeDeliveryRun).toHaveBeenCalledWith(7, undefined);
+    });
+    expect(browserConfirm).not.toHaveBeenCalled();
+    expect(await screen.findByText('Planning · Ready')).toBeInTheDocument();
   });
 
   it('marks published monitoring as observation-only without safe-point controls', async () => {
@@ -171,7 +195,6 @@ describe('DeliveryRunPanel', () => {
     });
     vi.mocked(api.getDeliveryRun).mockResolvedValue(failed);
     vi.mocked(api.retryDeliveryRun).mockResolvedValue(retried);
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     render(<DeliveryRunPanel runId={7} />);
 
@@ -194,9 +217,6 @@ describe('DeliveryRunPanel', () => {
         'Provider routes recovered',
       );
     });
-    expect(window.confirm).toHaveBeenCalledWith(
-      'Confirm retry from plan for Delivery Run #7?',
-    );
     expect(await screen.findByText('Planning · Ready')).toBeInTheDocument();
     expect(screen.getByText('Round 3 of 10 · 2 developer turns')).toBeInTheDocument();
   });

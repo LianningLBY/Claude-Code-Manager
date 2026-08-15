@@ -119,10 +119,6 @@ export function DeliveryRunPanel({
       setError(`${actionLabels[pendingAction]} requires a reason.`);
       return;
     }
-    if (!window.confirm(`Confirm ${actionLabels[pendingAction].toLowerCase()} for Delivery Run #${run.id}?`)) {
-      return;
-    }
-
     setActing(true);
     setError('');
     try {

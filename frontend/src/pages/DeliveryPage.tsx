@@ -45,17 +45,11 @@ export function DeliveryPage({ selectedRunId, onSelectedRunChange, onNavigate, o
 
   return (
     <div className="space-y-4">
-      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-gray-800 pb-3">
-        <div>
+      {selectedRunId == null && (
+        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-gray-800 pb-3">
+          <span className="text-xs text-gray-600">{active.length} active · {completed.length} completed</span>
           <div className="flex items-center gap-2">
-            <h1 className="text-lg font-semibold text-gray-100">Delivery</h1>
-            <span className="text-xs text-gray-600">{active.length} active · {completed.length} completed</span>
-          </div>
-          <p className="mt-0.5 text-xs text-gray-600">Plan, implementation, review and release evidence in one workspace.</p>
-        </div>
-        <div className="flex items-center gap-2">
-          <button type="button" onClick={() => void refresh()} className="rounded p-2 text-gray-500 hover:bg-gray-800 hover:text-gray-200" title="Refresh Deliveries"><RefreshCw size={15} /></button>
-          {selectedRunId == null && (
+            <button type="button" onClick={() => void refresh()} className="rounded p-2 text-gray-500 hover:bg-gray-800 hover:text-gray-200" title="Refresh Deliveries"><RefreshCw size={15} /></button>
             <button
               type="button"
               onClick={() => setCreateOpen((value) => !value)}
@@ -64,9 +58,9 @@ export function DeliveryPage({ selectedRunId, onSelectedRunChange, onNavigate, o
               {createOpen ? <X size={14} /> : <Play size={14} />}
               {createOpen ? 'Close' : 'New Delivery'}
             </button>
-          )}
-        </div>
-      </header>
+          </div>
+        </header>
+      )}
 
       {selectedRunId != null ? (
         <DeliveryRunDialog

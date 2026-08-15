@@ -22,6 +22,7 @@ import {
   Activity,
   Bot,
   CheckCircle2,
+  ChevronLeft,
   ChevronRight,
   Circle,
   Clock,
@@ -816,7 +817,7 @@ export function DeliveryRunDialog({
           </div>
           <div className="flex gap-1">
             <button type="button" onClick={() => void load()} className="rounded p-2 text-gray-500 hover:bg-gray-800 hover:text-gray-200" title="Refresh"><RefreshCw size={16} className={refreshing ? 'animate-spin' : ''} /></button>
-            <button type="button" onClick={onClose} className="inline-flex items-center gap-1.5 rounded px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-800 hover:text-gray-200" aria-label={embedded ? 'Back to Deliveries' : 'Close Delivery'}><X size={16} />{embedded && 'Back'}</button>
+            <button type="button" onClick={onClose} className="inline-flex items-center gap-1.5 rounded px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-800 hover:text-gray-200" aria-label={embedded ? 'Back to Deliveries' : 'Close Delivery'}>{embedded ? <ChevronLeft size={16} /> : <X size={16} />}{embedded && 'Back'}</button>
           </div>
         </header>
 

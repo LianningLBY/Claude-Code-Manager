@@ -936,7 +936,7 @@ describe('legacy TaskForm Delivery Loop entry (moved to Delivery tab)', () => {
     }]);
   });
 
-  it('shows a high-risk warning when the Codex sandbox override is active', async () => {
+  it('keeps global Delivery permission state out of the Task composer', async () => {
     vi.mocked(api.config).mockResolvedValue({
       ...config,
       agent_sandbox_unrestricted_enabled: true,
@@ -944,9 +944,8 @@ describe('legacy TaskForm Delivery Loop entry (moved to Delivery tab)', () => {
 
     render(<TaskForm onCreated={vi.fn()} />);
 
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      'All Delivery permissions are ON',
-    );
+    await screen.findByPlaceholderText(/Prompt \/ Description/);
+    expect(screen.queryByText('All Delivery permissions are ON', { exact: false })).not.toBeInTheDocument();
   });
 
   async function fillDeliveryForm(requirements: string) {

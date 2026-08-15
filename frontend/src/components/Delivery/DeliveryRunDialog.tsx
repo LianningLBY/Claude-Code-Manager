@@ -64,8 +64,21 @@ function titleCase(value: string | null | undefined): string {
 
 function deliveryStatusLabel(run: DeliveryRunDetail): string {
   if (run.activity !== 'terminal') return `${titleCase(run.phase)} · ${titleCase(run.activity)}`;
-  if (run.outcome === 'success') return run.terminal === 'merged' ? 'Merged' : 'Ready to merge';
+  if (run.outcome === 'success') {
+    if (isReportOnlySuccess(run)) return 'Report completed';
+    return run.terminal === 'merged' ? 'Merged' : 'Ready to merge';
+  }
   return titleCase(run.outcome || 'completed');
+}
+
+function isReportOnlySuccess(run: DeliveryRunDetail): boolean {
+  return Boolean(
+    run.activity === 'terminal'
+    && run.outcome === 'success'
+    && !run.pr_url
+    && run.base_sha
+    && run.head_sha === run.base_sha
+  );
 }
 
 function isPlanInputRequester(value: string): value is PlanInputRequest['requested_by'] {
@@ -463,6 +476,7 @@ export function DeliveryRunDialog({
   const frontendHarnessLatestEvent = frontendHarnessEvents.at(-1) || null;
   const runIsTerminal = Boolean(run?.activity === 'terminal' || progress?.phase === 'done');
   const runSucceeded = Boolean(runIsTerminal && run?.outcome === 'success');
+  const reportOnlySuccess = Boolean(run && isReportOnlySuccess(run));
   useEffect(() => {
     if (!task || !harness || !latestHarnessScreenshot) {
       if (harnessScreenshotObjectUrl.current) URL.revokeObjectURL(harnessScreenshotObjectUrl.current);
@@ -838,10 +852,10 @@ export function DeliveryRunDialog({
                 <ShieldCheck size={20} />
               </span>
               <div className="min-w-0 flex-1">
-                <h3 className="text-base font-semibold text-emerald-100">{run.terminal === 'merged' ? 'Delivered and merged' : 'Ready to merge'}</h3>
-                <p className="mt-0.5 text-xs text-gray-400">All required gates completed successfully across {run.cycle_count} delivery round{run.cycle_count === 1 ? '' : 's'}.</p>
+                <h3 className="text-base font-semibold text-emerald-100">{reportOnlySuccess ? 'Report completed' : run.terminal === 'merged' ? 'Delivered and merged' : 'Ready to merge'}</h3>
+                <p className="mt-0.5 text-xs text-gray-400">{reportOnlySuccess ? 'The requested read-only inspection completed without repository changes or a pull request.' : `All required gates completed successfully across ${run.cycle_count} delivery round${run.cycle_count === 1 ? '' : 's'}.`}</p>
                 <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-gray-500">
-                  <span className="inline-flex items-center gap-1"><CheckCircle2 size={11} className="text-emerald-400" /> Plan, code, frontend and PR checks complete</span>
+                  <span className="inline-flex items-center gap-1"><CheckCircle2 size={11} className="text-emerald-400" /> {reportOnlySuccess ? 'Plan and read-only report complete · code and PR gates not applicable' : 'Plan, code, frontend and PR checks complete'}</span>
                   <span>{run.turn_count} developer turn{run.turn_count === 1 ? '' : 's'}</span>
                   {run.head_sha && <span className="font-mono">{run.head_sha.slice(0, 10)}</span>}
                   <span>Updated {relativeTime(progress.last_activity_at)}</span>

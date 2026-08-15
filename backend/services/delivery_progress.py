@@ -68,6 +68,7 @@ _TRANSITION_TITLES = {
     "plan_ready": "Plan approved",
     "code_started": "Developer turn started",
     "code_completed": "Developer turn completed",
+    "report_completed": "Read-only report completed",
     "developer_no_progress": "Developer made no commit",
     "review_requested": "Code review started",
     "review_approved": "Code review approved",
@@ -114,7 +115,9 @@ def _text_size(entry: LogEntry) -> int:
 
 def _transition_stage(transition: DeliveryTransition) -> str:
     after = transition.after_state if isinstance(transition.after_state, dict) else {}
-    before = transition.before_state if isinstance(transition.before_state, dict) else {}
+    before = (
+        transition.before_state if isinstance(transition.before_state, dict) else {}
+    )
     phase = after.get("phase")
     if phase == "done" or phase not in _STAGE_ORDER:
         phase = before.get("phase")
@@ -239,15 +242,9 @@ async def _task_logs(
     if retry_count is not None:
         statement = statement.where(LogEntry.task_retry_count == retry_count)
     if turn_generation is not None:
-        statement = statement.where(
-            LogEntry.task_turn_generation == turn_generation
-        )
+        statement = statement.where(LogEntry.task_turn_generation == turn_generation)
     rows = list(
-        (
-            await db.execute(
-                statement.order_by(LogEntry.id.desc()).limit(200)
-            )
-        ).scalars()
+        (await db.execute(statement.order_by(LogEntry.id.desc()).limit(200))).scalars()
     )
     rows.reverse()
     return rows
@@ -348,9 +345,7 @@ def _plan_agent(projection: _PlanProjection) -> DeliveryAgentActivity | None:
             else None
         ),
         last_activity_at=(
-            _max_datetime(
-                [step.last_delta_at, step.finished_at, step.started_at]
-            )
+            _max_datetime([step.last_delta_at, step.finished_at, step.started_at])
             if step is not None
             else plan_run.updated_at
         ),
@@ -370,11 +365,7 @@ async def _frontend_projection(
 ]:
     policy = run.policy_snapshot if isinstance(run.policy_snapshot, dict) else {}
     frontend_policy = policy.get("frontend_review")
-    mode = (
-        frontend_policy.get("mode")
-        if isinstance(frontend_policy, dict)
-        else "off"
-    )
+    mode = frontend_policy.get("mode") if isinstance(frontend_policy, dict) else "off"
     if mode not in {"auto", "required", "off"}:
         mode = "off"
     harness = None
@@ -437,7 +428,9 @@ async def _frontend_projection(
             verdict=(
                 harness.verdict
                 if harness is not None
-                else cycle.frontend_review_verdict if cycle is not None else None
+                else cycle.frontend_review_verdict
+                if cycle is not None
+                else None
             ),
             report=harness.report if harness is not None else None,
             error=harness.error if harness is not None else None,
@@ -486,7 +479,9 @@ def _stage_summary(
             return "Disabled by Delivery policy"
         return "Black-box browser validation"
     if key == "publishing":
-        return f"Pull request #{run.pr_number}" if run.pr_number else run.delivery_branch
+        return (
+            f"Pull request #{run.pr_number}" if run.pr_number else run.delivery_branch
+        )
     if monitor is not None:
         return f"Monitor #{monitor.id}: {monitor.status.replace('_', ' ')}"
     return "Waiting for exact-head CI and PR review"
@@ -502,16 +497,28 @@ def _stage_progress(
 ) -> list[DeliveryStageProgress]:
     current_phase = run.phase
     terminal_state = None
+    report_completed = False
     if run.phase == "done":
         last = transitions[-1] if transitions else None
-        before = last.before_state if last and isinstance(last.before_state, dict) else {}
+        report_completed = bool(
+            last is not None
+            and last.cause == "report_completed"
+            and run.outcome == "success"
+        )
+        before = (
+            last.before_state if last and isinstance(last.before_state, dict) else {}
+        )
         current_phase = before.get("phase", "monitoring")
         terminal_state = (
             "completed"
             if run.outcome == "success"
-            else "cancelled" if run.outcome == "cancelled" else "failed"
+            else "cancelled"
+            if run.outcome == "cancelled"
+            else "failed"
         )
-    current_index = _STAGE_ORDER.index(current_phase) if current_phase in _STAGE_ORDER else 0
+    current_index = (
+        _STAGE_ORDER.index(current_phase) if current_phase in _STAGE_ORDER else 0
+    )
     cycle_started = cycle.created_at if cycle is not None else run.created_at
     relevant = [item for item in transitions if item.created_at >= cycle_started]
     result: list[DeliveryStageProgress] = []
@@ -538,12 +545,24 @@ def _stage_progress(
         ]
         if key == "frontend_review" and frontend.skip_reason:
             state = "skipped"
-        elif key == "frontend_review" and frontend.policy == "off" and index > current_index:
+        elif (
+            key == "frontend_review"
+            and frontend.policy == "off"
+            and index > current_index
+        ):
             state = "skipped"
+        elif report_completed:
+            state = "completed" if index <= _STAGE_ORDER.index("coding") else "skipped"
         elif terminal_state == "completed":
             state = "completed"
         elif terminal_state is not None:
-            state = "completed" if index < current_index else terminal_state if index == current_index else "pending"
+            state = (
+                "completed"
+                if index < current_index
+                else terminal_state
+                if index == current_index
+                else "pending"
+            )
         elif index < current_index:
             state = "completed"
         elif index == current_index:
@@ -649,7 +668,11 @@ async def build_delivery_progress(
         run,
         cycle,
     )
-    monitor = await db.get(PRMonitorRun, run.pr_monitor_run_id) if run.pr_monitor_run_id else None
+    monitor = (
+        await db.get(PRMonitorRun, run.pr_monitor_run_id)
+        if run.pr_monitor_run_id
+        else None
+    )
 
     active_agent: DeliveryAgentActivity | None = None
     task_logs: list[LogEntry] = []
@@ -673,17 +696,23 @@ async def build_delivery_progress(
         )
     elif run.phase == "pre_review" and cycle is not None:
         review_run = (
-            await db.execute(
-                select(CodeReviewRun)
-                .where(
-                    CodeReviewRun.capability_invocation_id
-                    == cycle.review_invocation_id
+            (
+                await db.execute(
+                    select(CodeReviewRun)
+                    .where(
+                        CodeReviewRun.capability_invocation_id
+                        == cycle.review_invocation_id
+                    )
+                    .order_by(CodeReviewRun.attempt.desc())
+                    .limit(1)
                 )
-                .order_by(CodeReviewRun.attempt.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none() if cycle.review_invocation_id else None
-        reviewer = await db.get(Task, review_run.reviewer_task_id) if review_run else None
+            ).scalar_one_or_none()
+            if cycle.review_invocation_id
+            else None
+        )
+        reviewer = (
+            await db.get(Task, review_run.reviewer_task_id) if review_run else None
+        )
         if reviewer is not None and review_run is not None:
             review_logs = await _task_logs(
                 db,
@@ -712,7 +741,9 @@ async def build_delivery_progress(
             provider=harness_attempt.provider if harness_attempt else None,
             model=harness_attempt.model if harness_attempt else None,
             effort=harness_attempt.reasoning_effort if harness_attempt else None,
-            service_tier=harness_attempt.codex_service_tier if harness_attempt else None,
+            service_tier=harness_attempt.codex_service_tier
+            if harness_attempt
+            else None,
             status=harness.status,
             activity_kind=(
                 "completed"
@@ -724,7 +755,9 @@ async def build_delivery_progress(
             started_at=harness.started_at or harness.created_at,
             first_output_at=first_public,
             last_activity_at=(
-                latest_event.created_at if latest_event is not None else harness.started_at
+                latest_event.created_at
+                if latest_event is not None
+                else harness.started_at
             ),
             output_chars=len(harness.report or ""),
         )
@@ -757,11 +790,7 @@ async def build_delivery_progress(
                 stage="planning",
                 kind=f"plan_{step.step_type}",
                 source="plan",
-                title=(
-                    "Plan reviewer"
-                    if step.step_type == "reviewer"
-                    else "Planner"
-                ),
+                title=("Plan reviewer" if step.step_type == "reviewer" else "Planner"),
                 detail=" · ".join(
                     value
                     for value in (step.provider, step.model, step.route_slot)

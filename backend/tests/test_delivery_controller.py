@@ -57,6 +57,7 @@ from backend.services.capability_registry import (
     unregister_capability,
 )
 from backend.services.delivery_reducer import DeliveryReducerEvent
+from backend.services.delivery_progress import _stage_progress
 from backend.services.delivery_service import (
     DeliveryConflictError,
     DeliveryCreateSpec,
@@ -1006,6 +1007,48 @@ def test_plan_prompt_preserves_explicit_report_only_requirements():
     assert "final repository-state audit" in prompt
     assert "Do not invent implementation or test work" in prompt
     assert context.requirements in prompt
+
+
+def test_report_only_terminal_progress_skips_code_and_pr_gates():
+    now = datetime.utcnow()
+    run = MagicMock(
+        phase="done",
+        activity="terminal",
+        outcome="success",
+        created_at=now,
+        turn_count=1,
+        pr_number=None,
+        delivery_branch="ccm/delivery/1-task",
+    )
+    transition = MagicMock(
+        cause="report_completed",
+        before_state={"phase": "coding", "activity": "running"},
+        after_state={"phase": "done", "activity": "terminal"},
+        created_at=now,
+    )
+    frontend = MagicMock(
+        policy="off",
+        skip_reason=None,
+        run_id=None,
+        status=None,
+    )
+
+    stages = _stage_progress(
+        run=run,
+        cycle=None,
+        transitions=[transition],
+        monitor=None,
+        frontend=frontend,
+    )
+
+    assert [stage.state for stage in stages] == [
+        "completed",
+        "completed",
+        "skipped",
+        "skipped",
+        "skipped",
+        "skipped",
+    ]
 
 
 async def _complete_code(db_factory, workspace, run_id, head, tree):

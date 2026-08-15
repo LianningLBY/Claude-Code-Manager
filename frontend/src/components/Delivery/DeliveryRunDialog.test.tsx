@@ -441,4 +441,40 @@ describe('DeliveryRunDialog', () => {
     expect(screen.getByText('No defects found.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /evidence-0\.png/ })).toBeInTheDocument();
   });
+
+  it('labels a successful no-change run as a completed report instead of ready to merge', async () => {
+    const sha = 'e'.repeat(40);
+    vi.mocked(api.getDeliveryRun).mockResolvedValue({
+      id: 19, title: 'Inspect stress tests', phase: 'done', activity: 'terminal', outcome: 'success', terminal: 'ready_to_merge',
+      developer_task_id: 1005, pr_monitor_run_id: null, cycles: [{ id: 19, cycle_number: 1, plan_version_id: 41 }],
+      turns: [{ id: 19, generation: 1, status: 'completed', attempts: 1, last_error: null }], transitions: [],
+      delivery_branch: 'ccm/delivery/19', cycle_count: 1, max_cycles: 10, turn_count: 1, base_sha: sha, head_sha: sha,
+      pr_number: null, pr_url: null, wait_reason: null,
+    } as never);
+    vi.mocked(api.getDeliveryProgress).mockResolvedValue({
+      run_id: 19, state_version: 6, phase: 'done', activity: 'terminal', headline: 'Delivery completed', detail: null,
+      attention_required: false, attention_kind: null, last_activity_at: '2026-08-15T16:12:00Z',
+      stages: [
+        { key: 'planning', label: 'Plan', state: 'completed', summary: '', started_at: null, completed_at: null },
+        { key: 'coding', label: 'Development', state: 'completed', summary: '', started_at: null, completed_at: null },
+        { key: 'pre_review', label: 'Code review', state: 'skipped', summary: '', started_at: null, completed_at: null },
+        { key: 'frontend_review', label: 'Frontend review', state: 'skipped', summary: '', started_at: null, completed_at: null },
+        { key: 'publishing', label: 'Publish PR', state: 'skipped', summary: '', started_at: null, completed_at: null },
+        { key: 'monitoring', label: 'CI & PR review', state: 'skipped', summary: '', started_at: null, completed_at: null },
+      ],
+      active_agent: null, events: [], plan_input: null,
+      frontend_review: { policy: 'off', run_id: null, status: null, stage: null, verdict: null, report: null, error: null, cleanup_status: null, evidence_archive_state: null, finding_count: 0, evidence_count: 0, skip_reason: 'Not applicable to report-only Delivery' },
+    } as never);
+    vi.mocked(api.getTask).mockResolvedValue({ id: 1005 } as never);
+    vi.mocked(api.getPlanVersion).mockResolvedValue({ id: 41, plan_id: 31, version_number: 1, content: '# Read-only plan' } as never);
+
+    render(<DeliveryRunDialog runId={19} onClose={() => {}} onOpenTask={() => {}} onOpenPlan={() => {}} onOpenPRMonitor={() => {}} />);
+
+    const outcome = await screen.findByTestId('delivery-outcome-summary');
+    expect(outcome).toHaveTextContent('Report completed');
+    expect(outcome).toHaveTextContent('without repository changes or a pull request');
+    expect(outcome).toHaveTextContent('code and PR gates not applicable');
+    expect(outcome).not.toHaveTextContent('Ready to merge');
+    expect(screen.queryByRole('link', { name: /Open PR/ })).not.toBeInTheDocument();
+  });
 });

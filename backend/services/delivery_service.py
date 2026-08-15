@@ -239,6 +239,7 @@ async def _idempotent_admission(
     project_id: int,
     idempotency_key: str,
     request_hash: str,
+    pre_strict_request_hash: str,
     legacy_request_hash: str,
 ) -> DeliveryRun | None:
     existing = (
@@ -259,11 +260,12 @@ async def _idempotent_admission(
         if isinstance(existing.policy_snapshot, dict)
         else {}
     )
-    legacy_replay = (
-        policy.get("schema_version") == 1
-        and existing.request_hash == legacy_request_hash
+    compatible_replay = (
+        "strict_branch_protection" not in policy
+        and existing.request_hash
+        in {pre_strict_request_hash, legacy_request_hash}
     )
-    if existing.request_hash != request_hash and not legacy_replay:
+    if existing.request_hash != request_hash and not compatible_replay:
         raise DeliveryConflictError(
             "Idempotency key is already bound to a different Delivery request"
         )
@@ -478,7 +480,10 @@ async def create_delivery_run(
         effort_level=requested_effort,
     )
     request_hash = value_hash(admission_request)
-    legacy_request = dict(admission_request)
+    pre_strict_request = dict(admission_request)
+    pre_strict_request.pop("strict_branch_protection", None)
+    pre_strict_request_hash = value_hash(pre_strict_request)
+    legacy_request = dict(pre_strict_request)
     legacy_request["schema_version"] = 1
     legacy_request.pop("auto_merge", None)
     legacy_request.pop("frontend_review", None)
@@ -509,6 +514,7 @@ async def create_delivery_run(
         project_id=project.id,
         idempotency_key=idempotency_key,
         request_hash=request_hash,
+        pre_strict_request_hash=pre_strict_request_hash,
         legacy_request_hash=legacy_request_hash,
     )
     if existing is not None:

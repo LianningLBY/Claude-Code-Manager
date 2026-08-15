@@ -88,10 +88,9 @@ export function DeliveryCreateForm({ projects, repos, config, onCreated, onNavig
   ));
 
   return (
-    <form onSubmit={submit} className="rounded-2xl border border-gray-800 bg-gray-900/70 p-4 shadow-sm sm:p-5">
+    <form onSubmit={submit} className="rounded-lg border border-gray-800 bg-gray-900/70 p-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div><h1 className="text-lg font-semibold text-gray-100">Start a Delivery</h1><p className="mt-1 text-xs leading-5 text-gray-500">Choose an imported Project and describe the result. CCM reuses its PR Monitor or creates a safe default automatically.</p></div>
-        <span className="rounded-full border border-indigo-500/30 bg-indigo-500/10 px-2.5 py-1 text-[11px] text-indigo-300">Plan → Code → Review → Frontend → PR Gate</span>
+        <div><h2 className="text-sm font-semibold text-gray-100">New Delivery</h2><p className="mt-1 text-xs text-gray-500">Choose a Project and describe the outcome.</p></div>
       </div>
       {config?.agent_sandbox_unrestricted_enabled && (
         <div role="alert" className="mt-4 rounded-lg border border-red-500/50 bg-red-950/50 px-3 py-2 text-xs leading-5 text-red-200">
@@ -102,7 +101,7 @@ export function DeliveryCreateForm({ projects, repos, config, onCreated, onNavig
         <ProjectSelect projects={projects.filter((item) => item.show_in_selector)} value={projectId} onChange={(value) => setProjectId(value ? Number(value) : undefined)} placeholder="Select Project" />
         <input aria-label="Delivery title" value={title} onChange={(event) => setTitle(event.target.value)} maxLength={200} placeholder="Optional short title (defaults to the first line)" className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500" />
       </div>
-      <textarea aria-label="Delivery requirements" value={requirements} onChange={(event) => setRequirements(event.target.value)} required rows={4} placeholder="Describe the task and acceptance criteria. This one message starts the full Plan → Code → Review → Frontend → PR loop…" className="mt-3 w-full resize-y rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500" />
+      <textarea aria-label="Delivery requirements" value={requirements} onChange={(event) => setRequirements(event.target.value)} required rows={3} placeholder="Describe the task and acceptance criteria…" className="mt-3 w-full resize-y rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-sm text-gray-100 outline-none focus:border-indigo-500" />
       {project && repo && <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 rounded-lg border border-gray-800 bg-gray-950/50 px-3 py-2 text-[11px] text-gray-500"><span>Repository <b className="text-gray-300">{repo.repo_full_name}</b></span><span>Branch <b className="text-gray-300">{project.default_branch}</b></span><span>Provider <b className="text-gray-300">{repo.provider}</b></span><span>PR Monitor <b className="text-gray-300">Panel{repo.wait_for_ci ? ' + exact CI' : ''}</b></span></div>}
       {willAutoConfigure && <div className="mt-3 rounded-lg border border-indigo-500/25 bg-indigo-500/10 px-3 py-2 text-xs leading-5 text-indigo-200">PR Monitor is created and bound automatically on first start. Panel review is always enabled; exact-head CI is added when GitHub exposes a required set, otherwise CCM continues with Panel review without asking you to configure Monitor fields.</div>}
       <label className="mt-3 flex items-start gap-2 rounded-lg border border-gray-800 bg-gray-950/40 px-3 py-2 text-xs text-gray-300">

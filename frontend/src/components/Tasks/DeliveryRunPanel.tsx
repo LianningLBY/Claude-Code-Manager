@@ -16,6 +16,7 @@ type DeliveryAction = 'pause' | 'resume' | 'cancel' | 'retry';
 interface DeliveryRunPanelProps {
   runId: number;
   className?: string;
+  showStatusDetails?: boolean;
 }
 
 function titleCase(value: string): string {
@@ -58,6 +59,7 @@ function isObservationOnly(run: DeliveryRun): boolean {
 export function DeliveryRunPanel({
   runId,
   className = '',
+  showStatusDetails = true,
 }: DeliveryRunPanelProps) {
   const [run, setRun] = useState<DeliveryRun | null>(null);
   const [loading, setLoading] = useState(true);
@@ -205,13 +207,13 @@ export function DeliveryRunPanel({
                 <dd className="inline break-words text-gray-300">{titleCase(run.wait_reason)}</dd>
               </div>
             )}
-            {run.pause_reason && (
+            {showStatusDetails && run.pause_reason && (
               <div className="min-w-0 sm:col-span-2">
                 <dt className="inline text-gray-500">Paused: </dt>
                 <dd className="inline break-words text-amber-300">{run.pause_reason}</dd>
               </div>
             )}
-            {run.error_message && (
+            {showStatusDetails && run.error_message && (
               <div className="min-w-0 sm:col-span-2">
                 <dt className="inline text-gray-500">Error{run.error_code ? ` (${run.error_code})` : ''}: </dt>
                 <dd className="inline break-words text-red-300">{run.error_message}</dd>

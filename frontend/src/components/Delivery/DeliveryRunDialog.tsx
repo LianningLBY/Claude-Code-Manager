@@ -50,6 +50,7 @@ const STAGE_META: Record<DeliveryStageKey, { label: string; description: string 
 interface Props {
   runId: number;
   project?: Project;
+  embedded?: boolean;
   onClose: () => void;
   onOpenTask: (taskId: number) => void;
   onOpenPlan: (planId: number) => void;
@@ -105,6 +106,37 @@ function relativeTime(value: string | null | undefined): string {
   if (seconds < 60) return `${seconds}s ago`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
   return `${Math.floor(seconds / 3600)}h ago`;
+}
+
+function deliveryDetailSummary(detail: string): string {
+  const normalized = detail.trim();
+  if (/permission denied \(publickey\)/i.test(normalized)) {
+    return 'GitHub authentication failed while preparing the Delivery workspace.';
+  }
+  if (/repository contains unsafe git configuration/i.test(normalized)) {
+    return 'The repository contains a Git setting that Delivery cannot safely use.';
+  }
+  if (/delivery workspace validation failed/i.test(normalized)) {
+    return 'Delivery could not prepare a safe workspace for this run.';
+  }
+  if (normalized.length <= 280) return normalized;
+  return `${normalized.slice(0, 277).trimEnd()}…`;
+}
+
+function DetailText({ detail }: { detail: string }) {
+  const summary = deliveryDetailSummary(detail);
+  const hasTechnicalDetail = summary !== detail.trim();
+  return (
+    <div className="mt-1 space-y-1.5">
+      <p className="text-xs leading-5 text-gray-400">{summary}</p>
+      {hasTechnicalDetail && (
+        <details className="text-[11px] text-gray-500">
+          <summary className="w-fit cursor-pointer select-none text-gray-500 hover:text-gray-300">Technical details</summary>
+          <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-gray-800 bg-gray-950/70 p-3 font-mono text-[10px] leading-4 text-gray-500">{detail}</pre>
+        </details>
+      )}
+    </div>
+  );
 }
 
 function currentStage(progress: DeliveryProgress): DeliveryStageKey {
@@ -259,6 +291,7 @@ function cycleDuration(cycle: DeliveryCycle): string {
 export function DeliveryRunDialog({
   runId,
   project,
+  embedded = false,
   onClose,
   onOpenTask,
   onOpenPlan,
@@ -759,8 +792,18 @@ export function DeliveryRunDialog({
   };
 
   return (
-    <div className="fixed inset-0 z-[85] flex items-end justify-center bg-black/70 sm:items-center sm:p-5" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div role="dialog" aria-modal="true" aria-label={`Delivery #${runId}`} className="flex h-[94dvh] w-full max-w-6xl flex-col overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl sm:h-[90vh] sm:rounded-2xl">
+    <div
+      className={embedded ? 'min-h-0' : 'fixed inset-0 z-[85] flex items-end justify-center bg-black/70 sm:items-center sm:p-5'}
+      onMouseDown={embedded ? undefined : (event) => event.target === event.currentTarget && onClose()}
+    >
+      <div
+        role={embedded ? 'region' : 'dialog'}
+        aria-modal={embedded ? undefined : true}
+        aria-label={`Delivery #${runId}`}
+        className={embedded
+          ? 'flex min-h-[calc(100dvh-8rem)] w-full flex-col overflow-hidden rounded-xl border border-gray-800 bg-gray-900/70'
+          : 'flex h-[94dvh] w-full max-w-6xl flex-col overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl sm:h-[90vh] sm:rounded-2xl'}
+      >
         <header className="flex shrink-0 items-start justify-between gap-3 border-b border-gray-800 px-4 py-3 sm:px-5">
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
@@ -773,7 +816,7 @@ export function DeliveryRunDialog({
           </div>
           <div className="flex gap-1">
             <button type="button" onClick={() => void load()} className="rounded p-2 text-gray-500 hover:bg-gray-800 hover:text-gray-200" title="Refresh"><RefreshCw size={16} className={refreshing ? 'animate-spin' : ''} /></button>
-            <button type="button" onClick={onClose} className="rounded p-2 text-gray-500 hover:bg-gray-800 hover:text-gray-200" aria-label="Close Delivery"><X size={18} /></button>
+            <button type="button" onClick={onClose} className="inline-flex items-center gap-1.5 rounded px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-800 hover:text-gray-200" aria-label={embedded ? 'Back to Deliveries' : 'Close Delivery'}><X size={16} />{embedded && 'Back'}</button>
           </div>
         </header>
 
@@ -811,7 +854,7 @@ export function DeliveryRunDialog({
                   <p className="text-sm font-semibold text-gray-100">{progress.headline}</p>
                   {progress.active_agent && <span className="rounded bg-gray-800 px-1.5 py-0.5 text-[10px] text-gray-400">{titleCase(progress.active_agent.role)} · {progress.active_agent.provider || 'provider'} {progress.active_agent.model || ''}</span>}
                 </div>
-                {progress.detail && <p className="mt-1 text-xs leading-5 text-gray-400">{progress.detail}</p>}
+                {progress.detail && <DetailText detail={progress.detail} />}
                 <div className="mt-1.5 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-gray-600">
                   <span className="inline-flex items-center gap-1"><Clock size={11} /> Last public activity {relativeTime(progress.last_activity_at)}</span>
                   {progress.active_agent && <span>{titleCase(progress.active_agent.activity_kind)} · {progress.active_agent.output_chars.toLocaleString()} public chars</span>}
@@ -951,7 +994,7 @@ export function DeliveryRunDialog({
               {error && <Notice tone="red" text={error} />}
               <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_320px]">
               <div className="min-w-0 space-y-4" role="tabpanel">
-                {!(runIsTerminal && run.outcome === 'success') && <DeliveryRunPanel runId={run.id} />}
+                {!(runIsTerminal && run.outcome === 'success') && <DeliveryRunPanel runId={run.id} showStatusDetails={false} />}
                 <section className="rounded-xl border border-gray-800 bg-gray-950/30 p-4">
                   <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
                     <div><h3 className="text-sm font-semibold text-gray-100">Round {selectedCycle.cycle_number} · {STAGE_META[activeStage].label}</h3><p className="mt-1 text-xs text-gray-600">{STAGE_META[activeStage].description}</p></div>
@@ -972,7 +1015,11 @@ export function DeliveryRunDialog({
                       <div className="min-w-0 flex-1">
                         <div className="flex items-start justify-between gap-2"><p className="text-xs font-medium leading-5 text-gray-300">{event.title}</p><span className="shrink-0 text-[9px] text-gray-700">{formatDateTime(event.created_at)}</span></div>
                         <p className="text-[10px] text-gray-600">{STAGE_META[event.stage as DeliveryStageKey]?.label || titleCase(event.stage)} · {event.status ? titleCase(event.status) : event.source}</p>
-                        {event.detail && <p className="mt-1 whitespace-pre-wrap break-words text-[11px] leading-4 text-gray-500">{event.detail}</p>}
+                        {event.detail && (
+                          event.detail.length > 240
+                            ? <DetailText detail={event.detail} />
+                            : <p className="mt-1 whitespace-pre-wrap break-words text-[11px] leading-4 text-gray-500">{event.detail}</p>
+                        )}
                       </div>
                     </div>
                   ))}

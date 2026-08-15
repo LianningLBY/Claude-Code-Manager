@@ -833,6 +833,7 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | `test_task_isolation_allows_verified_internal_codex_code_mode` | Member Codex sandbox 允许冻结的内置 code-mode，同时继续拒绝 ambient MCP |
 | `test_update_deployment_state.py` | running/disk/Alembic 三态、SQLite/外部 DB 准入、dirty checkout（含未跟踪源码）、claim 后二次 blocker、取消释放 lease、回滚元数据恢复、systemd-run ACK 不确定性与前端快照 |
 | `test_update_migrate_hardening.py` | 停服 SQLite 最终快照、迁移失败原子恢复、same-commit repair maintenance fence、回滚任一步失败不启服、慢启动稳定健康检查、late worker/token 门禁、旧 10 参数 worker self-claim、FD/权限/符号链接/超时故障；仅对白名单内的 `systemd --user [--deserialize=N]` user-manager 进程放行不可读 FD |
+| `test_server_side_sshd_session_allowlist_requires_root_parent` | 仅当 child 名称、账号绑定的 `pts/N`/`notty` 命令、user session scope、root-owned `[priv]` parent 与同 cgroup 全部精确匹配时放行不可读 FD；任一字段漂移仍阻断迁移 |
 | `test_pre_start_guard.py` | pre-start 端口解析、受控启动跳过依赖/迁移、未知/危险状态阻止启动；普通启动仅在 guard 放行后执行 |
 | `test_alembic_migrations.py::TestPublishedMigrationHistory` | `b6e1f4a2c9d7`、`f7a1c3d9e5b2` 与 sibling `5f7a9c2e4d61` 三种已部署状态都可升级到唯一 merge head；Plan cleanup 和 mergepoint 可降级/再升级，且旧 revision 文件无需改写 |
 | `client.update.test.ts` | repair/restart/confirmed rollback 使用独立 API；结构化 409 错误保留 status/detail 并给出可读消息 |
@@ -842,6 +843,8 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | 测试 | 验证内容 |
 |------|---------|
 | `test_build_review_prompt_*` | Reviewer prompt 始终禁止 Agent 执行 `gh pr merge`；合并权限只在后端 |
+| `test_fetch_base_guidance_ignores_unmanifested_root_documents` / `test_single_prompt_keeps_the_complete_patch_within_budget` / Panel prompt budget / superseding recovery | Reviewer 仅消费 manifest 显式授权 Guide、紧凑文件清单和完整 patch；legacy 隐式文档/changed-file 全文不会在恢复时回流，超限在 Task 物化前 fail closed |
+| `test_review_evidence_marker_is_hidden_from_rendered_human_body` / `test_review_evidence_reader_requires_an_exact_final_marker` / `test_find_review_evidence_reads_legacy_visible_marker_for_recovery` | 新 publication 只写末尾 HTML comment，human-visible body 无 nonce/schema；仅精确末尾 current/legacy marker 可恢复，legacy marker 不再写出 |
 | `test_publish_auto_merge_*` / `test_publish_merged_comment_*` | OFF 只发布 ready-to-merge Review；ON 固定 head merge，并以 nonce/head/actor/time 对账最终 merged comment；merge/comment ACK 丢失均不重复写 |
 | `test_delivery_durable_publication_*` | Delivery publication 只能恢复 Run 冻结的 merge policy，错配 outbox fail closed |
 | `test_create_pr_review_task_happy_path` | 创建 PRReview + Task 并广播 `review_created` |

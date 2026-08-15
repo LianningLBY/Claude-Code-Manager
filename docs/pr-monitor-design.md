@@ -716,6 +716,8 @@ Reviewer 和 Developer 都无权 enqueue 或 merge。Controller 通过持久 Act
 才落 `merged`。Ref update 或 comment 响应丢失时先 query-before-write，不重复副作用。direct auto-merge
 与非 `manual` Merge Queue 始终互斥。
 
+新 GitHub Review 把 publication nonce 放在正文末尾的 HTML comment，因此人类可见正文只保留结论与 Reviewer 摘要。恢复读取只接受末尾精确 marker；旧版可见 nonce 仅兼容读取，带尾随文本或正文内引用均不能作为远端 evidence。
+
 Direct-ref fast-forward 与 GitHub 的 `allow_merge_commit`、`allow_squash_merge`、`allow_rebase_merge` 开关无关；
 Manager 只要求远端 repository identity 与冻结记录一致、凭据可写 exact target ref，并通过 branch-protection
 Gate。任何公开 Review 前以及 ref mutation 前都重新读取保护策略；`required_conversation_resolution` 必须

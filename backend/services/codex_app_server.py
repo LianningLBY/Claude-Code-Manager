@@ -8675,6 +8675,15 @@ class CodexAppServerRegistry:
             for task_id in server.live_task_ids()
         )
 
+    def live_transport_pids(self) -> frozenset[int]:
+        """Return app-server PIDs owned by this registry generation."""
+
+        return frozenset(
+            server.pid
+            for server in self._servers.values()
+            if server.is_alive and server.pid > 0
+        )
+
     def _new_server(self, home: str) -> CodexAppServer:
         server_kwargs: dict[str, Any] = {}
         if self._env_remove_resolver is not None:

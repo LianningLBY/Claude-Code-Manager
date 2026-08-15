@@ -4762,6 +4762,14 @@ class InstanceManager:
             return frozenset()
         return registry.live_task_ids()
 
+    def active_codex_transport_pids(self) -> frozenset[int]:
+        """Return shared Codex transport PIDs owned by this manager."""
+
+        registry = self._codex_app_server
+        if registry is None:
+            return frozenset()
+        return registry.live_transport_pids()
+
     def _codex_actual_tier_route_for_home(self, codex_home: str):
         """Resolve a non-secret upstream route for the per-home proof proxy."""
 

@@ -2950,14 +2950,6 @@ class GlobalDispatcher:
                 )
             )
             persisted_instances = list(result.scalars().all())
-            active_codex_task_ids = set()
-            codex_task_ids = getattr(
-                self.instance_manager,
-                "active_codex_task_ids",
-                None,
-            )
-            if callable(codex_task_ids):
-                active_codex_task_ids.update(codex_task_ids())
             observed_instance_owners = {
                 inst.id: inst.current_task_id for inst in persisted_instances
             }
@@ -2969,6 +2961,14 @@ class GlobalDispatcher:
             reconciliation_race_instance_ids: set[int] = set()
             stale_instances: list[tuple[Instance, bool]] = []
             for inst in persisted_instances:
+                codex_task_ids = getattr(
+                    self.instance_manager,
+                    "active_codex_task_ids",
+                    None,
+                )
+                active_codex_task_ids = (
+                    set(codex_task_ids()) if callable(codex_task_ids) else set()
+                )
                 if inst.current_task_id is not None:
                     reverse_owner_ids.setdefault(inst.current_task_id, set()).add(
                         inst.id
@@ -2992,15 +2992,26 @@ class GlobalDispatcher:
                     continue
                 pid_may_be_alive = False
                 if inst.pid is not None:
-                    try:
-                        os.kill(inst.pid, 0)
-                        pid_may_be_alive = True
-                    except ProcessLookupError:
-                        pass
-                    except OSError:
-                        # Anything other than a definitive ESRCH is uncertain
-                        # and therefore fail-closed against duplicate writes.
-                        pid_may_be_alive = True
+                    codex_transport_pids = getattr(
+                        self.instance_manager,
+                        "active_codex_transport_pids",
+                        None,
+                    )
+                    live_transport_pids = (
+                        set(codex_transport_pids())
+                        if callable(codex_transport_pids)
+                        else set()
+                    )
+                    if inst.pid not in live_transport_pids:
+                        try:
+                            os.kill(inst.pid, 0)
+                            pid_may_be_alive = True
+                        except ProcessLookupError:
+                            pass
+                        except OSError:
+                            # Anything other than a definitive ESRCH is uncertain
+                            # and therefore fail-closed against duplicate writes.
+                            pid_may_be_alive = True
                 logger.warning(
                     "Quarantining unowned instance %s (%s), persisted PID %s%s",
                     inst.id,

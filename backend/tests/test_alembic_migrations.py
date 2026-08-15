@@ -109,6 +109,7 @@ TASK_MIGRATION_OPERATION_REVISION = "a3d9b5f7c1e4"
 WORKER_DESTROY_LIFECYCLE_NONCE_REVISION = "b4e1c7d9f203"
 WORKER_RENAME_TAG_OUTBOX_REVISION = "c4a8e2f6b190"
 PR_MONITOR_TASK_TOMBSTONE_REVISION = "e2a4c6f8b1d3"
+DELIVERY_PR_MONITOR_MERGE_REVISION = "f4c7a9d2e610"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
@@ -119,7 +120,7 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = PR_MONITOR_TASK_TOMBSTONE_REVISION
+CURRENT_HEAD_REVISION = DELIVERY_PR_MONITOR_MERGE_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -10415,11 +10416,16 @@ class TestPublishedMigrationHistory:
             }
         assert current_revisions == set(revisions)
 
-    def test_migration_graph_preserves_both_published_heads(self, tmp_path):
+    def test_migration_graph_merges_both_published_heads(self, tmp_path):
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
-        assert set(script.get_heads()) == {
+        assert set(script.get_heads()) == {DELIVERY_PR_MONITOR_MERGE_REVISION}
+        assert set(
+            script.get_revision(
+                DELIVERY_PR_MONITOR_MERGE_REVISION
+            ).down_revision
+        ) == {
             DELIVERY_PREVIEW_PROFILES_REVISION,
             PR_MONITOR_TASK_TOMBSTONE_REVISION,
         }

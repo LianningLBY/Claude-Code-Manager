@@ -308,6 +308,10 @@ class DeliveryCycle(Base):
         ),
         CheckConstraint("cycle_number >= 1", name="ck_delivery_cycles_number"),
         CheckConstraint("state_version >= 1", name="ck_delivery_cycles_version"),
+        CheckConstraint(
+            "frontend_review_profile_index >= 0",
+            name="ck_delivery_cycles_frontend_profile_index",
+        ),
         Index("ix_delivery_cycles_run_created", "run_id", "created_at"),
     )
 

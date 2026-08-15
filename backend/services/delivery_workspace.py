@@ -78,6 +78,7 @@ class _ValidatedGitRepository:
     fetch_url: str
     push_url: str
     repo_full_name: str | None
+    ssh_command: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -476,15 +477,15 @@ def _unsafe_git_config_key(key: str, value: str) -> bool:
     return key.startswith("tar.") and key.endswith(".command")
 
 
-def _is_ccm_managed_ssh_command(value: str) -> bool:
-    """Accept only CCM's own private-key command from its managed key vault."""
+def _canonical_ccm_managed_ssh_command(value: str) -> str | None:
+    """Return a shell-safe CCM-managed SSH command, or reject it."""
 
     try:
         argv = shlex.split(value, posix=True)
     except ValueError:
-        return False
+        return None
     if len(argv) < 3 or argv[0] != "ssh" or argv[1] != "-i":
-        return False
+        return None
     key_path = Path(argv[2])
     if (
         not key_path.is_absolute()
@@ -494,7 +495,7 @@ def _is_ccm_managed_ssh_command(value: str) -> bool:
         or key_path.stat().st_uid != os.geteuid()
         or stat.S_IMODE(key_path.stat().st_mode) & 0o077
     ):
-        return False
+        return None
     allowed_options = {
         "BatchMode=yes",
         "IdentitiesOnly=yes",
@@ -503,11 +504,13 @@ def _is_ccm_managed_ssh_command(value: str) -> bool:
     }
     remainder = argv[3:]
     if len(remainder) % 2:
-        return False
-    return all(
+        return None
+    if not all(
         remainder[index] == "-o" and remainder[index + 1] in allowed_options
         for index in range(0, len(remainder), 2)
-    )
+    ):
+        return None
+    return shlex.join(argv)
 
 
 async def _read_safe_git_config(
@@ -553,8 +556,9 @@ async def _read_safe_git_config(
             and allowed_hooks_path is not None
             and os.path.abspath(value) == str(allowed_hooks_path)
         )
-        managed_ssh_command = key == "core.sshcommand" and _is_ccm_managed_ssh_command(
-            value
+        managed_ssh_command = (
+            key == "core.sshcommand"
+            and _canonical_ccm_managed_ssh_command(value) is not None
         )
         if (
             not canonical_default_hooks
@@ -653,10 +657,16 @@ async def _validate_controller_git_repository(
 
     fetch_values = [value for key, value in entries if key == "remote.origin.url"]
     push_values = [value for key, value in entries if key == "remote.origin.pushurl"]
+    ssh_values = [value for key, value in entries if key == "core.sshcommand"]
     if len(fetch_values) != 1 or len(push_values) > 1:
         raise DeliveryWorkspaceConflict(
             "Origin must define exactly one fetch and at most one push URL"
         )
+    if len(ssh_values) > 1:
+        raise DeliveryWorkspaceConflict("Repository defines multiple SSH commands")
+    ssh_command = (
+        _canonical_ccm_managed_ssh_command(ssh_values[0]) if ssh_values else None
+    )
     fetch_url, fetch_repo = _validate_remote_endpoint(
         fetch_values[0],
         allow_local_remotes=allow_local_remotes,
@@ -698,6 +708,7 @@ async def _validate_controller_git_repository(
         fetch_url=fetch_url,
         push_url=push_url,
         repo_full_name=normalized_repo,
+        ssh_command=ssh_command,
     )
 
 
@@ -1068,6 +1079,12 @@ class DeliveryWorkspaceManager:
             expected_abs.rmdir()
 
         remote_ref = f"refs/remotes/origin/{base_branch}"
+        fetch_env = _git_env()
+        if repository.ssh_command is not None:
+            # GIT_SSH_COMMAND has precedence over the inert command-scope
+            # core.sshCommand override. The value was reconstructed only from
+            # CCM's owned 0600 key and a closed set of SSH options.
+            fetch_env["GIT_SSH_COMMAND"] = repository.ssh_command
         await _git(
             repo,
             [
@@ -1080,6 +1097,7 @@ class DeliveryWorkspaceManager:
                 f"refs/heads/{base_branch}:{remote_ref}",
             ],
             timeout=self.fetch_timeout,
+            env=fetch_env,
         )
         base_sha = (
             (await _git(repo, ["rev-parse", "--verify", f"{remote_ref}^{{commit}}"]))

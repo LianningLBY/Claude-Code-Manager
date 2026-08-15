@@ -3,6 +3,7 @@
 import asyncio
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 from unittest.mock import AsyncMock, MagicMock
 
@@ -166,11 +167,23 @@ async def test_prepare_fetches_from_validated_explicit_remote_url(
     monkeypatch,
 ):
     repo, remote = _repository(tmp_path)
-    calls: list[tuple[str, ...]] = []
+    managed_keys = tmp_path / ".ccm-task-git-credentials"
+    managed_keys.mkdir()
+    deploy_key = managed_keys / "repo-github"
+    deploy_key.write_text("test-key\n", encoding="utf-8")
+    deploy_key.chmod(0o600)
+    monkeypatch.setattr(
+        delivery_workspace,
+        "_CCM_GIT_CREDENTIALS_DIR",
+        managed_keys,
+    )
+    ssh_command = f"ssh -i {deploy_key} -o IdentitiesOnly=yes"
+    _git(repo, "config", "core.sshCommand", ssh_command)
+    calls: list[tuple[tuple[str, ...], dict[str, str] | None]] = []
     original_git = delivery_workspace._git
 
     async def recording_git(cwd, args, **kwargs):
-        calls.append(tuple(args))
+        calls.append((tuple(args), kwargs.get("env")))
         return await original_git(cwd, args, **kwargs)
 
     monkeypatch.setattr(delivery_workspace, "_git", recording_git)
@@ -182,9 +195,11 @@ async def test_prepare_fetches_from_validated_explicit_remote_url(
         base_branch="main",
     )
 
-    fetch = next(args for args in calls if "fetch" in args)
+    fetch, fetch_env = next(call for call in calls if "fetch" in call[0])
     assert str(remote) in fetch
     assert "origin" not in fetch
+    assert fetch_env is not None
+    assert fetch_env["GIT_SSH_COMMAND"] == shlex.join(shlex.split(ssh_command))
 
 
 @pytest.mark.asyncio

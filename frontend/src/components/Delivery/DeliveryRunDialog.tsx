@@ -159,7 +159,9 @@ function DetailText({ detail }: { detail: string }) {
 function currentStage(progress: DeliveryProgress): DeliveryStageKey {
   if (progress.phase !== 'done') return progress.phase;
   const terminal = progress.stages.find((stage) => ['failed', 'cancelled'].includes(stage.state));
-  return terminal?.key || 'monitoring';
+  if (terminal) return terminal.key;
+  const lastCompleted = [...progress.stages].reverse().find((stage) => stage.state === 'completed');
+  return lastCompleted?.key || 'monitoring';
 }
 
 interface CycleContext {

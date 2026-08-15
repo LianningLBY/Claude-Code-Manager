@@ -476,5 +476,7 @@ describe('DeliveryRunDialog', () => {
     expect(outcome).toHaveTextContent('code and PR gates not applicable');
     expect(outcome).not.toHaveTextContent('Ready to merge');
     expect(screen.queryByRole('link', { name: /Open PR/ })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Development: Completed' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: 'CI & PR review: Skipped' })).not.toHaveAttribute('aria-pressed', 'true');
   });
 });

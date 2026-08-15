@@ -674,6 +674,7 @@ async def test_progress_projects_open_plan_input_into_the_delivery_run(
     assert body["attention_required"] is True
     assert body["attention_kind"] == "plan_input"
     assert body["headline"] == "Plan needs your decision"
+    assert body["plan_id"] == plan.id
     assert body["plan_input"]["plan_id"] == plan.id
     assert body["plan_input"]["request"]["questions"][0]["id"] == "scope"
     assert body["plan_input"]["run"]["steps"] == []

@@ -688,6 +688,23 @@ describe('PlanDetail', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  it('opens the Delivery workspace instead of its parent Task chat', async () => {
+    const current = version({});
+    const prior = version({ id: 11, version_number: 1 });
+    const resource = plan(current, prior);
+    resource.target_task_id = 1005;
+    resource.delivery_run_id = 1;
+    vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
+    const navigate = vi.fn();
+    window.location.hash = '#/plans/2';
+
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} onNavigateTask={navigate} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Open Delivery DLV-1' }));
+
+    expect(window.location.hash).toBe('#/delivery/1');
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
   it('keeps failed Run details in Debug and offers an in-place retry', async () => {
     const current = version({});
     const prior = version({ id: 11, version_number: 1 });

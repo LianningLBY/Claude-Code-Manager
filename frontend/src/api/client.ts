@@ -1612,6 +1612,7 @@ export interface DeliveryProgress {
   stages: DeliveryStageProgress[];
   active_agent: DeliveryAgentActivity | null;
   events: DeliveryTimelineEvent[];
+  plan_id: number | null;
   plan_input: DeliveryPlanInputProjection | null;
   frontend_review: DeliveryFrontendReviewProgress;
 }

@@ -852,6 +852,7 @@ async def build_delivery_progress(
         ),
         active_agent=active_agent,
         events=timeline,
+        plan_id=plan.plan_run.plan_id if plan.plan_run is not None else None,
         plan_input=plan.input_projection,
         frontend_review=frontend,
     )

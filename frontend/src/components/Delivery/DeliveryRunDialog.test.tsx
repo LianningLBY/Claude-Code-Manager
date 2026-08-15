@@ -43,11 +43,11 @@ describe('DeliveryRunDialog', () => {
     expect(await screen.findByText('Actions for 7')).toBeInTheDocument();
     expect(screen.queryByRole('region', { name: 'Delivery rounds' })).not.toBeInTheDocument();
     expect(screen.queryByText('Full controls for 7')).not.toBeInTheDocument();
-    await userEvent.click(await screen.findByRole('tab', { name: /Plan/ }));
+    await userEvent.click(await screen.findByRole('button', { name: /Plan/ }));
     expect(await screen.findByText('Real Plan')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: /Open in Plans/ }));
     expect(onOpenPlan).toHaveBeenCalledWith(21);
-    await userEvent.click(screen.getByRole('tab', { name: /Development/ }));
+    await userEvent.click(screen.getByRole('button', { name: /Development/ }));
     await userEvent.click(screen.getByRole('button', { name: /Open real Task Chat/ }));
     expect(onOpenTask).toHaveBeenCalledWith(12);
   });
@@ -64,7 +64,7 @@ describe('DeliveryRunDialog', () => {
         { key: 'publishing', label: 'Publish PR', state: 'pending', summary: '', started_at: null, completed_at: null },
         { key: 'monitoring', label: 'CI & PR review', state: 'pending', summary: '', started_at: null, completed_at: null },
       ],
-      active_agent: null, events: [],
+      active_agent: null, events: [], plan_id: 44,
       plan_input: {
         plan_id: 44,
         run: { id: 55, generation: 2 },
@@ -77,7 +77,31 @@ describe('DeliveryRunDialog', () => {
 
     expect(await screen.findByText('The Loop needs your choice')).toBeInTheDocument();
     expect(screen.getByText('Inline plan input: Which rollout scope?')).toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: /Plan/ })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('button', { name: /^Plan: / })).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('links the Plan aggregate while its first Version is still being prepared', async () => {
+    vi.mocked(api.getDeliveryRun).mockResolvedValue({ id: 18, title: 'Prepare rollout', phase: 'planning', activity: 'waiting', outcome: null, terminal: 'ready_to_merge', developer_task_id: 1005, pr_monitor_run_id: null, current_cycle_id: 12, cycles: [{ id: 12, cycle_number: 1, plan_version_id: null }], turns: [], transitions: [], delivery_branch: 'ccm/delivery/18', turn_count: 0, head_sha: null, wait_reason: 'plan_capability' } as never);
+    vi.mocked(api.getDeliveryProgress).mockResolvedValue({
+      run_id: 18, state_version: 2, phase: 'planning', activity: 'waiting', headline: 'Planning started', detail: null, attention_required: false, attention_kind: null, last_activity_at: null, plan_id: 2,
+      stages: [
+        { key: 'planning', label: 'Plan', state: 'running', summary: '', started_at: null, completed_at: null },
+        { key: 'coding', label: 'Development', state: 'pending', summary: '', started_at: null, completed_at: null },
+        { key: 'pre_review', label: 'Code review', state: 'pending', summary: '', started_at: null, completed_at: null },
+        { key: 'frontend_review', label: 'Frontend review', state: 'pending', summary: '', started_at: null, completed_at: null },
+        { key: 'publishing', label: 'Publish PR', state: 'pending', summary: '', started_at: null, completed_at: null },
+        { key: 'monitoring', label: 'CI & PR review', state: 'pending', summary: '', started_at: null, completed_at: null },
+      ], active_agent: null, events: [], plan_input: null,
+      frontend_review: { policy: 'auto', run_id: null, status: null, stage: null, verdict: null, report: null, error: null, cleanup_status: null, evidence_archive_state: null, finding_count: 0, evidence_count: 0, skip_reason: null },
+    } as never);
+    vi.mocked(api.getTask).mockResolvedValue({ id: 1005 } as never);
+    const onOpenPlan = vi.fn();
+
+    render(<DeliveryRunDialog runId={18} onClose={() => {}} onOpenTask={() => {}} onOpenPlan={onOpenPlan} onOpenPRMonitor={() => {}} />);
+
+    expect(await screen.findByText('Plan #2 is being prepared')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Open Plan #2' }));
+    expect(onOpenPlan).toHaveBeenCalledWith(2);
   });
 
   it('shows Browser Agent findings and archived report in the frontend stage', async () => {
@@ -103,7 +127,7 @@ describe('DeliveryRunDialog', () => {
     expect(await screen.findByText(/Save action does not complete/)).toBeInTheDocument();
     expect(screen.getByText('The Save flow failed.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /save-flow\.png/ })).toBeInTheDocument();
-    expect(screen.getByRole('tab', { name: /Frontend review/ })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('button', { name: /Frontend review/ })).toHaveAttribute('aria-pressed', 'true');
   });
 
   it('shows the live Browser Agent stage, latest action, counters, and Task panel entry', async () => {
@@ -194,7 +218,7 @@ describe('DeliveryRunDialog', () => {
     expect(screen.getByTestId('delivery-frontend-live-jump')).toHaveTextContent('Frontend Browser Agent');
     expect(screen.getByTestId('delivery-frontend-live-jump')).toHaveTextContent('Live');
     expect(screen.getByTestId('delivery-frontend-live-jump')).toHaveTextContent('步骤 3/12');
-    expect(screen.getByRole('tab', { name: /Frontend review/ })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('button', { name: /Frontend review/ })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByTestId('delivery-frontend-agent-events')).toHaveTextContent('正在验证保存后的成功状态');
 
     await userEvent.click(screen.getByRole('button', { name: '打开完整实时测试面板' }));
@@ -382,9 +406,9 @@ describe('DeliveryRunDialog', () => {
 
     expect(screen.queryByTestId('delivery-frontend-live-jump')).not.toBeInTheDocument();
 
-    const frontendTab = screen.getByRole('tab', { name: /Frontend review/ });
+    const frontendTab = screen.getByRole('button', { name: /Frontend review/ });
     await userEvent.click(frontendTab);
-    expect(frontendTab).toHaveAttribute('aria-selected', 'true');
+    expect(frontendTab).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByText(`Harness ${harnessRunId.slice(0, 8)}`)).toBeInTheDocument();
     expect(screen.getByText('No defects found.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /evidence-0\.png/ })).toBeInTheDocument();

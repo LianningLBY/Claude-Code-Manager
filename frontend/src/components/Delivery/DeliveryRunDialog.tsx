@@ -493,6 +493,7 @@ export function DeliveryRunDialog({
     if (!run || !progress || !selectedCycle) return null;
     if (stage === 'planning') {
       const plan = selectedCycle.plan_version_id ? plans[selectedCycle.plan_version_id] : null;
+      const currentPlanId = selectedIsCurrent ? progress.plan_id : null;
       return (
         <div className="space-y-4">
           {selectedIsCurrent && progress.plan_input && (
@@ -522,6 +523,14 @@ export function DeliveryRunDialog({
               </div>
               <div className="prose prose-invert mt-3 max-w-none text-xs text-gray-300"><MarkdownRenderer content={plan.content} /></div>
             </article>
+          ) : currentPlanId && !progress.plan_input ? (
+            <div className="flex flex-wrap items-center justify-between gap-3 border-l-2 border-indigo-400/60 bg-indigo-500/5 px-4 py-3">
+              <div>
+                <p className="text-sm font-medium text-gray-200">Plan #{currentPlanId} is being prepared</p>
+                <p className="mt-1 text-xs text-gray-500">The Plan exists. Its first approved Version is not ready yet.</p>
+              </div>
+              <button type="button" onClick={() => onOpenPlan(currentPlanId)} className="text-xs font-medium text-indigo-300 hover:text-indigo-200">Open Plan #{currentPlanId}</button>
+            </div>
           ) : selectedCycle.error_message ? (
             <Notice tone="red" text={selectedCycle.error_message} />
           ) : (
@@ -911,22 +920,27 @@ export function DeliveryRunDialog({
           </section>
         )}
 
-        <div className="shrink-0 overflow-x-auto border-b border-gray-800 px-3 py-1.5 sm:px-5" role="tablist" aria-label="Delivery stages">
-          <div className="flex min-w-max gap-1">
-            {displayedStages.map((stage) => (
-              <button
-                key={stage.key}
-                type="button"
-                role="tab"
-                aria-selected={activeStage === stage.key}
-                aria-label={`${stage.label}: ${titleCase(stage.state)}`}
-                onClick={() => setActiveStage(stage.key)}
-                className={`flex min-w-32 items-center gap-2 rounded-lg px-3 py-2 text-left transition-colors ${activeStage === stage.key ? 'bg-indigo-500/15 text-indigo-200' : stage.state === 'completed' ? 'text-gray-400 hover:bg-gray-800 hover:text-gray-200' : 'text-gray-500 hover:bg-gray-800 hover:text-gray-300'}`}
-              >
-                <StageIcon state={stage.state} />
-                <span className="block text-xs font-medium">{stage.label}</span>
-              </button>
-            ))}
+        <div className="shrink-0 overflow-x-auto border-b border-gray-800 px-4 py-4 sm:px-6" aria-label="Delivery flow">
+          <div className="flex min-w-[720px] items-start" role="group" aria-label="Delivery stages">
+            {displayedStages.map((stage, index) => {
+              const selected = activeStage === stage.key;
+              const completed = stage.state === 'completed' || stage.state === 'skipped';
+              return <div key={stage.key} className="flex min-w-0 flex-1 items-start">
+                <button
+                  type="button"
+                  aria-pressed={selected}
+                  aria-label={`${stage.label}: ${titleCase(stage.state)}`}
+                  onClick={() => setActiveStage(stage.key)}
+                  className="group flex w-24 shrink-0 flex-col items-center gap-2 text-center"
+                >
+                  <span className={`flex h-9 w-9 items-center justify-center rounded-full border-2 transition-colors ${selected ? 'border-indigo-300 bg-indigo-500/20 text-indigo-200 ring-4 ring-indigo-500/10' : completed ? 'border-emerald-500/60 bg-emerald-500/10 text-emerald-300' : stage.state === 'failed' || stage.state === 'cancelled' ? 'border-red-500/60 bg-red-500/10 text-red-300' : 'border-gray-700 bg-gray-900 text-gray-500 group-hover:border-gray-500 group-hover:text-gray-300'}`}>
+                    <StageIcon state={stage.state} />
+                  </span>
+                  <span className={`text-[11px] font-medium leading-4 ${selected ? 'text-indigo-200' : 'text-gray-400'}`}>{stage.label}</span>
+                </button>
+                {index < displayedStages.length - 1 && <span aria-hidden="true" className={`mt-[17px] h-px min-w-5 flex-1 ${completed ? 'bg-emerald-500/50' : 'bg-gray-700'}`} />}
+              </div>;
+            })}
           </div>
         </div>
 
@@ -938,7 +952,7 @@ export function DeliveryRunDialog({
           ) : run && progress && selectedCycle && selectedContext ? (
             <div className="space-y-4">
               {error && <Notice tone="red" text={error} />}
-              <div className="min-w-0 space-y-4" role="tabpanel">
+              <div className="min-w-0 space-y-4" aria-live="polite">
                 <section className="rounded-xl border border-gray-800 bg-gray-950/30 p-4">
                   <div className="mb-4"><h3 className="text-sm font-semibold text-gray-100">{STAGE_META[activeStage].label}</h3><p className="mt-1 text-xs text-gray-600">{STAGE_META[activeStage].description}</p></div>
                   {stageContent(activeStage)}

@@ -341,6 +341,7 @@ class DeliveryProgressResponse(BaseModel):
     stages: list[DeliveryStageProgress]
     active_agent: DeliveryAgentActivity | None = None
     events: list[DeliveryTimelineEvent]
+    plan_id: int | None = None
     plan_input: DeliveryPlanInputProjection | None = None
     frontend_review: DeliveryFrontendReviewProgress
 

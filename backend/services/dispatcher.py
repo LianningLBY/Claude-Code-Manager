@@ -2304,7 +2304,7 @@ class GlobalDispatcher:
                 (run.instance_id is not None and run.instance_id != owner.id)
                 or owner.current_task_id is not None
                 or owner.pid is not None
-                or owner.status not in {"running", "idle"}
+                or owner.status not in {"running", "idle", "error"}
             ):
                 await db.rollback()
                 return False

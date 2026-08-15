@@ -391,6 +391,43 @@ async def test_ordinary_running_cold_recovery_advances_only_clean_generation(
 
 
 @pytest.mark.asyncio
+async def test_running_cold_recovery_releases_empty_error_owner(
+    db_factory,
+    monkeypatch,
+):
+    """A dead exact owner may be left in error after its provider crashes."""
+
+    from backend.services import plan_agent_runner
+
+    monkeypatch.setattr(plan_agent_runner, "active_plan_run_ids", lambda: set())
+    graph = await _seed_run_graph(
+        db_factory,
+        name="error-owner-clean-cold-recovery",
+        status="running",
+        generation=15,
+        receipt_status="cleaned",
+    )
+    assert graph.owner_id is not None
+    async with db_factory() as db:
+        owner = await db.get(Instance, graph.owner_id)
+        owner.status = "error"
+        await db.commit()
+
+    dispatcher = _dispatcher(db_factory)
+    await dispatcher._recover_versioned_plan_runs()
+
+    await _assert_owner_graph(
+        db_factory,
+        graph,
+        run_instance_id=None,
+        reverse_owner_run_id=None,
+        run_status="queued",
+        generation=16,
+        step_status="cancelled",
+    )
+
+
+@pytest.mark.asyncio
 async def test_ordinary_running_unclean_generation_preserves_entire_owner_graph(
     db_factory,
     monkeypatch,

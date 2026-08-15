@@ -677,6 +677,24 @@ describe('PoolDrawer', () => {
     });
 
     it('keeps a busy API tombstone visible with a safe cleanup retry action', async () => {
+      vi.mocked(api.getCloudRouterAccounts).mockResolvedValue([{
+        ...apiAccount,
+        id: 'cloudrouter-pending',
+        name: 'CloudRouter Pending',
+        enabled: false,
+        retired: true,
+        cleanup_pending: true,
+        cleanup_code: 'runtime_busy',
+        cleanup_reason: 'Task #42 is still using this API account',
+        cleanup_last_attempt_at: 1786802400,
+        cleanup_last_error_at: 1786802401,
+        models: {
+          claude: ['claude-sonnet-4-6'],
+          codex: ['gpt-5.5'],
+        },
+        providers: ['claude', 'codex'],
+        supported_models: ['claude-sonnet-4-6', 'gpt-5.5'],
+      }]);
       vi.mocked(api.getPoolUsage).mockResolvedValue({
         enabled: true,
         total: 1,
@@ -703,17 +721,40 @@ describe('PoolDrawer', () => {
           api_quota: apiQuota,
         }],
       });
-      vi.mocked(api.getCodexPoolUsage).mockResolvedValue({
+      enableCodexPool({
         enabled: true,
-        total: 0,
+        total: 1,
         available: 0,
         cooldown: 0,
-        disabled: 0,
+        disabled: 1,
         preferred: null,
-        accounts: [],
+        accounts: [{
+          id: 'cloudrouter:cloudrouter-pending:codex',
+          codex_home: '/tmp/cloudrouter-pending/codex',
+          email: '',
+          enabled: false,
+          available: false,
+          cooldown_until: null,
+          cooldown_remaining: 0,
+          auth_kind: 'cloudrouter_api',
+          display_name: 'CloudRouter Pending',
+          api_account_id: 'cloudrouter-pending',
+          retired: true,
+          cleanup_pending: true,
+          supported_models: ['gpt-5.5'],
+        }],
       });
       vi.mocked(api.deleteCloudRouterAccount).mockRejectedValue(
-        Object.assign(new Error('API account is still in use'), { status: 409 }),
+        Object.assign(new Error('Conflict'), {
+          status: 409,
+          detail: {
+            message: 'API account is still in use',
+            error: 'API account is still in use',
+            code: 'runtime_busy',
+            reason: 'Task #42 is still using this API account',
+            cleanup_pending: true,
+          },
+        }),
       );
       const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
       const alert = vi.spyOn(window, 'alert').mockImplementation(() => {});
@@ -723,32 +764,51 @@ describe('PoolDrawer', () => {
       await openDrawer(user);
 
       const card = screen.getByText('CloudRouter Pending').closest('.rounded-lg') as HTMLElement;
-      expect(within(card).getByText('待清理')).toBeInTheDocument();
+      expect(within(card).getByText('已停用')).toBeInTheDocument();
+      expect(within(card).getByText('删除受阻')).toBeInTheDocument();
       expect(card).toHaveTextContent('账号已停用，新的 Claude/Codex 任务不会再使用它');
-      expect(card).toHaveTextContent('API Key 与配置仍在等待安全清理');
+      expect(card).toHaveTextContent('API Key 与配置尚未删除');
+      expect(card).toHaveTextContent('账号仍被运行中的任务或监控使用，请先停止相关运行再重试');
+      expect(card).toHaveTextContent('后端详情：Task #42 is still using this API account');
+      expect(card).toHaveTextContent('Task #42 is still using this API account');
+      expect(card).toHaveTextContent('runtime_busy');
+      expect(card).toHaveTextContent('最近失败：');
       expect(card).toHaveTextContent('Claude projects 与 Codex sessions 会保留');
+      expect(card).toHaveTextContent('同一共享 API 账号会投影到 Claude 与 Codex 页签');
+      expect(card).not.toHaveTextContent('待清理');
       expect(within(card).queryByText('优先账号')).not.toBeInTheDocument();
       expect(within(card).queryByText('最近使用')).not.toBeInTheDocument();
       expect(within(card).queryByRole('button', { name: '切换到此账号' })).not.toBeInTheDocument();
       expect(within(card).queryByRole('button', { name: '查看额度与有效期' })).not.toBeInTheDocument();
 
-      await user.click(within(card).getByRole('button', { name: '继续清理' }));
+      await user.click(screen.getByRole('button', { name: 'Codex' }));
+      const codexCard = (await screen.findByText('CloudRouter Pending')).closest('.rounded-lg') as HTMLElement;
+      expect(codexCard).toHaveTextContent('Task #42 is still using this API account');
+      expect(codexCard).toHaveTextContent('同一共享 API 账号会投影到 Claude 与 Codex 页签');
+      expect(within(codexCard).getByRole('button', { name: '重试清理' })).toBeEnabled();
+
+      await user.click(screen.getByRole('button', { name: 'Claude' }));
+      const retryCard = (await screen.findByText('CloudRouter Pending')).closest('.rounded-lg') as HTMLElement;
+      await user.click(within(retryCard).getByRole('button', { name: '重试清理' }));
 
       await waitFor(() => {
         expect(api.deleteCloudRouterAccount).toHaveBeenCalledWith('cloudrouter-pending');
         expect(alert).toHaveBeenCalledWith(expect.stringContaining(
-          '账号已安全停用，但暂时无法完成清理',
+          '账号已停用，但删除受阻：账号仍被运行中的任务或监控使用，请先停止相关运行再重试',
+        ));
+        expect(alert).toHaveBeenCalledWith(expect.stringContaining(
+          '后端详情：Task #42 is still using this API account',
         ));
       });
       expect(confirm).toHaveBeenCalledWith(expect.stringContaining(
-        '继续清理 API 账号“CloudRouter Pending”',
+        '重试清理 API 账号“CloudRouter Pending”',
       ));
       expect(confirm).toHaveBeenCalledWith(expect.stringContaining(
-        '若仍在使用该账号，本次会继续保留“待清理”状态',
+        '若阻塞仍未解除，账号会继续显示“删除受阻”',
       ));
       expect(api.getPoolUsage).toHaveBeenCalledWith(false);
       expect(api.getCodexPoolUsage).toHaveBeenCalledWith(false);
-      expect(within(card).getByRole('button', { name: '继续清理' })).toBeEnabled();
+      expect(within(retryCard).getByRole('button', { name: '重试清理' })).toBeEnabled();
     });
 
     it('renders the same API account in Codex without OAuth controls and refreshes its shared quota', async () => {

@@ -1884,14 +1884,31 @@ export interface CloudRouterModelMap {
 
 export type ApiAccountProvider = 'cloudrouter' | 'apex' | 'apibest';
 
-export interface CloudRouterAccount {
+export interface ApiAccountCleanupDiagnostics {
+  cleanup_pending?: boolean;
+  cleanup_code?: string | null;
+  cleanup_reason?: string | null;
+  /** Unix timestamp in seconds for the most recent cleanup attempt. */
+  cleanup_last_attempt_at?: number | null;
+  /** Unix timestamp in seconds for the most recent failed cleanup attempt. */
+  cleanup_last_error_at?: number | null;
+}
+
+export interface ApiAccountCleanupConflictDetail {
+  message?: string;
+  error?: string;
+  code?: string | null;
+  reason?: string | null;
+  cleanup_pending?: boolean;
+}
+
+export interface CloudRouterAccount extends ApiAccountCleanupDiagnostics {
   id: string;
   name: string;
   api_provider: ApiAccountProvider;
   auth_kind: 'cloudrouter_api' | 'apex_api' | 'apibest_api';
   enabled: boolean;
   retired: boolean;
-  cleanup_pending?: boolean;
   key_hint: string;
   models: CloudRouterModelMap;
   /** API-advertised service tiers by Codex model. */
@@ -1909,14 +1926,13 @@ export interface CloudRouterRetireResult extends CloudRouterAccount {
   ok: boolean;
 }
 
-export interface CloudRouterAccountProjection {
+export interface CloudRouterAccountProjection extends ApiAccountCleanupDiagnostics {
   auth_kind?: string | null;
   api_provider?: ApiAccountProvider | null;
   display_name?: string | null;
   api_account_id?: string | null;
   /** A durable tombstone is kept while credential/config cleanup must be retried. */
   retired?: boolean;
-  cleanup_pending?: boolean;
   supported_models?: string[];
   service_tiers?: Record<string, string[]>;
   api_quota?: CloudRouterApiQuota | null;

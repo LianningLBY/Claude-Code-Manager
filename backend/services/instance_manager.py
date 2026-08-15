@@ -218,8 +218,14 @@ _DELIVERY_SAFE_GIT_ENV = {
     "GIT_OPTIONAL_LOCKS": "0",
 }
 _DELIVERY_RUNTIME_TEMP_ENV_KEYS = frozenset({"TMPDIR", "TMP", "TEMP"})
+_ACTUAL_TURN_PROVIDER_BY_TRANSPORT = {
+    "claude_pty": "claude",
+    "claude_exec": "claude",
+    "codex_app_server": "codex",
+    "codex_exec": "codex",
+}
 _ACTUAL_TURN_TRANSPORTS = frozenset(
-    {"claude_pty", "claude_exec", "codex_app_server", "codex_exec"}
+    _ACTUAL_TURN_PROVIDER_BY_TRANSPORT
 )
 _SEQUENTIAL_TURN_TOKEN_TTL_SECONDS = 300.0
 _TURN_FAILURE_EVENT_TYPE = "ccm.turn.failed"
@@ -2149,6 +2155,9 @@ class InstanceManager:
             raise ValueError(
                 f"Unsupported actual turn transport: {actual_transport}"
             )
+        actual_provider = _ACTUAL_TURN_PROVIDER_BY_TRANSPORT[
+            actual_transport
+        ]
         if task_id is None:
             return False
         if (
@@ -2537,6 +2546,11 @@ class InstanceManager:
                 raise LaunchSupersededError(
                     f"Instance {instance_id} is owned by another launch"
                 )
+            # Persist the provider selected by the final runtime route in the
+            # same Task -> Instance -> source transaction, before any model
+            # process or native turn can start.  The later PID commit both
+            # rechecks and rewrites this value for defense in depth.
+            instance.provider = actual_provider
 
             bound_source_id = task.turn_source_log_id
             if bound_source_id is None:
@@ -5397,13 +5411,17 @@ class InstanceManager:
                         raise LaunchSupersededError(
                             f"Task {task_id} no longer owns instance {instance_id}"
                         )
+                instance_identity = [Instance.id == instance_id]
+                if task_id is not None:
+                    instance_identity.append(Instance.provider == provider)
                 instance_update = await db.execute(
                     update(Instance)
-                    .where(Instance.id == instance_id)
+                    .where(*instance_identity)
                     .values(
                         pid=process.pid,
                         status="running",
                         current_task_id=task_id,
+                        provider=provider,
                         started_at=launch_started_at,
                         last_heartbeat=datetime.utcnow(),
                     )
@@ -5856,14 +5874,30 @@ class InstanceManager:
                     else {"claude", "codex"}
                 )
 
-                # An active task explicitly bound to this id blocks even in
-                # the pre-spawn preparation window.
+                claimed_task_ids = {
+                    instance.current_task_id
+                    for instance in instances
+                    if instance.current_task_id is not None
+                }
+
+                # A pre-spawn active Task explicitly bound to this id blocks
+                # even before an Instance generation can publish its exact
+                # source transport. Claimed generations are handled below
+                # from their stronger source evidence instead.
                 for task in tasks:
+                    if task.id in claimed_task_ids:
+                        continue
                     metadata = task.metadata_ or {}
-                    if account.id in {
-                        metadata.get("claude_account_id"),
-                        metadata.get("codex_account_id"),
-                    }:
+                    task_provider = str(
+                        getattr(task, "provider", None) or ""
+                    ).strip().lower()
+                    if task_provider in {"claude", "codex"}:
+                        bound_account_id = metadata.get(
+                            f"{task_provider}_account_id"
+                        )
+                    else:
+                        bound_account_id = None
+                    if account.id == bound_account_id:
                         blockers.append(f"task {task.id} ({task.status})")
 
                 for instance in instances:
@@ -5874,55 +5908,86 @@ class InstanceManager:
                             by_id[task_id] = task
                     else:
                         task = by_id.get(task_id)
-                    task_provider = str(
-                        getattr(task, "provider", None) or ""
-                    ).lower()
-                    instance_provider = str(
-                        instance.provider or task_provider or ""
-                    ).lower()
-                    observed_providers = {
-                        provider
-                        for provider in (task_provider, instance_provider)
-                        if provider
-                    }
-                    if (
-                        not observed_providers
-                        or not observed_providers.issubset(
-                            {"claude", "codex"}
-                        )
-                    ):
-                        blockers.append(
-                            f"instance {instance.id} has unverifiable "
-                            "provider ownership"
-                        )
-                        continue
-                    providers_to_check = {
-                        provider
-                        for provider in observed_providers
-                        if provider in relevant_providers
-                    }
-                    if not providers_to_check:
-                        continue
                     if task is None:
                         blockers.append(
                             f"instance {instance.id} has unverifiable "
                             f"task claim {task_id}"
                         )
                         continue
+
+                    source_id = task.turn_source_log_id
+                    source = (
+                        await db.get(LogEntry, source_id)
+                        if type(source_id) is int and source_id > 0
+                        else None
+                    )
+                    source_provider = None
+                    if (
+                        source is not None
+                        and source.id == source_id
+                        and source.task_id == task.id
+                        and source.task_retry_count == task.retry_count
+                        and source.task_turn_generation
+                        == task.turn_generation
+                        and source.turn_scope == "source"
+                        and source.instance_id == instance.id
+                    ):
+                        from backend.services.terminal_arbitration import (
+                            source_alias_original_log_id,
+                            source_shape_is_canonical,
+                        )
+
+                        original_source_id = source_alias_original_log_id(
+                            source
+                        )
+                        original_source = (
+                            await db.get(LogEntry, original_source_id)
+                            if original_source_id is not None
+                            else None
+                        )
+                        if source_shape_is_canonical(
+                            source,
+                            original_source,
+                        ):
+                            source_provider = (
+                                _ACTUAL_TURN_PROVIDER_BY_TRANSPORT.get(
+                                    source.actual_transport
+                                )
+                            )
+
                     metadata = task.metadata_ or {}
-                    bindings = {
-                        provider: metadata.get(f"{provider}_account_id")
-                        for provider in providers_to_check
-                    }
-                    if account.id in bindings.values():
+                    if source_provider is None:
+                        # A legacy, missing, malformed, or not-yet-admitted
+                        # source cannot provide a negative account-ownership
+                        # proof. Instance.provider may be stale on a reused
+                        # slot, so use metadata only to retain positive target
+                        # blockers and otherwise fail closed.
+                        if account.id in {
+                            metadata.get("claude_account_id"),
+                            metadata.get("codex_account_id"),
+                        }:
+                            blockers.append(
+                                f"instance {instance.id} task {task.id}"
+                            )
+                        else:
+                            blockers.append(
+                                f"instance {instance.id} has unverifiable "
+                                "provider ownership"
+                            )
+                        continue
+
+                    effective_provider = source_provider
+                    if effective_provider not in relevant_providers:
+                        continue
+                    binding = metadata.get(
+                        f"{effective_provider}_account_id"
+                    )
+                    if account.id == binding:
                         blockers.append(
                             f"instance {instance.id} task {task.id}"
                         )
                         continue
-                    if all(
-                        isinstance(binding, str) and binding.strip()
-                        for binding in bindings.values()
-                    ):
+                    if isinstance(binding, str) and binding.strip():
                         # A durable exact binding to another account is the
                         # only safe negative proof for a persisted generation.
                         continue
@@ -6865,13 +6930,17 @@ class InstanceManager:
                         raise LaunchSupersededError(
                             f"Task {task_id} no longer owns instance {instance_id}"
                         )
+                instance_identity = [Instance.id == instance_id]
+                if task_id is not None:
+                    instance_identity.append(Instance.provider == "claude")
                 instance_update = await db.execute(
                     update(Instance)
-                    .where(Instance.id == instance_id)
+                    .where(*instance_identity)
                     .values(
                         pid=pid,
                         status="running",
                         current_task_id=task_id,
+                        provider="claude",
                         started_at=turn_started_at,
                         last_heartbeat=datetime.utcnow(),
                     )
@@ -9850,11 +9919,13 @@ class InstanceManager:
                     Instance.pid.is_(None),
                     Instance.current_task_id.is_(None),
                     Instance.started_at == expected_started_at,
+                    Instance.provider == "claude",
                 )
                 .values(
                     status="running",
                     pid=(getattr(process, "pid", 0) or 0),
                     current_task_id=task_id,
+                    provider="claude",
                 )
             )
             if (
@@ -9920,8 +9991,9 @@ class InstanceManager:
                     Instance.pid == (getattr(process, "pid", 0) or 0),
                     Instance.current_task_id == task_id,
                     Instance.started_at == expected_started_at,
+                    Instance.provider == "claude",
                 )
-                .values(status="running")
+                .values(status="running", provider="claude")
             )
             if (
                 not task_armed.rowcount
@@ -10068,6 +10140,7 @@ class InstanceManager:
                         Instance.pid.is_(None),
                         Instance.current_task_id.is_(None),
                         Instance.started_at == expected_started_at,
+                        Instance.provider == "claude",
                     )
                     .with_for_update()
                     .execution_options(populate_existing=True)
@@ -10083,6 +10156,7 @@ class InstanceManager:
             instance.status = "running"
             instance.pid = getattr(process, "pid", 0) or 0
             instance.current_task_id = task_id
+            instance.provider = "claude"
             await db.flush()
             await db.commit()
             admission = None

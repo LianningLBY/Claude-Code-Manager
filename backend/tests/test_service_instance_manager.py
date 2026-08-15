@@ -297,6 +297,33 @@ def _api_account_stub(tmp_path, *, api_provider="cloudrouter"):
     )
 
 
+async def _bind_account_runtime_source(
+    db,
+    task,
+    instance,
+    *,
+    actual_transport: str | None,
+    generation_offset: int = 0,
+):
+    source = LogEntry(
+        instance_id=instance.id,
+        task_id=task.id,
+        task_retry_count=task.retry_count,
+        task_turn_generation=task.turn_generation + generation_offset,
+        turn_scope="source",
+        actual_transport=actual_transport,
+        event_type="turn_source",
+        role="system",
+        content=None,
+        raw_json=json.dumps({"original_source_log_id": None}),
+        is_error=False,
+    )
+    db.add(source)
+    await db.flush()
+    task.turn_source_log_id = source.id
+    return source
+
+
 async def _isolated_browser_launch_scope(
     db_factory,
     *,
@@ -552,7 +579,7 @@ async def test_api_account_delete_blocks_db_only_unknown_live_binding(
 
 
 @pytest.mark.asyncio
-async def test_api_account_delete_accepts_explicit_other_account_binding(
+async def test_api_account_delete_rejects_legacy_other_account_negative_proof(
     db_factory, tmp_path,
 ):
     async with db_factory() as db:
@@ -577,14 +604,229 @@ async def test_api_account_delete_accepts_explicit_other_account_binding(
         await db.commit()
 
     manager = InstanceManager(db_factory, MagicMock())
+    blockers = await manager.api_account_runtime_users(
+        _api_account_stub(tmp_path)
+    )
+
+    assert any("unverifiable provider ownership" in item for item in blockers)
+
+
+@pytest.mark.asyncio
+async def test_api_account_delete_uses_exact_source_over_mutable_task_and_instance(
+    db_factory, tmp_path,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="codex source after mutable provider drift",
+            status="in_progress",
+            provider="claude",
+            metadata_={
+                "claude_account_id": "cloudrouter-1",
+                "codex_account_id": "cloudrouter-2",
+            },
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="reused claude slot",
+            status="running",
+            pid=987654,
+            current_task_id=task.id,
+            provider="claude",
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await _bind_account_runtime_source(
+            db,
+            task,
+            instance,
+            actual_transport="codex_app_server",
+        )
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock())
+
     assert await manager.api_account_runtime_users(
         _api_account_stub(tmp_path)
     ) == []
 
 
 @pytest.mark.asyncio
-async def test_api_account_delete_blocks_missing_task_claim(
+async def test_api_account_delete_exact_source_blocks_real_provider_binding(
     db_factory, tmp_path,
+):
+    account = _api_account_stub(tmp_path)
+    async with db_factory() as db:
+        task = Task(
+            title="real codex source after mutable provider drift",
+            status="in_progress",
+            provider="claude",
+            metadata_={
+                "claude_account_id": "cloudrouter-2",
+                "codex_account_id": account.id,
+            },
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="reused claude slot with real codex owner",
+            status="running",
+            pid=987654,
+            current_task_id=task.id,
+            provider="claude",
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await _bind_account_runtime_source(
+            db,
+            task,
+            instance,
+            actual_transport="codex_app_server",
+        )
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock())
+    blockers = await manager.api_account_runtime_users(account)
+
+    assert any(f"task {task.id}" in blocker for blocker in blockers)
+
+
+@pytest.mark.asyncio
+async def test_api_account_delete_exact_source_rejects_blank_provider_binding(
+    db_factory, tmp_path,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="codex source without a durable account binding",
+            status="in_progress",
+            provider="codex",
+            metadata_={"codex_account_id": "  \t"},
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="codex owner without account proof",
+            status="running",
+            pid=987654,
+            current_task_id=task.id,
+            provider="codex",
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await _bind_account_runtime_source(
+            db,
+            task,
+            instance,
+            actual_transport="codex_app_server",
+        )
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock())
+    blockers = await manager.api_account_runtime_users(
+        _api_account_stub(tmp_path)
+    )
+
+    assert any(
+        "unverifiable provider account ownership" in blocker
+        for blocker in blockers
+    )
+
+
+@pytest.mark.asyncio
+async def test_api_account_delete_does_not_fallback_from_unknown_task_provider(
+    db_factory, tmp_path,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="unknown provider owner",
+            status="in_progress",
+            provider="future-provider",
+            metadata_={"codex_account_id": "cloudrouter-2"},
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="misleading codex recovery evidence",
+            status="running",
+            pid=987654,
+            current_task_id=task.id,
+            provider="codex",
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock())
+    blockers = await manager.api_account_runtime_users(
+        _api_account_stub(tmp_path)
+    )
+
+    assert any("unverifiable provider ownership" in item for item in blockers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "source_shape",
+    ("missing", "wrong_generation", "transport_missing"),
+)
+async def test_api_account_delete_source_missing_or_malformed_fails_closed(
+    db_factory, tmp_path, source_shape,
+):
+    async with db_factory() as db:
+        task = Task(
+            title=f"unverifiable source: {source_shape}",
+            status="in_progress",
+            provider="codex",
+            metadata_={"codex_account_id": "cloudrouter-2"},
+        )
+        db.add(task)
+        await db.flush()
+        instance = Instance(
+            name="codex recovery evidence",
+            status="running",
+            pid=987654,
+            current_task_id=task.id,
+            provider="codex",
+        )
+        db.add(instance)
+        await db.flush()
+        task.instance_id = instance.id
+        if source_shape != "missing":
+            await _bind_account_runtime_source(
+                db,
+                task,
+                instance,
+                actual_transport=(
+                    None
+                    if source_shape == "transport_missing"
+                    else "codex_app_server"
+                ),
+                generation_offset=(
+                    1 if source_shape == "wrong_generation" else 0
+                ),
+            )
+        await db.commit()
+
+    manager = InstanceManager(db_factory, MagicMock())
+
+    blockers = await manager.api_account_runtime_users(
+        _api_account_stub(tmp_path)
+    )
+
+    assert any("unverifiable provider ownership" in item for item in blockers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("instance_provider", "api_provider"),
+    (("codex", "cloudrouter"), ("claude", "apex")),
+)
+async def test_api_account_delete_blocks_missing_task_claim(
+    db_factory, tmp_path, instance_provider, api_provider,
 ):
     async with db_factory() as db:
         db.add(Instance(
@@ -592,13 +834,13 @@ async def test_api_account_delete_blocks_missing_task_claim(
             status="error",
             pid=None,
             current_task_id=999999,
-            provider="codex",
+            provider=instance_provider,
         ))
         await db.commit()
 
     manager = InstanceManager(db_factory, MagicMock())
     blockers = await manager.api_account_runtime_users(
-        _api_account_stub(tmp_path)
+        _api_account_stub(tmp_path, api_provider=api_provider)
     )
 
     assert any("unverifiable task claim" in blocker for blocker in blockers)
@@ -642,6 +884,104 @@ async def test_api_account_delete_fails_closed_on_db_query_error(tmp_path):
         await manager.api_account_runtime_users(
             _api_account_stub(tmp_path)
         )
+
+
+@pytest.mark.asyncio
+async def test_direct_launch_commit_persists_actual_instance_provider(
+    db_factory,
+):
+    async with db_factory() as db:
+        instance = Instance(
+            name="reused direct slot",
+            status="idle",
+            # The provider boundary has already committed the exact route.
+            provider="codex",
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="codex direct turn",
+            status="executing",
+            instance_id=instance.id,
+            provider="codex",
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    process = _make_mock_process(pid=987655, returncode=None)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    async def consume_until_cancelled(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    manager._consume_output = consume_until_cancelled
+    await manager._persist_and_track_launch(
+        instance_id=instance_id,
+        task_id=task_id,
+        process=process,
+        actual_cwd="/tmp",
+        loop_iteration=None,
+        chat_initiated=False,
+        provider="codex",
+    )
+
+    async with db_factory() as db:
+        persisted = await db.get(Instance, instance_id)
+        assert persisted.provider == "codex"
+
+    process.returncode = 0
+    consumer = manager._tasks[instance_id]
+    consumer.cancel()
+    await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_direct_launch_commit_rejects_provider_drift(db_factory):
+    async with db_factory() as db:
+        instance = Instance(
+            name="drifted direct slot",
+            status="idle",
+            provider="claude",
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="codex turn after provider drift",
+            status="executing",
+            instance_id=instance.id,
+            provider="codex",
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    process = _make_mock_process(pid=987657, returncode=0)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    with pytest.raises(InstanceNotFoundError):
+        await manager._persist_and_track_launch(
+            instance_id=instance_id,
+            task_id=task_id,
+            process=process,
+            actual_cwd="/tmp",
+            loop_iteration=None,
+            chat_initiated=False,
+            provider="codex",
+        )
+
+    async with db_factory() as db:
+        persisted = await db.get(Instance, instance_id)
+        assert persisted.provider == "claude"
+        assert persisted.pid is None
+        assert persisted.status == "idle"
+    assert instance_id not in manager._tasks
 
 
 def test_codex_main_mcp_capability_allows_explicit_env_opt_out(monkeypatch):
@@ -2735,22 +3075,37 @@ async def test_launch_persists_final_actual_transport_before_provider_boundary(
         db_factory,
         provider=provider,
     )
+    async with db_factory() as db:
+        instance = await db.get(Instance, instance_id)
+        # A reused slot may still describe the previous provider. The exact
+        # runtime route must replace that stale value in the same transaction
+        # that publishes actual_transport, before any provider effect.
+        instance.provider = "codex" if provider == "claude" else "claude"
+        await db.commit()
     manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     provider_effects = []
     process = _make_mock_process(pid=61_000 + source_id)
 
+    async def record_provider_effect(label):
+        async with db_factory() as db:
+            source = await db.get(LogEntry, source_id)
+            instance = await db.get(Instance, instance_id)
+            assert source.actual_transport == route
+            assert instance.provider == provider
+        provider_effects.append(label)
+
     async def direct_spawn(*_args, **_kwargs):
-        provider_effects.append("direct_spawn")
+        await record_provider_effect("direct_spawn")
         return process
 
     async def app_server_launch(**kwargs):
         await kwargs["on_launch_admitted"]()
-        provider_effects.append("app_server_turn_start")
+        await record_provider_effect("app_server_turn_start")
         return process.pid
 
     async def pty_launch(**kwargs):
         await kwargs["on_launch_admitted"]()
-        provider_effects.append("pty_send_prompt")
+        await record_provider_effect("pty_send_prompt")
         return process.pid
 
     manager._spawn_managed_direct_process = AsyncMock(side_effect=direct_spawn)
@@ -2774,7 +3129,9 @@ async def test_launch_persists_final_actual_transport_before_provider_boundary(
 
     async with db_factory() as db:
         source = await db.get(LogEntry, source_id)
+        instance = await db.get(Instance, instance_id)
         assert source.actual_transport == route
+        assert instance.provider == provider
         assert json.loads(source.raw_json)["transport"] == provider
     assert len(provider_effects) == 1
 
@@ -3082,6 +3439,10 @@ async def test_actual_transport_rejects_stale_source_before_process_start(
     launch_source_id = source_id
     async with db_factory() as db:
         source = await db.get(LogEntry, source_id)
+        instance = await db.get(Instance, instance_id)
+        # Detect an accidental partial commit of the provider write that is
+        # staged before the source-shape checks in the admission transaction.
+        instance.provider = "codex"
         if corruption == "stale_retry":
             source.task_retry_count = 1
         elif corruption == "stale_generation":
@@ -3160,7 +3521,9 @@ async def test_actual_transport_rejects_stale_source_before_process_start(
     manager._spawn_managed_direct_process.assert_not_awaited()
     async with db_factory() as db:
         source = await db.get(LogEntry, source_id)
+        instance = await db.get(Instance, instance_id)
         assert source.actual_transport is None
+        assert instance.provider == "codex"
 
 
 @pytest.mark.asyncio
@@ -8918,7 +9281,10 @@ async def test_launch_codex_app_server_routes_turn_to_canonical_home(
 ):
     monkeypatch.setattr(settings, "codex_main_mcp_enabled", False)
     async with db_factory() as db:
-        inst = Instance(name="codex-registry-inst")
+        # This unit calls the post-admission transport helper directly.  The
+        # real launch path has already committed the exact provider at the
+        # provider boundary before entering this helper.
+        inst = Instance(name="codex-registry-inst", provider="codex")
         db.add(inst)
         await db.flush()
         task = Task(
@@ -16849,6 +17215,75 @@ async def test_launch_delegates_to_pty_backend_for_claude():
     assert calls["prompt"] == "do it"
     assert calls["model"] is None  # "default" normalized away
     assert calls["cwd"] == "/w"
+
+
+@pytest.mark.asyncio
+async def test_pty_launch_commit_persists_actual_instance_provider(db_factory):
+    async with db_factory() as db:
+        instance = Instance(
+            name="reused PTY slot",
+            status="idle",
+            # The provider boundary has already committed the exact route.
+            provider="claude",
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="claude PTY turn",
+            status="executing",
+            instance_id=instance.id,
+            provider="claude",
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    class Process:
+        pid = 987656
+        returncode = None
+
+    process = Process()
+    consumer = None
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    class FakeBackend:
+        async def launch_for_ccm(self, **kwargs):
+            nonlocal consumer
+            consumer = asyncio.create_task(asyncio.Event().wait())
+            manager.processes[kwargs["instance_id"]] = process
+            manager._tasks[kwargs["instance_id"]] = consumer
+            return "session-provider-persist"
+
+    manager._pty_backend = FakeBackend()
+    await manager._launch_pty(
+        instance_id=instance_id,
+        prompt="run",
+        task_id=task_id,
+        cwd="/tmp",
+        model=None,
+        resume_session_id=None,
+        loop_iteration=None,
+        git_env=None,
+        thinking_budget=None,
+        effort_level=None,
+        chat_initiated=False,
+        config_dir=None,
+        enable_workflows=False,
+        enabled_skills=None,
+        mcp_config_path=None,
+    )
+
+    async with db_factory() as db:
+        persisted = await db.get(Instance, instance_id)
+        assert persisted.provider == "claude"
+
+    assert consumer is not None
+    process.returncode = 0
+    consumer.cancel()
+    await asyncio.gather(consumer, return_exceptions=True)
 
 
 @pytest.mark.asyncio

@@ -725,6 +725,86 @@ async def test_failed_retirement_is_disabled_and_idempotently_resumable(
 
 
 @pytest.mark.asyncio
+async def test_cleanup_diagnostics_are_bounded_persistent_and_idempotent(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    await store.stage_retirement(account.id)
+    first_attempt = await store.mark_cleanup_attempt(account.id)
+    assert first_attempt.cleanup_last_attempt_at is not None
+
+    failure = CloudRouterAccountBusyError(
+        "active sk-secret-value\n" + ("x" * 1000),
+        code="../invalid",
+    )
+    failed = await store.record_cleanup_failure(
+        account.id,
+        code=failure.code,
+        reason=failure.reason,
+    )
+    assert failed.cleanup_code == "cleanup_blocked"
+    assert "sk-secret-value" not in failed.cleanup_reason
+    assert "\n" not in failed.cleanup_reason
+    assert len(failed.cleanup_reason.encode("utf-8")) <= 512
+    assert failed.cleanup_last_error_at is not None
+
+    # Starting a retry updates the attempt receipt but preserves the last
+    # useful diagnosis if the process exits before it reaches the runtime
+    # fence or writes a replacement failure.
+    retrying = await store.mark_cleanup_attempt(account.id)
+    assert retrying.cleanup_code == failed.cleanup_code
+    assert retrying.cleanup_reason == failed.cleanup_reason
+    assert retrying.cleanup_last_error_at == failed.cleanup_last_error_at
+    assert retrying.cleanup_last_attempt_at >= failed.cleanup_last_attempt_at
+
+    restarted = CloudRouterAccountStore(store.root)
+    restored = restarted.account(account.id)
+    assert restored is not None
+    assert restored.cleanup_code == retrying.cleanup_code
+    assert restored.cleanup_reason == retrying.cleanup_reason
+    assert restored.cleanup_last_attempt_at == retrying.cleanup_last_attempt_at
+    assert restored.cleanup_last_error_at == retrying.cleanup_last_error_at
+
+    completed = await restarted.finalize_retirement(account.id)
+    assert completed.cleanup_pending is False
+    assert completed.cleanup_code is None
+    assert completed.cleanup_reason is None
+    assert completed.cleanup_last_attempt_at is None
+    assert completed.cleanup_last_error_at is None
+
+    # A late duplicate error receipt is a no-op after successful finalization.
+    duplicate = await restarted.record_cleanup_failure(
+        account.id,
+        code="runtime_busy",
+        reason="late runtime",
+    )
+    assert duplicate == completed
+
+
+@pytest.mark.asyncio
+async def test_modified_cleanup_diagnostics_fail_closed(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    await store.stage_retirement(account.id)
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.update({
+        "cleanup_code": "runtime_busy",
+        "cleanup_reason": "unexpected\nsecond line",
+        "cleanup_last_attempt_at": 1.0,
+        "cleanup_last_error_at": 1.0,
+    })
+    metadata_path.write_text(json.dumps(metadata))
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="Invalid cleanup metadata",
+    ):
+        store.reload()
+
+
+@pytest.mark.asyncio
 async def test_finalize_retirement_refuses_active_credential_lease(
     tmp_path, monkeypatch,
 ):
@@ -2198,6 +2278,13 @@ def test_unsafe_storage_error_is_not_reported_as_staged_busy_cleanup():
     )
 
     assert busy.status_code == 409
+    assert busy.detail == {
+        "message": "active turn",
+        "error": "active turn",
+        "code": "cleanup_blocked",
+        "reason": "active turn",
+        "cleanup_pending": True,
+    }
     assert unsafe.status_code == 500
     assert unsafe.detail == "API account storage is unsafe"
 
@@ -2406,17 +2493,39 @@ async def test_delete_endpoint_stages_busy_account_and_retry_finishes_cleanup(
     with pytest.raises(HTTPException) as blocked:
         await cloudrouter_api.retire_account(_admin_request(), account.id)
     assert blocked.value.status_code == 409
-    assert blocked.value.detail == "active turn"
+    assert blocked.value.detail == {
+        "message": "active turn",
+        "error": "active turn",
+        "code": "cleanup_blocked",
+        "reason": "active turn",
+        "cleanup_pending": True,
+    }
     pending = store.account(account.id)
     assert pending is not None
     assert pending.retired is True
     assert pending.cleanup_pending is True
+    assert pending.cleanup_code == "cleanup_blocked"
+    assert pending.cleanup_reason == "active turn"
+    assert pending.cleanup_last_attempt_at is not None
+    assert pending.cleanup_last_error_at is not None
     assert (account.root / "api.key").is_file()
     assert store.visible_accounts() == [pending]
+
+    restarted = CloudRouterAccountStore(store.root)
+    restored = restarted.account(account.id)
+    assert restored is not None
+    assert restored.cleanup_code == pending.cleanup_code
+    assert restored.cleanup_reason == pending.cleanup_reason
+    assert restored.cleanup_last_attempt_at == pending.cleanup_last_attempt_at
+    assert restored.cleanup_last_error_at == pending.cleanup_last_error_at
 
     listed = await cloudrouter_api.list_accounts(_admin_request())
     assert listed[0]["id"] == account.id
     assert listed[0]["cleanup_pending"] is True
+    assert listed[0]["cleanup_code"] == "cleanup_blocked"
+    assert listed[0]["cleanup_reason"] == "active turn"
+    assert listed[0]["cleanup_last_attempt_at"] is not None
+    assert listed[0]["cleanup_last_error_at"] is not None
     assert listed[0]["api_quota"] is None
 
     @asynccontextmanager
@@ -2432,10 +2541,48 @@ async def test_delete_endpoint_stages_busy_account_and_retry_finishes_cleanup(
     assert result["ok"] is True
     assert result["retired"] is True
     assert result["cleanup_pending"] is False
+    assert result["cleanup_code"] is None
+    assert result["cleanup_reason"] is None
+    assert result["cleanup_last_attempt_at"] is None
+    assert result["cleanup_last_error_at"] is None
     assert result["key_hint"] == ""
     assert not (account.root / "api.key").exists()
     assert store.visible_accounts() == []
+    completed_metadata = json.loads(
+        (account.root / "account.json").read_text()
+    )
+    assert completed_metadata["cleanup_code"] is None
+    assert completed_metadata["cleanup_reason"] is None
+    assert completed_metadata["cleanup_last_attempt_at"] is None
+    assert completed_metadata["cleanup_last_error_at"] is None
     assert reload_pools.call_count >= 4
+
+
+@pytest.mark.asyncio
+async def test_delete_does_not_record_diagnostics_after_storage_failure(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    monkeypatch.setattr(cloudrouter_api, "_get_store", lambda: store)
+    monkeypatch.setattr(cloudrouter_api, "_reload_runtime_pools", Mock())
+    record_failure = AsyncMock()
+    monkeypatch.setattr(store, "record_cleanup_failure", record_failure)
+
+    @asynccontextmanager
+    async def unsafe_fence(_account, _store):
+        raise CloudRouterUnsafePathError("account root changed")
+        yield
+
+    monkeypatch.setattr(
+        cloudrouter_api, "_runtime_retirement_fence", unsafe_fence,
+    )
+
+    with pytest.raises(HTTPException) as failed:
+        await cloudrouter_api.retire_account(_admin_request(), account.id)
+
+    assert failed.value.status_code == 500
+    assert failed.value.detail == "API account storage is unsafe"
+    record_failure.assert_not_awaited()
 
 
 def _install_retirement_runtime(
@@ -2458,6 +2605,64 @@ def _install_retirement_runtime(
     import backend
     monkeypatch.setattr(backend, "main", runtime, raising=False)
     return runtime
+
+
+@pytest.mark.asyncio
+async def test_cloudrouter_retirement_redacts_migration_failure(
+    tmp_path, monkeypatch,
+):
+    from backend.services.task_migrator import MigrationError
+
+    store, account = await _add(tmp_path, monkeypatch)
+    manager = types.SimpleNamespace()
+    runtime = _install_retirement_runtime(
+        monkeypatch,
+        store=store,
+        instance_manager=manager,
+    )
+
+    class BusyMigrator:
+        @asynccontextmanager
+        async def api_account_retirement_guard(self):
+            raise MigrationError("active migration sk-secret-value")
+            yield
+
+    runtime.task_migrator = BusyMigrator()
+
+    with pytest.raises(CloudRouterAccountBusyError) as blocked:
+        async with cloudrouter_api._runtime_retirement_fence(account, store):
+            pass
+
+    assert blocked.value.code == "migration_busy"
+    assert blocked.value.reason == (
+        "API account cleanup is blocked by an active task migration; "
+        "retry after it finishes"
+    )
+    assert "sk-secret-value" not in blocked.value.reason
+
+
+@pytest.mark.asyncio
+async def test_cloudrouter_retirement_preserves_storage_integrity_failure(
+    tmp_path, monkeypatch,
+):
+    store, account = await _add(tmp_path, monkeypatch)
+    manager = types.SimpleNamespace(
+        api_account_runtime_users=AsyncMock(
+            side_effect=CloudRouterUnsafePathError("account root changed"),
+        ),
+    )
+    _install_retirement_runtime(
+        monkeypatch,
+        store=store,
+        instance_manager=manager,
+    )
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="account root changed",
+    ):
+        async with cloudrouter_api._runtime_retirement_fence(account, store):
+            pass
 
 
 @pytest.mark.asyncio
@@ -2488,13 +2693,14 @@ async def test_cloudrouter_retirement_blocks_persisted_codex_monitor_owner(
     with pytest.raises(
         CloudRouterAccountBusyError,
         match="monitor 17",
-    ):
+    ) as blocked:
         async with cloudrouter_api._runtime_retirement_fence(
             account,
             store,
         ):
             pass
 
+    assert blocked.value.code == "runtime_busy"
     manager.begin_codex_app_server_home_maintenance.assert_not_awaited()
 
 
@@ -2612,10 +2818,11 @@ async def test_cloudrouter_retirement_container_failure_is_busy_and_releases_hom
     with pytest.raises(
         CloudRouterAccountBusyError,
         match="could not be verified",
-    ):
+    ) as blocked:
         async with cloudrouter_api._runtime_retirement_fence(account, store):
             pass
 
+    assert blocked.value.code == "runtime_verification_failed"
     manager.end_codex_app_server_home_maintenance.assert_awaited_once_with(
         account.codex_home
     )

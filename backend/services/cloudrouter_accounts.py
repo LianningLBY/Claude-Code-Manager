@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -135,6 +136,8 @@ MAX_SERVICE_TIERS_PER_MODEL = 16
 MAX_SERVICE_TIER_ID_BYTES = 64
 MAX_CODEX_MODELS_CACHE_BYTES = 4 * 1024 * 1024
 MAX_CODEX_MODELS_CACHE_MODELS = 2048
+MAX_CLEANUP_CODE_BYTES = 64
+MAX_CLEANUP_REASON_BYTES = 512
 SERVICE_TIER_SOURCE_NONE = "none"
 SERVICE_TIER_SOURCE_UPSTREAM = "upstream"
 DEFAULT_HTTP_TIMEOUT = httpx.Timeout(15.0, connect=10.0)
@@ -153,6 +156,11 @@ class CloudRouterAccountNotFound(CloudRouterAccountError):
 class CloudRouterAccountBusyError(CloudRouterAccountError):
     """The account still has a credential/runtime consumer."""
 
+    def __init__(self, message: str, *, code: str = "cleanup_blocked"):
+        self.code = _normalise_cleanup_code(code)
+        self.reason = _sanitise_cleanup_reason(message)
+        super().__init__(self.reason)
+
 
 class CloudRouterUnsafePathError(CloudRouterAccountError):
     """A managed path failed a no-symlink/type/containment check."""
@@ -169,6 +177,36 @@ class CloudRouterUpstreamError(CloudRouterAccountError):
 
 def _now() -> float:
     return time.time()
+
+
+def _normalise_cleanup_code(value: object) -> str:
+    code = str(value or "").strip().lower()
+    if (
+        not re.fullmatch(r"[a-z][a-z0-9_]*", code)
+        or len(code.encode("utf-8")) > MAX_CLEANUP_CODE_BYTES
+    ):
+        return "cleanup_blocked"
+    return code
+
+
+def _bounded_utf8(value: str, maximum: int) -> str:
+    payload = value.encode("utf-8")
+    if len(payload) <= maximum:
+        return value
+    return payload[:maximum].decode("utf-8", errors="ignore").rstrip()
+
+
+def _sanitise_cleanup_reason(value: object) -> str:
+    """Return a bounded, single-line administrator-safe cleanup reason."""
+
+    reason = " ".join(str(value or "").split())
+    reason = re.sub(
+        r"(?i)\b(?:bearer\s+)?(?:sk|lck|cr)-[a-z0-9._-]{4,}\b",
+        "[redacted]",
+        reason,
+    )
+    reason = _bounded_utf8(reason, MAX_CLEANUP_REASON_BYTES)
+    return reason or "API account cleanup is blocked"
 
 
 def normalize_api_provider(value: str | None) -> str:
@@ -1395,6 +1433,63 @@ def _unavailable_snapshot(account_id: str, reason: str) -> dict[str, Any]:
     }
 
 
+def _cleanup_diagnostics_from_metadata(
+    data: dict[str, Any],
+    account_id: str,
+) -> tuple[str | None, str | None, float | None, float | None]:
+    """Validate the bounded cleanup diagnostic fields on one tombstone."""
+
+    code = data.get("cleanup_code")
+    reason = data.get("cleanup_reason")
+    last_attempt_at = data.get("cleanup_last_attempt_at")
+    last_error_at = data.get("cleanup_last_error_at")
+    if code is not None and (
+        not isinstance(code, str)
+        or _normalise_cleanup_code(code) != code
+        or len(code.encode("utf-8")) > MAX_CLEANUP_CODE_BYTES
+    ):
+        raise CloudRouterUnsafePathError(
+            f"Invalid cleanup metadata: {account_id}",
+        )
+    if reason is not None and (
+        not isinstance(reason, str)
+        or not reason
+        or _sanitise_cleanup_reason(reason) != reason
+        or len(reason.encode("utf-8")) > MAX_CLEANUP_REASON_BYTES
+    ):
+        raise CloudRouterUnsafePathError(
+            f"Invalid cleanup metadata: {account_id}",
+        )
+    for value in (last_attempt_at, last_error_at):
+        if value is not None and (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) < 0
+        ):
+            raise CloudRouterUnsafePathError(
+                f"Invalid cleanup metadata: {account_id}",
+            )
+    has_error = (code is not None, reason is not None, last_error_at is not None)
+    if len(set(has_error)) != 1 or (any(has_error) and last_attempt_at is None):
+        raise CloudRouterUnsafePathError(
+            f"Inconsistent cleanup metadata: {account_id}",
+        )
+    cleanup_pending = bool(data.get("cleanup_pending", False))
+    if not cleanup_pending and (
+        any(has_error) or last_attempt_at is not None
+    ):
+        raise CloudRouterUnsafePathError(
+            f"Cleanup metadata on completed account: {account_id}",
+        )
+    return (
+        code,
+        reason,
+        float(last_attempt_at) if last_attempt_at is not None else None,
+        float(last_error_at) if last_error_at is not None else None,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CloudRouterAccount:
     id: str
@@ -1403,6 +1498,10 @@ class CloudRouterAccount:
     enabled: bool
     retired: bool
     cleanup_pending: bool
+    cleanup_code: str | None
+    cleanup_reason: str | None
+    cleanup_last_attempt_at: float | None
+    cleanup_last_error_at: float | None
     models: dict[str, list[str]]
     service_tiers: dict[str, list[str]]
     service_tiers_explicit: bool
@@ -1483,6 +1582,10 @@ class CloudRouterAccount:
             "enabled": self.enabled,
             "retired": self.retired,
             "cleanup_pending": self.cleanup_pending,
+            "cleanup_code": self.cleanup_code,
+            "cleanup_reason": self.cleanup_reason,
+            "cleanup_last_attempt_at": self.cleanup_last_attempt_at,
+            "cleanup_last_error_at": self.cleanup_last_error_at,
             "models": self.models,
             "service_tiers": self.service_tiers,
             "providers": self.providers,
@@ -1740,6 +1843,12 @@ class CloudRouterAccountStore:
                 raise CloudRouterUnsafePathError(
                     f"Invalid service tier source metadata: {account_id}"
                 )
+        (
+            cleanup_code,
+            cleanup_reason,
+            cleanup_last_attempt_at,
+            cleanup_last_error_at,
+        ) = _cleanup_diagnostics_from_metadata(data, account_id)
         account = CloudRouterAccount(
             id=account_id,
             name=name,
@@ -1747,6 +1856,10 @@ class CloudRouterAccountStore:
             enabled=bool(data.get("enabled", True)) and not bool(data.get("retired", False)),
             retired=bool(data.get("retired", False)),
             cleanup_pending=bool(data.get("cleanup_pending", False)),
+            cleanup_code=cleanup_code,
+            cleanup_reason=cleanup_reason,
+            cleanup_last_attempt_at=cleanup_last_attempt_at,
+            cleanup_last_error_at=cleanup_last_error_at,
             models=normalised_models,
             service_tiers=service_tiers,
             service_tiers_explicit=service_tiers_explicit,
@@ -2386,6 +2499,10 @@ class CloudRouterAccountStore:
             "enabled": enabled,
             "retired": retired,
             "cleanup_pending": False,
+            "cleanup_code": None,
+            "cleanup_reason": None,
+            "cleanup_last_attempt_at": None,
+            "cleanup_last_error_at": None,
             "models": provider_models,
             "service_tiers": service_tiers,
             "service_tiers_source": service_tiers_source,
@@ -2766,6 +2883,30 @@ class CloudRouterAccountStore:
             os.unlink(name, dir_fd=account_fd)
         os.fsync(account_fd)
 
+    @staticmethod
+    def _retirement_metadata_at(
+        account_fd: int,
+        account_id: str,
+    ) -> dict[str, Any]:
+        try:
+            data = json.loads(_read_regular_at(
+                account_fd,
+                "account.json",
+                maximum=MAX_METADATA_BYTES,
+            ).decode("utf-8"))
+        except CloudRouterAccountError:
+            raise
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CloudRouterUnsafePathError(
+                f"Invalid account metadata: {account_id}",
+            ) from exc
+        if not isinstance(data, dict) or data.get("id") != account_id:
+            raise CloudRouterUnsafePathError(
+                f"Mismatched account metadata: {account_id}",
+            )
+        _cleanup_diagnostics_from_metadata(data, account_id)
+        return data
+
     async def stage_retirement(self, account_id: str) -> CloudRouterAccount:
         """Durably disable an account before any runtime lifecycle fencing."""
 
@@ -2778,20 +2919,7 @@ class CloudRouterAccountStore:
                 self._assert_account_fd_current(
                     root_fd, account_fd, account.id,
                 )
-                try:
-                    data = json.loads(_read_regular_at(
-                        account_fd,
-                        "account.json",
-                        maximum=MAX_METADATA_BYTES,
-                    ).decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise CloudRouterUnsafePathError(
-                        f"Invalid account metadata: {account.id}",
-                    ) from exc
-                if not isinstance(data, dict) or data.get("id") != account.id:
-                    raise CloudRouterUnsafePathError(
-                        f"Mismatched account metadata: {account.id}",
-                    )
+                data = self._retirement_metadata_at(account_fd, account.id)
                 retired = bool(data.get("retired", False))
                 cleanup_pending = bool(
                     data.get("cleanup_pending", False)
@@ -2807,6 +2935,10 @@ class CloudRouterAccountStore:
                         "enabled": False,
                         "retired": True,
                         "cleanup_pending": True,
+                        "cleanup_code": None,
+                        "cleanup_reason": None,
+                        "cleanup_last_attempt_at": None,
+                        "cleanup_last_error_at": None,
                         "updated_at": _now(),
                     })
                     _atomic_private_json_at(
@@ -2823,6 +2955,88 @@ class CloudRouterAccountStore:
             self.reload()
             return self._require_account(account_id, allow_retired=True)
 
+    async def mark_cleanup_attempt(
+        self,
+        account_id: str,
+    ) -> CloudRouterAccount:
+        """Persist one retry timestamp without discarding the last failure."""
+
+        async with self._mutation_lock:
+            account = self._require_account(account_id, allow_retired=True)
+            if account.retired and not account.cleanup_pending:
+                return account
+            with self._open_account_fd(account.id) as (root_fd, account_fd):
+                self._assert_account_fd_current(root_fd, account_fd, account.id)
+                data = self._retirement_metadata_at(account_fd, account.id)
+                if (
+                    not bool(data.get("retired", False))
+                    or not bool(data.get("cleanup_pending", False))
+                ):
+                    raise CloudRouterAccountError(
+                        "API account retirement was not durably staged",
+                    )
+                attempted_at = _now()
+                data.update({
+                    "cleanup_last_attempt_at": attempted_at,
+                    "updated_at": attempted_at,
+                })
+                _atomic_private_json_at(
+                    account_fd,
+                    "account.json",
+                    data,
+                    maximum=MAX_METADATA_BYTES,
+                )
+                self._assert_account_fd_current(root_fd, account_fd, account.id)
+            self.reload()
+            return self._require_account(account_id, allow_retired=True)
+
+    async def record_cleanup_failure(
+        self,
+        account_id: str,
+        *,
+        code: str,
+        reason: str,
+    ) -> CloudRouterAccount:
+        """Persist a bounded failure only on a proven pending tombstone."""
+
+        safe_code = _normalise_cleanup_code(code)
+        safe_reason = _sanitise_cleanup_reason(reason)
+        async with self._mutation_lock:
+            account = self._require_account(account_id, allow_retired=True)
+            if account.retired and not account.cleanup_pending:
+                # A late duplicate failure must never resurrect diagnostics on
+                # an already finalized tombstone.
+                return account
+            with self._open_account_fd(account.id) as (root_fd, account_fd):
+                self._assert_account_fd_current(root_fd, account_fd, account.id)
+                data = self._retirement_metadata_at(account_fd, account.id)
+                if (
+                    not bool(data.get("retired", False))
+                    or not bool(data.get("cleanup_pending", False))
+                ):
+                    raise CloudRouterAccountError(
+                        "API account retirement was not durably staged",
+                    )
+                failed_at = _now()
+                data.update({
+                    "cleanup_code": safe_code,
+                    "cleanup_reason": safe_reason,
+                    "cleanup_last_attempt_at": (
+                        data.get("cleanup_last_attempt_at") or failed_at
+                    ),
+                    "cleanup_last_error_at": failed_at,
+                    "updated_at": failed_at,
+                })
+                _atomic_private_json_at(
+                    account_fd,
+                    "account.json",
+                    data,
+                    maximum=MAX_METADATA_BYTES,
+                )
+                self._assert_account_fd_current(root_fd, account_fd, account.id)
+            self.reload()
+            return self._require_account(account_id, allow_retired=True)
+
     async def finalize_retirement(
         self, account_id: str,
     ) -> CloudRouterAccount:
@@ -2833,6 +3047,7 @@ class CloudRouterAccountStore:
             if self._credential_users.get(account.id, 0) > 0:
                 raise CloudRouterAccountBusyError(
                     "API account still has an active credential request",
+                    code="credential_busy",
                 )
             with self._open_account_fd(account.id) as (
                 root_fd,
@@ -2841,20 +3056,7 @@ class CloudRouterAccountStore:
                 self._assert_account_fd_current(
                     root_fd, account_fd, account.id,
                 )
-                try:
-                    data = json.loads(_read_regular_at(
-                        account_fd,
-                        "account.json",
-                        maximum=MAX_METADATA_BYTES,
-                    ).decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                    raise CloudRouterUnsafePathError(
-                        f"Invalid account metadata: {account.id}",
-                    ) from exc
-                if not isinstance(data, dict) or data.get("id") != account.id:
-                    raise CloudRouterUnsafePathError(
-                        f"Mismatched account metadata: {account.id}",
-                    )
+                data = self._retirement_metadata_at(account_fd, account.id)
                 retired = bool(data.get("retired", False))
                 cleanup_pending = bool(
                     data.get("cleanup_pending", False)
@@ -2893,6 +3095,10 @@ class CloudRouterAccountStore:
                     "enabled": False,
                     "retired": True,
                     "cleanup_pending": False,
+                    "cleanup_code": None,
+                    "cleanup_reason": None,
+                    "cleanup_last_attempt_at": None,
+                    "cleanup_last_error_at": None,
                     "key_hint": "",
                     "updated_at": _now(),
                 })
@@ -2917,4 +3123,13 @@ class CloudRouterAccountStore:
             staged = await self.stage_retirement(account_id)
             if staged.retired and not staged.cleanup_pending:
                 return staged
-            return await self.finalize_retirement(account_id)
+            await self.mark_cleanup_attempt(account_id)
+            try:
+                return await self.finalize_retirement(account_id)
+            except CloudRouterAccountBusyError as exc:
+                await self.record_cleanup_failure(
+                    account_id,
+                    code=exc.code,
+                    reason=exc.reason,
+                )
+                raise

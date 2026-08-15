@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render, screen } from '@testing-library/react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { api } from '../../api/client';
 import { DeliveryRunDialog } from './DeliveryRunDialog';
@@ -476,7 +476,9 @@ describe('DeliveryRunDialog', () => {
     expect(outcome).toHaveTextContent('code and PR gates not applicable');
     expect(outcome).not.toHaveTextContent('Ready to merge');
     expect(screen.queryByRole('link', { name: /Open PR/ })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Development: Completed' })).toHaveAttribute('aria-pressed', 'true');
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Development: Completed' })).toHaveAttribute('aria-pressed', 'true');
+    });
     expect(screen.getByRole('button', { name: 'CI & PR review: Skipped' })).not.toHaveAttribute('aria-pressed', 'true');
   });
 });

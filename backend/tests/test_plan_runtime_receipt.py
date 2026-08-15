@@ -639,6 +639,36 @@ async def test_codex_thread_cleanup_deletes_exact_thread_and_marks_clean(db_fact
 
 
 @pytest.mark.asyncio
+async def test_codex_thread_cleanup_treats_missing_rollout_as_absent(db_factory):
+    step = await _create_step(db_factory, provider="codex")
+    receipt = await _create_receipt(
+        db_factory,
+        step,
+        status="cleanup_failed",
+        codex_home="/srv/codex/missing-rollout",
+        codex_thread_id="thread-702",
+    )
+    registry = _CodexRegistry()
+    registry.delete_thread.side_effect = RuntimeError(
+        "thread/delete failed: no rollout found for thread id thread-702"
+    )
+    manager = _CodexManager(registry)
+
+    assert await runtime_receipts.reconcile_runtime_receipt(
+        db_factory,
+        manager,
+        receipt_id=receipt.id,
+        allow_transport_kill=False,
+    )
+
+    registry.delete_thread.assert_awaited_once_with(
+        "/srv/codex/missing-rollout",
+        "thread-702",
+    )
+    assert await _receipt_status(db_factory, receipt.id) == ("cleaned", None)
+
+
+@pytest.mark.asyncio
 async def test_codex_cold_recovery_never_kills_live_unregistered_shared_transport(
     db_factory,
     monkeypatch,

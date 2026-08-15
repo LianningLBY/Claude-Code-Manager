@@ -135,6 +135,13 @@ function App() {
     setPage('plans');
   };
 
+  const handleNavigateDelivery = (runId: number) => {
+    setChatTaskId(null);
+    setPlanId(null);
+    setDeliveryRunId(runId);
+    setPage('delivery');
+  };
+
   useEffect(() => {
     // In Capacitor, require server URL to be configured first
     if (isCapacitor() && !getServerUrl()) {
@@ -207,7 +214,7 @@ function App() {
       <AppShell currentPage={page} onNavigate={handleNavigate} wide={page === 'tasks' && !!chatTaskId}>
         {page === 'dashboard' && <Dashboard />}
         {page === 'tasks' && <TasksPage chatTaskId={chatTaskId} onChatTaskChange={setChatTaskId} />}
-        {page === 'plans' && <PlansPage selectedPlanId={planId} onSelectedPlanChange={setPlanId} onNavigateTask={handleNavigateTask} onNavigateSettings={() => handleNavigate('settings')} />}
+        {page === 'plans' && <PlansPage selectedPlanId={planId} onSelectedPlanChange={setPlanId} onNavigateTask={handleNavigateTask} onNavigateDelivery={handleNavigateDelivery} onNavigateSettings={() => handleNavigate('settings')} />}
         {page === 'delivery' && <DeliveryPage selectedRunId={deliveryRunId} onSelectedRunChange={setDeliveryRunId} onNavigate={handleNavigate} onNavigateTask={handleNavigateTask} onNavigatePlan={handleNavigatePlan} />}
         {page === 'projects' && <ProjectsPage />}
         {page === 'secrets' && <SecretsPage />}

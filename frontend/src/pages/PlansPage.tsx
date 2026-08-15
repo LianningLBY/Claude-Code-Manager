@@ -51,10 +51,11 @@ interface Props {
   selectedPlanId: number | null;
   onSelectedPlanChange: (planId: number | null) => void;
   onNavigateTask: (taskId: number) => void;
+  onNavigateDelivery?: (runId: number) => void;
   onNavigateSettings: () => void;
 }
 
-export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask, onNavigateSettings }: Props) {
+export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask, onNavigateDelivery, onNavigateSettings }: Props) {
   const [plans, setPlans] = useState<PlanResource[]>([]);
   const [selectedPlan, setSelectedPlan] = useState<PlanResource | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
@@ -172,7 +173,7 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask
   return <div className="space-y-6">
     {selectedPlan ? (
       <section aria-label={`Plan #${selectedPlan.id}`} className="min-h-[calc(100dvh-8rem)] overflow-hidden rounded-lg border border-gray-800 bg-gray-900/60">
-        <PlanDetail key={selectedPlan.id} plan={selectedPlan} onRefresh={() => refresh()} onClose={close} onNavigateTask={onNavigateTask} embedded />
+        <PlanDetail key={selectedPlan.id} plan={selectedPlan} onRefresh={() => refresh()} onClose={close} onNavigateTask={onNavigateTask} onNavigateDelivery={onNavigateDelivery} embedded />
       </section>
     ) : <>
     <PlanCreateForm onCreated={created} onNavigateSettings={onNavigateSettings} />
@@ -196,7 +197,7 @@ export function PlansPage({ selectedPlanId, onSelectedPlanChange, onNavigateTask
       </div>
       <div className="flex gap-1 overflow-x-auto pb-1">{STATUS_OPTIONS.map((option) => <button key={option.value} type="button" onClick={() => setStatus(option.value)} aria-pressed={status === option.value} className={`whitespace-nowrap rounded-full px-3 py-1.5 text-xs ${status === option.value ? 'bg-indigo-500/20 text-indigo-300' : 'text-gray-500 hover:bg-gray-800 hover:text-gray-300'}`}>{option.label} <span className="tabular-nums">{statusCounts[option.value]}</span></button>)}</div>
       {error && <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
-      {loading ? <div className="py-12 text-center text-sm text-gray-500">Loading Plans…</div> : <PlanCatalog plans={plans} projects={projects} selectedPlanId={selectedPlanId} onSelectPlan={selectPlan} onNavigateTask={onNavigateTask} onSetArchived={setArchived} />}
+      {loading ? <div className="py-12 text-center text-sm text-gray-500">Loading Plans…</div> : <PlanCatalog plans={plans} projects={projects} selectedPlanId={selectedPlanId} onSelectPlan={selectPlan} onNavigateTask={onNavigateTask} onNavigateDelivery={onNavigateDelivery} onSetArchived={setArchived} />}
       {totalPages > 1 && <div className="flex items-center justify-center gap-3 py-2"><button type="button" onClick={() => setPage((value) => Math.max(1, value - 1))} disabled={page <= 1} className="rounded p-1.5 text-gray-400 disabled:opacity-30" aria-label="Previous Plans page"><ChevronLeft size={17} /></button><span className="text-xs text-gray-500">{page} / {totalPages} · {total} Plans</span><button type="button" onClick={() => setPage((value) => Math.min(totalPages, value + 1))} disabled={page >= totalPages} className="rounded p-1.5 text-gray-400 disabled:opacity-30" aria-label="Next Plans page"><ChevronRight size={17} /></button></div>}
     </section>
 

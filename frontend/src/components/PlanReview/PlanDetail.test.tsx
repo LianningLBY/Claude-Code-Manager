@@ -696,13 +696,13 @@ describe('PlanDetail', () => {
     resource.delivery_run_id = 1;
     vi.mocked(api.listPlanVersions).mockResolvedValue([current, prior]);
     const navigate = vi.fn();
+    const navigateDelivery = vi.fn();
     const onClose = vi.fn();
-    window.location.hash = '#/plans/2';
 
-    render(<PlanDetail plan={resource} onRefresh={vi.fn()} onNavigateTask={navigate} onClose={onClose} />);
+    render(<PlanDetail plan={resource} onRefresh={vi.fn()} onNavigateTask={navigate} onNavigateDelivery={navigateDelivery} onClose={onClose} />);
     await userEvent.click(await screen.findByRole('button', { name: 'Open Delivery DLV-1' }));
 
-    expect(window.location.hash).toBe('#/delivery/1');
+    expect(navigateDelivery).toHaveBeenCalledWith(1);
     expect(navigate).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
   });

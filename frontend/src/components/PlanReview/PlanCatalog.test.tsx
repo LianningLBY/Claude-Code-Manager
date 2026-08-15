@@ -111,12 +111,12 @@ describe('PlanCatalog', () => {
 
   it('opens the Delivery workspace for a Delivery-owned Plan', async () => {
     const onNavigateTask = vi.fn();
-    window.location.hash = '#/plans/2';
-    render(<PlanCatalog plans={[{ ...plan(2, 'Delivery Plan'), target_task_id: 1005, delivery_run_id: 1 }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onNavigateTask={onNavigateTask} onSetArchived={vi.fn()} />);
+    const onNavigateDelivery = vi.fn();
+    render(<PlanCatalog plans={[{ ...plan(2, 'Delivery Plan'), target_task_id: 1005, delivery_run_id: 1 }]} projects={[]} selectedPlanId={null} onSelectPlan={vi.fn()} onNavigateTask={onNavigateTask} onNavigateDelivery={onNavigateDelivery} onSetArchived={vi.fn()} />);
 
     await userEvent.click(screen.getByRole('button', { name: 'Open Delivery DLV-1' }));
 
-    expect(window.location.hash).toBe('#/delivery/1');
+    expect(onNavigateDelivery).toHaveBeenCalledWith(1);
     expect(onNavigateTask).not.toHaveBeenCalled();
   });
 });

@@ -128,16 +128,18 @@ describe('DeliveryRunPanel', () => {
     vi.mocked(api.resumeDeliveryRun).mockResolvedValue(resumed);
     const browserConfirm = vi.spyOn(window, 'confirm');
 
-    render(<DeliveryRunPanel runId={7} />);
+    render(<DeliveryRunPanel runId={7} compact />);
 
     await userEvent.click(await screen.findByRole('button', { name: 'Resume' }));
+    expect(screen.getByText('Resume this Delivery?')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Resume reason')).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Confirm Resume' }));
 
     await waitFor(() => {
       expect(api.resumeDeliveryRun).toHaveBeenCalledWith(7, undefined);
     });
     expect(browserConfirm).not.toHaveBeenCalled();
-    expect(await screen.findByText('Planning · Ready')).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Pause' })).toBeInTheDocument();
   });
 
   it('marks published monitoring as observation-only without safe-point controls', async () => {

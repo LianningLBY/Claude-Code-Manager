@@ -129,7 +129,7 @@ export function DeliveryRunPanel({
       const next = pendingAction === 'pause'
         ? await api.pauseDeliveryRun(run.id, normalizedReason)
         : pendingAction === 'resume'
-          ? await api.resumeDeliveryRun(run.id, normalizedReason || undefined)
+          ? await api.resumeDeliveryRun(run.id, undefined)
           : pendingAction === 'retry'
             ? await api.retryDeliveryRun(
               run.id,
@@ -163,10 +163,14 @@ export function DeliveryRunPanel({
         )}
         {pendingAction && (
           <div className="mt-2 w-full rounded border border-gray-700 bg-gray-950/70 p-2">
-            <label className="block text-xs text-gray-300">
-              {actionLabels[pendingAction]} reason{actionRequiresReason(pendingAction) ? '' : ' (optional)'}
-              <textarea aria-label={`${actionLabels[pendingAction]} reason`} value={reason} onChange={(event) => setReason(event.target.value)} maxLength={2000} rows={2} className="mt-1 w-full resize-none rounded border border-gray-700 bg-gray-800 px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500" />
-            </label>
+            {pendingAction === 'resume' ? (
+              <p className="text-xs text-gray-300">Resume this Delivery?</p>
+            ) : (
+              <label className="block text-xs text-gray-300">
+                {actionLabels[pendingAction]} reason{actionRequiresReason(pendingAction) ? '' : ' (optional)'}
+                <textarea aria-label={`${actionLabels[pendingAction]} reason`} value={reason} onChange={(event) => setReason(event.target.value)} maxLength={2000} rows={2} className="mt-1 w-full resize-none rounded border border-gray-700 bg-gray-800 px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500" />
+              </label>
+            )}
             <div className="mt-2 flex justify-end gap-2">
               <button type="button" onClick={() => { setPendingAction(null); setReason(''); setError(''); }} disabled={acting} className="rounded px-2 py-1 text-xs text-gray-400 hover:bg-gray-800">Back</button>
               <button type="button" onClick={() => void submitAction()} disabled={acting || (actionRequiresReason(pendingAction) && !reason.trim())} className={`rounded px-2 py-1 text-xs font-medium text-white disabled:opacity-40 ${pendingAction === 'cancel' ? 'bg-red-600 hover:bg-red-500' : 'bg-indigo-600 hover:bg-indigo-500'}`}>{acting ? 'Applying…' : `Confirm ${actionLabels[pendingAction]}`}</button>
@@ -310,17 +314,21 @@ export function DeliveryRunPanel({
 
           {pendingAction && (
             <div className="mt-3 rounded border border-gray-700 bg-gray-900/60 p-2">
-              <label className="block text-xs text-gray-300">
-                {actionLabels[pendingAction]} reason{actionRequiresReason(pendingAction) ? '' : ' (optional)'}
-                <textarea
-                  aria-label={`${actionLabels[pendingAction]} reason`}
-                  value={reason}
-                  onChange={(event) => setReason(event.target.value)}
-                  maxLength={2000}
-                  rows={2}
-                  className="mt-1 w-full resize-none rounded border border-gray-700 bg-gray-800 px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500"
-                />
-              </label>
+              {pendingAction === 'resume' ? (
+                <p className="text-xs text-gray-300">Resume this Delivery?</p>
+              ) : (
+                <label className="block text-xs text-gray-300">
+                  {actionLabels[pendingAction]} reason{actionRequiresReason(pendingAction) ? '' : ' (optional)'}
+                  <textarea
+                    aria-label={`${actionLabels[pendingAction]} reason`}
+                    value={reason}
+                    onChange={(event) => setReason(event.target.value)}
+                    maxLength={2000}
+                    rows={2}
+                    className="mt-1 w-full resize-none rounded border border-gray-700 bg-gray-800 px-2 py-1.5 text-xs text-gray-200 outline-none focus:border-indigo-500"
+                  />
+                </label>
+              )}
               <div className="mt-2 flex justify-end gap-2">
                 <button
                   type="button"

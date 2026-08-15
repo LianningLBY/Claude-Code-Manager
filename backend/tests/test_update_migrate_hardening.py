@@ -304,6 +304,41 @@ def test_systemd_user_manager_deserialize_is_narrowly_allowed() -> None:
     assert not classifier("python systemd --user")
 
 
+def test_server_side_sshd_session_allowlist_requires_root_parent() -> None:
+    content = SCRIPT.read_text()
+    start = content.index("def fixed_server_side_sshd_session")
+    end = content.index("\n\nunsafe_uninspectable", start)
+    namespace = {"re": re}
+    exec(content[start:end], namespace)
+    classifier = namespace["fixed_server_side_sshd_session"]
+    valid = {
+        "process_name": "sshd-session",
+        "command": "sshd-session: ubuntu@pts/0",
+        "cgroup": "0::/user.slice/user-1000.slice/session-799.scope",
+        "parent_name": "sshd-session",
+        "parent_uids": (0, 0, 0, 0),
+        "parent_command": "sshd-session: ubuntu [priv]",
+        "parent_cgroup": "0::/user.slice/user-1000.slice/session-799.scope",
+        "own_uid": 1000,
+        "account_name": "ubuntu",
+    }
+
+    assert classifier(**valid)
+    assert classifier(**{**valid, "command": "sshd-session: ubuntu@notty"})
+    assert not classifier(**{**valid, "process_name": "python"})
+    assert not classifier(**{**valid, "command": "sshd-session: ubuntu@pts/0 extra"})
+    assert not classifier(**{**valid, "cgroup": "0::/user.slice/user-1000.slice/app.slice"})
+    assert not classifier(**{**valid, "parent_name": "python"})
+    assert not classifier(**{**valid, "parent_uids": (1000, 1000, 1000, 1000)})
+    assert not classifier(**{**valid, "parent_command": "python [priv]"})
+    assert not classifier(
+        **{
+            **valid,
+            "parent_cgroup": "0::/user.slice/user-1000.slice/session-800.scope",
+        }
+    )
+
+
 def test_root_bootstrap_uses_isolated_system_python_before_setuid() -> None:
     content = SCRIPT.read_text()
     bootstrap_start = content.index('if [ "$(id -u)" = "0" ]; then')

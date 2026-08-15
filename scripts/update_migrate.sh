@@ -1012,6 +1012,7 @@ svc_start() {
 assert_database_unheld() {
     "$PYTHON_BIN" - "$DB_FILE" "$$" "$SERVER_PID" <<'PY'
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -1048,7 +1049,7 @@ holders = []
 uninspectable = []
 own_uid = os.getuid()
 
-def inaccessible_process_detail(process, error):
+def inaccessible_process_detail(process, error, status=""):
     try:
         command = (process / "cmdline").read_bytes().replace(
             b"\0", b" "
@@ -1059,7 +1060,19 @@ def inaccessible_process_detail(process, error):
         cgroup = (process / "cgroup").read_text(errors="replace").strip()
     except OSError:
         cgroup = ""
-    return process.name, command, cgroup, str(error)
+    process_name = ""
+    parent_pid = 0
+    for line in status.splitlines():
+        if line.startswith("Name:"):
+            process_name = line.split(":", 1)[1].strip()
+        elif line.startswith("PPid:"):
+            try:
+                parent_pid = int(line.split()[1])
+            except (IndexError, ValueError):
+                parent_pid = 0
+    return (
+        process.name, command, cgroup, str(error), process_name, parent_pid
+    )
 
 for process in Path("/proc").iterdir():
     if not process.name.isdigit() or int(process.name) in {
@@ -1085,7 +1098,9 @@ for process in Path("/proc").iterdir():
     except FileNotFoundError:
         continue
     except PermissionError as exc:
-        uninspectable.append(inaccessible_process_detail(process, exc))
+        uninspectable.append(
+            inaccessible_process_detail(process, exc, status)
+        )
         continue
     for descriptor in descriptors:
         try:
@@ -1093,7 +1108,9 @@ for process in Path("/proc").iterdir():
         except FileNotFoundError:
             continue
         except PermissionError as exc:
-            uninspectable.append(inaccessible_process_detail(process, exc))
+            uninspectable.append(
+                inaccessible_process_detail(process, exc, status)
+            )
             break
         matched = identities.get((metadata.st_dev, metadata.st_ino))
         if matched:
@@ -1126,9 +1143,10 @@ if result.returncode != 1:
         + result.stderr.strip()
     )
 # fuser cannot see a process that has disabled dumpability on some kernels.
-# The only inaccessible same-user processes ignored here are fixed systemd
-# helpers that cannot load CCM or its database. ssh-agent deliberately disables
-# dumpability on some hosts, so even its same-UID /proc/fd is unreadable.
+# The only inaccessible same-user processes ignored here are fixed systemd,
+# ssh-agent, and verified server-side OpenSSH helpers that cannot load CCM or
+# its database. These deliberately disable dumpability on some hosts, so even
+# their same-UID /proc/fd is unreadable.
 def fixed_systemd_user_manager(command):
     argv = command.split()
     return (
@@ -1142,8 +1160,46 @@ def fixed_systemd_user_manager(command):
     )
 
 
+def fixed_server_side_sshd_session(
+    process_name,
+    command,
+    cgroup,
+    parent_name,
+    parent_uids,
+    parent_command,
+    parent_cgroup,
+    own_uid,
+    account_name,
+):
+    session_scope = re.compile(
+        rf"[0-9]+:[^:]*:/user\.slice/user-{own_uid}\.slice/"
+        r"session-[0-9]+\.scope"
+    )
+    child_command = re.fullmatch(
+        rf"sshd-session: {re.escape(account_name)}@(notty|pts/[0-9]+)",
+        command,
+    )
+    parent_command_matches = (
+        parent_command == f"sshd-session: {account_name} [priv]"
+    )
+    return (
+        bool(account_name)
+        and process_name == "sshd-session"
+        and child_command is not None
+        and any(session_scope.fullmatch(line) for line in cgroup.splitlines())
+        and parent_name == "sshd-session"
+        and parent_uids == (0, 0, 0, 0)
+        and parent_command_matches
+        and parent_cgroup == cgroup
+    )
+
+
 unsafe_uninspectable = []
-for pid, command, cgroup, error in uninspectable:
+try:
+    account_name = pwd.getpwuid(own_uid).pw_name
+except KeyError:
+    account_name = ""
+for pid, command, cgroup, error, process_name, parent_pid in uninspectable:
     in_user_manager_init = (
         f"/user-{own_uid}.slice/user@{own_uid}.service/init.scope" in cgroup
     )
@@ -1159,9 +1215,44 @@ for pid, command, cgroup, error in uninspectable:
         "app.slice/ssh-agent.service" in cgroup
         and command == "/usr/bin/ssh-agent -D"
     )
+    parent_name = ""
+    parent_uids = ()
+    parent_command = ""
+    parent_cgroup = ""
+    if parent_pid > 0:
+        parent = Path("/proc") / str(parent_pid)
+        try:
+            parent_status = parent.joinpath("status").read_text(
+                errors="replace"
+            )
+            for line in parent_status.splitlines():
+                if line.startswith("Name:"):
+                    parent_name = line.split(":", 1)[1].strip()
+                elif line.startswith("Uid:"):
+                    parent_uids = tuple(int(value) for value in line.split()[1:])
+            parent_command = parent.joinpath("cmdline").read_bytes().replace(
+                b"\0", b" "
+            ).decode(errors="replace").strip()
+            parent_cgroup = parent.joinpath("cgroup").read_text(
+                errors="replace"
+            ).strip()
+        except (OSError, ValueError):
+            pass
+    fixed_sshd_session = fixed_server_side_sshd_session(
+        process_name,
+        command,
+        cgroup,
+        parent_name,
+        parent_uids,
+        parent_command,
+        parent_cgroup,
+        own_uid,
+        account_name,
+    )
     if not (
         (in_user_manager_init and fixed_system_helper)
         or fixed_ssh_agent
+        or fixed_sshd_session
     ):
         unsafe_uninspectable.append((pid, command, error))
 if unsafe_uninspectable:

@@ -405,15 +405,6 @@ export function DeliveryRunDialog({
       : [],
     [run, progress, selectedCycle],
   );
-  const activityEvents = useMemo(
-    () => selectedEvents.filter((event, index) => !(
-      selectedIsCurrent
-      && index === selectedEvents.length - 1
-      && progress?.detail
-      && event.detail === progress.detail
-    )),
-    [progress?.detail, selectedEvents, selectedIsCurrent],
-  );
   const selectedTurns = useMemo(
     () => run && selectedCycle
       ? run.turns.filter((turn) => turn.cycle_id === selectedCycle.id)
@@ -947,33 +938,11 @@ export function DeliveryRunDialog({
           ) : run && progress && selectedCycle && selectedContext ? (
             <div className="space-y-4">
               {error && <Notice tone="red" text={error} />}
-              <div className="grid gap-5 lg:grid-cols-[minmax(0,1fr)_320px]">
               <div className="min-w-0 space-y-4" role="tabpanel">
                 <section className="rounded-xl border border-gray-800 bg-gray-950/30 p-4">
                   <div className="mb-4"><h3 className="text-sm font-semibold text-gray-100">{STAGE_META[activeStage].label}</h3><p className="mt-1 text-xs text-gray-600">{STAGE_META[activeStage].description}</p></div>
                   {stageContent(activeStage)}
                 </section>
-              </div>
-              <aside className="min-w-0 rounded-xl border border-gray-800 bg-gray-950/30 p-4">
-                <h3 className="text-sm font-semibold text-gray-200">Activity</h3>
-                <div className="mt-4 space-y-0">
-                  {activityEvents.length === 0 ? <EmptyState text="No earlier activity was recorded for this round." /> : [...activityEvents].reverse().map((event, index) => (
-                    <div key={event.id} className="relative flex gap-3 pb-4">
-                      {index < activityEvents.length - 1 && <span className="absolute bottom-0 left-[5px] top-3 w-px bg-gray-800" />}
-                      <span className="relative mt-1 h-2.5 w-2.5 shrink-0 rounded-full border border-gray-700 bg-gray-900" />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-start justify-between gap-2"><p className="text-xs font-medium leading-5 text-gray-300">{event.title}</p><span className="shrink-0 text-[9px] text-gray-700">{formatDateTime(event.created_at)}</span></div>
-                        <p className="text-[10px] text-gray-600">{STAGE_META[event.stage as DeliveryStageKey]?.label || titleCase(event.stage)} · {event.status ? titleCase(event.status) : event.source}</p>
-                        {event.detail && (
-                          event.detail.length > 240
-                            ? <DetailText detail={event.detail} />
-                            : <p className="mt-1 whitespace-pre-wrap break-words text-[11px] leading-4 text-gray-500">{event.detail}</p>
-                        )}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </aside>
               </div>
             </div>
           ) : null}

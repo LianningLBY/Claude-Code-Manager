@@ -295,13 +295,11 @@ describe('DeliveryRunDialog', () => {
 
     expect(await screen.findByRole('tablist', { name: 'Delivery round history' })).toBeInTheDocument();
     expect(screen.getByRole('tab', { name: 'View round 3: PR review requested fixes' })).toHaveAttribute('aria-current', 'step');
-    expect(screen.getByText('Planning started')).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole('tab', { name: 'View round 2: Code review requested fixes' }));
 
-    expect(screen.getByRole('heading', { name: 'Activity' })).toBeInTheDocument();
-    expect(screen.getByText('Code review requested changes')).toBeInTheDocument();
-    expect(screen.queryByText('Planning started')).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Activity' })).not.toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'View round 2: Code review requested fixes' })).toHaveAttribute('aria-selected', 'true');
   });
 
   it('keeps a successful terminal run compact and moves completed Browser evidence into the stage detail', async () => {

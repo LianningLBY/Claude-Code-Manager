@@ -38,6 +38,10 @@ import {
 } from '../icons';
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'stale']);
+const ACTIVE_POLL_INTERVAL_MS = 1_000;
+const TASK_DISCOVERY_POLL_INTERVAL_MS = 5_000;
+const MAX_POLL_BACKOFF_MS = 30_000;
+type RefreshOutcome = 'success' | 'error' | 'stale';
 const STAGE_LABELS: Record<string, string> = {
   validating_workspace: '正在校验本地仓库',
   fingerprinted: '已锁定当前工作区版本',
@@ -257,6 +261,26 @@ export function BrowserReviewPanel({
   const expectedGoalReviewBaselineRef = useRef<string | null | undefined>(undefined);
   const goalReviewRequestIdRef = useRef<number | null>(null);
   const eventListRef = useRef<HTMLDivElement | null>(null);
+  const refreshGenerationRef = useRef(0);
+  const refreshFailureCountRef = useRef(0);
+  const lastRefreshCompletedAtRef = useRef<number | null>(null);
+  const lastRefreshOutcomeRef = useRef<RefreshOutcome | null>(null);
+  const refreshRequestIdRef = useRef(0);
+  const refreshInFlightRef = useRef<{
+    taskId: number;
+    generation: number;
+    requestId: number;
+    promise: Promise<RefreshOutcome>;
+  } | null>(null);
+
+  useEffect(() => {
+    const generation = ++refreshGenerationRef.current;
+    return () => {
+      if (refreshGenerationRef.current === generation) {
+        refreshGenerationRef.current += 1;
+      }
+    };
+  }, [taskId]);
 
   const applyRuntimeConfig = useCallback((config: TestHarnessRuntimeConfig) => {
     setRuntimeConfig(config);
@@ -295,69 +319,94 @@ export function BrowserReviewPanel({
     }
   }, [taskId]);
 
-  const refresh = useCallback(async () => {
-    try {
-      const nextRuns = await api.listTestRuns(taskId);
-      const seededRun = startedWorkspaceRunRef.current;
-      const visibleRuns = seededRun && !nextRuns.some((run) => run.id === seededRun.id)
-        ? [seededRun, ...nextRuns]
-        : nextRuns;
-      const nextLatestId = visibleRuns[0]?.id ?? null;
-      const expectedBaseline = expectedWorkspaceReviewBaselineRef.current;
-      const expectedWorkspaceRun = expectedBaseline !== undefined
-        && visibleRuns[0]
-        && visibleRuns[0].id !== expectedBaseline
-        ? visibleRuns[0]
-        : null;
-      const expectedGoalBaseline = expectedGoalReviewBaselineRef.current;
-      const expectedGoalRun = expectedGoalBaseline !== undefined
-        && visibleRuns[0]
-        && visibleRuns[0].id !== expectedGoalBaseline
-        ? visibleRuns[0]
-        : null;
-      const previousLatestId = latestReviewIdRef.current;
-      const hasNewReview = Boolean(
-        previousLatestId
-        && nextLatestId
-        && previousLatestId !== nextLatestId,
-      );
-      latestReviewIdRef.current = nextLatestId;
-      setRuns(visibleRuns);
-      setSelectedId((current) => (
-        expectedGoalRun || expectedWorkspaceRun
-          ? (expectedGoalRun || expectedWorkspaceRun)!.id
-          : !hasNewReview && current && (
-          visibleRuns.some((run) => run.id === current)
-        )
-          ? current
-          : nextLatestId
-      ));
-      if (expectedGoalRun) {
-        expectedGoalReviewBaselineRef.current = undefined;
-        setMinimized(false);
-        setSettingsOpen(false);
-        onGoalReviewFound?.();
-        onNewReview();
-      } else if (expectedWorkspaceRun) {
-        expectedWorkspaceReviewBaselineRef.current = undefined;
-        setWaitingForWorkspaceReview(false);
-        setMinimized(false);
-        setSettingsOpen(false);
-        onExpectedWorkspaceReviewFound?.();
-        onNewReview();
-      } else if (hasNewReview) {
-        setMinimized(false);
-        setSettingsOpen(false);
-        onNewReview();
-      }
-      setError(null);
-      onAvailableChange(visibleRuns.length > 0);
-      onActiveChange?.(visibleRuns.some((run) => !TERMINAL.has(run.status)));
-    } catch (nextError) {
-      setError(errorText(nextError));
-    } finally {
-      setLoading(false);
+  const refresh = useCallback((): Promise<RefreshOutcome> => {
+    const generation = refreshGenerationRef.current;
+    const existing = refreshInFlightRef.current;
+    if (existing?.taskId === taskId && existing.generation === generation) {
+      return existing.promise;
     }
+
+    const requestId = ++refreshRequestIdRef.current;
+    const request = (async () => {
+      try {
+        const nextRuns = await api.listTestRuns(taskId);
+        if (refreshGenerationRef.current !== generation) return 'stale';
+
+        const seededRun = startedWorkspaceRunRef.current;
+        const visibleRuns = seededRun && !nextRuns.some((run) => run.id === seededRun.id)
+          ? [seededRun, ...nextRuns]
+          : nextRuns;
+        const nextLatestId = visibleRuns[0]?.id ?? null;
+        const expectedBaseline = expectedWorkspaceReviewBaselineRef.current;
+        const expectedWorkspaceRun = expectedBaseline !== undefined
+          && visibleRuns[0]
+          && visibleRuns[0].id !== expectedBaseline
+          ? visibleRuns[0]
+          : null;
+        const expectedGoalBaseline = expectedGoalReviewBaselineRef.current;
+        const expectedGoalRun = expectedGoalBaseline !== undefined
+          && visibleRuns[0]
+          && visibleRuns[0].id !== expectedGoalBaseline
+          ? visibleRuns[0]
+          : null;
+        const previousLatestId = latestReviewIdRef.current;
+        const hasNewReview = Boolean(
+          previousLatestId
+          && nextLatestId
+          && previousLatestId !== nextLatestId,
+        );
+        latestReviewIdRef.current = nextLatestId;
+        setRuns(visibleRuns);
+        setSelectedId((current) => (
+          expectedGoalRun || expectedWorkspaceRun
+            ? (expectedGoalRun || expectedWorkspaceRun)!.id
+            : !hasNewReview && current && (
+            visibleRuns.some((run) => run.id === current)
+          )
+            ? current
+            : nextLatestId
+        ));
+        if (expectedGoalRun) {
+          expectedGoalReviewBaselineRef.current = undefined;
+          setMinimized(false);
+          setSettingsOpen(false);
+          onGoalReviewFound?.();
+          onNewReview();
+        } else if (expectedWorkspaceRun) {
+          expectedWorkspaceReviewBaselineRef.current = undefined;
+          setWaitingForWorkspaceReview(false);
+          setMinimized(false);
+          setSettingsOpen(false);
+          onExpectedWorkspaceReviewFound?.();
+          onNewReview();
+        } else if (hasNewReview) {
+          setMinimized(false);
+          setSettingsOpen(false);
+          onNewReview();
+        }
+        refreshFailureCountRef.current = 0;
+        lastRefreshCompletedAtRef.current = Date.now();
+        lastRefreshOutcomeRef.current = 'success';
+        setError(null);
+        onAvailableChange(visibleRuns.length > 0);
+        onActiveChange?.(visibleRuns.some((run) => !TERMINAL.has(run.status)));
+        return 'success';
+      } catch (nextError) {
+        if (refreshGenerationRef.current !== generation) return 'stale';
+        refreshFailureCountRef.current += 1;
+        lastRefreshCompletedAtRef.current = Date.now();
+        lastRefreshOutcomeRef.current = 'error';
+        setError(errorText(nextError));
+        return 'error';
+      } finally {
+        if (refreshInFlightRef.current?.requestId === requestId) {
+          refreshInFlightRef.current = null;
+        }
+        if (refreshGenerationRef.current === generation) setLoading(false);
+      }
+    })();
+    refreshInFlightRef.current = { taskId, generation, requestId, promise: request };
+    return request;
   }, [onActiveChange, onAvailableChange, onExpectedWorkspaceReviewFound, onGoalReviewFound, onNewReview, taskId]);
 
   useEffect(() => {
@@ -376,6 +425,9 @@ export function BrowserReviewPanel({
     setConfiguredGitRef('');
     setCapabilities(null);
     setCapabilitiesLoading(false);
+    refreshFailureCountRef.current = 0;
+    lastRefreshCompletedAtRef.current = null;
+    lastRefreshOutcomeRef.current = null;
     latestReviewIdRef.current = null;
     onAvailableChange(false);
     onActiveChange?.(false);
@@ -439,11 +491,49 @@ export function BrowserReviewPanel({
 
   const hasActiveReview = runs.some((run) => !TERMINAL.has(run.status));
   const waitingForGoalReview = goalStart != null;
+  const shouldPoll = taskActive || hasActiveReview || waitingForWorkspaceReview || waitingForGoalReview;
+  const pollInterval = hasActiveReview || waitingForWorkspaceReview || waitingForGoalReview
+    ? ACTIVE_POLL_INTERVAL_MS
+    : TASK_DISCOVERY_POLL_INTERVAL_MS;
   useEffect(() => {
-    if (!taskActive && !hasActiveReview && !waitingForWorkspaceReview && !waitingForGoalReview) return;
-    const timer = window.setInterval(() => { void refresh(); }, 1000);
-    return () => window.clearInterval(timer);
-  }, [hasActiveReview, refresh, taskActive, waitingForGoalReview, waitingForWorkspaceReview]);
+    if (!shouldPoll) return;
+    let cancelled = false;
+    let timer: number | null = null;
+
+    const nextDelay = (outcome: RefreshOutcome) => outcome === 'success'
+      ? pollInterval
+      : Math.min(
+          pollInterval * (2 ** Math.min(refreshFailureCountRef.current, 10)),
+          MAX_POLL_BACKOFF_MS,
+        );
+    const schedule = (delay: number) => {
+      timer = window.setTimeout(() => { void poll(); }, delay);
+    };
+    const poll = async () => {
+      const outcome = await refresh();
+      if (cancelled || outcome === 'stale') return;
+      schedule(nextDelay(outcome));
+    };
+
+    if (
+      refreshInFlightRef.current?.taskId === taskId
+      && refreshInFlightRef.current.generation === refreshGenerationRef.current
+    ) {
+      void poll();
+    } else if (
+      lastRefreshCompletedAtRef.current !== null
+      && lastRefreshOutcomeRef.current !== null
+    ) {
+      const elapsed = Math.max(0, Date.now() - lastRefreshCompletedAtRef.current);
+      schedule(Math.max(0, nextDelay(lastRefreshOutcomeRef.current) - elapsed));
+    } else {
+      void poll();
+    }
+    return () => {
+      cancelled = true;
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, [pollInterval, refresh, shouldPoll, taskId]);
 
   const harnessRun = runs.find((item) => item.id === selectedId)
     ?? runs[0]

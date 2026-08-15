@@ -3247,14 +3247,12 @@ async def rollback_migrated_task_import(
     reservation = _migration_import_operation(body)
     await db.rollback()
     async with get_task_operation_lock(body.task_id):
-        # Node control precedes Harness owner -> Task in the Worker-global
-        # mutation order.  The receipt transition remains in the same Task
-        # deletion transaction when a mirror exists.
-        node_draining = await fence_worker_node_receipt_resolution(db)
-        # Delete uses Harness owner -> Task as its global lock order.  Acquire
-        # that process fence before the scalar Task writer below, then tell the
-        # queue not to re-enter the non-reentrant fence.
+        # Process-local order is Task operation -> Harness owner. Inside that
+        # lease, the database writer order remains node-control -> Task. Never
+        # hold the node row while waiting for the owner fence: Workspace/Harness
+        # materialization holds owner first and then fences node-control.
         async with test_harness_owner_fence(body.task_id):
+            node_draining = await fence_worker_node_receipt_resolution(db)
             operation = await _persist_missing_worker_migration_rollback(
                 db,
                 task_id=body.task_id,

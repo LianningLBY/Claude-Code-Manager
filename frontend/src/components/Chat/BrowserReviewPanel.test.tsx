@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 
 import type {
   BrowserReviewJob,
@@ -24,6 +24,16 @@ vi.mock('../../api/client', () => ({
 }));
 
 import { api } from '../../api/client';
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((nextResolve, nextReject) => {
+    resolve = nextResolve;
+    reject = nextReject;
+  });
+  return { promise, resolve, reject };
+}
 
 const defaultRuntimeConfig: TestHarnessRuntimeConfig = {
   inherit_task: true,
@@ -279,6 +289,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.clearAllMocks();
   vi.mocked(api.listTestRuns).mockResolvedValue([]);
   localStorage.clear();
@@ -286,6 +297,164 @@ afterEach(() => {
 });
 
 describe('BrowserReviewPanel', () => {
+  it('keeps hidden running-Task discovery low-frequency and never overlaps a slow refresh', async () => {
+    vi.useFakeTimers();
+    const firstRefresh = deferred<TestHarnessRun[]>();
+    const activeRun = makeHarnessRun({
+      id: 'active-poll-run',
+      root_run_id: 'active-poll-run',
+      status: 'running',
+      stage: 'executing_actions',
+    });
+    vi.mocked(api.listTestRuns)
+      .mockImplementationOnce(() => firstRefresh.promise)
+      .mockResolvedValue([activeRun]);
+
+    render(
+      <BrowserReviewPanel
+        taskId={73}
+        taskActive
+        open={false}
+        displayMode="docked"
+        onAvailableChange={vi.fn()}
+        onClose={vi.fn()}
+        onDisplayModeChange={vi.fn()}
+        onNewReview={vi.fn()}
+      />,
+    );
+
+    expect(api.listTestRuns).toHaveBeenCalledTimes(1);
+    await act(async () => { vi.advanceTimersByTime(4_999); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstRefresh.resolve([]);
+      await firstRefresh.promise;
+    });
+    await act(async () => { vi.advanceTimersByTime(4_999); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      vi.advanceTimersByTime(1);
+      await Promise.resolve();
+    });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(2);
+    await act(async () => { vi.advanceTimersByTime(999); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(2);
+    await act(async () => { vi.advanceTimersByTime(1); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(3);
+  });
+
+  it('backs polling failures off exponentially with a cap and resets after success', async () => {
+    vi.useFakeTimers();
+    vi.mocked(api.listTestRuns)
+      .mockRejectedValueOnce(new Error('first failure'))
+      .mockRejectedValueOnce(new Error('second failure'))
+      .mockRejectedValueOnce(new Error('third failure'))
+      .mockResolvedValue([]);
+
+    render(
+      <BrowserReviewPanel
+        taskId={73}
+        taskActive
+        open={false}
+        displayMode="docked"
+        onAvailableChange={vi.fn()}
+        onClose={vi.fn()}
+        onDisplayModeChange={vi.fn()}
+        onNewReview={vi.fn()}
+      />,
+    );
+    await act(async () => { await Promise.resolve(); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(1);
+
+    await act(async () => { vi.advanceTimersByTime(9_999); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(1);
+    await act(async () => { vi.advanceTimersByTime(1); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(2);
+
+    await act(async () => { vi.advanceTimersByTime(19_999); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(2);
+    await act(async () => { vi.advanceTimersByTime(1); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(3);
+
+    await act(async () => { vi.advanceTimersByTime(29_999); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(3);
+    await act(async () => { vi.advanceTimersByTime(1); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(4);
+
+    await act(async () => { vi.advanceTimersByTime(4_999); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(4);
+    await act(async () => { vi.advanceTimersByTime(1); });
+    expect(api.listTestRuns).toHaveBeenCalledTimes(5);
+  });
+
+  it('coalesces initial, expectation, Goal, and manual refresh triggers into one request', () => {
+    const pending = deferred<TestHarnessRun[]>();
+    vi.mocked(api.listTestRuns).mockImplementation(() => pending.promise);
+
+    render(
+      <BrowserReviewPanel
+        taskId={73}
+        taskActive
+        open
+        displayMode="docked"
+        onAvailableChange={vi.fn()}
+        onClose={vi.fn()}
+        onDisplayModeChange={vi.fn()}
+        onNewReview={vi.fn()}
+        expectedWorkspaceReviewBaseline="old-run"
+        goalStart={{
+          requestId: 1,
+          prompt: '开始本轮浏览器复查',
+          maxTurns: 5,
+          phase: 'starting_review',
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByTitle('刷新审查进度'));
+
+    expect(api.listTestRuns).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let an old Task refresh overwrite the next Task', async () => {
+    const oldRefresh = deferred<TestHarnessRun[]>();
+    const oldRun = makeHarnessRun({
+      id: 'old-task-run',
+      root_run_id: 'old-task-run',
+      task_id: 73,
+      test_plan: { version: 1, objective: '旧 Task 审查', scenarios: [] },
+    });
+    const newRun = makeHarnessRun({
+      id: 'new-task-run',
+      root_run_id: 'new-task-run',
+      task_id: 74,
+      test_plan: { version: 1, objective: '新 Task 审查', scenarios: [] },
+    });
+    vi.mocked(api.listTestRuns).mockImplementation((taskId) => (
+      taskId === 73 ? oldRefresh.promise : Promise.resolve([newRun])
+    ));
+    const commonProps = {
+      taskActive: false,
+      open: true,
+      displayMode: 'docked' as const,
+      onAvailableChange: vi.fn(),
+      onClose: vi.fn(),
+      onDisplayModeChange: vi.fn(),
+      onNewReview: vi.fn(),
+    };
+    const view = render(<BrowserReviewPanel {...commonProps} taskId={73} />);
+
+    view.rerender(<BrowserReviewPanel {...commonProps} taskId={74} />);
+    expect(await screen.findByText('新 Task 审查')).toBeInTheDocument();
+
+    await act(async () => {
+      oldRefresh.resolve([oldRun]);
+      await oldRefresh.promise;
+    });
+    expect(screen.getByText('新 Task 审查')).toBeInTheDocument();
+    expect(screen.queryByText('旧 Task 审查')).not.toBeInTheDocument();
+  });
+
   it('shows durable workspace preparation, fingerprint, and cancellation before the browser job exists', async () => {
     const workspaceRun: WorkspaceReviewRun = {
       id: 'workspace-run-1',

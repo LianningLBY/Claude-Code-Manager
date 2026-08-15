@@ -269,6 +269,10 @@ async def list_workspace_reviews(
 ) -> list[dict[str, Any]]:
     task = await _task_or_404(task_id, db)
     await require_task_control(request, task, db)
+    # The compatibility projection reuses this session after the service
+    # refresh.  End the ACL read transaction first so the refresh never nests
+    # a second checkout beneath a request-owned pool connection.
+    await db.rollback()
     try:
         await refresh_workspace_review_staleness(task_id)
     except WorkspaceReviewError:

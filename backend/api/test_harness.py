@@ -41,6 +41,7 @@ from backend.services.test_harness_runtime import (
     harness_runtime_config_payload,
 )
 from backend.services.workspace_review import (
+    WorkspaceReviewError,
     public_workspace_review_capability,
     workspace_review_capability,
 )
@@ -381,9 +382,14 @@ async def list_test_harness_runs(
 ) -> list[dict[str, Any]]:
     task = await _task_or_404(task_id, db)
     await require_task_control(request, task, db)
+    # ACL evaluation has checked out the request-scoped connection.  Freshness
+    # probing uses independent service sessions and can spend seconds in Git;
+    # return this connection before entering that work so list polling cannot
+    # deadlock a small pool or starve Task control endpoints.
+    await db.rollback()
     try:
         await test_harness_service.refresh_task_staleness(task_id)
-    except (TestHarnessError, OSError, ValueError):
+    except (TestHarnessError, WorkspaceReviewError, OSError, ValueError):
         # Historical evidence remains readable if the checkout is temporarily
         # unavailable; it simply cannot be freshly proven in this poll.
         pass

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -26,6 +27,83 @@ from backend.services.test_harness_contracts import (
     compile_test_plan,
 )
 from backend.services.internal_service_auth import InternalServiceClaims
+
+
+@pytest.mark.asyncio
+async def test_list_test_runs_releases_route_connection_before_service_sessions(
+    monkeypatch,
+    tmp_path,
+):
+    """A one-connection pool must not deadlock on the route's nested service reads."""
+
+    from sqlalchemy.ext.asyncio import (
+        AsyncSession,
+        async_sessionmaker,
+        create_async_engine,
+    )
+
+    from backend.database import Base
+
+    engine = create_async_engine(
+        f"sqlite+aiosqlite:///{tmp_path / 'single-connection.db'}",
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.05,
+    )
+    factory = async_sessionmaker(
+        engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    try:
+        async with engine.begin() as connection:
+            await connection.run_sync(Base.metadata.create_all)
+        async with factory() as db:
+            task = Task(title="Single connection list", status="executing")
+            db.add(task)
+            await db.commit()
+            task_id = task.id
+
+        service = HarnessService(db_factory=factory, poll_interval=0.01)
+        monkeypatch.setattr(test_harness_api, "test_harness_service", service)
+
+        app = FastAPI()
+
+        @app.middleware("http")
+        async def _admin(request: Request, call_next):
+            request.state.user_role = "admin"
+            request.state.auth_type = "token"
+            return await call_next(request)
+
+        async def _get_db():
+            async with factory() as db:
+                yield db
+
+        app.include_router(test_harness_api.router)
+        app.dependency_overrides[get_db] = _get_db
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            response = await asyncio.wait_for(
+                client.get(f"/api/tasks/{task_id}/test-runs"),
+                timeout=1,
+            )
+            from backend.services.workspace_review import WorkspaceReviewError
+
+            refresh = AsyncMock(
+                side_effect=WorkspaceReviewError("Git snapshot unavailable")
+            )
+            monkeypatch.setattr(service, "refresh_task_staleness", refresh)
+            degraded = await client.get(f"/api/tasks/{task_id}/test-runs")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == []
+        assert degraded.status_code == 200, degraded.text
+        assert degraded.json() == []
+        refresh.assert_awaited_once_with(task_id)
+    finally:
+        await engine.dispose()
 
 
 def _request_state(

@@ -1789,6 +1789,91 @@ async def test_migration_rollback_before_import_blocks_delayed_prepare(
 
 
 @pytest.mark.asyncio
+async def test_migration_rollback_waits_for_owner_before_node_receipt_fence(
+    client,
+    monkeypatch,
+):
+    """Rollback keeps operation -> owner -> node process/database lock order."""
+
+    import backend.api.tasks as tasks_api
+    from backend.services.test_harness_owner_fence import (
+        test_harness_owner_fence,
+    )
+
+    task_id = 7024
+    operation_id = "8" * 32
+    exact = {
+        "task_id": task_id,
+        "operation_id": operation_id,
+        "operation_sequence": 1,
+        "incarnation_id": "9" * 32,
+        "retry_count": 3,
+        "turn_generation": 12,
+        "source_status": "completed",
+    }
+    operation_entered = asyncio.Event()
+    node_fence_called = asyncio.Event()
+    observed_order: list[str] = []
+    original_operation_lock = tasks_api.get_task_operation_lock
+    original_node_fence = tasks_api.fence_worker_node_receipt_resolution
+
+    @asynccontextmanager
+    async def observed_operation_lock(locked_task_id):
+        assert locked_task_id == task_id
+        async with original_operation_lock(locked_task_id):
+            observed_order.append("operation")
+            operation_entered.set()
+            yield
+
+    async def observed_node_fence(db):
+        observed_order.append("node")
+        node_fence_called.set()
+        return await original_node_fence(db)
+
+    monkeypatch.setattr(
+        tasks_api,
+        "get_task_operation_lock",
+        observed_operation_lock,
+    )
+    monkeypatch.setattr(
+        tasks_api,
+        "fence_worker_node_receipt_resolution",
+        observed_node_fence,
+    )
+
+    request_task = None
+    try:
+        async with test_harness_owner_fence(task_id):
+            request_task = asyncio.create_task(
+                _post_migration_import_rollback(client, exact)
+            )
+            await asyncio.wait_for(operation_entered.wait(), timeout=1)
+            # Event.set() does not pre-empt the request coroutine. By the time
+            # this waiter resumes, the request has advanced to its next await:
+            # the held owner fence in the correct implementation, or the node
+            # writer in the old operation -> node -> owner implementation.
+            await asyncio.sleep(0)
+            assert observed_order == ["operation"]
+            assert node_fence_called.is_set() is False
+
+        response = await asyncio.wait_for(request_task, timeout=2)
+    finally:
+        if request_task is not None and not request_task.done():
+            await asyncio.gather(request_task, return_exceptions=True)
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "ok": True,
+        "removed": False,
+        "task_id": task_id,
+        "operation_id": operation_id,
+        "operation_sequence": 1,
+    }
+    assert node_fence_called.is_set() is True
+    assert observed_order == ["operation", "node"]
+
+
+@pytest.mark.asyncio
 async def test_migration_rollback_before_import_uses_drain_as_durable_barrier(
     client,
     session_factory,

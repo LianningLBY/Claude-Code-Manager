@@ -488,6 +488,250 @@ async def test_manager_rejects_remote_authoritative_harness_owner(
 
 
 @pytest.mark.asyncio
+async def test_current_workspace_slow_start_releases_owner_fence_and_stop_wins(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    from backend.config import settings
+    from backend.services.test_harness_owner_fence import (
+        test_harness_owner_identity,
+        test_harness_owner_terminal_gate_matches,
+    )
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    preview_config = {
+        "version": 1,
+        "name": "Slow snapshot test preview",
+        "setup": [],
+        "processes": [
+            {
+                "name": "web",
+                "command": [
+                    "python",
+                    "-m",
+                    "http.server",
+                    "{preview_port}",
+                ],
+                "cwd": ".",
+            }
+        ],
+        "url": "http://127.0.0.1:{preview_port}/",
+        "health_url": "http://127.0.0.1:{preview_port}/",
+        "startup_timeout_seconds": 10,
+    }
+    async with db_factory() as db:
+        project = Project(
+            name="Slow current-workspace admission",
+            local_path=str(workspace),
+            status="ready",
+            preview_config=preview_config,
+        )
+        db.add(project)
+        await db.flush()
+        owner = Task(
+            title="Interrupt a slow workspace snapshot",
+            status="completed",
+            provider="codex",
+            model="gpt-5.6-sol",
+            project_id=project.id,
+            last_cwd=str(workspace),
+        )
+        db.add(owner)
+        await db.commit()
+        owner_id = owner.id
+        identity = test_harness_owner_identity(owner)
+
+    service = HarnessService(db_factory=db_factory, poll_interval=0.01)
+    snapshot_started = asyncio.Event()
+    release_snapshot = asyncio.Event()
+    late_workspace_start = asyncio.Event()
+
+    async def slow_workspace_start(*, run_id, **_kwargs):
+        # Stand in for WorkspaceReviewManager's lock-free Git snapshot. Its
+        # post-snapshot writer CAS must reject a terminalized Harness Run.
+        snapshot_started.set()
+        await release_snapshot.wait()
+        async with db_factory() as db:
+            current = await db.get(RunModel, run_id)
+        assert current is not None
+        if current.status in {"completed", "failed", "cancelled", "stale"}:
+            raise HarnessError(
+                "Harness Run ended while the workspace snapshot was running"
+            )
+        late_workspace_start.set()
+        return SimpleNamespace(id="late-workspace-run")
+
+    monkeypatch.setattr(service, "_start_workspace_review", slow_workspace_start)
+    start = asyncio.create_task(
+        service.start_task_run(
+            task_id=owner_id,
+            owner_identity=identity,
+            spec=HarnessSpec(
+                target_kind="current_workspace",
+                target={},
+                goal="Verify cancellation remains responsive during snapshot",
+            ),
+        )
+    )
+    snapshot_waiter = asyncio.create_task(snapshot_started.wait())
+    done, _ = await asyncio.wait(
+        {start, snapshot_waiter},
+        timeout=5,
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    if start in done:
+        snapshot_waiter.cancel()
+        await asyncio.gather(snapshot_waiter, return_exceptions=True)
+        await start
+        pytest.fail("workspace snapshot adapter was not entered")
+    assert snapshot_waiter in done
+
+    async def stop_owner_generation() -> None:
+        async with service.owner_stop_fence(
+            owner_id,
+            reason="Stop while the workspace snapshot is still running",
+            expected_identity=identity,
+        ):
+            pass
+
+    stop = asyncio.create_task(stop_owner_generation())
+    try:
+        # This times out on the old implementation because start_task_run
+        # retains the same process-local owner fence around the slow adapter.
+        await asyncio.wait_for(asyncio.shield(stop), timeout=1)
+    except BaseException:
+        release_snapshot.set()
+        await asyncio.gather(start, stop, return_exceptions=True)
+        raise
+    release_snapshot.set()
+
+    with pytest.raises(HarnessError, match="snapshot was running"):
+        await start
+    assert late_workspace_start.is_set() is False
+
+    async with db_factory() as db:
+        owner = await db.get(Task, owner_id)
+        run = await db.scalar(
+            select(RunModel).where(RunModel.task_id == owner_id)
+        )
+        workspace_run = await db.scalar(
+            select(WorkspaceReviewRun.id).where(
+                WorkspaceReviewRun.task_id == owner_id
+            )
+        )
+    assert owner is not None
+    assert test_harness_owner_terminal_gate_matches(owner, identity)
+    assert run is not None
+    assert run.status == "cancelled"
+    assert run.cleanup_status == "completed"
+    assert run.workspace_review_run_id is None
+    assert workspace_run is None
+
+
+@pytest.mark.asyncio
+async def test_restart_proves_pre_workspace_materialization_cleanup(
+    db_factory,
+    monkeypatch,
+    tmp_path,
+):
+    from backend.config import settings
+    from backend.services.test_harness_owner_fence import (
+        test_harness_owner_fence,
+        test_harness_owner_identity,
+    )
+
+    monkeypatch.setattr(settings, "auth_token", "manager-test-token")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    preview_config = {
+        "version": 1,
+        "name": "Crash-before-snapshot preview",
+        "setup": [],
+        "processes": [
+            {
+                "name": "web",
+                "command": [
+                    "python",
+                    "-m",
+                    "http.server",
+                    "{preview_port}",
+                ],
+                "cwd": ".",
+            }
+        ],
+        "url": "http://127.0.0.1:{preview_port}/",
+        "health_url": "http://127.0.0.1:{preview_port}/",
+        "startup_timeout_seconds": 10,
+    }
+    async with db_factory() as db:
+        project = Project(
+            name="Crash before Workspace materialization",
+            local_path=str(workspace),
+            status="ready",
+            preview_config=preview_config,
+        )
+        db.add(project)
+        await db.flush()
+        owner = Task(
+            title="Recover a pre-snapshot Harness Run",
+            status="completed",
+            provider="codex",
+            project_id=project.id,
+            last_cwd=str(workspace),
+        )
+        db.add(owner)
+        await db.commit()
+        owner_id = owner.id
+        identity = test_harness_owner_identity(owner)
+
+    class _NoopSandboxManager:
+        async def recover_interrupted(self):
+            return 0
+
+    service = HarnessService(
+        db_factory=db_factory,
+        retention_interval=0,
+        sandbox_manager=_NoopSandboxManager(),
+    )
+    spec = HarnessSpec(
+        target_kind="current_workspace",
+        target={},
+        goal="Recover after admission but before snapshot",
+    ).normalized()
+    async with test_harness_owner_fence(owner_id):
+        run, created, _ = await service._admit_task_run_under_owner_fence(
+            task_id=owner_id,
+            spec=spec,
+            owner_identity=identity,
+        )
+    assert created is True
+    assert run.status == "queued"
+    assert run.workspace_review_run_id is None
+
+    assert await service.recover_interrupted_runs() == 1
+    recovered = await service.get_run(run.id)
+    assert recovered is not None
+    assert recovered["status"] == "failed"
+    assert recovered["stage"] == "interrupted"
+    assert recovered["cleanup_status"] == "completed"
+    assert recovered["cleanup_error"] is None
+    async with db_factory() as db:
+        assert await db.scalar(
+            select(WorkspaceReviewRun.id).where(
+                WorkspaceReviewRun.harness_run_id == run.id
+            )
+        ) is None
+        assert await db.scalar(
+            select(ChildBindingModel.id).where(
+                ChildBindingModel.harness_run_id == run.id
+            )
+        ) is None
+
+
+@pytest.mark.asyncio
 async def test_owner_deleted_after_optimistic_read_cannot_create_orphan_run(
     db_factory,
     monkeypatch,

@@ -395,6 +395,56 @@ async def test_worker_claude_login_spawn_failure_clears_exact_journal(
     assert control.active_login_kind is None
 
 
+async def test_claude_login_reap_does_not_spin_under_anyio_cancellation(
+    monkeypatch,
+):
+    from anyio import CancelScope
+
+    process = _ControlledProcess(pid=424243)
+    wait_started = asyncio.Event()
+    allow_exit = asyncio.Event()
+    wait_calls = 0
+    real_wait = asyncio.wait
+
+    async def delayed_wait():
+        wait_started.set()
+        await allow_exit.wait()
+        process.returncode = -9
+        return -9
+
+    async def counting_wait(*args, **kwargs):
+        nonlocal wait_calls
+        if kwargs.get("timeout") is not None:
+            wait_calls += 1
+        return await real_wait(*args, **kwargs)
+
+    process.wait = AsyncMock(side_effect=delayed_wait)
+    monkeypatch.setattr(pool_api.os, "killpg", MagicMock())
+    monkeypatch.setattr(pool_api.asyncio, "wait", counting_wait)
+
+    async def release_process():
+        await wait_started.wait()
+        await asyncio.sleep(0)
+        allow_exit.set()
+
+    releaser = asyncio.create_task(release_process())
+    try:
+        with CancelScope() as scope:
+            scope.cancel()
+            await pool_api._stop_unfinished_claude_login_process(
+                process,
+                operation="AnyIO cancellation regression",
+            )
+        await releaser
+    finally:
+        if not releaser.done():
+            releaser.cancel()
+            await asyncio.gather(releaser, return_exceptions=True)
+
+    assert process.returncode == -9
+    assert wait_calls == 1
+
+
 @pytest.mark.parametrize("safe_reap", [True, False])
 async def test_worker_claude_watcher_cancellation_reaps_or_stays_fail_closed(
     session_factory,

@@ -1155,6 +1155,79 @@ async def test_worker_heartbeat_retries_transient_failure_without_losing_owner(
 
 
 @pytest.mark.asyncio
+async def test_worker_execution_cancellation_settles_runtime_and_error_receipt(
+    session_factory,
+    monkeypatch,
+):
+    from anyio import CancelScope
+
+    operation_id = "7" * 32
+    async with session_factory() as db:
+        task = Task(title="cancel worker execution safely", status="pending")
+        db.add(task)
+        await db.commit()
+        task_id = task.id
+        payload = _request_payload(task_id, operation_id)
+        await termination.stage_worker_receipt(
+            db,
+            task_id=task_id,
+            operation_id=operation_id,
+            operation="cancel",
+            request_payload=payload,
+            request_digest=termination.canonical_json_digest(payload),
+        )
+
+    scope_holder: dict[str, CancelScope] = {}
+    effect_cancelled = asyncio.Event()
+    error_recorded = asyncio.Event()
+
+    async def slow_effect(_db, _fence):
+        scope_holder["scope"].cancel()
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            effect_cancelled.set()
+            raise
+
+    original_record = termination.record_worker_reconcile_error
+
+    async def record_error(*args, **kwargs):
+        await asyncio.sleep(0)
+        result = await original_record(*args, **kwargs)
+        await asyncio.sleep(0)
+        error_recorded.set()
+        return result
+
+    monkeypatch.setattr(
+        termination,
+        "_execute_owned_worker_receipt",
+        slow_effect,
+    )
+    monkeypatch.setattr(
+        termination,
+        "record_worker_reconcile_error",
+        record_error,
+    )
+
+    async with session_factory() as db:
+        with CancelScope() as scope:
+            scope_holder["scope"] = scope
+            with pytest.raises(asyncio.CancelledError):
+                await termination.execute_worker_receipt(db, operation_id)
+
+    assert effect_cancelled.is_set()
+    assert error_recorded.is_set()
+    async with session_factory() as db:
+        durable = await db.get(
+            termination.WorkerTaskTerminationReceipt,
+            operation_id,
+        )
+    assert durable.status == "executing"
+    assert durable.reconcile_count == 1
+    assert durable.last_error == "Worker termination execution was cancelled"
+
+
+@pytest.mark.asyncio
 async def test_expired_lease_without_takeover_cancels_old_effect(
     session_factory,
     monkeypatch,

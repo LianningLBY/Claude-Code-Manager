@@ -111,6 +111,194 @@ async def test_cancelling_consumer_reaps_live_process():
 
 
 @pytest.mark.asyncio
+async def test_agent_anyio_cancel_finishes_stderr_and_durable_status(
+    db_factory,
+    monkeypatch,
+):
+    from anyio import CancelScope
+
+    async with db_factory() as db:
+        discussion = Discussion(title="cancelled agent finalization")
+        db.add(discussion)
+        await db.flush()
+        agent = DiscussionAgent(
+            discussion_id=discussion.id,
+            role_name="reviewer",
+            system_prompt="review",
+            status="running",
+        )
+        db.add(agent)
+        await db.commit()
+        discussion_id = discussion.id
+        agent_id = agent.id
+
+    scope_holder: dict[str, CancelScope] = {}
+    terminated = asyncio.Event()
+    release_stderr = asyncio.Event()
+    stderr_drained = asyncio.Event()
+
+    class FakeStream:
+        async def read(self):
+            await release_stderr.wait()
+            stderr_drained.set()
+            return b"cancelled safely"
+
+    class FakeStdout:
+        async def readline(self):
+            return b""
+
+    class FakeProcess:
+        pid = 515_201
+        returncode = None
+        stdout = FakeStdout()
+        stderr = FakeStream()
+
+    process = FakeProcess()
+
+    async def create_process(*_args, **_kwargs):
+        scope_holder["scope"].cancel()
+        return process
+
+    async def terminate(target):
+        assert target is process
+        await asyncio.sleep(0)
+        target.returncode = -2
+        terminated.set()
+
+    async def release_reader():
+        await terminated.wait()
+        await asyncio.sleep(0)
+        release_stderr.set()
+
+    service = DiscussionService(db_factory, _Broadcaster())
+    monkeypatch.setattr(
+        discussion_service.asyncio,
+        "create_subprocess_exec",
+        create_process,
+    )
+    monkeypatch.setattr(service, "_terminate_process", terminate)
+    monkeypatch.setattr(
+        service,
+        "_process_tree_alive",
+        lambda target: target.returncode is None,
+    )
+
+    releaser = asyncio.create_task(release_reader())
+    try:
+        with CancelScope() as scope:
+            scope_holder["scope"] = scope
+            with pytest.raises(asyncio.CancelledError):
+                await service._run_and_consume(
+                    agent_id,
+                    discussion_id,
+                    ["fake-agent"],
+                    {},
+                )
+        await releaser
+    finally:
+        release_stderr.set()
+        if not releaser.done():
+            releaser.cancel()
+        await asyncio.gather(releaser, return_exceptions=True)
+
+    assert stderr_drained.is_set()
+    assert process.returncode == -2
+    async with db_factory() as db:
+        durable = await db.get(DiscussionAgent, agent_id)
+    assert durable.status == "idle"
+    assert durable.pid is None
+    assert agent_id not in service._processes
+
+
+@pytest.mark.asyncio
+async def test_facilitator_anyio_cancel_finishes_stderr_finalizer(
+    db_factory,
+    monkeypatch,
+):
+    from anyio import CancelScope
+
+    scope_holder: dict[str, CancelScope] = {}
+    terminated = asyncio.Event()
+    release_stderr = asyncio.Event()
+    stderr_drained = asyncio.Event()
+
+    class FakeStream:
+        async def read(self):
+            await release_stderr.wait()
+            stderr_drained.set()
+            return b"cancelled safely"
+
+    class FakeStdout:
+        async def readline(self):
+            return b""
+
+    class FakeProcess:
+        pid = 515_202
+        returncode = None
+        stdout = FakeStdout()
+        stderr = FakeStream()
+
+    process = FakeProcess()
+
+    async def create_process(*_args, **_kwargs):
+        scope_holder["scope"].cancel()
+        return process
+
+    async def terminate(target):
+        assert target is process
+        await asyncio.sleep(0)
+        target.returncode = -2
+        terminated.set()
+
+    async def release_reader():
+        await terminated.wait()
+        await asyncio.sleep(0)
+        release_stderr.set()
+
+    service = DiscussionService(db_factory, _Broadcaster())
+    service._prepare_claude_security_context = AsyncMock(
+        return_value=(["fake-facilitator"], {}, os.path.abspath(os.sep))
+    )
+    monkeypatch.setattr(
+        discussion_service.asyncio,
+        "create_subprocess_exec",
+        create_process,
+    )
+    monkeypatch.setattr(service, "_terminate_process", terminate)
+    monkeypatch.setattr(
+        service,
+        "_process_tree_alive",
+        lambda target: target.returncode is None,
+    )
+
+    releaser = asyncio.create_task(release_reader())
+    try:
+        with CancelScope() as scope:
+            scope_holder["scope"] = scope
+            with pytest.raises(asyncio.CancelledError):
+                await service._run_facilitator_process(
+                    SimpleNamespace(
+                        id=515_202,
+                        facilitator_model="model",
+                        facilitator_session_id=None,
+                        project_id=None,
+                    ),
+                    "prompt",
+                )
+        await releaser
+    finally:
+        release_stderr.set()
+        if not releaser.done():
+            releaser.cancel()
+        await asyncio.gather(releaser, return_exceptions=True)
+
+    assert stderr_drained.is_set()
+    assert process.returncode == -2
+    assert service._facilitator_processes == {}
+    assert service._facilitator_tasks == set()
+
+
+@pytest.mark.asyncio
 async def test_stderr_is_drained_while_process_is_running():
     service = DiscussionService(lambda: _FakeDb(), _Broadcaster())
     consumer = asyncio.create_task(

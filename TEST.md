@@ -1188,7 +1188,7 @@ cd frontend && npx vitest run src/components/PRReview/FindingActions.test.tsx
 ```bash
 # 生成签名并发送模拟 webhook
 SECRET="<webhook_secret>"
-PAYLOAD='{"action":"opened","pull_request":{"number":1,"title":"Test PR","draft":false,"user":{"login":"user1"},"base":{"ref":"main"},"html_url":"https://github.com/test/repo/pull/1"},"repository":{"full_name":"test/repo"}}'
+PAYLOAD='{"action":"opened","pull_request":{"number":1,"title":"Test PR","draft":false,"user":{"login":"user1"},"base":{"ref":"main","sha":"1111111111111111111111111111111111111111"},"head":{"ref":"test-pr","sha":"2222222222222222222222222222222222222222"},"html_url":"https://github.com/test/repo/pull/1"},"repository":{"full_name":"test/repo"}}'
 SIG=$(echo -n "$PAYLOAD" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print "sha256="$2}')
 
 curl -X POST http://localhost:8000/api/github/webhook \

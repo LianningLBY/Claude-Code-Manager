@@ -170,6 +170,37 @@ async def require_worker_task_incarnation_header(
     return task
 
 
+async def require_worker_control_plane_task_incarnation(
+    request: Request,
+    task_id: int,
+    db,
+    *,
+    write_fence: bool = False,
+):
+    """Fence a plain Manager→Worker Task route to one logical Task.
+
+    The deployment bearer identifies the Manager control plane, not a Task
+    incarnation.  Human/JWT and scoped internal-service requests retain their
+    existing authorization contracts; only a Worker node accepting its broad
+    control-plane credential must also present the exact Task identity.
+    """
+
+    from backend.config import settings
+
+    if not (
+        settings.ccm_node_role == "worker"
+        and getattr(request.state, "auth_type", None)
+        == "worker_control_plane"
+    ):
+        return None
+    return await require_worker_task_incarnation_header(
+        request,
+        task_id,
+        db,
+        write_fence=write_fence,
+    )
+
+
 def require_internal_service(request: Request) -> None:
     """Allow scoped CCM callbacks (and the legacy deployment credential).
 
@@ -756,6 +787,13 @@ async def _task_access_allowed(
 ) -> bool:
     if _internal_task_access_allowed(request, task):
         return True
+    # A scoped child credential is an exact Task/incarnation capability, not
+    # a user identity.  If that identity no longer matches, fail immediately;
+    # it must never fall through to administrator, creator, Project, or share
+    # authorization (and those paths may require a database session that a
+    # rejected callback has no reason to touch).
+    if getattr(request.state, "auth_type", None) == "internal_service":
+        return False
     if is_admin(request):
         # Preserve the existing administrator diagnostics/terminal-review
         # workflow.  The boundary below prevents member grants from turning

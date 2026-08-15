@@ -23,7 +23,6 @@ from backend.models.global_settings import GlobalSettings
 from backend.services.cloudrouter_accounts import is_api_auth_kind
 from backend.services.cancellation import (
     await_task_completion,
-    consume_current_task_cancellation,
 )
 from backend.services.login_runtime import (
     LoginRuntimeError,
@@ -167,33 +166,22 @@ async def _stop_unfinished_claude_login_process(
         asyncio.get_running_loop().time()
         + _CLAUDE_LOGIN_REAP_TIMEOUT_SECONDS
     )
-    while not waiter.done():
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            waiter.cancel()
-            try:
-                await waiter
-            except asyncio.CancelledError:
-                pass
-            raise _ClaudeLoginProcessNotTerminal(
-                f"Claude {operation} wrapper termination timed out"
-            )
-        try:
-            done, _pending = await asyncio.wait({waiter}, timeout=remaining)
-        except asyncio.CancelledError:
-            # Shutdown cancellation cannot interrupt exact process reaping. A
-            # hard kill still leaves the durable Worker-node journal behind.
-            consume_current_task_cancellation()
-            continue
-        if not done:
-            waiter.cancel()
-            try:
-                await waiter
-            except asyncio.CancelledError:
-                pass
-            raise _ClaudeLoginProcessNotTerminal(
-                f"Claude {operation} wrapper termination timed out"
-            )
+    remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+    deadline_wait = asyncio.create_task(
+        asyncio.wait({waiter}, timeout=remaining)
+    )
+    # This cleanup task is intentionally uncancellable: it must finish the
+    # process/journal invariant before its owning watcher can unwind.  The
+    # outer _await_claude_login_cleanup boundary is responsible for reporting
+    # request cancellation after the complete journal finalizer settles.
+    await await_task_completion(deadline_wait)
+    done, _pending = deadline_wait.result()
+    if not done:
+        waiter.cancel()
+        await await_task_completion(waiter)
+        raise _ClaudeLoginProcessNotTerminal(
+            f"Claude {operation} wrapper termination timed out"
+        )
     if waiter.cancelled() or (waiter.exception() and proc.returncode is None):
         raise _ClaudeLoginProcessNotTerminal(
             f"Claude {operation} wrapper wait failed"

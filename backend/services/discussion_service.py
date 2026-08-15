@@ -176,6 +176,37 @@ async def _settle_despite_cancellation(awaitable):
     return await settle_awaitable(awaitable)
 
 
+async def _drain_stderr_task(
+    stderr_task: asyncio.Task[bytes],
+    *,
+    owner: str,
+) -> bytes:
+    """Drain one reaped child's stderr without leaving a reader task behind."""
+
+    if not stderr_task.done():
+        done, _ = await asyncio.wait(
+            {stderr_task},
+            timeout=_STDERR_DRAIN_TIMEOUT,
+        )
+        if not done:
+            stderr_task.cancel()
+            done, _ = await asyncio.wait(
+                {stderr_task},
+                timeout=_STDERR_DRAIN_TIMEOUT,
+            )
+            if not done:
+                raise DiscussionProcessCleanupError(
+                    f"{owner} stderr reader ignored cancellation"
+                )
+    if stderr_task.cancelled():
+        return b""
+    try:
+        return stderr_task.result()
+    except Exception:
+        logger.exception("Failed to drain %s stderr", owner)
+        return b""
+
+
 class DiscussionService:
     def __init__(
         self,
@@ -1299,7 +1330,6 @@ Write in Chinese."""
         self._facilitator_discussions[owner] = discussion_id
         process: asyncio.subprocess.Process | None = None
         stderr_task: asyncio.Task[bytes] | None = None
-        stderr_data = b""
         cancelled: asyncio.CancelledError | None = None
         run_error: BaseException | None = None
         cleanup_error: BaseException | None = None
@@ -1408,43 +1438,85 @@ Write in Chinese."""
                 ):
                     await self._terminate_process(process)
 
-            finish, finish_cancellation = await _settle_despite_cancellation(
-                _finish_process()
+            async def _finalize_facilitator() -> bytes:
+                finalization_error: BaseException | None = None
+                try:
+                    await _finish_process()
+                except BaseException as exc:
+                    finalization_error = exc
+
+                process_reaped = (
+                    process.returncode is not None
+                    and not self._process_tree_alive(process)
+                )
+                if (
+                    process_reaped
+                    and self._facilitator_processes.get(owner) is process
+                ):
+                    self._facilitator_processes.pop(owner, None)
+
+                finalized_stderr = b""
+                if stderr_task is not None:
+                    try:
+                        finalized_stderr = await _drain_stderr_task(
+                            stderr_task,
+                            owner="facilitator",
+                        )
+                    except BaseException as exc:
+                        if finalization_error is None:
+                            finalization_error = exc
+
+                if finalization_error is not None:
+                    raise finalization_error
+
+                if cancelled is None and run_error is None:
+                    if process.returncode != 0:
+                        stderr_text = finalized_stderr.decode(
+                            "utf-8",
+                            errors="replace",
+                        ).strip()
+                        raise RuntimeError(
+                            "Facilitator exited with code "
+                            f"{process.returncode}"
+                            + (
+                                f": {stderr_text[:2000]}"
+                                if stderr_text
+                                else ""
+                            )
+                        )
+                    if captured_session_id:
+                        async with self.db_factory() as db:
+                            await db.execute(
+                                update(Discussion)
+                                .where(Discussion.id == discussion_id)
+                                .values(
+                                    facilitator_session_id=(
+                                        captured_session_id
+                                    )
+                                )
+                            )
+                            await db.commit()
+                        disc.facilitator_session_id = captured_session_id
+
+                    await self.broadcaster.broadcast(
+                        f"discussion:{discussion_id}",
+                        {
+                            "event_type": "facilitator_status",
+                            "status": "done",
+                        },
+                    )
+
+                return finalized_stderr
+
+            finalization, finalization_cancellation = (
+                await _settle_despite_cancellation(_finalize_facilitator())
             )
-            if cancelled is None:
-                cancelled = finish_cancellation
             try:
-                finish.result()
+                finalization.result()
             except BaseException as exc:
                 cleanup_error = exc
-
-            process_reaped = (
-                process.returncode is not None
-                and not self._process_tree_alive(process)
-            )
-            if (
-                process_reaped
-                and self._facilitator_processes.get(owner) is process
-            ):
-                self._facilitator_processes.pop(owner, None)
-
-            if stderr_task is not None:
-                if not stderr_task.done():
-                    try:
-                        stderr_data = await asyncio.wait_for(
-                            asyncio.shield(stderr_task),
-                            timeout=_STDERR_DRAIN_TIMEOUT,
-                        )
-                    except asyncio.TimeoutError:
-                        stderr_task.cancel()
-                    except asyncio.CancelledError as exc:
-                        if cancelled is None:
-                            cancelled = exc
-                if stderr_task.done() and not stderr_task.cancelled():
-                    try:
-                        stderr_data = stderr_task.result()
-                    except Exception:
-                        logger.exception("Failed to drain facilitator stderr")
+            if cancelled is None:
+                cancelled = finalization_cancellation
 
             if cleanup_error is not None:
                 raise cleanup_error
@@ -1452,15 +1524,6 @@ Write in Chinese."""
                 raise cancelled
             if run_error is not None:
                 raise run_error
-            if process.returncode != 0:
-                stderr_text = stderr_data.decode(
-                    "utf-8",
-                    errors="replace",
-                ).strip()
-                raise RuntimeError(
-                    f"Facilitator exited with code {process.returncode}"
-                    + (f": {stderr_text[:2000]}" if stderr_text else "")
-                )
 
         except BaseException as exc:
             if not isinstance(exc, asyncio.CancelledError):
@@ -1486,21 +1549,6 @@ Write in Chinese."""
                     pass
             self._facilitator_tasks.discard(owner)
             self._facilitator_discussions.pop(owner, None)
-
-        if captured_session_id:
-            async with self.db_factory() as db:
-                await db.execute(
-                    update(Discussion)
-                    .where(Discussion.id == discussion_id)
-                    .values(facilitator_session_id=captured_session_id)
-                )
-                await db.commit()
-            disc.facilitator_session_id = captured_session_id
-
-        await self.broadcaster.broadcast(f"discussion:{discussion_id}", {
-            "event_type": "facilitator_status",
-            "status": "done",
-        })
 
         return collected_text
 
@@ -1833,95 +1881,121 @@ Guidelines:
                 ):
                     await self._terminate_process(process)
 
-            reap_task, reap_cancellation = await _settle_despite_cancellation(
-                _finish_process()
-            )
-            if cancelled is None:
-                cancelled = reap_cancellation
-            try:
-                reap_task.result()
-            except BaseException as exc:
-                cleanup_error = exc
+            consumer_owner = asyncio.current_task()
 
-            exit_code = process.returncode
-            process_reaped = (
-                exit_code is not None
-                and not self._process_tree_alive(process)
-            )
-            if process_reaped and self._processes.get(agent_id) is process:
-                self._processes.pop(agent_id, None)
+            async def _finalize_agent() -> tuple[str, bool]:
+                finalization_error: BaseException | None = None
+                try:
+                    await _finish_process()
+                except BaseException as exc:
+                    finalization_error = exc
 
-            stderr_data = b""
-            if stderr_task is not None:
-                if not stderr_task.done():
-                    try:
-                        stderr_data = await asyncio.wait_for(
-                            asyncio.shield(stderr_task),
-                            timeout=_STDERR_DRAIN_TIMEOUT,
-                        )
-                    except asyncio.TimeoutError:
-                        stderr_task.cancel()
-                    except asyncio.CancelledError as exc:
-                        if cancelled is None:
-                            cancelled = exc
-                if stderr_task.done() and not stderr_task.cancelled():
-                    try:
-                        stderr_data = stderr_task.result()
-                    except Exception:
-                        logger.exception(
-                            "Failed to drain stderr for discussion agent %s",
-                            agent_id,
-                        )
-            stderr_text = (
-                stderr_data.decode("utf-8", errors="replace").strip()
-                if stderr_data
-                else ""
-            )
-
-            new_status = (
-                "idle"
+                exit_code = process.returncode
+                process_reaped = (
+                    exit_code is not None
+                    and not self._process_tree_alive(process)
+                )
                 if (
                     process_reaped
-                    and (cancelled is not None or exit_code in (0, -2, 130))
+                    and self._processes.get(agent_id) is process
+                ):
+                    self._processes.pop(agent_id, None)
+
+                stderr_data = b""
+                if stderr_task is not None:
+                    try:
+                        stderr_data = await _drain_stderr_task(
+                            stderr_task,
+                            owner=f"discussion agent {agent_id}",
+                        )
+                    except BaseException as exc:
+                        if finalization_error is None:
+                            finalization_error = exc
+                stderr_text = (
+                    stderr_data.decode("utf-8", errors="replace").strip()
+                    if stderr_data
+                    else ""
                 )
-                else "error"
+
+                new_status = (
+                    "idle"
+                    if (
+                        process_reaped
+                        and (
+                            cancelled is not None
+                            or exit_code in (0, -2, 130)
+                        )
+                    )
+                    else "error"
+                )
+                values: dict[str, object] = {"status": new_status}
+                if process_reaped:
+                    values["pid"] = None
+
+                registered_consumer = self._consumers.get(agent_id)
+                owns_consumer = (
+                    registered_consumer is None
+                    or registered_consumer is consumer_owner
+                )
+                status_published = False
+                if owns_consumer:
+                    async with self.db_factory() as db:
+                        updated = await db.execute(
+                            update(DiscussionAgent)
+                            .where(
+                                DiscussionAgent.id == agent_id,
+                                DiscussionAgent.discussion_id
+                                == discussion_id,
+                                DiscussionAgent.status == "running",
+                            )
+                            .values(**values)
+                        )
+                        await db.commit()
+                    status_published = getattr(updated, "rowcount", 1) == 1
+
+                if status_published:
+                    await self.broadcaster.broadcast(
+                        f"discussion:{discussion_id}:agent:{agent_id}",
+                        {
+                            "event_type": "process_exit",
+                            "agent_id": agent_id,
+                            "exit_code": exit_code,
+                            "stderr": (
+                                stderr_text[:2000] if stderr_text else None
+                            ),
+                        },
+                    )
+                    await self.broadcaster.broadcast(
+                        f"discussion:{discussion_id}",
+                        {
+                            "event_type": "agent_status",
+                            "agent_id": agent_id,
+                            "status": new_status,
+                        },
+                    )
+
+                if finalization_error is not None:
+                    raise finalization_error
+                return new_status, status_published
+
+            finalization, finalization_cancellation = (
+                await _settle_despite_cancellation(_finalize_agent())
             )
-            values: dict[str, object] = {"status": new_status}
-            if process_reaped:
-                values["pid"] = None
-
-            async with self.db_factory() as db:
-                await db.execute(
-                    update(DiscussionAgent)
-                    .where(DiscussionAgent.id == agent_id)
-                    .values(**values)
-                )
-                await db.commit()
-
-            await self.broadcaster.broadcast(
-                f"discussion:{discussion_id}:agent:{agent_id}",
-                {
-                    "event_type": "process_exit",
-                    "agent_id": agent_id,
-                    "exit_code": exit_code,
-                    "stderr": stderr_text[:2000] if stderr_text else None,
-                },
-            )
-            await self.broadcaster.broadcast(f"discussion:{discussion_id}", {
-                "event_type": "agent_status",
-                "agent_id": agent_id,
-                "status": new_status,
-            })
-
-            if new_status == "idle" and cancelled is None:
-                asyncio.get_event_loop().create_task(
-                    self._maybe_auto_advance(discussion_id)
-                )
+            try:
+                new_status, status_published = finalization.result()
+            except BaseException as exc:
+                cleanup_error = exc
+            if cancelled is None:
+                cancelled = finalization_cancellation
 
             if cleanup_error is not None:
                 raise cleanup_error
             if cancelled is not None:
                 raise cancelled
+            if new_status == "idle" and status_published:
+                asyncio.get_event_loop().create_task(
+                    self._maybe_auto_advance(discussion_id)
+                )
         except asyncio.CancelledError as exc:
             if process is None:
                 rollback, _ = await _settle_despite_cancellation(

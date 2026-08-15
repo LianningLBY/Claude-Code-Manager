@@ -23,7 +23,6 @@ from backend.api.deps import require_admin
 from backend.services.codex_app_server import CodexAppServerBusyError
 from backend.services.cancellation import (
     await_task_completion,
-    consume_current_task_cancellation,
 )
 from backend.services.cloudrouter_accounts import is_api_auth_kind
 from backend.services.login_runtime import (
@@ -834,33 +833,21 @@ async def _stop_unfinished_login_process(
             logger.exception("Failed to stop Codex %s wrapper process", operation)
     waiter = asyncio.create_task(proc.wait())
     deadline = asyncio.get_running_loop().time() + LOGIN_REAP_TIMEOUT_SECONDS
-    while not waiter.done():
-        remaining = deadline - asyncio.get_running_loop().time()
-        if remaining <= 0:
-            waiter.cancel()
-            try:
-                await waiter
-            except asyncio.CancelledError:
-                pass
-            raise LoginProcessNotTerminal(
-                f"Codex {operation} wrapper did not terminate after SIGKILL"
-            )
-        try:
-            done, _pending = await asyncio.wait({waiter}, timeout=remaining)
-        except asyncio.CancelledError:
-            # Cleanup itself may be targeted during application shutdown. Keep
-            # waiting; the persistent journal is the fallback for hard kill.
-            consume_current_task_cancellation()
-            continue
-        if not done:
-            waiter.cancel()
-            try:
-                await waiter
-            except asyncio.CancelledError:
-                pass
-            raise LoginProcessNotTerminal(
-                f"Codex {operation} wrapper termination timed out"
-            )
+    remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+    deadline_wait = asyncio.create_task(
+        asyncio.wait({waiter}, timeout=remaining)
+    )
+    # Keep the exact wrapper/journal finalizer uncancellable.  Its outer
+    # _await_login_cleanup boundary re-delivers request cancellation only after
+    # every credential and journal transition has settled.
+    await await_task_completion(deadline_wait)
+    done, _pending = deadline_wait.result()
+    if not done:
+        waiter.cancel()
+        await await_task_completion(waiter)
+        raise LoginProcessNotTerminal(
+            f"Codex {operation} wrapper termination timed out"
+        )
     if waiter.cancelled():
         raise LoginProcessNotTerminal(
             f"Codex {operation} wrapper waiter was cancelled"

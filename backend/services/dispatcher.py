@@ -39,7 +39,11 @@ from backend.models.project import Project
 from backend.models.global_settings import GlobalSettings
 from backend.models.secret import Secret
 from backend.services.git_config import merge_git_config, settings_to_dict
-from backend.services.cancellation import settle_awaitable
+from backend.services.cancellation import (
+    await_task_completion,
+    finish_awaitable,
+    settle_awaitable,
+)
 from backend.services.context_compaction import (
     build_compacted_resume_prompt,
     build_compacted_task_retry_prompt,
@@ -67,6 +71,7 @@ from backend.services.deployment_start_guard import (
 )
 from backend.services.task_queue import (
     TaskQueue,
+    pr_review_dispatch_predicate,
     task_is_pr_review_superseded,
     task_retry_not_superseded_predicate,
     fence_native_execution_principal,
@@ -208,6 +213,70 @@ def _canonical_queue_execution_principal(
         if all(payload[key] == value for key, value in expected.items())
         else None
     )
+
+
+def _worker_handoff_replay_envelope_principal(
+    *,
+    task: Task,
+    receipt: WorkerTurnHandoffReceipt,
+    payload: object,
+    payload_digest: str | None,
+    request_digest: str | None,
+) -> dict[str, object] | None:
+    """Validate immutable Worker handoff authority needed for replay.
+
+    Startup cleanup and volatile-queue recovery must interpret one durable
+    receipt identically.  In particular, neither path may infer a principal
+    or incarnation from Task defaults when the signed queue/request envelope
+    is incomplete.
+    """
+
+    if not isinstance(payload, dict) or not isinstance(
+        receipt.request_payload,
+        dict,
+    ):
+        return None
+    principal = _canonical_queue_execution_principal(payload)
+    expected = payload.get("expected_task_routing")
+    timestamp = payload.get("queue_timestamp")
+    delivery_key = payload.get("delivery_key")
+    from backend.services.task_creation import (
+        TASK_EXECUTION_WORKER_PRINCIPAL_KINDS,
+    )
+
+    valid = bool(
+        receipt.queue_payload_digest == payload_digest
+        and receipt.request_digest == request_digest
+        and payload.get("worker_turn_handoff_id") == receipt.handoff_id
+        and payload.get("source_log_id") == receipt.source_log_id
+        and type(receipt.retry_count) is int
+        and receipt.retry_count >= 0
+        and type(receipt.from_generation) is int
+        and receipt.from_generation >= 0
+        and payload.get("worker_turn_handoff_retry_count")
+        == receipt.retry_count
+        and payload.get("worker_turn_handoff_from_generation")
+        == receipt.from_generation
+        and payload.get("worker_turn_handoff_incarnation_id")
+        == task.incarnation_id
+        and receipt.request_payload.get(
+            "worker_turn_handoff_incarnation_id"
+        )
+        == task.incarnation_id
+        and principal is not None
+        and principal["execution_principal_kind"]
+        in TASK_EXECUTION_WORKER_PRINCIPAL_KINDS
+        and "prompt" in payload
+        and (delivery_key is None or isinstance(delivery_key, str))
+        and isinstance(expected, list)
+        and len(expected) == 3
+        and isinstance(expected[0], str)
+        and (expected[1] is None or isinstance(expected[1], str))
+        and isinstance(expected[2], str)
+        and isinstance(timestamp, (int, float))
+        and not isinstance(timestamp, bool)
+    )
+    return principal if valid else None
 
 class QueuedMessagePrelaunchError(RuntimeError):
     """A queued message launch failed before any managed turn could start."""
@@ -1347,11 +1416,14 @@ class GlobalDispatcher:
             ):
                 return False
         lifecycle.cancel()
-        try:
-            await asyncio.wait_for(
+        operation, cancellation = await settle_awaitable(
+            asyncio.wait_for(
                 asyncio.shield(asyncio.gather(lifecycle, return_exceptions=True)),
                 timeout=AUX_LIFECYCLE_CANCEL_TIMEOUT,
             )
+        )
+        try:
+            operation.result()
         except asyncio.TimeoutError as exc:
             raise RuntimeError(
                 f"Plan Task {task_id} lifecycle ignored cancellation"
@@ -1364,6 +1436,8 @@ class GlobalDispatcher:
             raise RuntimeError(
                 f"Plan Task {task_id} process cleanup could not be confirmed"
             )
+        if cancellation is not None:
+            raise cancellation
         return True
 
     async def stop_plan_run_lifecycle(
@@ -1419,11 +1493,14 @@ class GlobalDispatcher:
             # restart proof therefore belongs to the Capability-only adapter.
             return False
         lifecycle.cancel()
-        try:
-            await asyncio.wait_for(
+        operation, cancellation = await settle_awaitable(
+            asyncio.wait_for(
                 asyncio.shield(asyncio.gather(lifecycle, return_exceptions=True)),
                 timeout=AUX_LIFECYCLE_CANCEL_TIMEOUT,
             )
+        )
+        try:
+            operation.result()
         except asyncio.TimeoutError as exc:
             raise RuntimeError(f"Plan Run {run_id} ignored cancellation") from exc
         from backend.services.plan_agent_runner import active_plan_run_ids
@@ -1432,6 +1509,8 @@ class GlobalDispatcher:
             raise RuntimeError(
                 f"Plan Run {run_id} runtime cleanup could not be confirmed"
             )
+        if cancellation is not None:
+            raise cancellation
         return True
 
     async def stop_capability_plan_run_lifecycle(
@@ -3434,15 +3513,38 @@ class GlobalDispatcher:
                     except (TypeError, ValueError, UnicodeError):
                         queue_digest = None
                         request_digest = None
-                    expected_route = (
-                        queue_payload.get("expected_task_routing")
-                        if isinstance(queue_payload, dict)
-                        else None
+                    payload_principal = (
+                        _worker_handoff_replay_envelope_principal(
+                            task=t,
+                            receipt=handoff,
+                            payload=queue_payload,
+                            payload_digest=queue_digest,
+                            request_digest=request_digest,
+                        )
                     )
-                    queue_timestamp = (
-                        queue_payload.get("queue_timestamp")
-                        if isinstance(queue_payload, dict)
-                        else None
+                    source_principal_matches = bool(
+                        payload_principal is not None
+                        and source is not None
+                        and await self._turn_source_matches_exact_request(
+                            db,
+                            task=t,
+                            source_log_id=handoff.source_log_id,
+                            expected_bound_source_id=source.id,
+                            expected_execution_principal={
+                                "user_id": payload_principal[
+                                    "initiating_user_id"
+                                ],
+                                "role": payload_principal[
+                                    "initiating_user_role"
+                                ],
+                                "mode": payload_principal[
+                                    "execution_mode"
+                                ],
+                                "kind": payload_principal[
+                                    "execution_principal_kind"
+                                ],
+                            },
+                        )
                     )
                     worker_claim_identity_valid = bool(
                         source_is_canonical
@@ -3456,26 +3558,8 @@ class GlobalDispatcher:
                         and handoff_source.task_turn_generation
                         == t.turn_generation
                         and handoff_source.turn_scope == "source"
-                        and isinstance(queue_payload, dict)
-                        and handoff.queue_payload_digest == queue_digest
-                        and handoff.request_digest == request_digest
-                        and queue_payload.get("worker_turn_handoff_id")
-                        == handoff.handoff_id
-                        and queue_payload.get("source_log_id")
-                        == handoff.source_log_id
-                        and queue_payload.get(
-                            "worker_turn_handoff_retry_count"
-                        )
-                        == handoff.retry_count
-                        and queue_payload.get(
-                            "worker_turn_handoff_from_generation"
-                        )
-                        == handoff.from_generation
-                        and "prompt" in queue_payload
-                        and isinstance(expected_route, list)
-                        and len(expected_route) == 3
-                        and isinstance(queue_timestamp, (int, float))
-                        and not isinstance(queue_timestamp, bool)
+                        and payload_principal is not None
+                        and source_principal_matches
                     )
                     worker_claim_crossed_transport = bool(
                         worker_claim_identity_valid
@@ -5653,6 +5737,7 @@ class GlobalDispatcher:
                     .is_not(True),
                     task_retry_not_superseded_predicate(),
                     no_active_worker_task_termination_predicate(),
+                    pr_review_dispatch_predicate(),
                 )
             )
             worker_tasks = list(result.scalars().all())
@@ -5828,6 +5913,7 @@ class GlobalDispatcher:
                             task_retry_not_superseded_predicate(),
                             *target_repo_guard_predicates,
                             no_active_worker_task_termination_predicate(),
+                            pr_review_dispatch_predicate(),
                         )
                         .values(status=Task.status)
                     )
@@ -5948,6 +6034,7 @@ class GlobalDispatcher:
                             task_retry_not_superseded_predicate(),
                             *target_repo_guard_predicates,
                             no_active_worker_task_termination_predicate(),
+                            pr_review_dispatch_predicate(),
                         )
                         .values(**claim_values)
                     )
@@ -6048,9 +6135,14 @@ class GlobalDispatcher:
                             task.id,
                         )
 
-                await asyncio.shield(quarantine_uncertain_forward())
+                quarantine, quarantine_cancellation = await settle_awaitable(
+                    quarantine_uncertain_forward()
+                )
+                quarantine.result()
                 if e.cancellation is not None:
                     raise e.cancellation
+                if quarantine_cancellation is not None:
+                    raise quarantine_cancellation
                 return
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -14858,19 +14950,9 @@ Do NOT create a new PR. Push fixes to the existing branch."""
         delivered.
         """
 
-        spawn_task = asyncio.create_task(
+        spawn_task, delayed_cancellation = await settle_awaitable(
             asyncio.create_subprocess_exec(*cmd, **spawn_kwargs)
         )
-        delayed_cancellation: asyncio.CancelledError | None = None
-        while not spawn_task.done():
-            try:
-                await asyncio.shield(spawn_task)
-            except asyncio.CancelledError as exc:
-                if spawn_task.done():
-                    break
-                delayed_cancellation = exc
-            except Exception:
-                break
 
         try:
             process = spawn_task.result()
@@ -14927,16 +15009,7 @@ Do NOT create a new PR. Push fixes to the existing branch."""
                     )
                 await asyncio.sleep(min(0.05, remaining))
 
-        operation = asyncio.create_task(terminate())
-        cancellation: asyncio.CancelledError | None = None
-        while not operation.done():
-            try:
-                await asyncio.shield(operation)
-            except asyncio.CancelledError as exc:
-                cancellation = exc
-        operation.result()
-        if cancellation is not None:
-            raise cancellation
+        await finish_awaitable(terminate())
 
     async def _stop_aux_session(
         self,
@@ -18389,22 +18462,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
 
         current = asyncio.current_task()
         old_worker.cancel()
-        delayed_cancellation: asyncio.CancelledError | None = None
-        while not old_worker.done():
-            try:
-                await asyncio.shield(old_worker)
-            except asyncio.CancelledError as exc:
-                if old_worker.done():
-                    # The shield is surfacing the old worker's expected
-                    # cancellation, not cancellation of this handoff.
-                    break
-                # abort_task_queue/shutdown may cancel this handoff too.  Keep
-                # waiting for the old consumer's reservation/process cleanup,
-                # then deliver cancellation without spawning a replacement.
-                delayed_cancellation = exc
-            except BaseException:
-                break
-        await asyncio.gather(old_worker, return_exceptions=True)
+        delayed_cancellation = await await_task_completion(old_worker)
+        # Retrieve the terminal result synchronously so no cancelled AnyIO
+        # scope can interrupt the ownership handoff after the old worker has
+        # settled. Its failure is not the replacement task's public outcome.
+        try:
+            old_worker.result()
+        except BaseException:
+            pass
 
         cancellation_requested = bool(
             delayed_cancellation is not None
@@ -18705,7 +18770,6 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             ):
                 return False
             payload = receipt.queue_payload
-            payload_principal = _canonical_queue_execution_principal(payload)
             try:
                 payload_digest = (
                     _durable_json_digest(payload)
@@ -18720,26 +18784,14 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
             except (TypeError, ValueError, UnicodeError):
                 payload_digest = None
                 request_digest = None
-            payload_identity_valid = bool(
-                isinstance(payload, dict)
-                and receipt.queue_payload_digest == payload_digest
-                and receipt.request_digest == request_digest
-                and payload.get("worker_turn_handoff_id") == handoff_id
-                and payload.get("source_log_id") == source_log_id
-                and type(receipt.retry_count) is int
-                and type(receipt.from_generation) is int
-                and payload.get("worker_turn_handoff_retry_count")
-                == receipt.retry_count
-                and payload.get("worker_turn_handoff_from_generation")
-                == receipt.from_generation
-                and payload.get("worker_turn_handoff_incarnation_id")
-                == task.incarnation_id
-                and isinstance(receipt.request_payload, dict)
-                and receipt.request_payload.get(
-                    "worker_turn_handoff_incarnation_id"
-                )
-                == task.incarnation_id
+            payload_principal = _worker_handoff_replay_envelope_principal(
+                task=task,
+                receipt=receipt,
+                payload=payload,
+                payload_digest=payload_digest,
+                request_digest=request_digest,
             )
+            payload_identity_valid = payload_principal is not None
             claimed_generation = receipt.claimed_turn_generation
             if receipt.status == "accepted":
                 valid_generation = bool(
@@ -18793,9 +18845,6 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 if payload_identity_valid and isinstance(payload, dict)
                 else None
             )
-            delivery_key_valid = delivery_key is None or isinstance(
-                delivery_key, str
-            )
             expected = (
                 payload.get("expected_task_routing")
                 if payload_identity_valid and isinstance(payload, dict)
@@ -18806,23 +18855,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 if payload_identity_valid and isinstance(payload, dict)
                 else None
             )
-            from backend.services.task_creation import (
-                TASK_EXECUTION_WORKER_PRINCIPAL_KINDS,
-            )
-
-            payload_replayable = bool(
-                payload_identity_valid
-                and isinstance(payload, dict)
-                and payload_principal is not None
-                and payload_principal["execution_principal_kind"]
-                in TASK_EXECUTION_WORKER_PRINCIPAL_KINDS
-                and "prompt" in payload
-                and delivery_key_valid
-                and isinstance(expected, list)
-                and len(expected) == 3
-                and isinstance(timestamp, (int, float))
-                and not isinstance(timestamp, bool)
-            )
+            payload_replayable = payload_identity_valid
             if receipt.status == "claimed":
                 bound_source = await self._canonical_exact_turn_source(db, task)
                 source_matches = bool(

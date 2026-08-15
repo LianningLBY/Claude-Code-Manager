@@ -2,7 +2,9 @@
 import asyncio
 import json
 import threading
+from dataclasses import replace
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -2170,6 +2172,15 @@ async def test_worker_sync_response_cannot_borrow_new_manager_generation(
         target_worker_id=None,
         operation_id=f"{task.id:032x}",
     )
+    incarnation_support = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "worker_proxy",
+        SimpleNamespace(
+            require_worker_task_incarnation_support=incarnation_support,
+        ),
+    )
+    request_headers = {}
 
     class Response:
         status_code = 200
@@ -2178,6 +2189,7 @@ async def test_worker_sync_response_cannot_borrow_new_manager_generation(
         def json():
             return {
                 "id": task.id,
+                "incarnation_id": claimed.incarnation_id,
                 "status": "completed",
                 "retry_count": task.retry_count,
                 "turn_generation": task.turn_generation,
@@ -2191,7 +2203,8 @@ async def test_worker_sync_response_cannot_borrow_new_manager_generation(
         async def __aexit__(self, *_args):
             return None
 
-        async def get(self, *_args, **_kwargs):
+        async def get(self, *_args, **kwargs):
+            request_headers.update(kwargs["headers"])
             async with session_factory() as db:
                 await db.execute(
                     update(Task)
@@ -2219,17 +2232,33 @@ async def test_worker_sync_response_cannot_borrow_new_manager_generation(
     assert current.status == "migrating"
     assert current.retry_count == task.retry_count + 1
     assert current.session_id == "old-session"
+    incarnation_support.assert_awaited_once_with(worker)
+    assert request_headers == {
+        "Authorization": f"Bearer {worker.auth_token}",
+        "X-CCM-Task-Incarnation": claimed.incarnation_id,
+    }
 
 
 @pytest.mark.parametrize(
-    "remote_turn_generation",
-    [None, 13],
-    ids=["missing", "different"],
+    ("remote_incarnation", "remote_turn_generation"),
+    [
+        ("claimed", None),
+        ("claimed", 13),
+        (None, 12),
+        ("b" * 32, 12),
+    ],
+    ids=[
+        "missing-turn",
+        "different-turn",
+        "missing-incarnation",
+        "different-incarnation",
+    ],
 )
-async def test_worker_sync_requires_exact_remote_turn_generation(
+async def test_worker_sync_requires_exact_remote_generation(
     db_factory,
     session_factory,
     monkeypatch,
+    remote_incarnation,
     remote_turn_generation,
 ):
     worker = await _mk_worker(session_factory)
@@ -2250,6 +2279,14 @@ async def test_worker_sync_requires_exact_remote_turn_generation(
         target_worker_id=None,
         operation_id=f"{task.id:032x}",
     )
+    incarnation_support = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "worker_proxy",
+        SimpleNamespace(
+            require_worker_task_incarnation_support=incarnation_support,
+        ),
+    )
 
     class Response:
         status_code = 200
@@ -2262,6 +2299,10 @@ async def test_worker_sync_requires_exact_remote_turn_generation(
                 "retry_count": task.retry_count,
                 "session_id": "remote-session",
             }
+            if remote_incarnation == "claimed":
+                payload["incarnation_id"] = claimed.incarnation_id
+            elif remote_incarnation is not None:
+                payload["incarnation_id"] = remote_incarnation
             if remote_turn_generation is not None:
                 payload["turn_generation"] = remote_turn_generation
             return payload
@@ -2294,6 +2335,7 @@ async def test_worker_sync_requires_exact_remote_turn_generation(
     assert current.status == "migrating"
     assert current.turn_generation == 12
     assert current.session_id == "manager-session"
+    incarnation_support.assert_awaited_once_with(worker)
 
 
 async def test_worker_sync_explicit_empty_fields_clear_stale_manager_mirror(
@@ -2321,6 +2363,14 @@ async def test_worker_sync_explicit_empty_fields_clear_stale_manager_mirror(
         target_worker_id=None,
         operation_id=f"{task.id:032x}",
     )
+    incarnation_support = AsyncMock()
+    monkeypatch.setattr(
+        main_module,
+        "worker_proxy",
+        SimpleNamespace(
+            require_worker_task_incarnation_support=incarnation_support,
+        ),
+    )
 
     class Response:
         status_code = 200
@@ -2329,6 +2379,7 @@ async def test_worker_sync_explicit_empty_fields_clear_stale_manager_mirror(
         def json():
             return {
                 "id": task.id,
+                "incarnation_id": claimed.incarnation_id,
                 "status": "completed",
                 "retry_count": task.retry_count,
                 "turn_generation": task.turn_generation,
@@ -2366,6 +2417,92 @@ async def test_worker_sync_explicit_empty_fields_clear_stale_manager_mirror(
         assert current.last_cwd is None
         assert current.target_repo == ""
         assert current.error_message is None
+    incarnation_support.assert_awaited_once_with(worker)
+
+
+async def test_worker_sync_rejects_old_protocol_before_task_get(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+    )
+    migrator = TaskMigrator(
+        db_factory=db_factory,
+        relay=FakeRelay(),
+        broadcaster=None,
+    )
+    claimed = await migrator._claim_migration(
+        migration_task_generation(task),
+        target_worker_id=None,
+        operation_id=f"{task.id:032x}",
+    )
+    incarnation_support = AsyncMock(
+        side_effect=RuntimeError("legacy Worker has no protocol v1"),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "worker_proxy",
+        SimpleNamespace(
+            require_worker_task_incarnation_support=incarnation_support,
+        ),
+    )
+
+    class Client:
+        def __init__(self, **_kwargs):
+            raise AssertionError("Task GET must not reach an old Worker")
+
+    monkeypatch.setattr(task_migrator_module.httpx, "AsyncClient", Client)
+
+    with pytest.raises(MigrationError, match="legacy Worker"):
+        await migrator._sync_task_fields_from_worker(
+            worker,
+            claimed,
+            expected_remote_status="completed",
+        )
+
+    incarnation_support.assert_awaited_once_with(worker)
+
+
+async def test_worker_sync_rejects_legacy_null_incarnation_before_network(
+    db_factory,
+    session_factory,
+    monkeypatch,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="completed",
+    )
+    migrator = TaskMigrator(
+        db_factory=db_factory,
+        relay=FakeRelay(),
+        broadcaster=None,
+    )
+    claimed = await migrator._claim_migration(
+        migration_task_generation(task),
+        target_worker_id=None,
+        operation_id=f"{task.id:032x}",
+    )
+    legacy_claimed = replace(claimed, incarnation_id=None)
+
+    class Client:
+        def __init__(self, **_kwargs):
+            raise AssertionError("legacy Task must fail before network access")
+
+    monkeypatch.setattr(task_migrator_module.httpx, "AsyncClient", Client)
+
+    with pytest.raises(MigrationError, match="incarnation"):
+        await migrator._sync_task_fields_from_worker(
+            worker,
+            legacy_claimed,
+            expected_remote_status="completed",
+        )
 
 
 async def test_worker_task_import_is_one_inert_request(

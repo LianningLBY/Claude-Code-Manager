@@ -17,6 +17,7 @@ def pr_monitor_owned_task_predicate(task_id):
     from backend.models.pr_monitor import (
         PRFindingAction,
         PRFindingRebuttal,
+        PRMonitorTaskTombstone,
         PRReview,
         PRReviewerRun,
     )
@@ -37,6 +38,10 @@ def pr_monitor_owned_task_predicate(task_id):
         select(PRFindingRebuttal.id)
         .where(PRFindingRebuttal.task_id == task_id)
         .correlate_except(PRFindingRebuttal)
+        .exists(),
+        select(PRMonitorTaskTombstone.task_id)
+        .where(PRMonitorTaskTombstone.task_id == task_id)
+        .correlate_except(PRMonitorTaskTombstone)
         .exists(),
     )
 

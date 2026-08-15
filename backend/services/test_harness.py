@@ -31,6 +31,7 @@ from backend.models.test_harness import (
     TestHarnessSandboxLease,
 )
 from backend.models.workspace_review import WorkspaceReviewRun
+from backend.services.cancellation import finish_awaitable, settle_awaitable
 from backend.services.test_harness_contracts import (
     DEFAULT_BROWSER_CHANNEL,
     HARNESS_TERMINAL_STATUSES,
@@ -964,22 +965,28 @@ class TestHarnessService:
         await browser_review_job_manager.cancel(job.id)
 
     async def _cleanup_git_target(self, run_id: str) -> str | None:
-        try:
-            await asyncio.shield(self.sandbox_manager.cleanup(run_id))
-        except BaseException as exc:
-            return _safe_error(exc)
-        async with self.db_factory() as db:
-            lease = await db.scalar(
-                select(TestHarnessSandboxLease).where(
-                    TestHarnessSandboxLease.run_id == run_id
+        async def cleanup_and_verify() -> str | None:
+            cleanup_error: str | None = None
+            try:
+                await self.sandbox_manager.cleanup(run_id)
+            except BaseException as exc:
+                cleanup_error = _safe_error(exc)
+            async with self.db_factory() as db:
+                lease = await db.scalar(
+                    select(TestHarnessSandboxLease).where(
+                        TestHarnessSandboxLease.run_id == run_id
+                    )
                 )
-            )
-        if lease is not None and lease.cleanup_status != "completed":
-            return (
-                lease.cleanup_error
-                or "Sandbox cleanup returned without a durable completion receipt"
-            )
-        return None
+            if cleanup_error is not None:
+                return cleanup_error
+            if lease is not None and lease.cleanup_status != "completed":
+                return (
+                    lease.cleanup_error
+                    or "Sandbox cleanup returned without a durable completion receipt"
+                )
+            return None
+
+        return await finish_awaitable(cleanup_and_verify())
 
     async def _run_git_target_pipeline(self, run_id: str) -> None:
         """Own target preparation, black-box execution and exact cleanup."""
@@ -1205,10 +1212,10 @@ class TestHarnessService:
                 source_key=f"sandbox:terminal:{status}:{cleanup_status}",
             )
         except asyncio.CancelledError:
-            await asyncio.shield(self._stop_git_target_children(job))
-            cleanup_error = await self._cleanup_git_target(run_id)
-            await asyncio.shield(
-                self._update_run(
+            async def cancel_pipeline() -> None:
+                await self._stop_git_target_children(job)
+                cleanup_error = await self._cleanup_git_target(run_id)
+                await self._update_run(
                     run_id,
                     values={
                         "status": "cancelled",
@@ -1225,7 +1232,9 @@ class TestHarnessService:
                     detail=cleanup_error,
                     source_key="sandbox:cancelled",
                 )
-            )
+
+            operation, _ = await settle_awaitable(cancel_pipeline())
+            operation.result()
             raise
         except Exception as exc:
             logger.exception("Git target Harness pipeline failed run=%s", run_id)

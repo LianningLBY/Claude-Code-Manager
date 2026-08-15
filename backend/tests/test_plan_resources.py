@@ -33,6 +33,7 @@ from backend.services.plan_service import (
     apply_worker_plan_outcome,
     decide_version,
     materialize_execution_task,
+    stage_plan_with_run,
 )
 from backend.tests.group_acl_test_helpers import (
     grant_group_project_access,
@@ -42,6 +43,65 @@ from backend.tests.test_auth_ws_security import (
     _create_user,
     secured_client as secured_client,
 )
+
+
+@pytest.mark.asyncio
+async def test_plan_authorization_cancel_finishes_transaction_rollback_under_anyio():
+    from anyio import CancelScope
+
+    scope_holder: dict[str, CancelScope] = {}
+    rollback_started = asyncio.Event()
+    release_rollback = asyncio.Event()
+    rollback_finished = asyncio.Event()
+
+    class FakeSession:
+        async def rollback(self):
+            rollback_started.set()
+            await release_rollback.wait()
+            rollback_finished.set()
+
+    async def cancel_authorization(_db):
+        scope_holder["scope"].cancel()
+        await asyncio.sleep(0)
+
+    async def release():
+        await rollback_started.wait()
+        await asyncio.sleep(0)
+        release_rollback.set()
+
+    releaser = asyncio.create_task(release())
+    try:
+        with CancelScope() as scope:
+            scope_holder["scope"] = scope
+            with pytest.raises(asyncio.CancelledError):
+                await stage_plan_with_run(
+                    FakeSession(),
+                    title="cancelled Plan authorization",
+                    initial_request="rollback before materialization",
+                    attachments=None,
+                    target_task_id=None,
+                    project_id=None,
+                    target_repo=None,
+                    target_branch=None,
+                    worker_id=None,
+                    priority=0,
+                    timeout_hours=None,
+                    created_by=None,
+                    pipeline_config={},
+                    context_session_id=None,
+                    context_log_id=None,
+                    context_snapshot=None,
+                    repo_revision=None,
+                    authorize_effect_boundary=cancel_authorization,
+                )
+        await releaser
+    finally:
+        release_rollback.set()
+        if not releaser.done():
+            releaser.cancel()
+        await asyncio.gather(releaser, return_exceptions=True)
+
+    assert rollback_finished.is_set()
 
 
 async def _target(client, session_factory) -> Task:

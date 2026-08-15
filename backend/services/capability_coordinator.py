@@ -33,6 +33,7 @@ from backend.services.capability_service import (
     active_execution_for,
     fail_execution,
 )
+from backend.services.cancellation import finish_awaitable
 
 
 logger = logging.getLogger(__name__)
@@ -130,43 +131,36 @@ class CapabilityCoordinator:
     async def shutdown(self) -> None:
         """Stop new admissions and await every callback already in flight."""
 
-        async with self._lifecycle_lock:
-            self._stop_event.set()
-            self._wake_event.set()
-            runner = self._runner
-
-        cancellation: asyncio.CancelledError | None = None
-        try:
-            if runner is not None:
-                # Shielding matters here: cancelling ASGI lifespan teardown
-                # must not propagate into an executor halfway through stopping
-                # its external process.
-                try:
-                    await asyncio.shield(runner)
-                except asyncio.CancelledError as exc:
-                    cancellation = exc
-                    await asyncio.shield(runner)
-
-            while True:
-                async with self._dispatch_lock:
-                    callbacks = tuple(
-                        callback
-                        for callback in self._inflight.values()
-                        if not callback.done()
-                    )
-                if not callbacks:
-                    break
-                try:
-                    await self._await_callbacks(callbacks)
-                except asyncio.CancelledError as exc:
-                    cancellation = cancellation or exc
-        finally:
+        async def settle() -> None:
             async with self._lifecycle_lock:
-                if self._runner is runner:
-                    self._runner = None
-        if cancellation is not None:
-            raise cancellation
-        logger.info("CapabilityCoordinator stopped")
+                self._stop_event.set()
+                self._wake_event.set()
+                runner = self._runner
+
+            try:
+                if runner is not None:
+                    await runner
+
+                while True:
+                    async with self._dispatch_lock:
+                        callbacks = tuple(
+                            callback
+                            for callback in self._inflight.values()
+                            if not callback.done()
+                        )
+                    if not callbacks:
+                        break
+                    await self._await_callbacks(callbacks)
+            finally:
+                async with self._lifecycle_lock:
+                    if self._runner is runner:
+                        self._runner = None
+            logger.info("CapabilityCoordinator stopped")
+
+        # Protect the complete shutdown graph, including the locks acquired
+        # after the runner exits.  Shielding only the runner would let AnyIO
+        # level cancellation interrupt the next lock checkpoint.
+        await finish_awaitable(settle())
 
     async def _run_loop(self) -> None:
         try:
@@ -235,11 +229,7 @@ class CapabilityCoordinator:
         """Delay caller cancellation until executor callbacks have settled."""
 
         waiter = asyncio.gather(*callbacks, return_exceptions=True)
-        try:
-            await asyncio.shield(waiter)
-        except asyncio.CancelledError:
-            await asyncio.shield(waiter)
-            raise
+        await finish_awaitable(waiter)
 
     async def _scan_invocation_ids(
         self,

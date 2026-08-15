@@ -24,6 +24,7 @@ from backend.models.pr_monitor import (
     PRReview,
 )
 from backend.models.task import Task
+from backend.services.cancellation import finish_awaitable
 from backend.services.task_creation import system_task_execution_principal_values
 from backend.services.worker_task_termination import (
     no_active_worker_task_termination_predicate,
@@ -1174,11 +1175,7 @@ async def _stop_resolution_lease_renewal(
     renewal_task: asyncio.Task,
 ) -> None:
     stop.set()
-    try:
-        await asyncio.shield(renewal_task)
-    except asyncio.CancelledError:
-        renewal_task.cancel()
-        raise
+    await finish_awaitable(renewal_task)
 
 
 async def _claim_fixed_resolution(

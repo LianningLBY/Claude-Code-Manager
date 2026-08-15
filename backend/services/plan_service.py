@@ -37,6 +37,7 @@ from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 from backend.models.worker import Worker
+from backend.services.cancellation import settle_awaitable
 from backend.services.task_creation import stage_task_record
 from backend.services.plan_tasks import MAX_ACTIVE_PLANS_PER_TASK
 from backend.services.worker_task_termination import (
@@ -779,7 +780,8 @@ async def stage_plan_with_run(
         try:
             await authorize_effect_boundary(db)
         except BaseException:
-            await asyncio.shield(db.rollback())
+            operation, _ = await settle_awaitable(db.rollback())
+            operation.result()
             raise
     else:
         # On a Worker the node-control row is the outermost producer fence.
@@ -804,7 +806,8 @@ async def stage_plan_with_run(
             # can never publish a Plan/Run pair from stale routing data.
             await authorize_locked_creation(db)
         except BaseException:
-            await asyncio.shield(db.rollback())
+            operation, _ = await settle_awaitable(db.rollback())
+            operation.result()
             raise
     if target_task_id is not None:
         # The target Task write fence above serializes this COUNT -> INSERT
@@ -985,7 +988,8 @@ async def create_plan_run(
         try:
             await authorize_effect_boundary(db)
         except BaseException:
-            await asyncio.shield(db.rollback())
+            operation, _ = await settle_awaitable(db.rollback())
+            operation.result()
             raise
     else:
         await fence_worker_node_mutation(db)
@@ -1078,7 +1082,8 @@ async def create_plan_run(
         elif source_run_id is not None:
             raise HTTPException(422, "source_run_id is only valid for retry")
     except BaseException:
-        await asyncio.shield(db.rollback())
+        operation, _ = await settle_awaitable(db.rollback())
+        operation.result()
         raise
 
     now = datetime.utcnow()
@@ -1832,7 +1837,8 @@ async def materialize_execution_task(
             try:
                 await authorize_effect_boundary(db)
             except BaseException:
-                await asyncio.shield(db.rollback())
+                operation, _ = await settle_awaitable(db.rollback())
+                operation.result()
                 raise
 
         # All Plan admission paths keep Worker before Plan.  Taking the Worker
@@ -1884,7 +1890,8 @@ async def materialize_execution_task(
                     try:
                         await authorize_locked_plan(db, existing_result.plan)
                     except BaseException:
-                        await asyncio.shield(db.rollback())
+                        operation, _ = await settle_awaitable(db.rollback())
+                        operation.result()
                         raise
                 return existing_result
             concurrent_plan = await db.get(
@@ -2048,7 +2055,8 @@ async def materialize_execution_task(
                 try:
                     await authorize_locked_plan(db, existing_result.plan)
                 except BaseException:
-                    await asyncio.shield(db.rollback())
+                    operation, _ = await settle_awaitable(db.rollback())
+                    operation.result()
                     raise
             return existing_result
         except Exception:

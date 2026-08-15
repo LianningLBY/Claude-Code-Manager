@@ -44,6 +44,7 @@ from backend.services.capability_service import (
     _lock_task,
     capability_task_lock,
 )
+from backend.services.cancellation import finish_awaitable
 from backend.services.worker_task_termination import (
     active_worker_task_termination_receipt,
 )
@@ -2053,35 +2054,31 @@ class CapabilityResumeCoordinator:
             logger.info("CapabilityResumeCoordinator started")
 
     async def shutdown(self) -> None:
-        async with self._lifecycle_lock:
-            self._stop_event.set()
-            self._wake_event.set()
-            runner = self._runner
-        cancellation: asyncio.CancelledError | None = None
-        if runner is not None:
+        async def settle() -> None:
+            async with self._lifecycle_lock:
+                self._stop_event.set()
+                self._wake_event.set()
+                runner = self._runner
             try:
-                await asyncio.shield(runner)
-            except asyncio.CancelledError as exc:
-                cancellation = exc
-                await asyncio.shield(runner)
-        while True:
-            async with self._inflight_lock:
-                pending = tuple(
-                    task for task in self._inflight.values() if not task.done()
-                )
-            if not pending:
-                break
-            try:
-                await asyncio.shield(asyncio.gather(*pending))
-            except asyncio.CancelledError as exc:
-                cancellation = cancellation or exc
-                await asyncio.shield(asyncio.gather(*pending))
-        async with self._lifecycle_lock:
-            if self._runner is runner:
-                self._runner = None
-        logger.info("CapabilityResumeCoordinator stopped")
-        if cancellation is not None:
-            raise cancellation
+                if runner is not None:
+                    await runner
+                while True:
+                    async with self._inflight_lock:
+                        pending = tuple(
+                            task
+                            for task in self._inflight.values()
+                            if not task.done()
+                        )
+                    if not pending:
+                        break
+                    await asyncio.gather(*pending)
+            finally:
+                async with self._lifecycle_lock:
+                    if self._runner is runner:
+                        self._runner = None
+            logger.info("CapabilityResumeCoordinator stopped")
+
+        await finish_awaitable(settle())
 
     async def _run_loop(self) -> None:
         try:

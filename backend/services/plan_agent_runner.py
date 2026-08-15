@@ -17,6 +17,10 @@ from typing import Any
 from sqlalchemy import select, update
 
 from backend.config import settings
+from backend.services.cancellation import (
+    await_task_completion,
+    settle_awaitable,
+)
 from backend.models.plan_agent import (
     PlanAgentRun,
     PlanAgentRuntimeReceipt,
@@ -501,19 +505,9 @@ async def _settle_spawn(
 ) -> tuple[asyncio.subprocess.Process, asyncio.CancelledError | None]:
     """Recover the exact child even when cancellation races process spawn."""
 
-    spawn_task = asyncio.create_task(
+    spawn_task, delayed_cancellation = await settle_awaitable(
         asyncio.create_subprocess_exec(*cmd, **spawn_kwargs)
     )
-    delayed_cancellation: asyncio.CancelledError | None = None
-    while not spawn_task.done():
-        try:
-            await asyncio.shield(spawn_task)
-        except asyncio.CancelledError as exc:
-            if spawn_task.done():
-                break
-            delayed_cancellation = exc
-        except Exception:
-            break
     try:
         process = spawn_task.result()
     except BaseException:
@@ -646,23 +640,22 @@ async def _shielded_terminate(
         )
         retained.cleanup_task = cleanup
     cancellation = delayed_cancellation
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-        except Exception:
-            break
+    later_cancellation = await await_task_completion(cleanup)
+    cancellation = cancellation or later_cancellation
     try:
         cleanup.result()
         if (
             retained.runtime_receipt is not None
             and retained.runtime_db_factory is not None
         ):
-            await mark_runtime_cleaned(
-                retained.runtime_db_factory,
-                retained.runtime_receipt,
+            mark_task, mark_cancellation = await settle_awaitable(
+                mark_runtime_cleaned(
+                    retained.runtime_db_factory,
+                    retained.runtime_receipt,
+                )
             )
+            cancellation = cancellation or mark_cancellation
+            mark_task.result()
     except Exception as exc:
         retained.cleanup_task = None
         raise PlanAgentCleanupError(
@@ -763,23 +756,22 @@ async def _shielded_cleanup_codex_turn(
         cleanup = asyncio.create_task(_cleanup_codex_turn(retained))
         retained.cleanup_task = cleanup
     cancellation = delayed_cancellation
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-        except Exception:
-            break
+    later_cancellation = await await_task_completion(cleanup)
+    cancellation = cancellation or later_cancellation
     try:
         cleanup.result()
         if (
             retained.runtime_receipt is not None
             and retained.runtime_db_factory is not None
         ):
-            await mark_runtime_cleaned(
-                retained.runtime_db_factory,
-                retained.runtime_receipt,
+            mark_task, mark_cancellation = await settle_awaitable(
+                mark_runtime_cleaned(
+                    retained.runtime_db_factory,
+                    retained.runtime_receipt,
+                )
             )
+            cancellation = cancellation or mark_cancellation
+            mark_task.result()
     except Exception as exc:
         retained.cleanup_task = None
         raise PlanAgentCleanupError(
@@ -2269,11 +2261,7 @@ class PlanAgentRunner:
                         allow_transport_kill=False,
                     )
                 )
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        continue
+                await await_task_completion(cleanup)
                 if not cleanup.result():
                     raise PlanAgentCleanupError(
                         "Plan Agent runtime cleanup is not durably confirmed",

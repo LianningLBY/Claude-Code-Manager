@@ -435,3 +435,45 @@ async def test_shutdown_waits_for_callback_and_leaves_no_background_task(
     assert coordinator.is_running is False
     assert coordinator._runner is None
     assert coordinator._inflight == {}
+
+
+@pytest.mark.asyncio
+async def test_shutdown_settles_complete_graph_under_anyio_cancellation(
+    db_factory,
+):
+    from anyio import CancelScope
+
+    coordinator = _coordinator(db_factory)
+    runner_started = asyncio.Event()
+    callback_started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def wait_for_release(started: asyncio.Event) -> None:
+        started.set()
+        await release.wait()
+
+    runner = asyncio.create_task(wait_for_release(runner_started))
+    callback = asyncio.create_task(wait_for_release(callback_started))
+    coordinator._runner = runner
+    coordinator._inflight[1] = callback
+
+    async def release_graph() -> None:
+        await runner_started.wait()
+        await callback_started.wait()
+        await asyncio.sleep(0)
+        release.set()
+
+    releaser = asyncio.create_task(release_graph())
+    try:
+        with CancelScope() as scope:
+            scope.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await coordinator.shutdown()
+        await releaser
+    finally:
+        release.set()
+        await asyncio.gather(runner, callback, releaser, return_exceptions=True)
+
+    assert runner.done()
+    assert callback.done()
+    assert coordinator._runner is None

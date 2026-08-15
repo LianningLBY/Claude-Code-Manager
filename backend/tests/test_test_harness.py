@@ -62,6 +62,107 @@ async def _task(db_factory) -> int:
         return task.id
 
 
+class _CompletedSandboxLeaseSession:
+    def __init__(self, verified: asyncio.Event):
+        self.verified = verified
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def scalar(self, _statement):
+        await asyncio.sleep(0)
+        self.verified.set()
+        return SimpleNamespace(cleanup_status="completed", cleanup_error=None)
+
+
+@pytest.mark.asyncio
+async def test_git_target_cleanup_finishes_lease_proof_then_redelivers_anyio_cancel():
+    from anyio import CancelScope
+
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    lease_verified = asyncio.Event()
+
+    class FakeSandboxManager:
+        async def cleanup(self, run_id):
+            assert run_id == "cancelled-git-cleanup"
+            cleanup_started.set()
+            await release_cleanup.wait()
+            cleanup_finished.set()
+
+    service = HarnessService(
+        db_factory=lambda: _CompletedSandboxLeaseSession(lease_verified),
+        sandbox_manager=FakeSandboxManager(),
+        child_service=SimpleNamespace(),
+    )
+
+    async def release():
+        await cleanup_started.wait()
+        await asyncio.sleep(0)
+        release_cleanup.set()
+
+    releaser = asyncio.create_task(release())
+    try:
+        with CancelScope() as scope:
+            scope.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await service._cleanup_git_target("cancelled-git-cleanup")
+        await releaser
+    finally:
+        release_cleanup.set()
+        if not releaser.done():
+            releaser.cancel()
+        await asyncio.gather(releaser, return_exceptions=True)
+
+    assert cleanup_finished.is_set()
+    assert lease_verified.is_set()
+
+
+@pytest.mark.asyncio
+async def test_git_target_pipeline_settles_cancel_cleanup_and_receipt_under_anyio():
+    from anyio import CancelScope
+
+    sandbox_cleaned = asyncio.Event()
+    lease_verified = asyncio.Event()
+    updates: list[dict] = []
+
+    class FakeSandboxManager:
+        async def cleanup(self, run_id):
+            assert run_id == "cancelled-git-pipeline"
+            await asyncio.sleep(0)
+            sandbox_cleaned.set()
+
+    service = HarnessService(
+        db_factory=lambda: _CompletedSandboxLeaseSession(lease_verified),
+        sandbox_manager=FakeSandboxManager(),
+        child_service=SimpleNamespace(),
+    )
+
+    async def update_run(run_id, *, values, **_kwargs):
+        assert run_id == "cancelled-git-pipeline"
+        updates.append(values)
+        await asyncio.sleep(0)
+
+    service._update_run = update_run
+
+    with CancelScope() as scope:
+        scope.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await service._run_git_target_pipeline("cancelled-git-pipeline")
+
+    assert sandbox_cleaned.is_set()
+    assert lease_verified.is_set()
+    assert any(
+        values.get("status") == "cancelled"
+        and values.get("cleanup_status") == "completed"
+        for values in updates
+    )
+
+
 @pytest.mark.asyncio
 async def test_public_harness_projection_redacts_managed_workspace_routes(
     db_factory,

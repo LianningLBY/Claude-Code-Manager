@@ -32,6 +32,7 @@ from backend.models.pr_monitor import (
     PRFindingAction,
     PRFindingRebuttal,
     PRMergeQueueAction,
+    PRMonitorTaskTombstone,
     PRReview,
     PRReviewerRun,
     PRMonitorRun,
@@ -118,6 +119,61 @@ def _pr_repo_write_lock(repo_id: int) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
     locks = _PR_SYNCHRONIZE_LOCKS.setdefault(loop, {})
     return locks.setdefault(repo_id, asyncio.Lock())
+
+
+async def _record_pr_monitor_task_tombstones(
+    db: AsyncSession,
+    task_ids,
+) -> None:
+    """Idempotently preserve internal Task identities in this transaction."""
+
+    canonical_ids = sorted({
+        task_id
+        for task_id in task_ids
+        if isinstance(task_id, int) and not isinstance(task_id, bool)
+    })
+    if not canonical_ids:
+        return
+    values = [{"task_id": task_id} for task_id in canonical_ids]
+    dialect = db.get_bind().dialect.name
+    if dialect == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as dialect_insert
+
+        statement = dialect_insert(PRMonitorTaskTombstone).values(values)
+        await db.execute(statement.on_conflict_do_nothing(
+            index_elements=[PRMonitorTaskTombstone.task_id]
+        ))
+        return
+    if dialect == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as dialect_insert
+
+        statement = dialect_insert(PRMonitorTaskTombstone).values(values)
+        await db.execute(statement.on_conflict_do_nothing(
+            index_elements=[PRMonitorTaskTombstone.task_id]
+        ))
+        return
+    if dialect in {"mysql", "mariadb"}:
+        from sqlalchemy.dialects.mysql import insert as dialect_insert
+
+        statement = dialect_insert(PRMonitorTaskTombstone).values(values)
+        await db.execute(statement.on_duplicate_key_update(
+            task_id=statement.inserted.task_id
+        ))
+        return
+
+    # Keep an explicit fallback for supported SQLAlchemy test dialects.  The
+    # production dialects above use atomic conflict handling.
+    existing_ids = set((await db.execute(
+        select(PRMonitorTaskTombstone.task_id).where(
+            PRMonitorTaskTombstone.task_id.in_(canonical_ids)
+        )
+    )).scalars())
+    db.add_all(
+        PRMonitorTaskTombstone(task_id=task_id)
+        for task_id in canonical_ids
+        if task_id not in existing_ids
+    )
+    await db.flush()
 
 
 async def _delivery_repo_run_reference(
@@ -1174,16 +1230,62 @@ async def delete_repo(repo_id: int, request: Request, db: AsyncSession = Depends
                 )
             )
         if review_ids:
-            run_ids = list((await db.execute(
-                select(PRReviewerRun.id).where(
+            reviewer_task_ids = (await db.execute(
+                select(PRReviewerRun.task_id).where(
                     PRReviewerRun.pr_review_id.in_(review_ids)
                 )
-            )).scalars())
+            )).scalars()
             finding_ids = list((await db.execute(
                 select(PRFinding.id).where(
                     PRFinding.pr_review_id.in_(review_ids)
                 )
             )).scalars())
+            owned_task_ids = {
+                review.task_id
+                for review in reviews
+                if review.task_id is not None
+            }
+            owned_task_ids.update(
+                task_id
+                for task_id in reviewer_task_ids
+                if task_id is not None
+            )
+            rebuttal_owner_predicate = (
+                PRFindingRebuttal.pr_review_id.in_(review_ids)
+            )
+            if finding_ids:
+                rebuttal_owner_predicate = or_(
+                    rebuttal_owner_predicate,
+                    PRFindingRebuttal.finding_id.in_(finding_ids),
+                )
+            rebuttal_task_ids = (await db.execute(
+                select(PRFindingRebuttal.task_id).where(
+                    rebuttal_owner_predicate,
+                    PRFindingRebuttal.task_id.is_not(None),
+                )
+            )).scalars()
+            owned_task_ids.update(rebuttal_task_ids)
+            if finding_ids:
+                action_task_ids = (await db.execute(
+                    select(PRFindingAction.task_id).where(
+                        PRFindingAction.finding_id.in_(finding_ids),
+                        PRFindingAction.task_id.is_not(None),
+                    )
+                )).scalars()
+                owned_task_ids.update(action_task_ids)
+            # Preserve all four owner identities before deleting any owner
+            # row.  The final commit makes tombstones and owner cleanup one
+            # atomic repository-delete transition.
+            await _record_pr_monitor_task_tombstones(db, owned_task_ids)
+            # Legacy rows can disagree in either direction: the direct review
+            # or the Finding can belong to this repository.  Classify and
+            # delete the union before either owner graph is removed, using the
+            # exact same predicate for Task tombstones and cleanup.
+            await db.execute(
+                sa_delete(PRFindingRebuttal).where(
+                    rebuttal_owner_predicate
+                )
+            )
             if finding_ids:
                 # Do not rely on database-level cascades here.  SQLite
                 # deployments may predate foreign_keys=ON, and orphaned
@@ -1192,11 +1294,6 @@ async def delete_repo(repo_id: int, request: Request, db: AsyncSession = Depends
                 await db.execute(
                     sa_delete(PRFindingAction).where(
                         PRFindingAction.finding_id.in_(finding_ids)
-                    )
-                )
-                await db.execute(
-                    sa_delete(PRFindingRebuttal).where(
-                        PRFindingRebuttal.finding_id.in_(finding_ids)
                     )
                 )
                 await db.execute(

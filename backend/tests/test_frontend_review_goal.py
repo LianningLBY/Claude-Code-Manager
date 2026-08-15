@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
@@ -12,6 +13,7 @@ from backend.services.frontend_review_goal import (
     frontend_review_goal_config,
     frontend_review_goal_restore_snapshot,
     frontend_review_goal_terminal_updates,
+    inspect_frontend_review_local_repository,
 )
 
 
@@ -27,6 +29,62 @@ def test_frontend_review_goal_config_is_bounded_and_normalized():
         "profile": "standard",
         "max_iterations": 10,
     }
+
+
+@pytest.mark.asyncio
+async def test_repository_inspection_cancel_reaps_git_process_under_anyio(
+    monkeypatch,
+    tmp_path,
+):
+    from anyio import CancelScope
+
+    scope_holder: dict[str, CancelScope] = {}
+    killed = asyncio.Event()
+    reaped = asyncio.Event()
+
+    class FakeProcess:
+        returncode = None
+        communicate_calls = 0
+
+        async def communicate(self):
+            self.communicate_calls += 1
+            if self.communicate_calls == 1:
+                scope_holder["scope"].cancel()
+                await asyncio.Future()
+            await asyncio.sleep(0)
+            self.returncode = -9
+            reaped.set()
+            return b"", b""
+
+        def kill(self):
+            killed.set()
+
+    process = FakeProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    monkeypatch.setattr(
+        "backend.services.frontend_review_goal.shutil.which",
+        lambda _name: "/usr/bin/git",
+    )
+    monkeypatch.setattr(
+        "backend.services.frontend_review_goal.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    task = Task(last_cwd=str(tmp_path))
+
+    with CancelScope() as scope:
+        scope_holder["scope"] = scope
+        with pytest.raises(asyncio.CancelledError):
+            await inspect_frontend_review_local_repository(
+                task,
+                AsyncMock(),
+            )
+
+    assert killed.is_set()
+    assert reaped.is_set()
+    assert process.communicate_calls == 2
 
 
 def test_frontend_review_goal_condition_and_protocol_require_browser_recheck():

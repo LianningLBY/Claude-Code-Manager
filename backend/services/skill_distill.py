@@ -22,6 +22,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
+from backend.services.cancellation import (
+    await_task_completion,
+    settle_awaitable,
+)
 from backend.services.claude_auth_projection import (
     ClaudeAuthProjectionError,
     apply_claude_auth_projection,
@@ -294,19 +298,9 @@ async def _settle_task_distill_spawn(
 ) -> tuple[object, asyncio.CancelledError | None]:
     """Recover the exact child even when cancellation races process spawn."""
 
-    spawn_task = asyncio.create_task(
+    spawn_task, delayed_cancellation = await settle_awaitable(
         asyncio.create_subprocess_exec(*cmd, **spawn_kwargs)
     )
-    delayed_cancellation: asyncio.CancelledError | None = None
-    while not spawn_task.done():
-        try:
-            await asyncio.shield(spawn_task)
-        except asyncio.CancelledError as exc:
-            if spawn_task.done():
-                break
-            delayed_cancellation = exc
-        except Exception:
-            break
     try:
         process = spawn_task.result()
     except BaseException:
@@ -496,13 +490,8 @@ async def _shielded_terminate_task_distill_process(
             _terminate_task_distill_process(None, communicate_task)
         )
     cancellation = delayed_cancellation
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-        except Exception:
-            break
+    later_cancellation = await await_task_completion(cleanup)
+    cancellation = cancellation or later_cancellation
     try:
         cleanup.result()
     except Exception as exc:

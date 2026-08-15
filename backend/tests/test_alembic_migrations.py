@@ -58,6 +58,7 @@ import backend.models.plan_agent  # noqa: F401
 import backend.models.capability  # noqa: F401
 import backend.models.code_review  # noqa: F401
 import backend.models.delivery  # noqa: F401
+import backend.models.pr_monitor  # noqa: F401
 import backend.models.worker_task_termination  # noqa: F401
 import backend.models.discussion  # noqa: F401
 import backend.models.user_group  # noqa: F401
@@ -107,6 +108,7 @@ WORKER_NODE_DRAIN_REVISION = "f2c8a4e6d1b0"
 TASK_MIGRATION_OPERATION_REVISION = "a3d9b5f7c1e4"
 WORKER_DESTROY_LIFECYCLE_NONCE_REVISION = "b4e1c7d9f203"
 WORKER_RENAME_TAG_OUTBOX_REVISION = "c4a8e2f6b190"
+PR_MONITOR_TASK_TOMBSTONE_REVISION = "e2a4c6f8b1d3"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
@@ -117,7 +119,7 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = WORKER_RENAME_TAG_OUTBOX_REVISION
+CURRENT_HEAD_REVISION = PR_MONITOR_TASK_TOMBSTONE_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -2348,6 +2350,197 @@ class TestWorkerRenameTagOutboxMigration:
         assert downgrade_call.args[1] == {
             "expected_revision": module.revision
         }
+
+
+class TestPRMonitorTaskTombstoneMigration:
+    migration_file = "e2a4c6f8b1d3_add_pr_monitor_task_tombstones.py"
+
+    def test_pristine_upgrade_downgrade_upgrade(self, tmp_path):
+        db_path = str(tmp_path / "pr-monitor-task-tombstones.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_RENAME_TAG_OUTBOX_REVISION,
+        )
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            PR_MONITOR_TASK_TOMBSTONE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        columns = {
+            column["name"]: column
+            for column in inspector.get_columns(
+                "pr_monitor_task_tombstones"
+            )
+        }
+        assert set(columns) == {"task_id", "created_at"}
+        assert columns["task_id"]["nullable"] is False
+        assert columns["created_at"]["nullable"] is False
+        assert inspector.get_pk_constraint(
+            "pr_monitor_task_tombstones"
+        )["constrained_columns"] == ["task_id"]
+        assert inspector.get_foreign_keys(
+            "pr_monitor_task_tombstones"
+        ) == []
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            WORKER_RENAME_TAG_OUTBOX_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert not inspect(engine).has_table("pr_monitor_task_tombstones")
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            PR_MONITOR_TASK_TOMBSTONE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        assert inspect(engine).has_table("pr_monitor_task_tombstones")
+        engine.dispose()
+
+    def test_upgrade_replays_create_before_revision_stamp(self, tmp_path):
+        from backend.models.pr_monitor import PRMonitorTaskTombstone
+
+        db_path = str(tmp_path / "pr-monitor-tombstone-create-crash.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            WORKER_RENAME_TAG_OUTBOX_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        PRMonitorTaskTombstone.__table__.create(engine)
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            PR_MONITOR_TASK_TOMBSTONE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == PR_MONITOR_TASK_TOMBSTONE_REVISION
+        engine.dispose()
+
+    def test_downgrade_replays_drop_before_revision_stamp(self, tmp_path):
+        db_path = str(tmp_path / "pr-monitor-tombstone-drop-crash.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            PR_MONITOR_TASK_TOMBSTONE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE pr_monitor_task_tombstones"))
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            WORKER_RENAME_TAG_OUTBOX_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == WORKER_RENAME_TAG_OUTBOX_REVISION
+        assert not inspect(engine).has_table("pr_monitor_task_tombstones")
+        engine.dispose()
+
+    def test_downgrade_refuses_durable_identity(self, tmp_path):
+        db_path = str(tmp_path / "pr-monitor-tombstone-nonempty.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.upgrade,
+            PR_MONITOR_TASK_TOMBSTONE_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO pr_monitor_task_tombstones (task_id) VALUES (41)"
+            ))
+        engine.dispose()
+
+        with pytest.raises(RuntimeError, match="tombstones exist"):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                WORKER_RENAME_TAG_OUTBOX_REVISION,
+            )
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT task_id FROM pr_monitor_task_tombstones"
+            )).scalar_one() == 41
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == PR_MONITOR_TASK_TOMBSTONE_REVISION
+        engine.dispose()
+
+    def test_model_ddl_is_portable_and_deliberately_fk_free(self):
+        from backend.models.pr_monitor import PRMonitorTaskTombstone
+
+        table = PRMonitorTaskTombstone.__table__
+        assert list(table.primary_key.columns.keys()) == ["task_id"]
+        assert list(table.foreign_keys) == []
+        for dialect in (
+            sqlite.dialect(),
+            postgresql.dialect(),
+            mysql.dialect(),
+        ):
+            ddl = str(CreateTable(table).compile(dialect=dialect)).lower()
+            assert "primary key (task_id)" in ddl
+            assert "created_at" in ddl
+            assert "current_timestamp" in ddl or "now()" in ddl
+            assert "foreign key" not in ddl
+
+    def test_postgresql_offline_upgrade_emits_canonical_table(self):
+        module = _load_revision_migration(
+            self.migration_file,
+            "pr_monitor_tombstone_postgresql_offline_upgrade",
+        )
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with patch.object(module, "op", Operations(context)):
+            module.upgrade()
+
+        ddl = " ".join(output.getvalue().lower().split())
+        assert "create table pr_monitor_task_tombstones" in ddl
+        assert "task_id serial not null" not in ddl
+        assert "primary key (task_id)" in ddl
+        assert "created_at timestamp without time zone default now()" in ddl
+
+    def test_mysql_offline_upgrade_fails_closed(self):
+        module = _load_revision_migration(
+            self.migration_file,
+            "pr_monitor_tombstone_mysql_offline_upgrade",
+        )
+        output = io.StringIO()
+        context = MigrationContext.configure(
+            dialect_name="mysql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with (
+            patch.object(module, "op", Operations(context)),
+            pytest.raises(RuntimeError, match="refuses MySQL/MariaDB"),
+        ):
+            module.upgrade()
+        assert output.getvalue() == ""
 
 
 def _task_migration_values(**overrides):
@@ -7566,6 +7759,7 @@ class TestFreshMigration:
             "ssh_profiles",
             "task_id_allocators",
             "task_migration_operations",
+            "pr_monitor_task_tombstones",
             "task_ssh_grants",
             "task_ssh_effect_receipts",
             "worker_node_controls",
@@ -10227,13 +10421,19 @@ class TestPublishedMigrationHistory:
 
         assert set(script.get_heads()) == {
             DELIVERY_PREVIEW_PROFILES_REVISION,
-            WORKER_RENAME_TAG_OUTBOX_REVISION,
+            PR_MONITOR_TASK_TOMBSTONE_REVISION,
         }
         assert (
             script.get_revision(
                 DELIVERY_PREVIEW_PROFILES_REVISION
             ).down_revision
             == DELIVERY_FRONTEND_REVIEW_REVISION
+        )
+        assert (
+            script.get_revision(
+                PR_MONITOR_TASK_TOMBSTONE_REVISION
+            ).down_revision
+            == WORKER_RENAME_TAG_OUTBOX_REVISION
         )
         assert (
             script.get_revision(

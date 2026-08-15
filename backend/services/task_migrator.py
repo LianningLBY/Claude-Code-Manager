@@ -1897,10 +1897,31 @@ class TaskMigrator:
     ):
         """worker 广播会 pop session_id、last_cwd 只写 worker DB——迁移前必须拉全。"""
         task_id = claimed.task_id
+        incarnation_id = claimed.incarnation_id
+        if (
+            not isinstance(incarnation_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", incarnation_id) is None
+        ):
+            raise MigrationError(
+                "源 Worker task 缺少稳定 incarnation，拒绝迁移旧状态"
+            )
+        from backend.main import worker_proxy
+
+        if worker_proxy is None:
+            raise MigrationError("Worker 代理未初始化")
+        try:
+            await worker_proxy.require_worker_task_incarnation_support(worker)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise MigrationError(str(exc)) from exc
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.get(
                 f"http://{worker.private_ip}:{worker.ccm_port}/api/tasks/{task_id}",
-                headers={"Authorization": f"Bearer {worker.auth_token}"},
+                headers={
+                    "Authorization": f"Bearer {worker.auth_token}",
+                    "X-CCM-Task-Incarnation": incarnation_id,
+                },
             )
             if r.status_code != 200:
                 raise MigrationError(f"从 worker 拉取 task 详情失败: HTTP {r.status_code}")
@@ -1908,6 +1929,7 @@ class TaskMigrator:
         if (
             not isinstance(wt, dict)
             or wt.get("id") != task_id
+            or wt.get("incarnation_id") != incarnation_id
             # Destination imports are deliberately inert ("cancelled") while
             # the Manager mirror restores the pre-migration status.  A later
             # move back must accept that intentional mismatch, but no other

@@ -11,6 +11,7 @@ from sqlalchemy import (
     UniqueConstraint,
     CheckConstraint,
     false,
+    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from backend.database import Base
@@ -51,6 +52,27 @@ class MonitoredRepo(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PRMonitorTaskTombstone(Base):
+    """Durable identity for a PR Monitor Task after its owner graph is deleted."""
+
+    __tablename__ = "pr_monitor_task_tombstones"
+
+    # This intentionally has no foreign key.  The identity must not disappear
+    # when a monitor's owner rows are removed, and must remain safe even while
+    # legacy databases clean up Task rows outside an FK-enabled transaction.
+    task_id: Mapped[int] = mapped_column(
+        Integer,
+        primary_key=True,
+        autoincrement=False,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        server_default=func.now(),
+    )
 
 
 class PRReview(Base):

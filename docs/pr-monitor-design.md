@@ -248,9 +248,11 @@ GitHub head SHA 是二者之间的代码事实边界。
 ### 3.1 Reviewer 输入包
 
 Reviewer 不读取 Worker 本地 checkout。Manager 对同一 captured subject 只注入：冻结 SHA、PR title/body、
-紧凑 changed-file 清单、完整 exact-SHA patch，以及 exact-base Guide Pack。默认 Guide Pack 只有
-`CLAUDE.md`；`PROGRESS.md` 和其他文档必须由 exact-base `.ccm/review-guides.json` 显式按角色授权。
-不会默认抓取或重复注入 changed file 的 base/head 全文：
+紧凑 changed-file 清单、完整 exact-SHA patch，以及可选的 exact-base Guide Pack。Guide Pack 默认
+为空；`CLAUDE.md`、`AGENTS.md`、`PROGRESS.md` 和所有其他仓库文档都必须由 exact-base
+`.ccm/review-guides.json` 显式按角色授权。Manifest 最大 16 KiB，最多声明 6 个文档；每个文档最大
+32 KiB、合计最大 64 KiB，任一超限都在 Reviewer Task 入库前拒绝，绝不截断。滚动升级恢复旧 prepared
+context 时，没有 manifest role map 的隐式文档和 legacy changed-file 全文同样不会重新进入 Prompt：
 
 ```json
 {
@@ -809,7 +811,7 @@ UI detail 以 REST snapshot 为事实来源，WebSocket 只提示刷新。至少
 
 ### Phase R2：AI Review 公开问题闭环
 
-- 注入 exact-SHA 完整 patch、紧凑 changed-file manifest 与显式 Guide Pack；默认不注入 changed-file 全文或 `PROGRESS.md`。
+- 注入 exact-SHA 完整 patch、紧凑 changed-file manifest 与显式 Guide Pack；默认不注入 changed-file 全文或任何仓库 Guide。
 - repo policy 固定 required Guardrails/Lint/Type/Unit/Visual/Security/Boot check identity。
 - 每条 blocking Finding 通过 durable outbox 发布 inline Thread；无效行安全降级但仍保持 blocker。
 - 支持 evidence-based Rebut 和独立 adjudication。

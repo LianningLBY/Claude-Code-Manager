@@ -31,6 +31,7 @@ from backend.models.pr_monitor import (
     PRFindingRebuttal,
 )
 from backend.models.task import Task
+from backend.services.cancellation import settle_awaitable
 from backend.services.delivery_pr_policy import legacy_pr_effect_is_forbidden
 from backend.services.task_creation import (
     stage_task_record,
@@ -1149,19 +1150,17 @@ async def create_fix_task(
         )
     except BaseException as exc:
         message = str(exc) or f"PR fix capture interrupted by {type(exc).__name__}"
-        cleanup = asyncio.create_task(_abort_creation_reservation(
-            db,
-            repo_id=repo_id,
-            action_id=reserved_action_id,
-            finding_id=finding_id,
-            reservation_token=reservation_token,
-            error=message,
-        ))
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await asyncio.shield(cleanup)
-            raise
+        cleanup, _cleanup_cancel = await settle_awaitable(
+            _abort_creation_reservation(
+                db,
+                repo_id=repo_id,
+                action_id=reserved_action_id,
+                finding_id=finding_id,
+                reservation_token=reservation_token,
+                error=message,
+            )
+        )
+        cleanup.result()
         raise
 
     # Network capture and reservation-expiry recovery may have committed and
@@ -1174,22 +1173,20 @@ async def create_fix_task(
         try:
             await effect_authorizer(db, locked_repo)
         except BaseException as exc:
-            cleanup = asyncio.create_task(_abort_creation_reservation(
-                db,
-                repo_id=repo_id,
-                action_id=reserved_action_id,
-                finding_id=finding_id,
-                reservation_token=reservation_token,
-                error=(
-                    "PR fix authorization was revoked before Task creation: "
-                    f"{exc}"
-                ),
-            ))
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                await asyncio.shield(cleanup)
-                raise
+            cleanup, _cleanup_cancel = await settle_awaitable(
+                _abort_creation_reservation(
+                    db,
+                    repo_id=repo_id,
+                    action_id=reserved_action_id,
+                    finding_id=finding_id,
+                    reservation_token=reservation_token,
+                    error=(
+                        "PR fix authorization was revoked before Task creation: "
+                        f"{exc}"
+                    ),
+                )
+            )
+            cleanup.result()
             raise
     locked_review = (
         await db.execute(
@@ -1319,20 +1316,19 @@ async def create_fix_task(
             raise FindingActionConflict("PR fix Task creation ownership changed")
         await db.commit()
     except BaseException as exc:
-        await db.rollback()
-        cleanup = asyncio.create_task(_abort_creation_reservation(
-            db,
-            repo_id=repo_id,
-            action_id=reserved_action_id,
-            finding_id=finding_id,
-            reservation_token=reservation_token,
-            error=f"PR fix Task creation failed: {exc}",
-        ))
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await asyncio.shield(cleanup)
-            raise
+        rollback, _rollback_cancel = await settle_awaitable(db.rollback())
+        rollback.result()
+        cleanup, _cleanup_cancel = await settle_awaitable(
+            _abort_creation_reservation(
+                db,
+                repo_id=repo_id,
+                action_id=reserved_action_id,
+                finding_id=finding_id,
+                reservation_token=reservation_token,
+                error=f"PR fix Task creation failed: {exc}",
+            )
+        )
+        cleanup.result()
         raise
     await db.refresh(action)
     try:
@@ -1363,7 +1359,7 @@ async def _run_git(
 ) -> tuple[bytes, bytes]:
     """Run bounded git argv with cancellation-safe process-group cleanup."""
 
-    spawn = asyncio.create_task(
+    spawn, delayed_cancel = await settle_awaitable(
         asyncio.create_subprocess_exec(
             "git",
             *args,
@@ -1375,17 +1371,12 @@ async def _run_git(
             env=env,
         )
     )
-    delayed_cancel: asyncio.CancelledError | None = None
-    while not spawn.done():
-        try:
-            await asyncio.shield(spawn)
-        except asyncio.CancelledError as exc:
-            delayed_cancel = exc
-        except BaseException:
-            break
     process = spawn.result()
     if delayed_cancel is not None:
-        await asyncio.shield(_stop_git_process(process))
+        cleanup, _cleanup_cancel = await settle_awaitable(
+            _stop_git_process(process)
+        )
+        cleanup.result()
         raise delayed_cancel
 
     communicate = asyncio.create_task(process.communicate(input_bytes))
@@ -1395,10 +1386,16 @@ async def _run_git(
             timeout=timeout,
         )
     except BaseException:
-        await asyncio.shield(_stop_git_process(process))
-        if not communicate.done():
-            communicate.cancel()
-        await asyncio.gather(communicate, return_exceptions=True)
+        async def cleanup_failed_communication() -> None:
+            await _stop_git_process(process)
+            if not communicate.done():
+                communicate.cancel()
+            await asyncio.gather(communicate, return_exceptions=True)
+
+        cleanup, _cleanup_cancel = await settle_awaitable(
+            cleanup_failed_communication()
+        )
+        cleanup.result()
         raise
     if len(stdout) + len(stderr) > 1024 * 1024:
         raise error_type("git validation output exceeds 1 MiB")

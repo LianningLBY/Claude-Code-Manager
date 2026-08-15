@@ -43,6 +43,7 @@ from backend.models.test_harness import (
 )
 from backend.models.workspace_review import WorkspaceReviewRun
 from backend.services.browser_review import BrowserReviewOptions
+from backend.services.cancellation import settle_awaitable
 from backend.services.process_safety import require_safe_process_group_id
 from backend.services.test_harness_children import TestHarnessChildService
 from backend.services.test_harness_contracts import DEFAULT_BROWSER_CHANNEL
@@ -878,10 +879,16 @@ async def _run_argv(
             asyncio.shield(communicate), timeout=timeout
         )
     except BaseException:
-        await _terminate_process(process)
-        if not communicate.done():
-            communicate.cancel()
-        await asyncio.gather(communicate, return_exceptions=True)
+        async def settle_process() -> None:
+            try:
+                await _terminate_process(process)
+            finally:
+                if not communicate.done():
+                    communicate.cancel()
+                await asyncio.gather(communicate, return_exceptions=True)
+
+        operation, _ = await settle_awaitable(settle_process())
+        operation.result()
         raise
     if len(stdout) + len(stderr) > max_output:
         raise WorkspaceReviewError("preview command output exceeded the safety limit")
@@ -1147,7 +1154,8 @@ class WorkspacePreviewManager:
             )
             return handle
         except BaseException:
-            await asyncio.shield(self.stop(run_id))
+            operation, _ = await settle_awaitable(self.stop(run_id))
+            operation.result()
             raise
 
     async def _wait_until_ready(self, handle: PreviewHandle, *, timeout: float) -> None:
@@ -1996,25 +2004,27 @@ class WorkspaceReviewManager:
                     report=report,
                 )
         except asyncio.CancelledError:
-            if child_binding_id:
-                await asyncio.shield(
-                    self.child_service.stop_binding(
+            async def cancel_pipeline() -> None:
+                if child_binding_id:
+                    await self.child_service.stop_binding(
                         child_binding_id,
                         reason="Workspace review pipeline was cancelled",
                     )
-                )
-            elif job_id:
-                from backend.services.browser_review_jobs import (
-                    browser_review_job_manager,
+                elif job_id:
+                    from backend.services.browser_review_jobs import (
+                        browser_review_job_manager,
+                    )
+
+                    await browser_review_job_manager.cancel(job_id)
+                await self._update(
+                    run_id,
+                    status="cancelled",
+                    stage="cancelled",
+                    completed_at=datetime.utcnow(),
                 )
 
-                await asyncio.shield(browser_review_job_manager.cancel(job_id))
-            await self._update(
-                run_id,
-                status="cancelled",
-                stage="cancelled",
-                completed_at=datetime.utcnow(),
-            )
+            operation, _ = await settle_awaitable(cancel_pipeline())
+            operation.result()
             raise
         except Exception as exc:
             logger.exception("Workspace review pipeline failed run=%s", run_id)
@@ -2046,49 +2056,60 @@ class WorkspaceReviewManager:
                 except Exception:
                     logger.exception("Could not fail Browser Review job %s", job_id)
         finally:
-            try:
-                cleanup_confirmed = await asyncio.shield(
-                    self.preview_manager.stop(run_id)
-                )
-                if handle is not None and cleanup_confirmed is False:
-                    raise WorkspaceReviewError(
-                        "Workspace preview handle disappeared before cleanup was proven"
+            pending_exception = sys.exception()
+
+            async def finalize_pipeline() -> None:
+                try:
+                    cleanup_confirmed = await self.preview_manager.stop(run_id)
+                    if handle is not None and cleanup_confirmed is False:
+                        raise WorkspaceReviewError(
+                            "Workspace preview handle disappeared before cleanup "
+                            "was proven"
+                        )
+                except Exception as exc:
+                    await self._update(
+                        run_id,
+                        cleanup_status="failed",
+                        cleanup_error=str(exc)[:4000],
                     )
-            except Exception as exc:
-                await self._update(
-                    run_id,
-                    cleanup_status="failed",
-                    cleanup_error=str(exc)[:4000],
-                )
-            else:
-                await self._update(
-                    run_id, cleanup_status="completed", cleanup_error=None
-                )
-            try:
-                async with async_session() as db:
-                    final_run = await db.get(WorkspaceReviewRun, run_id)
-                if (
-                    final_run is not None
-                    and final_run.status == "failed"
-                    and not final_run.report
-                ):
-                    await self._publish_parent_message(
-                        final_run.task_id,
-                        content=(
-                            "## 当前改动浏览器审查未完成\n\n"
-                            f"- Run: `{run_id}`\n"
-                            f"- Stage: `{final_run.stage}`\n"
-                            f"- Cleanup: `{final_run.cleanup_status}`\n\n"
-                            f"{final_run.error or 'Browser Review failed without an error message.'}"
-                        ),
-                        metadata={
-                            "workspace_review_run_id": run_id,
-                            "failed": True,
-                            "cleanup_status": final_run.cleanup_status,
-                        },
+                else:
+                    await self._update(
+                        run_id,
+                        cleanup_status="completed",
+                        cleanup_error=None,
                     )
-            except Exception:
-                logger.exception("Could not publish workspace review failure")
+                try:
+                    async with async_session() as db:
+                        final_run = await db.get(WorkspaceReviewRun, run_id)
+                    if (
+                        final_run is not None
+                        and final_run.status == "failed"
+                        and not final_run.report
+                    ):
+                        await self._publish_parent_message(
+                            final_run.task_id,
+                            content=(
+                                "## 当前改动浏览器审查未完成\n\n"
+                                f"- Run: `{run_id}`\n"
+                                f"- Stage: `{final_run.stage}`\n"
+                                f"- Cleanup: `{final_run.cleanup_status}`\n\n"
+                                f"{final_run.error or 'Browser Review failed without an error message.'}"
+                            ),
+                            metadata={
+                                "workspace_review_run_id": run_id,
+                                "failed": True,
+                                "cleanup_status": final_run.cleanup_status,
+                            },
+                        )
+                except Exception:
+                    logger.exception("Could not publish workspace review failure")
+
+            operation, delayed_cancellation = await settle_awaitable(
+                finalize_pipeline()
+            )
+            operation.result()
+            if pending_exception is None and delayed_cancellation is not None:
+                raise delayed_cancellation
 
     async def _publish_parent_report(
         self,

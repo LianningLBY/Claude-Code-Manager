@@ -54,7 +54,13 @@ PR_DATA = {
 }
 TREE_SHA = "c" * 40
 CLAUDE_BLOB_SHA = "d" * 40
+CCM_TREE_SHA = "e" * 40
+GUIDANCE_MANIFEST_SHA = "f" * 40
 ACTION_NONCE = "f" * 48
+REVIEW_EVIDENCE_MARKER = (
+    f"<!-- ccm-pr-review-evidence:nonce={ACTION_NONCE} -->"
+)
+LEGACY_REVIEW_EVIDENCE_MARKER = f"CCM review nonce: {ACTION_NONCE}"
 PUBLISHING_STARTED_AT = datetime(2026, 7, 31, 0, 0, 0)
 ACTOR = "ccm-bot"
 
@@ -198,7 +204,7 @@ def _review_response(
     *,
     state="APPROVED",
     head_sha=PR_DATA["head_sha"],
-    body=f"review\n\nCCM review nonce: {ACTION_NONCE}",
+    body=f"review\n\n{REVIEW_EVIDENCE_MARKER}",
 ):
     return {
         "id": 91,
@@ -212,7 +218,7 @@ def _review_response(
 
 def _comment_response(
     *,
-    body=f"comment\n\nCCM review nonce: {ACTION_NONCE}",
+    body=f"comment\n\n{REVIEW_EVIDENCE_MARKER}",
 ):
     return {
         "id": 92,
@@ -264,18 +270,45 @@ def _blob_payload(sha: str, content: bytes) -> dict:
 def _guidance_api_side_effect(
     claude: bytes = b"# Rules\nUse tests.",
 ):
-    entries = [
-        {
+    manifest = json.dumps({
+        "version": 1,
+        "documents": [{
+            "path": "CLAUDE.md",
+            "roles": sorted(pr_review_service._GUIDANCE_ROLES),
+        }],
+    }).encode()
+    return [
+        {"sha": PR_DATA["base_sha"], "tree": {"sha": TREE_SHA}},
+        {"sha": TREE_SHA, "truncated": False, "tree": [
+            {
+                "path": ".ccm",
+                "type": "tree",
+                "mode": "040000",
+                "sha": CCM_TREE_SHA,
+            },
+            {
+                "path": "CLAUDE.md",
+                "type": "blob",
+                "mode": "100644",
+                "sha": CLAUDE_BLOB_SHA,
+                "size": len(claude),
+            },
+        ]},
+        {"sha": CCM_TREE_SHA, "truncated": False, "tree": [{
+            "path": "review-guides.json",
+            "type": "blob",
+            "mode": "100644",
+            "sha": GUIDANCE_MANIFEST_SHA,
+            "size": len(manifest),
+        }]},
+        _blob_payload(GUIDANCE_MANIFEST_SHA, manifest),
+        {"sha": TREE_SHA, "truncated": False, "tree": [{
             "path": "CLAUDE.md",
             "type": "blob",
             "mode": "100644",
             "sha": CLAUDE_BLOB_SHA,
             "size": len(claude),
-        },
-    ]
-    return [
-        {"sha": PR_DATA["base_sha"], "tree": {"sha": TREE_SHA}},
-        {"sha": TREE_SHA, "truncated": False, "tree": entries},
+        }]},
         _blob_payload(CLAUDE_BLOB_SHA, claude),
     ]
 
@@ -289,9 +322,7 @@ def _prepared_context(
         "base_ref": "main",
         "base_sha": PR_DATA["base_sha"],
         "head_sha": PR_DATA["head_sha"],
-        "guidance": guidance or {
-            "CLAUDE.md": None,
-        },
+        "guidance": guidance or {},
         "material": {
             "number": PR_DATA["number"],
             "title": PR_DATA["title"],
@@ -575,6 +606,7 @@ def test_build_review_prompt_injects_verified_documents_as_json():
         "CLAUDE.md": "Rule: use tests.\n`$(never-run)`",
         "PROGRESS.md": "Lesson: keep snapshots pinned.",
         pr_review_service._GUIDANCE_ROLE_MAP_KEY: {
+            "CLAUDE.md": ["principal_engineer"],
             "PROGRESS.md": ["principal_engineer"],
         },
     }
@@ -608,19 +640,22 @@ def test_build_review_prompt_injects_verified_documents_as_json():
     ).hexdigest()
 
 
-def test_build_review_prompt_records_optional_documents_as_absent():
+def test_build_review_prompt_allows_empty_pack_and_ignores_legacy_documents():
     prompt = build_review_prompt(
         _make_repo(auto_merge=True),
         PR_DATA,
-        guidance_documents={"CLAUDE.md": None, "PROGRESS.md": None},
+        guidance_documents={
+            "CLAUDE.md": "LEGACY_IMPLICIT_CLAUDE_SENTINEL",
+            "PROGRESS.md": "LEGACY_IMPLICIT_PROGRESS_SENTINEL",
+        },
     )
-    assert '{"name":"CLAUDE.md","present":false}' in prompt
     injected = prompt.split(
         "<ccm_verified_base_guidance>\n", 1
     )[1].split("\n</ccm_verified_base_guidance>", 1)[0]
-    assert [json.loads(line)["name"] for line in injected.splitlines()] == [
-        "CLAUDE.md",
-    ]
+    assert injected == ""
+    assert "LEGACY_IMPLICIT_CLAUDE_SENTINEL" not in prompt
+    assert "LEGACY_IMPLICIT_PROGRESS_SENTINEL" not in prompt
+    assert "This block may\nbe empty" in prompt
     assert "PR_REVIEW_RESULT: approved_merged" in prompt
 
 
@@ -670,7 +705,7 @@ def test_single_prompt_keeps_the_complete_patch_within_budget():
     prompt = build_review_prompt(
         _make_repo(provider="codex"),
         PR_DATA,
-        guidance_documents={"CLAUDE.md": None},
+        guidance_documents={},
         pr_material=material,
     )
     pr_review_service.validate_review_prompt_budget(
@@ -688,7 +723,7 @@ def test_build_review_prompt_uses_three_lens_evidence_harness():
     prompt = build_review_prompt(
         _make_repo(auto_merge=False),
         PR_DATA,
-        guidance_documents={"CLAUDE.md": None, "PROGRESS.md": None},
+        guidance_documents={},
     )
 
     assert "Principal Engineer — architecture and system fit" in prompt
@@ -744,10 +779,18 @@ async def test_fetch_base_guidance_reads_exact_commit_root_and_blobs():
             PR_DATA["base_sha"],
         )
 
-    assert result == {"CLAUDE.md": "# Rules\nUse tests."}
+    assert result == {
+        "CLAUDE.md": "# Rules\nUse tests.",
+        pr_review_service._GUIDANCE_ROLE_MAP_KEY: {
+            "CLAUDE.md": sorted(pr_review_service._GUIDANCE_ROLES),
+        },
+    }
     assert [call.args[0] for call in api.await_args_list] == [
         f"repos/owner/repo/git/commits/{PR_DATA['base_sha']}",
         f"repos/owner/repo/git/trees/{TREE_SHA}",
+        f"repos/owner/repo/git/trees/{CCM_TREE_SHA}",
+        f"repos/owner/repo/git/blobs/{GUIDANCE_MANIFEST_SHA}",
+        f"repos/owner/repo/git/trees/{TREE_SHA}?recursive=1",
         f"repos/owner/repo/git/blobs/{CLAUDE_BLOB_SHA}",
     ]
     assert api.await_args_list[1].kwargs["max_output_bytes"] == (
@@ -756,13 +799,19 @@ async def test_fetch_base_guidance_reads_exact_commit_root_and_blobs():
 
 
 @pytest.mark.asyncio
-async def test_fetch_base_guidance_accepts_proven_root_absence():
+async def test_fetch_base_guidance_ignores_unmanifested_root_documents():
     api = AsyncMock(side_effect=[
         {"sha": PR_DATA["base_sha"], "tree": {"sha": TREE_SHA}},
         {
             "sha": TREE_SHA,
             "truncated": False,
-            "tree": [{"path": "src", "type": "tree", "mode": "040000"}],
+            "tree": [{
+                "path": "CLAUDE.md",
+                "type": "blob",
+                "mode": "100644",
+                "sha": CLAUDE_BLOB_SHA,
+                "size": 200_000,
+            }],
         },
     ])
     with patch.object(pr_review_service, "_gh_api_json", api):
@@ -770,7 +819,7 @@ async def test_fetch_base_guidance_accepts_proven_root_absence():
             "owner/repo",
             PR_DATA["base_sha"],
         )
-    assert result == {"CLAUDE.md": None}
+    assert result == {}
     assert api.await_count == 2
 
 
@@ -821,8 +870,33 @@ async def test_fetch_base_guidance_rejects_unproven_tree(tree):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["120000", "160000", "040000"])
 async def test_fetch_base_guidance_rejects_symlink_or_non_regular(mode):
+    manifest = json.dumps({
+        "version": 1,
+        "documents": [{
+            "path": "CLAUDE.md",
+            "roles": ["principal_engineer"],
+        }],
+    }).encode()
     api = AsyncMock(side_effect=[
         {"sha": PR_DATA["base_sha"], "tree": {"sha": TREE_SHA}},
+        {
+            "sha": TREE_SHA,
+            "truncated": False,
+            "tree": [{
+                "path": ".ccm",
+                "type": "tree",
+                "mode": "040000",
+                "sha": CCM_TREE_SHA,
+            }],
+        },
+        {"sha": CCM_TREE_SHA, "truncated": False, "tree": [{
+            "path": "review-guides.json",
+            "type": "blob",
+            "mode": "100644",
+            "sha": GUIDANCE_MANIFEST_SHA,
+            "size": len(manifest),
+        }]},
+        _blob_payload(GUIDANCE_MANIFEST_SHA, manifest),
         {
             "sha": TREE_SHA,
             "truncated": False,
@@ -836,7 +910,7 @@ async def test_fetch_base_guidance_rejects_symlink_or_non_regular(mode):
         },
     ])
     with patch.object(pr_review_service, "_gh_api_json", api):
-        with pytest.raises(GhError, match="unsafe root guidance"):
+        with pytest.raises(GhError, match="unsafe review guidance"):
             await pr_review_service._fetch_base_guidance(
                 "owner/repo",
                 PR_DATA["base_sha"],
@@ -882,19 +956,46 @@ def test_decode_guidance_blob_fails_closed(
             name="CLAUDE.md",
             entry=entry,
             blob=blob,
+            max_bytes=pr_review_service._MAX_GUIDANCE_FILE_BYTES,
+        )
+
+
+def test_decode_guidance_manifest_has_an_independent_small_limit():
+    content = b"x" * (pr_review_service._MAX_GUIDANCE_MANIFEST_BYTES + 1)
+    with pytest.raises(GhError, match="oversized"):
+        pr_review_service._decode_guidance_blob(
+            name=pr_review_service._GUIDANCE_MANIFEST_PATH,
+            entry={"sha": GUIDANCE_MANIFEST_SHA, "size": len(content)},
+            blob=_blob_payload(GUIDANCE_MANIFEST_SHA, content),
+            max_bytes=pr_review_service._MAX_GUIDANCE_MANIFEST_BYTES,
         )
 
 
 def test_render_guidance_documents_enforces_combined_limit():
-    each = "x" * (200 * 1024)
+    each = "x" * pr_review_service._MAX_GUIDANCE_FILE_BYTES
     with pytest.raises(ValueError, match="combined"):
         pr_review_service._render_guidance_documents({
-            "CLAUDE.md": each,
-            "docs/review-history.md": each,
+            "docs/one.md": each,
+            "docs/two.md": each,
+            "docs/three.md": each,
             pr_review_service._GUIDANCE_ROLE_MAP_KEY: {
-                "docs/review-history.md": ["senior_engineer"],
+                "docs/one.md": ["senior_engineer"],
+                "docs/two.md": ["senior_engineer"],
+                "docs/three.md": ["senior_engineer"],
             },
         }, role="senior_engineer")
+
+
+def test_render_guidance_documents_enforces_manifest_document_count():
+    role_map = {
+        f"docs/guide-{index}.md": ["qa_engineer"]
+        for index in range(pr_review_service._MAX_GUIDANCE_DOCUMENTS + 1)
+    }
+    with pytest.raises(ValueError, match="role map"):
+        pr_review_service._render_guidance_documents({
+            **{name: "guide" for name in role_map},
+            pr_review_service._GUIDANCE_ROLE_MAP_KEY: role_map,
+        }, role="qa_engineer")
 
 
 def _compare_identity(
@@ -1081,6 +1182,7 @@ async def test_create_pr_review_task_prefetches_guidance_and_freezes_nonce(
         "CLAUDE.md": "Always test.",
         "PROGRESS.md": "Never trust head docs.",
         pr_review_service._GUIDANCE_ROLE_MAP_KEY: {
+            "CLAUDE.md": ["principal_engineer"],
             "PROGRESS.md": ["senior_engineer"],
         },
     }
@@ -1528,11 +1630,50 @@ async def test_gh_api_json_fails_closed(
             await pr_review_service._gh_api_json("repos/owner/repo")
 
 
+def test_review_evidence_marker_is_hidden_from_rendered_human_body():
+    body = pr_review_service._review_body_with_evidence(
+        "Review passed with no blocking findings.",
+        ACTION_NONCE,
+    )
+
+    assert body.endswith(f"\n\n{REVIEW_EVIDENCE_MARKER}")
+    assert LEGACY_REVIEW_EVIDENCE_MARKER not in body
+    # GitHub Markdown does not render HTML comments. The text before the
+    # final comment is therefore the complete human-visible review body.
+    visible_markdown = body.removesuffix(REVIEW_EVIDENCE_MARKER).rstrip()
+    assert visible_markdown == "Review passed with no blocking findings."
+    for internal_protocol in (
+        ACTION_NONCE,
+        "nonce",
+        "PR_REVIEW_",
+        "schema_version",
+        "{",
+        "}",
+    ):
+        assert internal_protocol not in visible_markdown
+
+
+def test_review_evidence_reader_requires_an_exact_final_marker():
+    hidden = f"Readable review.\n\n{REVIEW_EVIDENCE_MARKER}"
+    legacy = f"Readable legacy review.\n\n{LEGACY_REVIEW_EVIDENCE_MARKER}"
+
+    assert pr_review_service._review_body_has_evidence(hidden, ACTION_NONCE)
+    assert pr_review_service._review_body_has_evidence(legacy, ACTION_NONCE)
+    assert not pr_review_service._review_body_has_evidence(
+        f"{hidden}\nvisible trailing text",
+        ACTION_NONCE,
+    )
+    assert not pr_review_service._review_body_has_evidence(
+        f"quoted {REVIEW_EVIDENCE_MARKER} inline",
+        ACTION_NONCE,
+    )
+
+
 @pytest.mark.asyncio
 async def test_publish_changes_review_uses_pinned_commit_nonce_and_json():
     gh_view = AsyncMock(return_value=_snapshot())
     api = AsyncMock(return_value=_comment_response(
-        body=f"Fix the race.\n\nCCM review nonce: {ACTION_NONCE}",
+        body=f"Fix the race.\n\n{REVIEW_EVIDENCE_MARKER}",
     ))
     find_review = AsyncMock(return_value=None)
     find_merge = AsyncMock()
@@ -1564,7 +1705,7 @@ async def test_publish_changes_review_uses_pinned_commit_nonce_and_json():
     assert api.await_args.kwargs == {
         "method": "POST",
         "payload": {
-            "body": f"Fix the race.\n\nCCM review nonce: {ACTION_NONCE}",
+            "body": f"Fix the race.\n\n{REVIEW_EVIDENCE_MARKER}",
             "commit_id": PR_DATA["head_sha"],
             "event": "COMMENT",
         },
@@ -1603,7 +1744,8 @@ async def test_publish_lgtm_creates_non_authorizing_backend_comment():
     payload = api.await_args.kwargs["payload"]
     assert payload["event"] == "COMMENT"
     assert payload["commit_id"] == PR_DATA["head_sha"]
-    assert f"CCM review nonce: {ACTION_NONCE}" in payload["body"]
+    assert REVIEW_EVIDENCE_MARKER in payload["body"]
+    assert LEGACY_REVIEW_EVIDENCE_MARKER not in payload["body"]
     assert "ready to merge" in payload["body"]
     assert PR_DATA["head_sha"] in payload["body"]
     assert "agent body" not in payload["body"]
@@ -1673,7 +1815,8 @@ async def test_publish_finding_comment_does_not_retry_state_change_error():
     assert payload["event"] == "COMMENT"
     assert payload["commit_id"] == PR_DATA["head_sha"]
     assert "blocking findings" in payload["body"]
-    assert f"CCM review nonce: {ACTION_NONCE}" in payload["body"]
+    assert REVIEW_EVIDENCE_MARKER in payload["body"]
+    assert LEGACY_REVIEW_EVIDENCE_MARKER not in payload["body"]
     assert kwargs["ensure_current"].await_count == 1
 
 
@@ -2149,6 +2292,29 @@ async def test_find_review_evidence_accepts_valid_among_forged_markers():
     assert evidence == "APPROVED"
 
 
+@pytest.mark.asyncio
+async def test_find_review_evidence_reads_legacy_visible_marker_for_recovery():
+    legacy = _review_response(
+        body=f"legacy review\n\n{LEGACY_REVIEW_EVIDENCE_MARKER}",
+    )
+    with patch.object(
+        pr_review_service,
+        "_gh_api_value",
+        AsyncMock(return_value=[[legacy]]),
+    ):
+        evidence = await pr_review_service._find_review_evidence(
+            repo_name="owner/repo",
+            pr_number=PR_DATA["number"],
+            head_sha=PR_DATA["head_sha"],
+            result="lgtm_comment",
+            nonce=ACTION_NONCE,
+            actor=ACTOR,
+            publishing_started_at=PUBLISHING_STARTED_AT,
+        )
+
+    assert evidence == "APPROVED"
+
+
 @pytest.mark.parametrize(
     "merge_preferences",
     [
@@ -2414,6 +2580,29 @@ async def test_require_direct_merge_protection_reads_exact_classic_controls():
     rules_read.assert_awaited_once_with(
         "repos/owner/repo/rules/branches/release%2F2026?per_page=1&page=1"
     )
+
+
+@pytest.mark.asyncio
+async def test_trusted_direct_merge_requires_only_exact_actor_permission():
+    permission = _standard_collaborator_permission()
+    json_read = AsyncMock(return_value=permission)
+    rules_read = AsyncMock()
+    with (
+        patch.object(pr_review_service, "_gh_api_json", json_read),
+        patch.object(pr_review_service, "_gh_api_value", rules_read),
+    ):
+        await pr_review_service._require_direct_merge_protection(
+            repo_name="owner/repo",
+            base_ref="main",
+            actor=ACTOR,
+            merge_method="fast-forward",
+            strict_branch_protection=False,
+        )
+
+    json_read.assert_awaited_once_with(
+        f"repos/owner/repo/collaborators/{ACTOR}/permission"
+    )
+    rules_read.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -5327,6 +5516,15 @@ async def test_recover_superseding_intent_creates_replacement_after_cleanup(
     }
     context = _prepared_context()
     context["head_sha"] = replacement["head_sha"]
+    context["guidance"] = {
+        "CLAUDE.md": "LEGACY_RECOVERY_CLAUDE_SENTINEL",
+        "PROGRESS.md": "LEGACY_RECOVERY_PROGRESS_SENTINEL",
+    }
+    context["material"]["changed_file_contents"] = [{
+        "path": "backend/legacy.py",
+        "base": {"content": "LEGACY_RECOVERY_BASE_FILE_SENTINEL"},
+        "head": {"content": "LEGACY_RECOVERY_HEAD_FILE_SENTINEL"},
+    }]
     async with session_factory() as db:
         repo = _make_repo()
         db.add(repo)
@@ -5398,6 +5596,15 @@ async def test_recover_superseding_intent_creates_replacement_after_cleanup(
         assert len(reviews) == 2
         new = next(review for review in reviews if review.id != review_id)
         assert new.status == "reviewing"
+        replacement_task = await db.get(Task, new.task_id)
+        assert replacement_task is not None
+        for sentinel in (
+            "LEGACY_RECOVERY_CLAUDE_SENTINEL",
+            "LEGACY_RECOVERY_PROGRESS_SENTINEL",
+            "LEGACY_RECOVERY_BASE_FILE_SENTINEL",
+            "LEGACY_RECOVERY_HEAD_FILE_SENTINEL",
+        ):
+            assert sentinel not in replacement_task.description
     assert new.head_sha == replacement["head_sha"]
 
 

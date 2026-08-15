@@ -523,6 +523,10 @@ async def test_worker_control_plane_keeps_complete_task_wire(
     assert created_payload["metadata_"]["ccm_user_skill_snapshots"][0][
         "content"
     ].startswith("never expose")
+    control_headers = {
+        **headers,
+        "X-CCM-Task-Incarnation": incarnation_id,
+    }
 
     async with session_factory() as db:
         task = await db.get(Task, task_id)
@@ -534,7 +538,10 @@ async def test_worker_control_plane_keeps_complete_task_wire(
         task.metadata_ = metadata
         await db.commit()
 
-    fetched = await client.get(f"/api/tasks/{task_id}", headers=headers)
+    fetched = await client.get(
+        f"/api/tasks/{task_id}",
+        headers=control_headers,
+    )
     assert fetched.status_code == 200, fetched.text
     assert fetched.json()["metadata_"]["worker_migration_receipt"][
         "nonce"
@@ -542,7 +549,7 @@ async def test_worker_control_plane_keeps_complete_task_wire(
 
     updated = await client.put(
         f"/api/tasks/{task_id}",
-        headers=headers,
+        headers=control_headers,
         json={"title": "worker wire updated"},
     )
     assert updated.status_code == 200, updated.text

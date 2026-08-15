@@ -133,6 +133,62 @@ async def test_sandbox_command_failure_preserves_only_bounded_printable_tail():
 
 
 @pytest.mark.asyncio
+async def test_sandbox_command_reaps_process_under_anyio_cancellation(monkeypatch):
+    from anyio import CancelScope
+
+    reaped = asyncio.Event()
+    terminated = asyncio.Event()
+
+    class FakeOutput:
+        async def read(self, _size):
+            await reaped.wait()
+            return b""
+
+    class FakeProcess:
+        pid = 424_242
+        returncode = None
+        stdout = FakeOutput()
+
+        async def wait(self):
+            await reaped.wait()
+            self.returncode = -15
+            return self.returncode
+
+        def terminate(self):
+            terminated.set()
+            reaped.set()
+
+        def kill(self):
+            terminated.set()
+            reaped.set()
+
+    process = FakeProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    def kill_group(pid, _signal):
+        assert pid == process.pid
+        terminated.set()
+        reaped.set()
+
+    monkeypatch.setattr(
+        sandbox_module.asyncio,
+        "create_subprocess_exec",
+        create_process,
+    )
+    monkeypatch.setattr(sandbox_module.os, "killpg", kill_group)
+
+    with CancelScope() as scope:
+        scope.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await sandbox_module._run_command(["docker", "version"], 30)
+
+    assert terminated.is_set()
+    assert process.returncode == -15
+
+
+@pytest.mark.asyncio
 async def test_docker_sandbox_provision_has_no_host_mount_or_network(monkeypatch):
     run_id = "a" * 32
     lease_id = "b" * 32
@@ -1002,6 +1058,82 @@ async def test_sandbox_manager_cancellation_cleans_reserved_identity(db_factory)
     with pytest.raises(asyncio.CancelledError):
         await manager.provision(run.id)
 
+    async with db_factory() as db:
+        lease = await db.scalar(
+            select(SandboxLeaseModel).where(
+                SandboxLeaseModel.run_id == run.id
+            )
+        )
+    assert lease is not None
+    assert lease.status == "failed"
+    assert lease.cleanup_status == "completed"
+    assert runtime.cleaned == [(run.id, lease.id, lease.lease_nonce)]
+
+
+@pytest.mark.asyncio
+async def test_sandbox_manager_records_empty_cleanup_cancellation_fail_closed(
+    db_factory,
+):
+    run = await _fixed_url_run(db_factory)
+
+    class CancelledCleanupRuntime(_ManagedRuntime):
+        async def cleanup_identity(self, **_identity):
+            raise asyncio.CancelledError()
+
+    runtime = CancelledCleanupRuntime(fail=RuntimeError("provision failed"))
+    manager = SandboxManager(runtime=runtime, db_factory=db_factory)
+
+    with pytest.raises(RuntimeError, match="provision failed"):
+        await manager.provision(run.id)
+
+    async with db_factory() as db:
+        lease = await db.scalar(
+            select(SandboxLeaseModel).where(
+                SandboxLeaseModel.run_id == run.id
+            )
+        )
+    assert lease is not None
+    assert lease.status == "failed"
+    assert lease.cleanup_status == "failed"
+    assert lease.cleanup_error == "CancelledError"
+
+
+@pytest.mark.asyncio
+async def test_sandbox_manager_anyio_cancel_finishes_cleanup_and_failed_receipt(
+    db_factory,
+):
+    from anyio import CancelScope
+
+    run = await _fixed_url_run(db_factory)
+    scope_holder: dict[str, CancelScope] = {}
+    cleanup_finished = asyncio.Event()
+
+    class LevelCancelledRuntime(_ManagedRuntime):
+        async def provision(self, **_identity):
+            scope_holder["scope"].cancel()
+            await asyncio.sleep(0)
+
+        async def cleanup_identity(self, **identity):
+            await asyncio.sleep(0)
+            self.cleaned.append(
+                (
+                    identity["run_id"],
+                    identity["lease_id"],
+                    identity["lease_nonce"],
+                )
+            )
+            cleanup_finished.set()
+            return 1
+
+    runtime = LevelCancelledRuntime()
+    manager = SandboxManager(runtime=runtime, db_factory=db_factory)
+
+    with CancelScope() as scope:
+        scope_holder["scope"] = scope
+        with pytest.raises(asyncio.CancelledError):
+            await manager.provision(run.id)
+
+    assert cleanup_finished.is_set()
     async with db_factory() as db:
         lease = await db.scalar(
             select(SandboxLeaseModel).where(

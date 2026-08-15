@@ -26,6 +26,7 @@ from sqlalchemy import and_, or_, select, update
 
 from backend.config import settings
 from backend.models.worker import Worker
+from backend.services.cancellation import settle_awaitable
 from backend.services.cloud_provider import (
     CloudProvider,
     canonical_cloud_termination_scope,
@@ -765,6 +766,8 @@ class WorkerProvisioner:
 
         require_worker_control_plane_enabled()
         async with self.db_factory() as db:
+            cancellation: asyncio.CancelledError | None = None
+            reconciled_worker: Worker | None = None
             try:
                 locked = await db.execute(
                     update(Worker)
@@ -819,31 +822,32 @@ class WorkerProvisioner:
                 # while this older request was still in flight. Delay caller
                 # cancellation until the provider attempt has actually
                 # settled, keeping the monotonic writer fence intact.
-                effect = asyncio.create_task(
-                    self.cloud.update_instance_tags(
+                async def apply_effect_and_ack() -> Worker:
+                    await self.cloud.update_instance_tags(
                         receipt["cloud_instance_id"],
                         {"Name": receipt["desired_name"]},
                     )
+                    # This attached row is still protected by the same writer
+                    # transaction. Clearing exactly this outbox and committing
+                    # publishes the provider acknowledgement atomically.
+                    worker.rename_tag_outbox = None
+                    await db.commit()
+                    await db.refresh(worker)
+                    return worker
+
+                operation, cancellation = await settle_awaitable(
+                    apply_effect_and_ack()
                 )
-                cancellation: asyncio.CancelledError | None = None
-                while not effect.done():
-                    try:
-                        await asyncio.shield(effect)
-                    except asyncio.CancelledError as exc:
-                        cancellation = exc
-                effect.result()
-                # This attached row is still protected by the same writer
-                # transaction. Clearing exactly this outbox and committing
-                # publishes the provider acknowledgement atomically.
-                worker.rename_tag_outbox = None
-                await db.commit()
-                await db.refresh(worker)
-                if cancellation is not None:
-                    raise cancellation
-                return worker
+                reconciled_worker = operation.result()
             except BaseException:
-                await db.rollback()
+                rollback, _rollback_cancellation = await settle_awaitable(
+                    db.rollback()
+                )
+                rollback.result()
                 raise
+            if cancellation is not None:
+                raise cancellation
+            return reconciled_worker
 
     async def recover_worker_rename_tag_outboxes(self) -> tuple[int, int]:
         """Best-effort startup/health recovery for every pending rename."""

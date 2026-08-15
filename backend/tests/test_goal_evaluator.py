@@ -35,6 +35,14 @@ from backend.services.goal_evaluator import (
 def _stub_claude_zero_tool_preflight(monkeypatch, tmp_path):
     """Unit tests inspect admission args without invoking installed CLIs."""
 
+    # Goal evaluation is an Agent workload and therefore requires an explicit
+    # service-token boundary.  Never inherit this security precondition from
+    # the developer's .env or from mutable state left by an earlier API test.
+    monkeypatch.setattr(
+        goal_evaluator_module.settings,
+        "auth_token",
+        "goal-evaluator-test-token",
+    )
     probe = MagicMock()
     monkeypatch.setattr(
         goal_evaluator_module,
@@ -127,6 +135,33 @@ async def _wait_for_child_pid(path, task: asyncio.Task, timeout: float = 2.0) ->
             raise AssertionError("Evaluator exited before spawning its child")
         await asyncio.sleep(0.01)
     raise AssertionError("Timed out waiting for evaluator child PID")
+
+
+async def _wait_for_event_or_task(
+    event: asyncio.Event,
+    task: asyncio.Task,
+    *,
+    timeout: float = 2.0,
+) -> None:
+    """Wait for a launch event while surfacing an early evaluator failure."""
+
+    event_waiter = asyncio.create_task(event.wait())
+    try:
+        done, _ = await asyncio.wait(
+            {event_waiter, task},
+            timeout=timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if task in done:
+            await task
+            raise AssertionError("Evaluator exited before the expected event")
+        if event_waiter not in done:
+            raise AssertionError("Timed out waiting for evaluator event")
+        await event_waiter
+    finally:
+        if not event_waiter.done():
+            event_waiter.cancel()
+        await asyncio.gather(event_waiter, return_exceptions=True)
 
 
 async def _wait_until_not_running(pid: int, timeout: float = 2.0) -> None:
@@ -331,7 +366,7 @@ async def test_active_claude_runtime_user_matches_exact_canonical_home(
                 config_dir=str(alias_home),
                 task_id=901,
             ))
-            await communicate_started.wait()
+            await _wait_for_event_or_task(communicate_started, evaluation)
 
             expected = ["goal-evaluator:claude:task=901:pid=55101"]
             assert goal_evaluator_runtime_users(

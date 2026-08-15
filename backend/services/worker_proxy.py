@@ -100,6 +100,22 @@ WORKER_DESTROY_TERMINATION_RECEIPT_VERSION = 2
 WORKER_DESTROY_TERMINATION_ACTION = "terminate_instance"
 
 
+def _exact_task_incarnation(task: Task) -> str:
+    """Return one canonical Task incarnation or reject legacy ambiguity."""
+
+    incarnation_id = task.incarnation_id
+    if (
+        not isinstance(incarnation_id, str)
+        or len(incarnation_id) != 32
+        or any(char not in "0123456789abcdef" for char in incarnation_id)
+    ):
+        raise HTTPException(
+            409,
+            "Task has no stable incarnation identity",
+        )
+    return incarnation_id
+
+
 def worker_managed_upload_paths(paths: list[str]) -> list[str]:
     """Map validated Manager uploads into the Worker's own upload root."""
 
@@ -2882,6 +2898,17 @@ class WorkerProxy:
             normalize_user_skill_ids,
         )
 
+        incarnation_id = _exact_task_incarnation(task)
+        try:
+            await self.require_worker_task_incarnation_support(worker)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                409,
+                "Worker must be upgraded before Task Skill synchronization",
+            ) from exc
+
         user_skill_snapshots = await self._user_skill_snapshots(task)
         payload = {
             "enabled_skills": ensure_default_skills(task.enabled_skills),
@@ -2890,10 +2917,12 @@ class WorkerProxy:
             ),
             "user_skill_snapshots": user_skill_snapshots,
         }
+        headers = self._headers(worker)
+        headers["X-CCM-Task-Incarnation"] = incarnation_id
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.put(
                 self._api(worker, f"/api/tasks/{task.id}"),
-                headers=self._headers(worker),
+                headers=headers,
                 json=payload,
             )
             response.raise_for_status()
@@ -2925,8 +2954,10 @@ class WorkerProxy:
         if (
             not isinstance(confirmed, dict)
             or confirmed.get("id") != task.id
+            or confirmed.get("incarnation_id") != incarnation_id
             or confirmed.get("status") != task.status
             or confirmed.get("retry_count") != task.retry_count
+            or confirmed.get("turn_generation") != task.turn_generation
             or confirmed.get("enabled_skills") != payload["enabled_skills"]
             or confirmed.get("selected_user_skills")
             != payload["selected_user_skills"]
@@ -3159,16 +3190,12 @@ class WorkerProxy:
         require_task_incarnation_fence: bool,
     ):
         if self.db_factory is not None:
-            if not task.incarnation_id:
-                raise HTTPException(
-                    409,
-                    "Manager Task has no stable incarnation identity",
-                )
+            incarnation_id = _exact_task_incarnation(task)
             async with self.db_factory() as db:
                 current = await db.scalar(
                     select(Task).where(
                         Task.id == task.id,
-                        Task.incarnation_id == task.incarnation_id,
+                        Task.incarnation_id == incarnation_id,
                         Task.worker_id == task.worker_id,
                     )
                 )
@@ -3504,9 +3531,7 @@ class WorkerProxy:
                 raise ValueError("Worker destroy cleanup headers are incomplete")
             headers.update(destroy_cleanup_headers)
         if task_incarnation_fenced:
-            if not task.incarnation_id:
-                raise HTTPException(409, "Task has no stable incarnation identity")
-            headers["X-CCM-Task-Incarnation"] = task.incarnation_id
+            headers["X-CCM-Task-Incarnation"] = _exact_task_incarnation(task)
         if pr_review_terminal_chat:
             headers[PR_REVIEW_TERMINAL_CHAT_HEADER] = (
                 PR_REVIEW_TERMINAL_CHAT_HEADER_VALUE

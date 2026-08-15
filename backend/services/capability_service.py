@@ -35,6 +35,7 @@ from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 from backend.services.capability_events import broadcast_capability_event
 from backend.services.capability_registry import CAPABILITY_KEY_RE, resolve_capability
+from backend.services.cancellation import finish_awaitable
 from backend.services.worker_task_termination import (
     no_active_worker_task_termination_predicate,
 )
@@ -808,14 +809,9 @@ async def _commit_transition(
 async def _rollback_safely(db: AsyncSession) -> None:
     """Finish rollback even when the caller was cancelled mid-transition."""
 
-    rollback = asyncio.create_task(db.rollback())
-    try:
-        await asyncio.shield(rollback)
-    except asyncio.CancelledError:
-        # A second cancellation must not leave a transaction containing
-        # adapter-owned staged rows open for accidental reuse.
-        await rollback
-        raise
+    # A second cancellation must not leave a transaction containing
+    # adapter-owned staged rows open for accidental reuse.
+    await finish_awaitable(db.rollback())
 
 
 async def _end_routing_read(db: AsyncSession) -> None:

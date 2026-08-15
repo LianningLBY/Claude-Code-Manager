@@ -168,19 +168,31 @@ def _ordinary_task_visibility_predicate():
     return ordinary_task_visibility_predicate()
 
 
-def _pr_review_dispatch_predicate():
+def pr_review_dispatch_predicate():
     """Only dispatch a reviewer Task while its durable owner is runnable.
 
     The first panel Task is also stored in ``PRReview.task_id`` for legacy
     compatibility.  A panel link must therefore take precedence over the
     single-review link; otherwise cancelling that reviewer run would still
     leave the Task runnable through the parent review's ``reviewing`` state.
-    Correlated ``EXISTS`` predicates keep the same semantics on SQLite,
-    PostgreSQL, and MySQL and can be repeated in the final Task claim CAS.
+    A deletion tombstone has no runnable owner graph and must never fall back
+    to ordinary dispatch.  Correlated ``EXISTS`` predicates keep the same
+    semantics on SQLite, PostgreSQL, and MySQL and can be repeated in the
+    final Task claim CAS.
     """
 
-    from backend.models.pr_monitor import PRReview, PRReviewerRun
+    from backend.models.pr_monitor import (
+        PRMonitorTaskTombstone,
+        PRReview,
+        PRReviewerRun,
+    )
 
+    tombstoned = (
+        select(PRMonitorTaskTombstone.task_id)
+        .where(PRMonitorTaskTombstone.task_id == Task.id)
+        .correlate(Task)
+        .exists()
+    )
     panel_review = (
         select(PRReviewerRun.id)
         .where(PRReviewerRun.task_id == Task.id)
@@ -213,11 +225,14 @@ def _pr_review_dispatch_predicate():
         .correlate(Task)
         .exists()
     )
-    return or_(
-        runnable_panel_review,
-        and_(
-            ~panel_review,
-            or_(~single_review, runnable_single_review),
+    return and_(
+        ~tombstoned,
+        or_(
+            runnable_panel_review,
+            and_(
+                ~panel_review,
+                or_(~single_review, runnable_single_review),
+            ),
         ),
     )
 
@@ -2155,7 +2170,7 @@ class TaskQueue:
         blocked_ids = set(exclude_ids or ())
         while True:
             dispatcher_scope = _dispatcher_scope_predicate()
-            pr_review_scope = _pr_review_dispatch_predicate()
+            pr_review_scope = pr_review_dispatch_predicate()
             stmt = (
                 select(Task.id)
                 # worker task 不走本地 instance；shadow task (shared_from_id) 不执行

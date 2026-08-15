@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.models.log_entry import LogEntry
 from backend.models.sub_agent import SubAgentSession
 from backend.models.task import Task
+from backend.services.cancellation import settle_awaitable
 from backend.services.task_termination import _finish_despite_cancellation
 from backend.services.worker_task_termination import (
     active_worker_task_termination_receipt,
@@ -517,6 +518,21 @@ async def capture_repo_revision(path: str | None) -> dict | None:
     async def run_git(*args: str) -> tuple[int, bytes]:
         process = None
         communicate_task = None
+
+        async def finish_process() -> None:
+            if process is not None and process.returncode is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+            if communicate_task is not None:
+                await asyncio.gather(
+                    communicate_task,
+                    return_exceptions=True,
+                )
+            if process is not None and process.returncode is None:
+                await process.wait()
+
         try:
             git_env = {
                 key: value
@@ -544,31 +560,14 @@ async def capture_repo_revision(path: str | None) -> dict | None:
             )
             return process.returncode or 0, stdout
         except asyncio.CancelledError:
-            if process is not None and process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            if communicate_task is not None:
-                await asyncio.gather(communicate_task, return_exceptions=True)
+            cleanup, _ = await settle_awaitable(finish_process())
+            cleanup.result()
             raise
-        except asyncio.TimeoutError:
-            if process is not None and process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            if communicate_task is not None:
-                await asyncio.gather(communicate_task, return_exceptions=True)
-            return -1, b""
-        except OSError:
-            if process is not None and process.returncode is None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-            if communicate_task is not None:
-                await asyncio.gather(communicate_task, return_exceptions=True)
+        except (asyncio.TimeoutError, OSError):
+            cleanup, cancellation = await settle_awaitable(finish_process())
+            cleanup.result()
+            if cancellation is not None:
+                raise cancellation
             return -1, b""
 
     head_rc, head_raw = await run_git("rev-parse", "--verify", "HEAD")

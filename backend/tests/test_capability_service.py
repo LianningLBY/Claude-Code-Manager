@@ -805,6 +805,41 @@ async def test_atomic_stage_cancellation_rolls_back_callback_writes(db_session):
 
 
 @pytest.mark.asyncio
+async def test_rollback_safely_settles_under_anyio_level_cancellation():
+    from anyio import CancelScope
+
+    rollback_started = asyncio.Event()
+    allow_rollback = asyncio.Event()
+    rollback_completed = False
+
+    class FakeSession:
+        async def rollback(self):
+            nonlocal rollback_completed
+            rollback_started.set()
+            await allow_rollback.wait()
+            rollback_completed = True
+
+    async def release_rollback():
+        await rollback_started.wait()
+        await asyncio.sleep(0)
+        allow_rollback.set()
+
+    releaser = asyncio.create_task(release_rollback())
+    try:
+        with CancelScope() as scope:
+            scope.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await service._rollback_safely(FakeSession())
+        await releaser
+    finally:
+        if not releaser.done():
+            releaser.cancel()
+            await asyncio.gather(releaser, return_exceptions=True)
+
+    assert rollback_completed is True
+
+
+@pytest.mark.asyncio
 async def test_locked_aggregate_refreshes_preloaded_stale_rows(
     db_session,
     db_factory,

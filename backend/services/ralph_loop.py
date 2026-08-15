@@ -9,6 +9,7 @@ from backend.models.instance import Instance
 from backend.models.log_entry import LogEntry
 from backend.models.task import Task
 from backend.config import settings
+from backend.services.cancellation import await_task_completion
 from backend.services.instance_manager import InstanceManager
 from backend.services.dispatcher import TaskStartPausedError
 from backend.services.task_queue import (
@@ -1888,11 +1889,7 @@ class RalphLoop:
                 cleanup = asyncio.create_task(
                     self._release_cancelled_claim(instance_id, task)
                 )
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError:
-                        continue
+                await await_task_completion(cleanup)
                 cleanup.result()
                 raise
             except Exception as e:
@@ -1928,12 +1925,7 @@ class RalphLoop:
                 cleanup = asyncio.create_task(
                     self._fail_unexpected_claim(instance_id, task, e)
                 )
-                cancellation: asyncio.CancelledError | None = None
-                while not cleanup.done():
-                    try:
-                        await asyncio.shield(cleanup)
-                    except asyncio.CancelledError as cancel_exc:
-                        cancellation = cancel_exc
+                cancellation = await await_task_completion(cleanup)
                 cleanup.result()
                 if cancellation is not None:
                     raise cancellation

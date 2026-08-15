@@ -358,10 +358,10 @@ comment, approve, merge, or claim that the overall Gate passed.
 {rendered_guidance}
 </ccm_verified_base_guidance>
 
-The fixed contract outranks the guides. Base `CLAUDE.md` is normative.
-`PROGRESS.md` or any other repository document is included only when the exact
-base manifest explicitly assigns it to this role. Head changes to guides are
-ordinary diff.
+The fixed contract outranks the guides. This block may be empty. Every included
+document was explicitly selected by the exact-base manifest and assigned to
+this reviewer role; no `CLAUDE.md`, `AGENTS.md`, `PROGRESS.md`, or other
+repository document is implicit. Head changes to guides are ordinary diff.
 
 ## Shared engineering design standard
 
@@ -1199,21 +1199,81 @@ def _finding_fingerprint(role: str, finding: dict) -> str:
 
 
 def _render_gate_body(runs: list[PRReviewerRun], findings: list[PRFinding]) -> str:
-    by_run = {run.id: run for run in runs}
-    sections = []
+    role_labels = {
+        "principal_engineer": "Principal engineer",
+        "senior_engineer": "Senior engineer",
+        "qa_engineer": "QA engineer",
+    }
+    open_blockers = [
+        finding
+        for finding in findings
+        if finding.status == "open"
+        and finding.severity in BLOCKING_SEVERITIES
+    ]
+    open_advisories = [
+        finding
+        for finding in findings
+        if finding.status == "open"
+        and finding.severity not in BLOCKING_SEVERITIES
+    ]
+    if open_blockers:
+        sections = [
+            "# CCM reviewer panel: changes required",
+            (
+                f"The panel found {len(open_blockers)} open blocking "
+                f"finding{'s' if len(open_blockers) != 1 else ''} on this "
+                "reviewed PR head. Address the inline finding threads before "
+                "merging."
+            ),
+        ]
+    else:
+        sections = [
+            "# CCM reviewer panel: passed",
+            "All required reviewers completed and no open blocking findings remain.",
+        ]
+    if open_advisories:
+        sections.append(
+            f"The panel also recorded {len(open_advisories)} advisory "
+            f"finding{'s' if len(open_advisories) != 1 else ''}."
+        )
+    sections.append("## Reviewer summaries")
     for role in REVIEWER_ROLES:
         run = next(item for item in runs if item.role == role)
-        sections.append(f"## {role}\n\n{run.result_body or 'Review completed.'}")
-        for finding in findings:
-            if finding.reviewer_run_id != run.id:
-                continue
-            location = f"{finding.path}:{finding.line}" if finding.line else f"{finding.path} ({finding.hunk or 'hunk'})"
-            sections.append(
-                f"[{finding.severity}] [{role}] {location} — {finding.title}\n"
-                f"Evidence: {finding.evidence}\nImpact: {finding.impact}\n"
-                f"Required fix: {finding.required_fix}\nTest: {finding.test}"
+        role_findings = [
+            finding
+            for finding in findings
+            if finding.reviewer_run_id == run.id
+        ]
+        blocking_count = sum(
+            finding.severity in BLOCKING_SEVERITIES
+            for finding in role_findings
+        )
+        advisory_count = len(role_findings) - blocking_count
+        if role_findings:
+            count_summary = (
+                f"{len(role_findings)} total "
+                f"({blocking_count} blocking, {advisory_count} advisory)"
             )
-    del by_run
+        else:
+            count_summary = "none"
+        verdict = {
+            "passed": "Passed",
+            "changes_required": "Changes required",
+        }.get(run.status)
+        if verdict is None:
+            raise ValueError(
+                f"Reviewer role {role} has no terminal code verdict"
+            )
+        sections.append(
+            f"### {role_labels[role]} — {verdict}\n\n"
+            f"{run.result_body or 'Review completed.'}\n\n"
+            f"Finding count: {count_summary}."
+        )
+    if findings:
+        sections.append(
+            "Detailed evidence, impact, required fixes, and verification steps "
+            "are published in dedicated finding threads/comments."
+        )
     return "\n\n".join(sections)
 
 

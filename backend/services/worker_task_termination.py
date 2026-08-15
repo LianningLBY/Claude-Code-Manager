@@ -37,7 +37,7 @@ from backend.models.worker_task_termination import (
 )
 from backend.models.worker_turn_handoff import WorkerTurnHandoffReceipt
 from backend.services.pr_review_runtime import is_pr_sandbox_task
-from backend.services.cancellation import finish_awaitable
+from backend.services.cancellation import finish_awaitable, settle_awaitable
 from backend.services.skill_context import is_worker_managed_task_metadata
 from backend.services.worker_node_control import (
     fence_worker_node_receipt_resolution,
@@ -2736,21 +2736,24 @@ async def execute_worker_receipt(
             return current
         resulting = await effect
     except asyncio.CancelledError:
-        effect.cancel()
-        await asyncio.shield(
-            asyncio.gather(effect, return_exceptions=True)
-        )
-        heartbeat_stop.set()
-        await asyncio.shield(heartbeat)
-        await asyncio.shield(
-            record_worker_reconcile_error(
+        async def cancel_execution() -> None:
+            effect.cancel()
+            await asyncio.gather(effect, return_exceptions=True)
+            heartbeat_stop.set()
+            await heartbeat
+            if not lost_waiter.done():
+                lost_waiter.cancel()
+            await asyncio.gather(lost_waiter, return_exceptions=True)
+            await record_worker_reconcile_error(
                 db,
                 operation_id,
                 "Worker termination execution was cancelled",
                 execution_token=execution_token,
                 expected_state_version=fence.state_version,
             )
-        )
+
+        operation, _ = await settle_awaitable(cancel_execution())
+        operation.result()
         raise
     except WorkerTaskTerminationConflict as exc:
         heartbeat_stop.set()
@@ -2808,7 +2811,7 @@ async def execute_worker_receipt(
     finally:
         if not lost_waiter.done():
             lost_waiter.cancel()
-        await asyncio.gather(lost_waiter, return_exceptions=True)
+            await asyncio.gather(lost_waiter, return_exceptions=True)
 
 
 async def _heartbeat_worker_execution(
@@ -3880,7 +3883,8 @@ async def _publish_manager_result_if_current(
             },
         )
     except asyncio.CancelledError:
-        await asyncio.shield(db.rollback())
+        operation, _ = await settle_awaitable(db.rollback())
+        operation.result()
         raise
     except Exception:
         # The durable transition already committed.  WebSocket publication is
@@ -4643,15 +4647,17 @@ async def reconcile_manager_task_delete_receipt(
                 allow_task_absent=True,
                 operation_lock_held=True,
                 quarantine_on_transport_uncertainty=True,
+                require_task_incarnation_fence=True,
             )
         except asyncio.CancelledError:
-            await asyncio.shield(
+            operation, _ = await settle_awaitable(
                 _record_manager_task_delete_error(
                     db,
                     operation_id,
                     "Manager Task deletion was cancelled after remote_possible",
                 )
             )
+            operation.result()
             raise
         except Exception:
             remote = None
@@ -4681,15 +4687,17 @@ async def reconcile_manager_task_delete_receipt(
             require_json=True,
             surface_endpoint_not_found=True,
             operation_lock_held=True,
+            require_task_incarnation_fence=True,
         )
     except asyncio.CancelledError:
-        await asyncio.shield(
+        operation, _ = await settle_awaitable(
             _record_manager_task_delete_error(
                 db,
                 operation_id,
                 "Manager Task deletion audit was cancelled",
             )
         )
+        operation.result()
         raise
     except Exception as exc:
         await _record_manager_task_delete_error(db, operation_id, str(exc))
@@ -4927,11 +4935,12 @@ async def reconcile_manager_receipt(
         await _record_manager_reconcile_error(db, operation_id, str(exc))
         raise
     except asyncio.CancelledError:
-        await asyncio.shield(
+        operation, _ = await settle_awaitable(
             _record_manager_reconcile_error(
                 db, operation_id, "Manager reconciliation was cancelled"
             )
         )
+        operation.result()
         raise
     except WorkerTaskTerminationConflict as exc:
         (

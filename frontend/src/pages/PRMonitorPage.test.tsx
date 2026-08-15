@@ -427,14 +427,14 @@ describe('PRMonitorPage safety controls', () => {
       reviewer_verdict_counts: { pass: 1, changes_required: 1 },
       reviewer_runs: [{
         id: 31,
-        role: 'principal',
+        role: 'principal_engineer',
         task_id: 301,
         provider: 'codex',
         model: 'gpt-5.6-sol',
         effort: 'high',
         status: 'completed',
         verdict: 'changes_required',
-        result_body: 'Principal found one correctness issue in the changed request path.',
+        result_body: 'Principal found **one correctness issue** in the changed request path.',
         outcome_kind: 'review_result',
         error_message: null,
         created_at: '2026-08-02T00:00:00Z',
@@ -447,7 +447,8 @@ describe('PRMonitorPage safety controls', () => {
     expect(screen.getAllByText('Review system failed').length).toBeGreaterThan(0);
     expect(screen.getByRole('alert')).toHaveTextContent('Senior reviewer could not start');
     expect(screen.getByRole('alert')).toHaveTextContent('No code verdict was produced');
-    expect(screen.getByText('Principal found one correctness issue in the changed request path.')).toBeInTheDocument();
+    expect(screen.getByText('Principal engineer')).toBeInTheDocument();
+    expect(screen.getByText('one correctness issue').tagName).toBe('STRONG');
     expect(screen.getByText('Task #301')).toBeInTheDocument();
     expect(screen.getByText(/3 reviewers/)).toBeInTheDocument();
     expect(screen.getByText(/Progress: 2 completed · 1 review failed/)).toBeInTheDocument();
@@ -500,11 +501,35 @@ describe('PRMonitorPage safety controls', () => {
     await openRepo(user);
     await user.click(await screen.findByText(listReview.pr_title));
 
-    expect(await screen.findByText(/Authorization can be bypassed/)).toHaveTextContent(
-      'Authorization can be bypassed. Check the project ACL before dispatch.',
-    );
+    expect(await screen.findByText('Authorization can be bypassed.')).toBeInTheDocument();
+    expect(screen.getByText('Check the project ACL before dispatch.')).toBeInTheDocument();
     expect(screen.queryByText('Authorization finding preview…')).not.toBeInTheDocument();
     expect(api.getReviewDetail).toHaveBeenCalledWith(listReview.id);
+  });
+
+  it('renders the complete review body as readable Markdown', async () => {
+    const user = userEvent.setup();
+    const markdownBody = [
+      '# Review result',
+      '',
+      '- Rejects stale task claims',
+      '- Preserves the exact head SHA',
+      '',
+      '```python',
+      'assert task.incarnation == expected_incarnation',
+      '```',
+    ].join('\n');
+    const review = reviewFixture({
+      display_summary: markdownBody,
+      review_summary: markdownBody,
+    });
+
+    await openReview(user, review, runFixture());
+
+    expect(screen.getByRole('heading', { name: 'Review result', level: 1 })).toBeInTheDocument();
+    expect(screen.getByRole('list')).toHaveTextContent('Rejects stale task claims');
+    expect(screen.getByRole('list')).toHaveTextContent('Preserves the exact head SHA');
+    expect(screen.getByText('assert task.incarnation == expected_incarnation')).toBeInTheDocument();
   });
 
   it('labels current and historical review heads in history', async () => {

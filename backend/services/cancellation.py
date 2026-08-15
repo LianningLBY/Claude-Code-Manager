@@ -49,8 +49,22 @@ async def await_task_completion(
     """
 
     delayed_cancellation: asyncio.CancelledError | None = None
-    while not operation.done():
+    first_wait = True
+    while first_wait or not operation.done():
+        # Even an already-settled Future needs one checkpoint.  Otherwise a
+        # cancellation that was requested immediately before entering this
+        # helper could be skipped and the caller would incorrectly observe a
+        # successful result.
+        checkpoint = first_wait
+        first_wait = False
         try:
+            if checkpoint:
+                await asyncio.sleep(0)
+                if operation.done():
+                    # Do not retrieve a completed Task's cancellation through
+                    # shield first: on Python 3.14 that consumes its original
+                    # CancelledError message before the caller reads result().
+                    break
             await asyncio.shield(operation)
         except asyncio.CancelledError as exc:
             # An inner cancellation is an operation result, not a caller

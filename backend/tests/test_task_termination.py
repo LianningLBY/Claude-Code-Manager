@@ -93,6 +93,23 @@ async def test_finish_awaitable_passively_settles_under_anyio_level_cancellation
 
 
 @pytest.mark.asyncio
+async def test_finish_awaitable_checkpoints_already_completed_future():
+    """A ready result must not skip cancellation requested at entry."""
+
+    from anyio import CancelScope
+
+    from backend.services.cancellation import finish_awaitable
+
+    completed = asyncio.get_running_loop().create_future()
+    completed.set_result("settled")
+
+    with CancelScope() as scope:
+        scope.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await finish_awaitable(completed)
+
+
+@pytest.mark.asyncio
 async def test_finish_awaitable_preserves_inner_cancellation_result():
     """An operation's own cancellation is not mistaken for caller cancel."""
 

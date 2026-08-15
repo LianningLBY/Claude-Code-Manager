@@ -306,7 +306,47 @@ def test_panel_prompts_share_engineering_standard_and_keep_distinct_litmus():
     for prompt in prompts.values():
         assert "NEW_FULL_FILE_SENTINEL" not in prompt
         assert "OLD_FULL_FILE_SENTINEL" not in prompt
+        assert "Keep the gate strict." not in prompt
         assert "LEGACY_PROGRESS_SENTINEL" not in prompt
+        assert "no `CLAUDE.md`, `AGENTS.md`, `PROGRESS.md`" in prompt
+
+
+def test_panel_prompts_include_only_manifest_guides_for_each_role():
+    guidance = {
+        "docs/shared.md": "SHARED_GUIDE_SENTINEL",
+        "docs/principal.md": "PRINCIPAL_GUIDE_SENTINEL",
+        "docs/senior.md": "SENIOR_GUIDE_SENTINEL",
+        "docs/qa.md": "QA_GUIDE_SENTINEL",
+        pr_review_service._GUIDANCE_ROLE_MAP_KEY: {
+            "docs/shared.md": list(pr_review_panel.REVIEWER_ROLES),
+            "docs/principal.md": ["principal_engineer"],
+            "docs/senior.md": ["senior_engineer"],
+            "docs/qa.md": ["qa_engineer"],
+        },
+    }
+    sentinels = {
+        "principal_engineer": "PRINCIPAL_GUIDE_SENTINEL",
+        "senior_engineer": "SENIOR_GUIDE_SENTINEL",
+        "qa_engineer": "QA_GUIDE_SENTINEL",
+    }
+
+    for role in pr_review_panel.REVIEWER_ROLES:
+        prompt, _policy_hash, _guide_hash = (
+            pr_review_panel.build_panel_review_prompt(
+                repo_name="owner/repo",
+                pr_number=17,
+                base_sha=BASE_SHA,
+                head_sha=HEAD_SHA,
+                role=role,
+                guidance=guidance,
+                material=_context()["material"],
+            )
+        )
+        assert "SHARED_GUIDE_SENTINEL" in prompt
+        assert sentinels[role] in prompt
+        for other_role, sentinel in sentinels.items():
+            if other_role != role:
+                assert sentinel not in prompt
 
 
 def test_panel_prompts_keep_the_complete_patch_within_budget():
@@ -514,6 +554,76 @@ def test_parse_panel_output_enforces_subject_role_and_blocking_verdict():
             base_sha=BASE_SHA,
             head_sha=HEAD_SHA,
         )
+
+
+def test_gate_body_is_readable_and_keeps_finding_details_in_threads():
+    runs = [
+        PRReviewerRun(
+            id=index,
+            pr_review_id=1,
+            role=role,
+            provider="claude",
+            status=("changes_required" if role == "qa_engineer" else "passed"),
+            result_body=f"{role} short summary",
+            prompt_policy_hash=str(index) * 64,
+            guide_pack_hash=str(index) * 64,
+        )
+        for index, role in enumerate(pr_review_panel.REVIEWER_ROLES, start=1)
+    ]
+    finding = PRFinding(
+        pr_review_id=1,
+        reviewer_run_id=runs[-1].id,
+        fingerprint="f" * 64,
+        role="qa_engineer",
+        severity="medium",
+        category="correctness",
+        path="backend/example.py",
+        line=12,
+        hunk=None,
+        title="Public body should not repeat this title",
+        evidence="PRIVATE_EVIDENCE_DETAIL",
+        impact="PRIVATE_IMPACT_DETAIL",
+        required_fix="PRIVATE_FIX_DETAIL",
+        test="PRIVATE_TEST_DETAIL",
+        status="open",
+        thread_nonce="n" * 64,
+        thread_status="pending",
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    )
+
+    body = pr_review_panel._render_gate_body(runs, [finding])
+
+    assert body.startswith("# CCM reviewer panel: changes required")
+    assert "1 open blocking finding" in body
+    assert "### Principal engineer — Passed" in body
+    assert "### Senior engineer — Passed" in body
+    assert "### QA engineer — Changes required" in body
+    assert "Finding count: 1 total (1 blocking, 0 advisory)." in body
+    assert "dedicated finding threads/comments" in body
+    assert "Public body should not repeat this title" not in body
+    assert "PRIVATE_EVIDENCE_DETAIL" not in body
+    assert "PRIVATE_IMPACT_DETAIL" not in body
+    assert "PRIVATE_FIX_DETAIL" not in body
+    assert "PRIVATE_TEST_DETAIL" not in body
+    for internal_protocol in (
+        "PR_REVIEW_",
+        "schema_version",
+        '"subject"',
+        '"verdict"',
+        '"findings"',
+    ):
+        assert internal_protocol not in body
+
+    runs[-1].status = "passed"
+    clean_body = pr_review_panel._render_gate_body(runs, [])
+    assert clean_body.startswith("# CCM reviewer panel: passed")
+    assert "no open blocking findings remain" in clean_body
+    assert clean_body.count("Finding count: none.") == 3
+
+    runs[-1].status = "error"
+    with pytest.raises(ValueError, match="no terminal code verdict"):
+        pr_review_panel._render_gate_body(runs, [])
 
 
 @pytest.mark.asyncio
@@ -1638,7 +1748,6 @@ async def test_exact_base_guide_manifest_adds_only_declared_regular_files():
     ):
         guides = await pr_review_service._fetch_base_guidance("owner/repo", BASE_SHA)
     assert guides == {
-        "CLAUDE.md": None,
         "docs/architecture/invariants.md": guide_raw.decode(),
         "__ccm_review_guide_roles__": {
             "docs/architecture/invariants.md": [

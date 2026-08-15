@@ -29,6 +29,8 @@ from typing import Any
 
 import httpx
 
+from backend.services.cancellation import finish_awaitable
+
 logger = logging.getLogger(__name__)
 
 CLAUDE_BASE_URL = "https://console.cloudrouter.online"
@@ -2102,21 +2104,9 @@ class CloudRouterAccountStore:
         try:
             yield account
         finally:
-            cleanup = asyncio.create_task(
+            await finish_awaitable(
                 self._release_credential_user(valid_id)
             )
-            delayed_cancellation: asyncio.CancelledError | None = None
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError as exc:
-                    if delayed_cancellation is None:
-                        delayed_cancellation = exc
-                except BaseException:
-                    break
-            cleanup.result()
-            if delayed_cancellation is not None:
-                raise delayed_cancellation
 
     @staticmethod
     def _canonical_runtime_path(path: str | os.PathLike[str]) -> str:

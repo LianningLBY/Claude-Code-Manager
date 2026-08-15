@@ -129,6 +129,71 @@ async def test_run_cmd_timeout_kills_grandchild_process_group(tmp_path):
         os.kill(child_pid, 0)
 
 
+@pytest.mark.asyncio
+async def test_run_cmd_anyio_cancel_reaps_process_and_streams(
+    tmp_path,
+    monkeypatch,
+):
+    from anyio import CancelScope
+
+    service = _make_service(tmp_path)
+    scope_holder: dict[str, CancelScope] = {}
+    reaped = asyncio.Event()
+    killed = asyncio.Event()
+
+    class FakeStream:
+        async def readline(self):
+            await reaped.wait()
+            return b""
+
+    class FakeProcess:
+        pid = 515_151
+        returncode = None
+        stdout = FakeStream()
+        stderr = FakeStream()
+        wait_calls = 0
+
+        async def wait(self):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                scope_holder["scope"].cancel()
+                await asyncio.Future()
+            await asyncio.sleep(0)
+            self.returncode = -9
+            reaped.set()
+            return self.returncode
+
+        def kill(self):
+            killed.set()
+
+    process = FakeProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    def kill_group(pid, _signal):
+        assert pid == process.pid
+        killed.set()
+
+    monkeypatch.setattr(
+        "backend.services.update_service.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    monkeypatch.setattr(
+        "backend.services.update_service.os.killpg",
+        kill_group,
+    )
+
+    with CancelScope() as scope:
+        scope_holder["scope"] = scope
+        with pytest.raises(asyncio.CancelledError):
+            await service._run_cmd(["fake-update-command"])
+
+    assert killed.is_set()
+    assert reaped.is_set()
+    assert process.returncode == -9
+
+
 def test_helper_missing_at_process_start_cannot_be_captured_late(tmp_path):
     broadcaster = MagicMock()
     broadcaster.broadcast = AsyncMock()

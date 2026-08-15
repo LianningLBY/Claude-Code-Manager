@@ -1840,6 +1840,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           const terminal = ['completed', 'failed', 'cancelled', 'conflict']
             .includes(updated.status);
           if (terminal) {
+            // This authoritative HTTP snapshot is the same kind of fresh
+            // status evidence as a WS terminal event.  Without refreshing
+            // these clocks, the stale-override effects see their initial
+            // timestamp (0) and can immediately clear the reconciled status
+            // on an unrelated render, reviving the old executing prop.
+            const reconciledAt = Date.now();
+            lastWsStatusAt.current = reconciledAt;
+            lastWsBackgroundAt.current = reconciledAt;
             setLocalStatus(updated.status);
             setLocalBackgroundActive(updated.background_active === true);
             setSending(false);

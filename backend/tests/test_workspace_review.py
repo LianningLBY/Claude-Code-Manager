@@ -17,6 +17,7 @@ from backend.services import workspace_review as workspace_review_module
 from backend.services.browser_review import BrowserReviewOptions
 from backend.services.workspace_review import (
     _browser_agent_prompt,
+    _run_argv,
     _safe_preview_env,
     PreviewConfigurationError,
     PreviewHandle,
@@ -668,6 +669,170 @@ async def test_preview_stop_retains_exact_handle_until_retry_succeeds(
     assert await manager.stop(handle.run_id) is True
     assert handle.run_id not in manager._handles
     assert not temp_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_run_argv_settles_process_cleanup_under_anyio_cancellation(
+    monkeypatch,
+    tmp_path,
+):
+    from anyio import CancelScope
+
+    termination_finished = asyncio.Event()
+
+    class FakeProcess:
+        returncode = None
+
+        async def communicate(self):
+            await asyncio.Future()
+
+    process = FakeProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    async def terminate(target):
+        assert target is process
+        await asyncio.sleep(0)
+        target.returncode = -15
+        termination_finished.set()
+
+    monkeypatch.setattr(
+        workspace_review_module.asyncio,
+        "create_subprocess_exec",
+        create_process,
+    )
+    monkeypatch.setattr(workspace_review_module, "_terminate_process", terminate)
+
+    with CancelScope() as scope:
+        scope.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await _run_argv(["fake-command"], cwd=tmp_path)
+
+    assert termination_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_workspace_pipeline_settles_cancel_and_finalizer_graph_under_anyio(
+    monkeypatch,
+    tmp_path,
+    db_factory,
+):
+    from anyio import CancelScope
+
+    monkeypatch.setattr(workspace_review_module, "async_session", db_factory)
+    update_calls: list[dict] = []
+    preview_stopped = asyncio.Event()
+
+    class FakePreviewManager:
+        async def stop(self, run_id):
+            assert run_id == "cancelled-workspace-run"
+            await asyncio.sleep(0)
+            preview_stopped.set()
+            return True
+
+    manager = WorkspaceReviewManager(preview_manager=FakePreviewManager())
+
+    async def update_run(run_id, **values):
+        assert run_id == "cancelled-workspace-run"
+        update_calls.append(values)
+        await asyncio.sleep(0)
+
+    manager._update = update_run
+    snapshot = SimpleNamespace(path=tmp_path, fingerprint="a" * 64)
+
+    with CancelScope() as scope:
+        scope.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await manager._run_pipeline(
+                "cancelled-workspace-run",
+                snapshot=snapshot,
+                allow_actions=False,
+                browser_channel="chromium",
+                viewport_width=1280,
+                viewport_height=720,
+                max_steps=None,
+                max_actions=None,
+                test_plan=None,
+                runtime_config={},
+            )
+
+    assert preview_stopped.is_set()
+    assert any(call.get("status") == "cancelled" for call in update_calls)
+    assert any(
+        call.get("cleanup_status") == "completed" for call in update_calls
+    )
+
+
+@pytest.mark.asyncio
+async def test_workspace_finalizer_redelivers_cancellation_after_cleanup(
+    monkeypatch,
+    tmp_path,
+    db_factory,
+):
+    from anyio import CancelScope
+
+    monkeypatch.setattr(workspace_review_module, "async_session", db_factory)
+    scope_holder: dict[str, CancelScope] = {}
+    update_calls: list[dict] = []
+    stop_started = asyncio.Event()
+    release_stop = asyncio.Event()
+    stop_finished = asyncio.Event()
+
+    class FakePreviewManager:
+        async def stop(self, run_id):
+            assert run_id == "finalizer-cancel-run"
+            stop_started.set()
+            await release_stop.wait()
+            stop_finished.set()
+            return True
+
+    manager = WorkspaceReviewManager(preview_manager=FakePreviewManager())
+
+    async def update_run(run_id, **values):
+        assert run_id == "finalizer-cancel-run"
+        update_calls.append(values)
+        if len(update_calls) == 1:
+            raise RuntimeError("enter the handled failure path")
+        await asyncio.sleep(0)
+
+    manager._update = update_run
+    snapshot = SimpleNamespace(path=tmp_path, fingerprint="b" * 64)
+
+    async def cancel_during_stop():
+        await stop_started.wait()
+        scope_holder["scope"].cancel()
+        await asyncio.sleep(0)
+        release_stop.set()
+
+    canceller = asyncio.create_task(cancel_during_stop())
+    try:
+        with CancelScope() as scope:
+            scope_holder["scope"] = scope
+            with pytest.raises(asyncio.CancelledError):
+                await manager._run_pipeline(
+                    "finalizer-cancel-run",
+                    snapshot=snapshot,
+                    allow_actions=False,
+                    browser_channel="chromium",
+                    viewport_width=1280,
+                    viewport_height=720,
+                    max_steps=None,
+                    max_actions=None,
+                    test_plan=None,
+                    runtime_config={},
+                )
+        await canceller
+    finally:
+        release_stop.set()
+        if not canceller.done():
+            canceller.cancel()
+        await asyncio.gather(canceller, return_exceptions=True)
+
+    assert stop_finished.is_set()
+    assert any(
+        call.get("cleanup_status") == "completed" for call in update_calls
+    )
 
 
 @pytest.mark.asyncio

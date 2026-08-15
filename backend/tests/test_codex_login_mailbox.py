@@ -1392,6 +1392,57 @@ async def test_stop_unfinished_login_rejects_unsafe_group_without_signal(
     proc.wait.assert_not_awaited()
 
 
+async def test_stop_unfinished_login_does_not_spin_under_anyio_cancellation(
+    monkeypatch,
+):
+    from anyio import CancelScope
+
+    wait_started = asyncio.Event()
+    allow_exit = asyncio.Event()
+    wait_calls = 0
+    real_wait = asyncio.wait
+    proc = SimpleNamespace(pid=54_344, returncode=None, kill=Mock())
+
+    async def delayed_wait():
+        wait_started.set()
+        await allow_exit.wait()
+        proc.returncode = -9
+        return -9
+
+    async def counting_wait(*args, **kwargs):
+        nonlocal wait_calls
+        if kwargs.get("timeout") is not None:
+            wait_calls += 1
+        return await real_wait(*args, **kwargs)
+
+    proc.wait = AsyncMock(side_effect=delayed_wait)
+    monkeypatch.setattr(codex_pool_api.os, "killpg", Mock())
+    monkeypatch.setattr(codex_pool_api.asyncio, "wait", counting_wait)
+
+    async def release_process():
+        await wait_started.wait()
+        await asyncio.sleep(0)
+        allow_exit.set()
+
+    releaser = asyncio.create_task(release_process())
+    try:
+        with CancelScope() as scope:
+            scope.cancel()
+            result = await codex_pool_api._stop_unfinished_login_process(
+                proc,
+                operation="AnyIO cancellation regression",
+            )
+        await releaser
+    finally:
+        if not releaser.done():
+            releaser.cancel()
+            await asyncio.gather(releaser, return_exceptions=True)
+
+    assert result is True
+    assert proc.returncode == -9
+    assert wait_calls == 1
+
+
 @pytest.mark.parametrize("watcher_kind", ["add", "relogin"])
 async def test_login_watcher_kills_live_process_before_releasing_home(
     monkeypatch, tmp_path, watcher_kind,

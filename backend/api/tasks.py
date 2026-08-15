@@ -198,6 +198,7 @@ from backend.api.deps import (
     require_task_access,
     require_task_control,
     require_worker_target_access,
+    require_worker_control_plane_task_incarnation,
     require_worker_task_incarnation_header,
     task_execution_principal_from_request,
 )
@@ -3384,7 +3385,13 @@ async def get_task(
     queue: TaskQueue = Depends(_get_queue),
     db: AsyncSession = Depends(get_db),
 ):
-    task = await queue.get(task_id)
+    task = await require_worker_control_plane_task_incarnation(
+        request,
+        task_id,
+        db,
+    )
+    if task is None:
+        task = await queue.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
     await require_internal_task_incarnation(request, task_id, db)
@@ -4074,6 +4081,7 @@ async def _read_legacy_worker_routing(
         f"/api/tasks/{task.id}",
         require_json=True,
         operation_lock_held=operation_lock_held,
+        require_task_incarnation_fence=True,
     )
     return _validate_legacy_worker_routing_snapshot(result, task=task)
 
@@ -4597,7 +4605,14 @@ async def _update_task_impl(
     request: Request,
     queue: TaskQueue = Depends(_get_queue),
 ):
-    task = await queue.get(task_id)
+    task = await require_worker_control_plane_task_incarnation(
+        request,
+        task_id,
+        queue.db,
+        write_fence=True,
+    )
+    if task is None:
+        task = await queue.get(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
     await require_task_control(request, task, queue.db)
@@ -5364,7 +5379,14 @@ async def delete_task(
     queue: TaskQueue = Depends(_get_queue),
     db: AsyncSession = Depends(get_db),
 ):
-    task = await db.get(Task, task_id)
+    task = await require_worker_control_plane_task_incarnation(
+        request,
+        task_id,
+        db,
+        write_fence=True,
+    )
+    if task is None:
+        task = await db.get(Task, task_id)
     if task:
         await require_task_control(request, task, db)
     from backend.main import instance_manager, task_migrator, worker_proxy

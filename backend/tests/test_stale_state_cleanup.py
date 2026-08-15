@@ -269,6 +269,8 @@ async def _seed_claimed_worker_handoff(
     *,
     handoff_id: str,
     actual_transport: str | None,
+    include_queue_principal: bool = True,
+    include_source_principal: bool = True,
 ):
     """Persist one exact claimed G+1 with only a forward Instance pointer."""
 
@@ -281,6 +283,16 @@ async def _seed_claimed_worker_handoff(
         "worker_turn_handoff_id": handoff_id,
         "worker_turn_handoff_retry_count": retry_count,
         "worker_turn_handoff_from_generation": from_generation,
+        "execution_user_id": None,
+        "execution_user_role": "member",
+        "execution_mode": "sandbox",
+        "execution_principal_kind": "system",
+    }
+    source_principal = {
+        "user_id": None,
+        "role": "member",
+        "mode": "sandbox",
+        "kind": "system",
     }
     async with db_factory() as db:
         instance = Instance(name="worker-pre-spawn", status="idle")
@@ -293,6 +305,10 @@ async def _seed_claimed_worker_handoff(
             retry_count=retry_count,
             turn_generation=claimed_generation,
             instance_id=instance.id,
+            execution_user_id=None,
+            execution_user_role="member",
+            execution_mode="sandbox",
+            execution_principal_kind="system",
         )
         db.add(task)
         await db.flush()
@@ -309,6 +325,11 @@ async def _seed_claimed_worker_handoff(
             role="user",
             content=message,
             is_error=False,
+            raw_json=(
+                json.dumps({"execution_principal": source_principal})
+                if include_source_principal
+                else None
+            ),
         )
         db.add(source)
         await db.flush()
@@ -331,6 +352,13 @@ async def _seed_claimed_worker_handoff(
             "worker_turn_handoff_from_generation": from_generation,
             "worker_turn_handoff_incarnation_id": task.incarnation_id,
         }
+        if include_queue_principal:
+            queue_payload.update({
+                "initiating_user_id": None,
+                "initiating_user_role": "member",
+                "execution_mode": "sandbox",
+                "execution_principal_kind": "system",
+            })
         db.add(
             WorkerTurnHandoffReceipt(
                 handoff_id=handoff_id,
@@ -1556,6 +1584,54 @@ async def test_cleanup_replays_pretransport_claimed_worker_handoff_exactly(
     assert task.turn_generation == claimed_generation
     assert receipt.status == "claimed"
     assert receipt.claimed_turn_generation == claimed_generation
+
+
+@pytest.mark.parametrize(
+    ("include_queue_principal", "include_source_principal"),
+    [(False, True), (True, False)],
+    ids=["missing-queue-principal", "missing-source-principal"],
+)
+@pytest.mark.asyncio
+async def test_cleanup_fail_closes_claimed_worker_handoff_without_principal_proof(
+    db_factory,
+    include_queue_principal,
+    include_source_principal,
+):
+    """One startup pass rejects every incomplete Worker authority proof."""
+
+    d = _make_dispatcher(db_factory)
+    seed = await _seed_claimed_worker_handoff(
+        db_factory,
+        handoff_id=("9" if include_queue_principal else "a") * 32,
+        actual_transport=None,
+        include_queue_principal=include_queue_principal,
+        include_source_principal=include_source_principal,
+    )
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        task = await db.get(Task, seed["task_id"])
+        receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            seed["handoff_id"],
+        )
+    assert task.status == "failed"
+    assert task.instance_id is None
+    assert "invalid claimed Worker handoff" in task.error_message
+    assert receipt.status == "claimed"
+
+    # The same startup's outbox recovery may quarantine the malformed receipt,
+    # but it must never require a second cleanup pass or enqueue that G+1.
+    d._ensure_queue_worker = MagicMock()
+    await d._recover_worker_turn_handoff_outbox()
+    assert d._get_task_queue(seed["task_id"]).empty()
+    async with db_factory() as db:
+        receipt = await db.get(
+            WorkerTurnHandoffReceipt,
+            seed["handoff_id"],
+        )
+    assert receipt.status == "launching"
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,7 @@ import { api } from '../api/client';
 import type { MonitoredRepo, PRFinding, PRMonitorRun, PRReview, RequiredCheckPolicy } from '../api/client';
 import { Plus, ArrowLeft, X, Copy, RefreshCw, ToggleLeft, ToggleRight, Trash2, GitPullRequest, Check } from '../components/icons';
 import { FindingActions } from '../components/PRReview/FindingActions';
+import { MarkdownContent } from '../components/MarkdownContent';
 import { useDialogA11y } from '../hooks/useDialogA11y';
 import { useWebSocket } from '../hooks/useWebSocket';
 
@@ -181,9 +182,19 @@ const REVIEW_STATUS_LABELS: Record<string, string> = {
   closed: 'Closed',
 };
 
+const REVIEWER_ROLE_LABELS: Record<string, string> = {
+  principal_engineer: 'Principal engineer',
+  senior_engineer: 'Senior engineer',
+  qa_engineer: 'QA engineer',
+};
+
 function statusText(status: string): string {
   return REVIEW_STATUS_LABELS[status]
     || status.split('_').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+}
+
+function reviewerRoleText(role: string): string {
+  return REVIEWER_ROLE_LABELS[role] || statusText(role);
 }
 
 function reviewStatusText(review: PRReview): string {
@@ -1050,7 +1061,7 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                   <h6 className="mb-2 text-sm font-medium text-foreground">
                     {selectedReview.outcome_kind === 'infrastructure_error' ? 'Review system failure' : 'Review summary'}
                   </h6>
-                  <p className="whitespace-pre-wrap text-xs text-gray-300">{selectedReviewSummary}</p>
+                  <MarkdownContent content={selectedReviewSummary} className="text-xs text-gray-300" />
                   {selectedReview.outcome_kind === 'infrastructure_error' && (
                     <p className="mt-2 text-xs text-red-300">No code verdict was produced by this failed review run.</p>
                   )}
@@ -1140,12 +1151,14 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                   <div key={run.id} className="rounded bg-gray-900/40 p-3">
                     <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
                       <span className="font-medium text-gray-200">
-                        {statusText(run.role)}
+                        {reviewerRoleText(run.role)}
                         {run.task_id != null && <span className="ml-2 text-xs font-normal text-indigo-300">Task #{run.task_id}</span>}
                       </span>
                       <span className={STATUS_COLORS[run.status] || 'text-gray-400'}>{statusText(run.status)}</span>
                     </div>
-                    {run.result_body && <p className="mt-2 whitespace-pre-wrap text-xs text-gray-300">{run.result_body}</p>}
+                    {run.result_body && (
+                      <MarkdownContent content={run.result_body} className="mt-2 text-xs text-gray-300" />
+                    )}
                     {run.outcome_kind === 'infrastructure_error' && !run.result_body && (
                       <p className="mt-2 text-xs text-red-300">This reviewer did not produce a code verdict.</p>
                     )}

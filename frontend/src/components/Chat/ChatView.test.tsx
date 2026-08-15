@@ -1737,10 +1737,19 @@ describe('ChatView', () => {
         retry_count: 2,
         turn_generation: 11,
       });
-      vi.mocked(api.getTask).mockImplementation(async (taskId) => (
+      const terminalTask = {
+        ...task,
+        status: 'completed',
+        background_active: false,
+      } as Task;
+      let resolveTerminalTask!: (value: Task) => void;
+      const terminalTaskRequest = new Promise<Task>((resolve) => {
+        resolveTerminalTask = resolve;
+      });
+      vi.mocked(api.getTask).mockImplementation((taskId) => (
         taskId === 413
-          ? { ...task, status: 'completed', background_active: false }
-          : { ...task, id: taskId, status: 'executing' }
+          ? terminalTaskRequest
+          : Promise.resolve({ ...task, id: taskId, status: 'executing' } as Task)
       ));
       render(
         <ChatView
@@ -1766,6 +1775,10 @@ describe('ChatView', () => {
 
       await waitFor(() => expect(api.getTask).toHaveBeenCalledWith(413), {
         timeout: 1500,
+      });
+      await act(async () => {
+        resolveTerminalTask(terminalTask);
+        await terminalTaskRequest;
       });
       await waitFor(() => {
         expect(screen.queryByText('Claude is thinking...')).not.toBeInTheDocument();

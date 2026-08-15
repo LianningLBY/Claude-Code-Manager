@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.project import Project
 from backend.models.task import Task
+from backend.services.cancellation import finish_awaitable, settle_awaitable
 
 
 FRONTEND_REVIEW_METADATA_KEY = "frontend_review"
@@ -121,7 +122,7 @@ async def inspect_frontend_review_local_repository(
                 process.kill()
             except ProcessLookupError:
                 pass
-            await process.communicate()
+            await finish_awaitable(process.communicate())
         return {
             "available": False,
             "reason": "Git 仓库检查超时",
@@ -133,7 +134,8 @@ async def inspect_frontend_review_local_repository(
                 process.kill()
             except ProcessLookupError:
                 pass
-            await asyncio.shield(process.communicate())
+            operation, _ = await settle_awaitable(process.communicate())
+            operation.result()
         raise
     except OSError:
         return {

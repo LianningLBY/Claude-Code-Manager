@@ -330,5 +330,103 @@ async def test_manager_terminal_status_event_carries_exact_turn_identity(tmp_pat
         ]
         assert len(status_events) == 1
         assert status_events[0]["new_status"] == "completed"
-        assert status_events[0]["task_retry_count"] == 2
-        assert status_events[0]["task_turn_generation"] == 7
+    assert status_events[0]["task_retry_count"] == 2
+    assert status_events[0]["task_turn_generation"] == 7
+
+
+@pytest.mark.asyncio
+async def test_manager_publication_cancel_finishes_rollback_under_anyio(
+    tmp_path,
+    monkeypatch,
+):
+    from anyio import CancelScope
+
+    async with _wal_session_factory(
+        tmp_path / "manager-publication-cancel.db"
+    ) as factory:
+        task_id, operation_id, success = await _create_manager_operation(
+            factory,
+            title="Manager publication cancellation",
+        )
+        scope_holder: dict[str, CancelScope] = {}
+        publication_cancelled = False
+        rollback_completed = asyncio.Event()
+        original_rollback = AsyncSession.rollback
+
+        async def delayed_rollback(self):
+            result = await original_rollback(self)
+            if publication_cancelled:
+                await asyncio.sleep(0)
+                rollback_completed.set()
+            return result
+
+        async def cancel_publication(_channel, _data):
+            nonlocal publication_cancelled
+            publication_cancelled = True
+            scope_holder["scope"].cancel()
+            await asyncio.sleep(0)
+
+        monkeypatch.setattr(AsyncSession, "rollback", delayed_rollback)
+        with patch.object(
+            main_module.broadcaster,
+            "broadcast",
+            side_effect=cancel_publication,
+        ):
+            async with factory() as coordinator:
+                with CancelScope() as scope:
+                    scope_holder["scope"] = scope
+                    with pytest.raises(asyncio.CancelledError):
+                        await termination.apply_manager_result(
+                            coordinator,
+                            operation_id,
+                            success,
+                        )
+
+        assert rollback_completed.is_set()
+        async with factory() as db:
+            task = await db.get(Task, task_id)
+            receipt = await db.get(
+                termination.WorkerTaskTerminationReceipt,
+                operation_id,
+            )
+        assert task.status == "completed"
+        assert receipt.status == "awaiting_ack"
+
+
+@pytest.mark.asyncio
+async def test_manager_reconcile_cancel_commits_error_receipt_under_anyio(
+    tmp_path,
+):
+    from anyio import CancelScope
+
+    async with _wal_session_factory(
+        tmp_path / "manager-reconcile-cancel.db"
+    ) as factory:
+        _task_id, operation_id, _success = await _create_manager_operation(
+            factory,
+            title="Manager reconciliation cancellation",
+        )
+        scope_holder: dict[str, CancelScope] = {}
+
+        async def cancel_proxy(*_args, **_kwargs):
+            scope_holder["scope"].cancel()
+            await asyncio.sleep(0)
+
+        async with factory() as coordinator:
+            with CancelScope() as scope:
+                scope_holder["scope"] = scope
+                with pytest.raises(asyncio.CancelledError):
+                    await termination.reconcile_manager_receipt(
+                        coordinator,
+                        operation_id,
+                        proxy_request=cancel_proxy,
+                    )
+
+        async with factory() as db:
+            receipt = await db.get(
+                termination.WorkerTaskTerminationReceipt,
+                operation_id,
+            )
+        assert receipt.status == "pending_remote"
+        assert receipt.reconcile_count == 1
+        assert receipt.last_error == "Manager reconciliation was cancelled"

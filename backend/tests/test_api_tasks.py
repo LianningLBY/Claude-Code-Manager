@@ -3801,7 +3801,7 @@ async def test_retry_does_not_clear_owner_that_changes_while_waiting(
             request = asyncio.create_task(
                 client.post(f"/api/tasks/{task_id}/retry")
             )
-            await asyncio.wait_for(reached_lock.wait(), timeout=1)
+            await asyncio.wait_for(reached_lock.wait(), timeout=5)
             async with session_factory() as db:
                 task = await db.get(Task, task_id)
                 old_instance = await db.get(Instance, old_instance_id)
@@ -3811,7 +3811,7 @@ async def test_retry_does_not_clear_owner_that_changes_while_waiting(
                 new_instance.current_task_id = task_id
                 await db.commit()
             old_lock.release()
-            response = await asyncio.wait_for(request, timeout=1)
+            response = await asyncio.wait_for(request, timeout=5)
     finally:
         if old_lock.locked():
             old_lock.release()

@@ -15,6 +15,11 @@ import weakref
 from dataclasses import dataclass
 
 from backend.config import settings
+from backend.services.cancellation import (
+    await_task_completion,
+    finish_awaitable,
+    settle_awaitable,
+)
 from backend.services.codex_app_server import (
     normalize_codex_service_tier,
 )
@@ -364,19 +369,9 @@ async def _settle_process_spawn(
 ) -> tuple[asyncio.subprocess.Process, asyncio.CancelledError | None]:
     """Return the exact spawned process even across caller cancellation."""
 
-    spawn_task = asyncio.create_task(
+    spawn_task, delayed_cancellation = await settle_awaitable(
         asyncio.create_subprocess_exec(*cmd, **spawn_kwargs)
     )
-    delayed_cancellation: asyncio.CancelledError | None = None
-    while not spawn_task.done():
-        try:
-            await asyncio.shield(spawn_task)
-        except asyncio.CancelledError as exc:
-            if spawn_task.done():
-                break
-            delayed_cancellation = exc
-        except Exception:
-            break
 
     try:
         process = spawn_task.result()
@@ -508,17 +503,8 @@ async def _terminate_process_shielded(
             )
 
     cancellation = delayed_cancellation
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError as exc:
-            # Multiple cancellations must not strand the evaluator.  Preserve
-            # the latest one and keep waiting for the shielded cleanup task.
-            cancellation = exc
-        except Exception:
-            # Inspect and classify the settled cleanup failure below, where the
-            # exact process handle is retained before propagating it.
-            break
+    later_cancellation = await await_task_completion(cleanup)
+    cancellation = cancellation or later_cancellation
 
     try:
         try:
@@ -955,18 +941,7 @@ class GoalEvaluator:
         transport_removed = False
 
         async def settle_cleanup(awaitable) -> None:
-            cleanup = asyncio.ensure_future(awaitable)
-            delayed_cancellation: asyncio.CancelledError | None = None
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError as exc:
-                    delayed_cancellation = exc
-                except BaseException:
-                    break
-            cleanup.result()
-            if delayed_cancellation is not None:
-                raise delayed_cancellation
+            await finish_awaitable(awaitable)
 
         async def abort_turn(reason: str) -> None:
             nonlocal transport_removed

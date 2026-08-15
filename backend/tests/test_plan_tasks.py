@@ -1075,6 +1075,68 @@ async def test_plan_tasks_never_silently_downgrade_codex_fast(
 
 
 @pytest.mark.asyncio
+async def test_repo_fingerprint_cancel_reaps_git_process_under_anyio(
+    monkeypatch,
+    tmp_path,
+):
+    from anyio import CancelScope
+
+    scope_holder: dict[str, CancelScope] = {}
+    communicate_started = asyncio.Event()
+    killed = asyncio.Event()
+    reaped = asyncio.Event()
+
+    class FakeProcess:
+        returncode = None
+        communicate_owner = None
+
+        async def communicate(self):
+            self.communicate_owner = asyncio.current_task()
+            communicate_started.set()
+            await asyncio.Future()
+
+        async def wait(self):
+            await asyncio.sleep(0)
+            self.returncode = -9
+            reaped.set()
+            return self.returncode
+
+        def kill(self):
+            killed.set()
+            assert self.communicate_owner is not None
+            self.communicate_owner.cancel()
+
+    process = FakeProcess()
+
+    async def create_process(*_args, **_kwargs):
+        return process
+
+    async def cancel_capture():
+        await communicate_started.wait()
+        scope_holder["scope"].cancel()
+
+    monkeypatch.setattr(
+        "backend.services.plan_tasks.asyncio.create_subprocess_exec",
+        create_process,
+    )
+    canceller = asyncio.create_task(cancel_capture())
+    try:
+        with CancelScope() as scope:
+            scope_holder["scope"] = scope
+            with pytest.raises(asyncio.CancelledError):
+                await capture_repo_revision(str(tmp_path))
+        await canceller
+    finally:
+        if not canceller.done():
+            canceller.cancel()
+        await asyncio.gather(canceller, return_exceptions=True)
+
+    assert killed.is_set()
+    assert reaped.is_set()
+    assert process.returncode == -9
+
+
+@pytest.mark.asyncio
 async def test_repo_fingerprint_detects_repeated_edits_to_same_dirty_path(
     tmp_path,
 ):

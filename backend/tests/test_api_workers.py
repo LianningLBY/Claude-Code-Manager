@@ -73,6 +73,15 @@ FAKE_CLOUD_SCOPE = {
 # === Fixtures ===
 
 
+@pytest.fixture(scope="module", autouse=True)
+def assert_worker_api_auth_isolation():
+    """Worker API fixture teardown must preserve the entering auth state."""
+
+    original_token = settings.auth_token
+    yield
+    assert settings.auth_token == original_token
+
+
 @pytest.fixture
 def fake_provisioner(monkeypatch, session_factory):
     prov = AsyncMock()

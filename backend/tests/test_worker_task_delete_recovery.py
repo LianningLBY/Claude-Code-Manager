@@ -21,6 +21,7 @@ from backend.services.worker_proxy import (
     WorkerTaskPlanDeleteProtocolUnsupported,
 )
 from backend.services.plan_service import fence_plan_target_task
+from backend.services import worker_task_termination as termination
 from backend.services.worker_task_termination import (
     WorkerTaskTerminationCoordinator,
     active_worker_task_termination_receipt,
@@ -124,6 +125,12 @@ async def test_pending_remote_restart_sends_one_delete_and_finalizes_graph(
     proxy.require_task_plan_delete_protocol.assert_awaited_once()
     proxy.proxy_to_worker.assert_awaited_once()
     assert proxy.proxy_to_worker.await_args.args[1] == "DELETE"
+    assert (
+        proxy.proxy_to_worker.await_args.kwargs[
+            "require_task_incarnation_fence"
+        ]
+        is True
+    )
     async with session_factory() as db:
         assert await db.get(Task, task_id) is None
         assert await db.get(Plan, plan_id) is None
@@ -169,6 +176,10 @@ async def test_remote_possible_restart_never_replays_delete_and_late_commit_conv
     assert proxy.proxy_to_worker.await_count == 2
     assert all(
         call.args[1] == "GET" for call in proxy.proxy_to_worker.await_args_list
+    )
+    assert all(
+        call.kwargs["require_task_incarnation_fence"] is True
+        for call in proxy.proxy_to_worker.await_args_list
     )
     proxy.require_task_plan_delete_protocol.assert_not_awaited()
     async with session_factory() as db:
@@ -288,6 +299,10 @@ async def test_lost_delete_ack_and_failed_audit_leave_remote_possible_owner(
         "DELETE",
         "GET",
     ]
+    assert all(
+        call.kwargs["require_task_incarnation_fence"] is True
+        for call in proxy.proxy_to_worker.await_args_list
+    )
     async with session_factory() as db:
         assert await db.get(Task, task_id) is not None
         assert await db.get(Plan, plan_id) is not None
@@ -362,6 +377,58 @@ async def test_remote_possible_owner_blocks_retry_plan_and_generic_proxy(
 
     retry = await client.post(f"/api/tasks/{task_id}/retry")
     assert retry.status_code == 409
+
+
+@pytest.mark.parametrize("remote_possible", [False, True])
+async def test_delete_reconcile_cancel_commits_exact_error_under_anyio(
+    session_factory,
+    remote_possible,
+):
+    from anyio import CancelScope
+
+    _worker_id, task_id, _plan_id = await _worker_graph(
+        session_factory,
+        with_plan=False,
+    )
+    operation_id = await _prepare_receipt(session_factory, task_id)
+    if remote_possible:
+        async with session_factory() as db:
+            await mark_manager_task_delete_remote_possible(db, operation_id)
+
+    scope_holder: dict[str, CancelScope] = {}
+    observed_method: str | None = None
+
+    async def protocol_check(*_args, **_kwargs):
+        return None
+
+    async def cancel_proxy(_route, method, _path, **_kwargs):
+        nonlocal observed_method
+        observed_method = method
+        scope_holder["scope"].cancel()
+        await asyncio.sleep(0)
+
+    async with session_factory() as db:
+        with CancelScope() as scope:
+            scope_holder["scope"] = scope
+            with pytest.raises(asyncio.CancelledError):
+                await termination.reconcile_manager_task_delete_receipt(
+                    db,
+                    operation_id,
+                    proxy_request=cancel_proxy,
+                    protocol_check=protocol_check,
+                )
+
+    expected_detail = (
+        "Manager Task deletion audit was cancelled"
+        if remote_possible
+        else "Manager Task deletion was cancelled after remote_possible"
+    )
+    assert observed_method == ("GET" if remote_possible else "DELETE")
+    async with session_factory() as db:
+        receipt = await db.get(WorkerTaskTerminationReceipt, operation_id)
+    assert receipt.status == "conflict"
+    assert receipt.reconcile_count == 1
+    assert receipt.last_error == expected_detail
 
 
 async def test_api_cancellation_waits_for_exact_local_graph_commit(

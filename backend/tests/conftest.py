@@ -140,7 +140,7 @@ async def db_factory(db_engine):
 
 
 @pytest_asyncio.fixture
-async def app(db_engine):
+async def app(db_engine, monkeypatch):
     """Create a test FastAPI app with in-memory DB and auth disabled.
 
     Yields (real_app, session_factory) tuple.
@@ -160,12 +160,11 @@ async def app(db_engine):
     real_app.dependency_overrides[get_db] = override_get_db
 
     from backend.config import settings
-    original_token = settings.auth_token
     original_harness_db_factory = test_harness_service.db_factory
     original_harness_child_db_factory = test_harness_service.child_service.db_factory
     original_workspace_child_db_factory = workspace_review_manager.child_service.db_factory
     original_workspace_db_factory = workspace_review_module.async_session
-    settings.auth_token = ""
+    monkeypatch.setattr(settings, "auth_token", "")
     test_harness_service.db_factory = session_factory
     test_harness_service.child_service.db_factory = session_factory
     workspace_review_manager.child_service.db_factory = session_factory
@@ -174,7 +173,6 @@ async def app(db_engine):
     yield real_app, session_factory
 
     real_app.dependency_overrides.clear()
-    settings.auth_token = original_token
     test_harness_service.db_factory = original_harness_db_factory
     test_harness_service.child_service.db_factory = original_harness_child_db_factory
     workspace_review_manager.child_service.db_factory = original_workspace_child_db_factory

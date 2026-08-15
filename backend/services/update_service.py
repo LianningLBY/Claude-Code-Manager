@@ -27,6 +27,7 @@ from sqlalchemy import or_, select
 
 from backend.models.instance import Instance
 from backend.models.task import Task
+from backend.services.cancellation import finish_awaitable, settle_awaitable
 from backend.services.git_info import git_head_commit
 from backend.services.update_runtime import (
     TrustedUpdateRuntime,
@@ -3329,6 +3330,15 @@ class UpdateService:
             try:
                 stdout_task = asyncio.create_task(read_stream(proc.stdout))
                 stderr_task = asyncio.create_task(read_stream(proc.stderr, True))
+
+                async def settle_process() -> None:
+                    await proc.wait()
+                    await asyncio.gather(
+                        stdout_task,
+                        stderr_task,
+                        return_exceptions=True,
+                    )
+
                 await asyncio.wait_for(proc.wait(), timeout=timeout)
                 stdout = await stdout_task
                 stderr = await stderr_task
@@ -3340,10 +3350,7 @@ class UpdateService:
                         proc.kill()
                 except ProcessLookupError:
                     pass
-                await proc.wait()
-                await asyncio.gather(
-                    stdout_task, stderr_task, return_exceptions=True
-                )
+                await finish_awaitable(settle_process())
                 return {"returncode": -1, "stdout": "", "stderr": f"命令超时 ({timeout}s)"}
             except asyncio.CancelledError:
                 try:
@@ -3353,10 +3360,8 @@ class UpdateService:
                         proc.kill()
                 except ProcessLookupError:
                     pass
-                await asyncio.shield(proc.wait())
-                await asyncio.gather(
-                    stdout_task, stderr_task, return_exceptions=True
-                )
+                operation, _ = await settle_awaitable(settle_process())
+                operation.result()
                 raise
 
             return {

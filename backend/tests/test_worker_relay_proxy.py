@@ -24,6 +24,12 @@ from backend.config import settings
 from backend.models.log_entry import LogEntry
 from backend.models.instance import Instance
 from backend.models.monitor_session import MonitorCheck, MonitorSession
+from backend.models.pr_monitor import (
+    MonitoredRepo,
+    PRMonitorTaskTombstone,
+    PRReview,
+    PRReviewerRun,
+)
 from backend.models.project import Project
 from backend.models.plan import (
     Plan,
@@ -382,6 +388,67 @@ async def _mk_task(session_factory, **fields) -> Task:
         await db.commit()
         await db.refresh(t)
         return t
+
+
+async def _mk_worker_pr_reviewer_task(
+    session_factory,
+    *,
+    review_status: str,
+    reviewer_status: str | None = None,
+    archived: bool = False,
+) -> tuple[Worker, Task, int | None]:
+    worker = await _mk_worker(
+        session_factory,
+        name=f"review-worker-{review_status}-{reviewer_status}-{archived}",
+    )
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="pending",
+        archived=archived,
+    )
+    async with session_factory() as db:
+        repo = MonitoredRepo(
+            repo_full_name=f"example/worker-review-dispatch-{task.id}",
+            webhook_secret="worker-review-secret",
+        )
+        db.add(repo)
+        await db.flush()
+        review = PRReview(
+            repo_id=repo.id,
+            pr_number=task.id,
+            base_ref="main",
+            base_sha="a" * 40,
+            head_sha="b" * 40,
+            pr_title="Worker reviewer dispatch",
+            pr_author="alice",
+            pr_url=(
+                "https://github.com/example/worker-review-dispatch/"
+                f"pull/{task.id}"
+            ),
+            # Panel review creation retains this legacy first-task link.  The
+            # reviewer-run lifecycle must take precedence when present.
+            task_id=task.id,
+            status=review_status,
+        )
+        db.add(review)
+        await db.flush()
+        reviewer_id = None
+        if reviewer_status is not None:
+            reviewer = PRReviewerRun(
+                pr_review_id=review.id,
+                role="principal_engineer",
+                task_id=task.id,
+                provider="claude",
+                status=reviewer_status,
+                prompt_policy_hash="c" * 64,
+                guide_pack_hash="d" * 64,
+            )
+            db.add(reviewer)
+            await db.flush()
+            reviewer_id = reviewer.id
+        await db.commit()
+    return worker, task, reviewer_id
 
 
 @pytest.mark.parametrize("mapped", [False, True])
@@ -2512,6 +2579,7 @@ async def test_worker_forward_syncs_related_plan_uploads(monkeypatch):
 
 async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
     captured_payload = {}
+    captured_headers = {}
 
     class Response:
         def raise_for_status(self):
@@ -2520,8 +2588,10 @@ async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
         def json(self):
             return {
                 "id": task.id,
+                "incarnation_id": task.incarnation_id,
                 "status": task.status,
                 "retry_count": task.retry_count,
+                "turn_generation": task.turn_generation,
                 # Worker instance ids belong to a different database and are
                 # intentionally not comparable with the Manager mirror.
                 "instance_id": None,
@@ -2546,7 +2616,14 @@ async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
         async def __aexit__(self, *_args):
             return False
 
+        async def get(self, _url, *, headers):
+            return _ProxyResponse(
+                200,
+                {"worker_task_incarnation_proxy_version": 1},
+            )
+
         async def put(self, _url, *, headers, json):
+            captured_headers.update(headers)
             captured_payload.update(json)
             return Response()
 
@@ -2569,6 +2646,10 @@ async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
         title="remote",
         description="continue",
         worker_id=worker.id,
+        incarnation_id="1" * 32,
+        status="completed",
+        retry_count=0,
+        turn_generation=1,
         enabled_skills={"code-review": True},
         selected_user_skills=[6],
     )
@@ -2585,11 +2666,27 @@ async def test_worker_skill_selection_syncs_before_follow_up(monkeypatch):
             "content": "body",
         }],
     }
+    assert captured_headers == {
+        "Authorization": "Bearer token",
+        "X-CCM-Task-Incarnation": task.incarnation_id,
+    }
 
 
+@pytest.mark.parametrize(
+    "mismatch",
+    ["incarnation", "turn-generation", "skills"],
+)
 async def test_worker_skill_selection_sync_fails_closed_on_stale_confirmation(
     monkeypatch,
+    mismatch,
 ):
+    authoritative_snapshots = [{
+        "id": 9,
+        "name": "Authoritative",
+        "description": "Manager copy",
+        "content": "body",
+    }]
+
     class Response:
         def raise_for_status(self):
             return None
@@ -2597,12 +2694,28 @@ async def test_worker_skill_selection_sync_fails_closed_on_stale_confirmation(
         def json(self):
             return {
                 "id": task.id,
+                "incarnation_id": (
+                    "3" * 32
+                    if mismatch == "incarnation"
+                    else task.incarnation_id
+                ),
                 "status": task.status,
                 "retry_count": task.retry_count,
+                "turn_generation": (
+                    task.turn_generation + 1
+                    if mismatch == "turn-generation"
+                    else task.turn_generation
+                ),
                 "instance_id": task.instance_id,
-                "enabled_skills": {},
-                "selected_user_skills": [],
-                "metadata_": {"ccm_user_skill_snapshots": []},
+                "enabled_skills": (
+                    {}
+                    if mismatch == "skills"
+                    else {"code-review": True}
+                ),
+                "selected_user_skills": [9],
+                "metadata_": {
+                    "ccm_user_skill_snapshots": authoritative_snapshots,
+                },
             }
 
     class Client:
@@ -2615,17 +2728,20 @@ async def test_worker_skill_selection_sync_fails_closed_on_stale_confirmation(
         async def __aexit__(self, *_args):
             return False
 
+        async def get(self, _url, *, headers):
+            return _ProxyResponse(
+                200,
+                {"worker_task_incarnation_proxy_version": 1},
+            )
+
         async def put(self, _url, *, headers, json):
             return Response()
 
     monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
     proxy = WorkerProxy(None, relay=AsyncMock())
-    proxy._user_skill_snapshots = AsyncMock(return_value=[{
-        "id": 9,
-        "name": "Authoritative",
-        "description": "Manager copy",
-        "content": "body",
-    }])
+    proxy._user_skill_snapshots = AsyncMock(
+        return_value=authoritative_snapshots,
+    )
     worker = Worker(
         id=79,
         name="worker",
@@ -2637,6 +2753,10 @@ async def test_worker_skill_selection_sync_fails_closed_on_stale_confirmation(
         title="remote",
         description="continue",
         worker_id=worker.id,
+        incarnation_id="2" * 32,
+        status="completed",
+        retry_count=0,
+        turn_generation=1,
         instance_id=444,
         enabled_skills={"code-review": True},
         selected_user_skills=[9],
@@ -2647,6 +2767,77 @@ async def test_worker_skill_selection_sync_fails_closed_on_stale_confirmation(
 
     assert exc.value.status_code == 409
     assert "execution was blocked" in exc.value.detail
+
+
+async def test_worker_skill_selection_rejects_old_worker_before_put(monkeypatch):
+    put = AsyncMock()
+
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def get(self, _url, *, headers):
+            return _ProxyResponse(200, {})
+
+        async def put(self, *args, **kwargs):
+            return await put(*args, **kwargs)
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(None, relay=AsyncMock())
+    worker = Worker(
+        id=80,
+        name="legacy-worker",
+        private_ip="10.0.0.80",
+        auth_token="token",
+    )
+    task = Task(
+        id=904,
+        title="remote",
+        worker_id=worker.id,
+        incarnation_id="f" * 32,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await proxy.sync_task_skill_selection(worker, task)
+
+    assert exc.value.status_code == 409
+    assert "upgraded" in exc.value.detail
+    put.assert_not_awaited()
+
+
+async def test_worker_skill_selection_rejects_legacy_null_incarnation(
+    monkeypatch,
+):
+    class Client:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("legacy Task must fail before network access")
+
+    monkeypatch.setattr(worker_proxy_module.httpx, "AsyncClient", Client)
+    proxy = WorkerProxy(None, relay=AsyncMock())
+    worker = Worker(
+        id=81,
+        name="worker",
+        private_ip="10.0.0.81",
+        auth_token="token",
+    )
+    task = Task(
+        id=905,
+        title="legacy remote",
+        worker_id=worker.id,
+        incarnation_id=None,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        await proxy.sync_task_skill_selection(worker, task)
+
+    assert exc.value.status_code == 409
+    assert "stable incarnation" in exc.value.detail
 
 
 @pytest.mark.parametrize(
@@ -7287,6 +7478,184 @@ async def test_dispatch_worker_tasks_forwards(db_factory, session_factory, broad
     assert resulting.status == "executing"
 
 
+@pytest.mark.parametrize(
+    (
+        "review_status",
+        "reviewer_status",
+        "archived",
+        "should_forward",
+    ),
+    [
+        ("reviewing", None, False, True),
+        ("error", None, False, False),
+        ("reviewing", "pending", False, True),
+        ("reviewing", "cancelled", False, False),
+        ("reviewing", "completed", False, False),
+        ("reviewing", "reviewing", True, True),
+    ],
+    ids=(
+        "single-runnable",
+        "single-terminal",
+        "panel-runnable",
+        "panel-cancelled",
+        "panel-terminal",
+        "archived-panel-runnable",
+    ),
+)
+async def test_dispatch_worker_requires_runnable_pr_review_owner(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+    review_status,
+    reviewer_status,
+    archived,
+    should_forward,
+):
+    from backend.services.dispatcher import GlobalDispatcher
+
+    _, task, _ = await _mk_worker_pr_reviewer_task(
+        session_factory,
+        review_status=review_status,
+        reviewer_status=reviewer_status,
+        archived=archived,
+    )
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_tasks()
+    forward = dispatcher._running_tasks.get(f"worker-{task.id}")
+    if forward is not None:
+        await forward
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    if should_forward:
+        assert current.status == "in_progress"
+        assert current.turn_generation == task.turn_generation + 1
+        proxy.forward_task_to_worker.assert_awaited_once()
+        assert any(
+            channel == "tasks"
+            and event.get("task_id") == task.id
+            and event.get("new_status") == "in_progress"
+            for channel, event in broadcaster.sent
+        )
+    else:
+        assert current.status == "pending"
+        assert current.turn_generation == task.turn_generation
+        proxy.forward_task_to_worker.assert_not_awaited()
+        assert dispatcher._running_tasks == {}
+        assert broadcaster.sent == []
+
+
+async def test_dispatch_worker_final_claim_rechecks_cancelled_panel_reviewer(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.services.dispatcher import GlobalDispatcher
+
+    _, task, reviewer_id = await _mk_worker_pr_reviewer_task(
+        session_factory,
+        review_status="reviewing",
+        reviewer_status="pending",
+    )
+    assert reviewer_id is not None
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    original_execute = AsyncSession.execute
+    task_updates = 0
+    cancelled = False
+
+    async def cancel_immediately_before_final_claim(
+        session,
+        statement,
+        *args,
+        **kwargs,
+    ):
+        nonlocal task_updates, cancelled
+        table = getattr(statement, "table", None)
+        if (
+            getattr(statement, "is_update", False)
+            and getattr(table, "name", None) == "tasks"
+        ):
+            task_updates += 1
+            if task_updates == 2:
+                cancelled = True
+                await original_execute(
+                    session,
+                    update(PRReviewerRun)
+                    .where(PRReviewerRun.id == reviewer_id)
+                    .values(status="cancelled"),
+                )
+                await session.commit()
+        return await original_execute(session, statement, *args, **kwargs)
+
+    with patch.object(
+        AsyncSession,
+        "execute",
+        new=cancel_immediately_before_final_claim,
+    ):
+        await dispatcher._dispatch_worker_tasks()
+
+    assert cancelled
+    assert task_updates == 2
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        reviewer = await db.get(PRReviewerRun, reviewer_id)
+    assert current.status == "pending"
+    assert current.turn_generation == task.turn_generation
+    assert reviewer.status == "cancelled"
+    proxy.forward_task_to_worker.assert_not_awaited()
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
+
+
+async def test_dispatch_worker_never_forwards_deleted_owner_tombstone(
+    db_factory,
+    session_factory,
+    broadcaster,
+    monkeypatch,
+):
+    from backend.services.dispatcher import GlobalDispatcher
+
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        status="pending",
+    )
+    async with session_factory() as db:
+        db.add(PRMonitorTaskTombstone(task_id=task.id))
+        await db.commit()
+    proxy = AsyncMock()
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    dispatcher = GlobalDispatcher.__new__(GlobalDispatcher)
+    dispatcher.db_factory = db_factory
+    dispatcher.broadcaster = broadcaster
+    dispatcher._running_tasks = {}
+
+    await dispatcher._dispatch_worker_tasks()
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+    assert current.status == "pending"
+    assert current.turn_generation == task.turn_generation
+    proxy.forward_task_to_worker.assert_not_awaited()
+    assert dispatcher._running_tasks == {}
+    assert broadcaster.sent == []
+
+
 async def test_dispatch_worker_fresh_claim_uses_task_worker_user_lock_order(
     db_factory,
     session_factory,
@@ -10783,8 +11152,10 @@ async def test_worker_execution_admission_syncs_latest_manager_skills(
         def json(self):
             return {
                 "id": task.id,
+                "incarnation_id": task.incarnation_id,
                 "status": task.status,
                 "retry_count": task.retry_count,
+                "turn_generation": task.turn_generation,
                 "instance_id": task.instance_id,
                 "enabled_skills": self.payload["enabled_skills"],
                 "selected_user_skills": self.payload[
@@ -10807,7 +11178,14 @@ async def test_worker_execution_admission_syncs_latest_manager_skills(
         async def __aexit__(self, *_args):
             return False
 
+        async def get(self, _url, *, headers):
+            return _ProxyResponse(
+                200,
+                {"worker_task_incarnation_proxy_version": 1},
+            )
+
         async def put(self, _url, *, headers, json):
+            assert headers["X-CCM-Task-Incarnation"] == task.incarnation_id
             admission_order.append("skills")
             worker_skill_payloads.append(json)
             return Response(json)
@@ -11187,6 +11565,7 @@ async def test_worker_standard_execution_accepts_matching_legacy_routing(
             assert kwargs["surface_endpoint_not_found"] is True
             raise WorkerEndpointNotFoundError(path)
         assert path == f"/api/tasks/{task.id}"
+        assert kwargs["require_task_incarnation_fence"] is True
         return {
             "id": task.id,
             "status": task.status,
@@ -14922,6 +15301,7 @@ async def test_delete_worker_task_remote_first_then_cleans_exact_manager_mirror(
         "allow_task_absent": True,
         "operation_lock_held": True,
         "quarantine_on_transport_uncertainty": True,
+        "require_task_incarnation_fence": True,
     }
     proxy.relay.unsubscribe_task.assert_called_once_with(worker.id, task.id)
     async with session_factory() as db:
@@ -15089,6 +15469,10 @@ async def test_delete_worker_task_lost_ack_converges_by_read_only_plan_audit(
 
     assert response.status_code == 200, response.text
     assert proxy.proxy_to_worker.await_count == 2
+    assert all(
+        call.kwargs["require_task_incarnation_fence"] is True
+        for call in proxy.proxy_to_worker.await_args_list
+    )
     proxy.relay.unsubscribe_task.assert_called_once_with(worker.id, task.id)
     async with session_factory() as db:
         assert await db.get(Task, task.id) is None
@@ -15109,8 +15493,17 @@ async def test_delete_worker_task_retry_converges_when_remote_is_already_absent(
     requests = _install_proxy_transport(
         monkeypatch,
         [
-            _ProxyResponse(200, {"plan_cascade_protocol": 1}),
+            _ProxyResponse(200, {
+                "plan_cascade_protocol": 1,
+                "worker_task_incarnation_proxy_version": 1,
+            }),
+            _ProxyResponse(200, {
+                "worker_task_incarnation_proxy_version": 1,
+            }),
             _ProxyResponse(404, {"detail": "Task not found"}),
+            _ProxyResponse(200, {
+                "worker_task_incarnation_proxy_version": 1,
+            }),
             _ProxyResponse(
                 200,
                 {
@@ -15130,11 +15523,25 @@ async def test_delete_worker_task_retry_converges_when_remote_is_already_absent(
     response = await client.delete(f"/api/tasks/{task.id}")
 
     assert response.status_code == 200, response.text
-    assert [request[0] for request in requests] == ["GET", "DELETE", "GET"]
+    assert [request[0] for request in requests] == [
+        "GET",
+        "GET",
+        "DELETE",
+        "GET",
+        "GET",
+    ]
     assert requests[0][1].endswith("/api/system/config")
-    assert requests[1][1].endswith(f"/api/tasks/{task.id}")
-    assert requests[2][1].endswith(
+    assert requests[1][1].endswith("/api/system/config")
+    assert requests[2][1].endswith(f"/api/tasks/{task.id}")
+    assert requests[3][1].endswith("/api/system/config")
+    assert requests[4][1].endswith(
         f"/api/tasks/{task.id}/plan-delete-audit"
+    )
+    assert requests[2][2]["headers"]["X-CCM-Task-Incarnation"] == (
+        task.incarnation_id
+    )
+    assert requests[4][2]["headers"]["X-CCM-Task-Incarnation"] == (
+        task.incarnation_id
     )
     relay.unsubscribe_task.assert_called_once_with(worker.id, task.id)
     async with session_factory() as db:
@@ -15155,8 +15562,17 @@ async def test_delete_worker_task_does_not_treat_unrelated_404_as_confirmation(
     requests = _install_proxy_transport(
         monkeypatch,
         [
-            _ProxyResponse(200, {"plan_cascade_protocol": 1}),
+            _ProxyResponse(200, {
+                "plan_cascade_protocol": 1,
+                "worker_task_incarnation_proxy_version": 1,
+            }),
+            _ProxyResponse(200, {
+                "worker_task_incarnation_proxy_version": 1,
+            }),
             _ProxyResponse(404, {"detail": "Route not found"}),
+            _ProxyResponse(200, {
+                "worker_task_incarnation_proxy_version": 1,
+            }),
             _ProxyResponse(404, {"detail": "Route not found"}),
         ],
     )
@@ -15169,7 +15585,13 @@ async def test_delete_worker_task_does_not_treat_unrelated_404_as_confirmation(
     response = await client.delete(f"/api/tasks/{task.id}")
 
     assert response.status_code == 503
-    assert [request[0] for request in requests] == ["GET", "DELETE", "GET"]
+    assert [request[0] for request in requests] == [
+        "GET",
+        "GET",
+        "DELETE",
+        "GET",
+        "GET",
+    ]
     relay.unsubscribe_task.assert_not_called()
     async with session_factory() as db:
         assert await db.get(Task, task.id) is not None
@@ -15225,6 +15647,10 @@ async def test_delete_worker_task_preserves_manager_mirror_without_confirmation(
         ("DELETE", f"/api/tasks/{task.id}"),
         ("GET", f"/api/tasks/{task.id}/plan-delete-audit"),
     ]
+    assert all(
+        call.kwargs["require_task_incarnation_fence"] is True
+        for call in proxy.proxy_to_worker.await_args_list
+    )
     proxy.relay.unsubscribe_task.assert_not_called()
     async with session_factory() as db:
         assert await db.get(Task, task.id) is not None

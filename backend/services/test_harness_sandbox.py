@@ -28,6 +28,7 @@ from sqlalchemy import select, update
 
 from backend.database import async_session
 from backend.models.test_harness import TestHarnessRun, TestHarnessSandboxLease
+from backend.services.cancellation import settle_awaitable
 from backend.services.test_harness_egress_proxy import normalize_allowed_hosts
 from backend.services.test_harness_git_targets import ResolvedGitTarget
 
@@ -237,10 +238,16 @@ async def _run_command(argv: list[str], timeout: float) -> tuple[int, str]:
         stdout = await asyncio.wait_for(asyncio.shield(collect), timeout)
         await process.wait()
     except BaseException:
-        await asyncio.shield(_terminate_process(process))
-        if not collect.done():
-            collect.cancel()
-        await asyncio.gather(collect, return_exceptions=True)
+        async def settle_process() -> None:
+            try:
+                await _terminate_process(process)
+            finally:
+                if not collect.done():
+                    collect.cancel()
+                await asyncio.gather(collect, return_exceptions=True)
+
+        operation, _ = await settle_awaitable(settle_process())
+        operation.result()
         raise
     return process.returncode or 0, (stdout or b"").decode(
         "utf-8", errors="replace"
@@ -647,13 +654,14 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
             )
         except BaseException:
             try:
-                await asyncio.shield(
+                operation, _ = await settle_awaitable(
                     self.cleanup_identity(
                         run_id=run_id,
                         lease_id=lease_id,
                         lease_nonce=lease_nonce,
                     )
                 )
+                operation.result()
             except BaseException as cleanup_exc:
                 raise TestHarnessSandboxError(
                     "sandbox provisioning failed and cleanup could not be proven"
@@ -1180,13 +1188,14 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
             )
         except BaseException:
             try:
-                await asyncio.shield(
+                operation, _ = await settle_awaitable(
                     self.cleanup_identity(
                         run_id=run_id,
                         lease_id=lease_id,
                         lease_nonce=lease_nonce,
                     )
                 )
+                operation.result()
             except BaseException as cleanup_exc:
                 raise TestHarnessSandboxError(
                     "sandbox source acquisition failed and cleanup could not be proven"
@@ -1626,13 +1635,14 @@ class DockerTestHarnessSandboxRuntime(TestHarnessSandboxRuntime):
             )
         except BaseException:
             try:
-                await asyncio.shield(
+                operation, _ = await settle_awaitable(
                     self.cleanup_identity(
                         run_id=run_id,
                         lease_id=lease_id,
                         lease_nonce=lease_nonce,
                     )
                 )
+                operation.result()
             except BaseException as cleanup_exc:
                 raise TestHarnessSandboxError(
                     "sandbox preview failed and cleanup could not be proven"
@@ -1868,24 +1878,15 @@ class TestHarnessSandboxManager:
                 lease_nonce=lease_nonce,
             )
         except BaseException as exc:
-            cleanup_error: str | None = None
-            try:
-                await asyncio.shield(
-                    self.runtime.cleanup_identity(
-                        run_id=run_id,
-                        lease_id=lease_id,
-                        lease_nonce=lease_nonce,
-                    )
-                )
-            except BaseException as cleanup_exc:
-                cleanup_error = str(cleanup_exc)[:4000]
-            await asyncio.shield(
-                self._mark_failed(
-                    lease_id,
+            operation, _ = await settle_awaitable(
+                self._cleanup_and_mark_failed(
+                    run_id=run_id,
+                    lease_id=lease_id,
+                    lease_nonce=lease_nonce,
                     error=(str(exc) or type(exc).__name__)[:4000],
-                    cleanup_error=cleanup_error,
                 )
             )
+            operation.result()
             raise
         try:
             async with self.db_factory() as db:
@@ -1903,30 +1904,19 @@ class TestHarnessSandboxManager:
                 await db.refresh(lease)
                 return lease
         except BaseException as exc:
-            cleanup_error: str | None = None
-            try:
-                await asyncio.shield(
-                    self.runtime.cleanup_identity(
-                        run_id=run_id,
-                        lease_id=lease_id,
-                        lease_nonce=lease_nonce,
-                    )
+            operation, _ = await settle_awaitable(
+                self._cleanup_and_mark_failed(
+                    run_id=run_id,
+                    lease_id=lease_id,
+                    lease_nonce=lease_nonce,
+                    error=(str(exc) or type(exc).__name__)[:4000],
                 )
-            except BaseException as cleanup_exc:
-                cleanup_error = str(cleanup_exc)[:4000]
-            try:
-                await asyncio.shield(
-                    self._mark_failed(
-                        lease_id,
-                        error=(str(exc) or type(exc).__name__)[:4000],
-                        cleanup_error=cleanup_error,
-                    )
-                )
-            finally:
-                if cleanup_error:
-                    raise TestHarnessSandboxError(
-                        "sandbox persistence failed and cleanup could not be proven"
-                    ) from exc
+            )
+            cleanup_error = operation.result()
+            if cleanup_error:
+                raise TestHarnessSandboxError(
+                    "sandbox persistence failed and cleanup could not be proven"
+                ) from exc
             raise
 
     async def _mark_failed(
@@ -1950,6 +1940,32 @@ class TestHarnessSandboxManager:
                 lease.cleanup_error = cleanup_error
             lease.completed_at = datetime.utcnow()
             await db.commit()
+
+    async def _cleanup_and_mark_failed(
+        self,
+        *,
+        run_id: str,
+        lease_id: str,
+        lease_nonce: str,
+        error: str,
+    ) -> str | None:
+        cleanup_error: str | None = None
+        try:
+            await self.runtime.cleanup_identity(
+                run_id=run_id,
+                lease_id=lease_id,
+                lease_nonce=lease_nonce,
+            )
+        except BaseException as cleanup_exc:
+            cleanup_error = (
+                str(cleanup_exc) or type(cleanup_exc).__name__
+            )[:4000]
+        await self._mark_failed(
+            lease_id,
+            error=error,
+            cleanup_error=cleanup_error,
+        )
+        return cleanup_error
 
     async def acquire_source(
         self,
@@ -2006,24 +2022,15 @@ class TestHarnessSandboxManager:
                 additional_allowed_hosts=additional_allowed_hosts,
             )
         except BaseException as exc:
-            cleanup_error: str | None = None
-            try:
-                await asyncio.shield(
-                    self.runtime.cleanup_identity(
-                        run_id=run_id,
-                        lease_id=lease_id,
-                        lease_nonce=lease_nonce,
-                    )
-                )
-            except BaseException as cleanup_exc:
-                cleanup_error = str(cleanup_exc)[:4000]
-            await asyncio.shield(
-                self._mark_failed(
-                    lease_id,
+            operation, _ = await settle_awaitable(
+                self._cleanup_and_mark_failed(
+                    run_id=run_id,
+                    lease_id=lease_id,
+                    lease_nonce=lease_nonce,
                     error=(str(exc) or type(exc).__name__)[:4000],
-                    cleanup_error=cleanup_error,
                 )
             )
+            operation.result()
             raise
         try:
             async with self.db_factory() as db:
@@ -2051,24 +2058,15 @@ class TestHarnessSandboxManager:
                 await db.commit()
             return snapshot
         except BaseException as exc:
-            cleanup_error: str | None = None
-            try:
-                await asyncio.shield(
-                    self.runtime.cleanup_identity(
-                        run_id=run_id,
-                        lease_id=lease_id,
-                        lease_nonce=lease_nonce,
-                    )
-                )
-            except BaseException as cleanup_exc:
-                cleanup_error = str(cleanup_exc)[:4000]
-            await asyncio.shield(
-                self._mark_failed(
-                    lease_id,
+            operation, _ = await settle_awaitable(
+                self._cleanup_and_mark_failed(
+                    run_id=run_id,
+                    lease_id=lease_id,
+                    lease_nonce=lease_nonce,
                     error=(str(exc) or type(exc).__name__)[:4000],
-                    cleanup_error=cleanup_error,
                 )
             )
+            operation.result()
             raise
 
     async def prepare_preview(
@@ -2131,24 +2129,15 @@ class TestHarnessSandboxManager:
                 health_url_template=health_url_template,
             )
         except BaseException as exc:
-            cleanup_error: str | None = None
-            try:
-                await asyncio.shield(
-                    self.runtime.cleanup_identity(
-                        run_id=run_id,
-                        lease_id=lease_id,
-                        lease_nonce=lease_nonce,
-                    )
-                )
-            except BaseException as cleanup_exc:
-                cleanup_error = str(cleanup_exc)[:4000]
-            await asyncio.shield(
-                self._mark_failed(
-                    lease_id,
+            operation, _ = await settle_awaitable(
+                self._cleanup_and_mark_failed(
+                    run_id=run_id,
+                    lease_id=lease_id,
+                    lease_nonce=lease_nonce,
                     error=(str(exc) or type(exc).__name__)[:4000],
-                    cleanup_error=cleanup_error,
                 )
             )
+            operation.result()
             raise
         try:
             async with self.db_factory() as db:
@@ -2171,24 +2160,15 @@ class TestHarnessSandboxManager:
                 await db.commit()
             return preview
         except BaseException as exc:
-            cleanup_error: str | None = None
-            try:
-                await asyncio.shield(
-                    self.runtime.cleanup_identity(
-                        run_id=run_id,
-                        lease_id=lease_id,
-                        lease_nonce=lease_nonce,
-                    )
-                )
-            except BaseException as cleanup_exc:
-                cleanup_error = str(cleanup_exc)[:4000]
-            await asyncio.shield(
-                self._mark_failed(
-                    lease_id,
+            operation, _ = await settle_awaitable(
+                self._cleanup_and_mark_failed(
+                    run_id=run_id,
+                    lease_id=lease_id,
+                    lease_nonce=lease_nonce,
                     error=(str(exc) or type(exc).__name__)[:4000],
-                    cleanup_error=cleanup_error,
                 )
             )
+            operation.result()
             raise
 
     async def cleanup(self, run_id: str) -> TestHarnessSandboxLease | None:

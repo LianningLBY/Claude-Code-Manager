@@ -185,6 +185,26 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
         return False
 
     @staticmethod
+    def _worker_plain_task_path(method: str, path: str) -> bool:
+        """Identify the broad Task row routes that require a second identity."""
+
+        parts = path.strip("/").split("/")
+        return bool(
+            method.upper() in {"GET", "PUT", "DELETE"}
+            and len(parts) == 3
+            and parts[:2] == ["api", "tasks"]
+            and parts[2].isdigit()
+        )
+
+    @staticmethod
+    def _valid_worker_task_incarnation_header(value: object) -> bool:
+        return bool(
+            isinstance(value, str)
+            and len(value) == 32
+            and all(char in "0123456789abcdef" for char in value)
+        )
+
+    @staticmethod
     def _worker_project_protocol_path_allowed(method: str, path: str) -> bool:
         """Allow only remote checkout discovery/materialization."""
 
@@ -616,6 +636,23 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
                             "detail": (
                                 "Endpoint is outside the CCM Worker control-plane "
                                 "protocol"
+                            )
+                        },
+                    )
+                if (
+                    self._worker_plain_task_path(request.method, path)
+                    and not self._valid_worker_task_incarnation_header(
+                        request.headers.get("x-ccm-task-incarnation")
+                    )
+                ):
+                    # Reject before FastAPI parses a PUT body.  The route then
+                    # revalidates the syntactically valid value against the
+                    # exact Task row in its own read/write transaction.
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "detail": (
+                                "Worker Task incarnation header is required"
                             )
                         },
                     )

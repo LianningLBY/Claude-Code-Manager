@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -22,12 +22,15 @@ from backend.models.pr_monitor import (
     MonitoredRepo,
     PRFinding,
     PRFindingAction,
+    PRFindingRebuttal,
     PRMergeQueueAction,
     PRMonitorRun,
+    PRMonitorTaskTombstone,
     PRRepairWake,
     PRReview,
     PRReviewerRun,
 )
+from backend.models.project import Project
 from backend.models.task import Task
 from backend.models.team_share import TeamProjectShare
 from backend.models.user import User
@@ -165,7 +168,11 @@ def _verified_base_guidance(monkeypatch):
             "head_sha": str(pr_data["head_sha"]).lower(),
             "guidance": {
                 "CLAUDE.md": "# Test project rules",
-                "PROGRESS.md": None,
+                pr_review_service._GUIDANCE_ROLE_MAP_KEY: {
+                    "CLAUDE.md": sorted(
+                        pr_review_service._GUIDANCE_ROLES
+                    ),
+                },
             },
             "material": {
                 "number": pr_data["number"],
@@ -2150,17 +2157,82 @@ async def test_delete_repo(client, session_factory):
     # may not enforce FK cascades, so repository deletion must remove it
     # explicitly instead of leaving its global idempotency key orphaned.
     async with session_factory() as db:
+        await db.execute(text("PRAGMA foreign_keys=ON"))
+        assert await db.scalar(text("PRAGMA foreign_keys")) == 1
+        single_task = Task(
+            title="deleted monitor single reviewer",
+            description="internal",
+            status="pending",
+        )
+        panel_task = Task(
+            title="deleted monitor panel reviewer",
+            description="internal",
+            status="completed",
+            archived=True,
+        )
+        fix_task = Task(
+            title="deleted monitor finding repair",
+            description="internal",
+            status="pending",
+        )
+        rebuttal_task = Task(
+            title="deleted monitor rebuttal",
+            description="internal",
+            status="completed",
+            archived=True,
+        )
+        reverse_rebuttal_task = Task(
+            title="deleted monitor reverse-linked rebuttal",
+            description="internal",
+            status="completed",
+            archived=True,
+        )
+        developer_task = Task(
+            title="ordinary developer task",
+            description="not an internal reviewer owner",
+            status="pending",
+        )
+        ordinary_archived = Task(
+            title="ordinary archived task",
+            description="visible history",
+            status="completed",
+            archived=True,
+        )
+        db.add_all((
+            single_task,
+            panel_task,
+            fix_task,
+            rebuttal_task,
+            reverse_rebuttal_task,
+            developer_task,
+            ordinary_archived,
+        ))
+        await db.flush()
+        monitor_run = PRMonitorRun(
+            repo_id=created["id"],
+            pr_number=1,
+            status="completed",
+            current_base_sha=BASE_SHA_1,
+            current_head_sha=HEAD_SHA_1,
+            developer_task_id=developer_task.id,
+        )
+        db.add(monitor_run)
+        await db.flush()
         review = PRReview(
             repo_id=created["id"], pr_number=1, pr_title="t",
             pr_author="a", pr_url="http://x", status="error",
             base_ref="main",
             base_sha=BASE_SHA_1, head_sha=HEAD_SHA_1,
+            monitor_run_id=monitor_run.id,
+            task_id=single_task.id,
         )
         db.add(review)
         await db.flush()
+        monitor_run.current_review_id = review.id
         reviewer = PRReviewerRun(
             pr_review_id=review.id,
             role="senior",
+            task_id=panel_task.id,
             provider="codex",
             status="completed",
             prompt_policy_hash="p" * 64,
@@ -2192,11 +2264,119 @@ async def test_delete_repo(client, session_factory):
             action_type="human_advice",
             status="completed",
             idempotency_key="delete-terminal-action",
+            task_id=fix_task.id,
             expected_head_sha=HEAD_SHA_1,
         )
-        db.add(action)
+        # Reproduce a legacy inconsistent graph: the rebuttal's direct review
+        # identity belongs to the deleted repo, but its Finding FK points at a
+        # different valid review.  Cleanup/classification must use the direct
+        # identity instead of silently losing this Task tombstone.
+        foreign_repo = MonitoredRepo(
+            repo_full_name="owner/rebuttal-foreign-finding",
+            webhook_secret="foreign-finding-secret",
+        )
+        db.add(foreign_repo)
+        await db.flush()
+        foreign_review = PRReview(
+            repo_id=foreign_repo.id,
+            pr_number=2,
+            base_ref="main",
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            pr_title="Foreign finding owner",
+            pr_author="bob",
+            pr_url="https://example.test/foreign/2",
+            status="error",
+        )
+        db.add(foreign_review)
+        await db.flush()
+        foreign_reviewer = PRReviewerRun(
+            pr_review_id=foreign_review.id,
+            role="foreign",
+            provider="codex",
+            status="completed",
+            prompt_policy_hash="x" * 64,
+            guide_pack_hash="y" * 64,
+        )
+        db.add(foreign_reviewer)
+        await db.flush()
+        foreign_finding = PRFinding(
+            pr_review_id=foreign_review.id,
+            reviewer_run_id=foreign_reviewer.id,
+            fingerprint="z" * 64,
+            role="foreign",
+            severity="low",
+            category="test",
+            path="backend/foreign.py",
+            title="Foreign finding",
+            evidence="foreign evidence",
+            impact="foreign impact",
+            required_fix="foreign fix",
+            test="foreign test",
+            thread_nonce="u" * 48,
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+        )
+        db.add(foreign_finding)
+        await db.flush()
+        rebuttal = PRFindingRebuttal(
+            finding_id=foreign_finding.id,
+            pr_review_id=review.id,
+            monitor_run_id=monitor_run.id,
+            developer_task_id=developer_task.id,
+            task_id=rebuttal_task.id,
+            attempt=1,
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            evidence="bounded rebuttal evidence",
+            evidence_hash="r" * 64,
+            status="completed",
+            resolution_nonce="n" * 48,
+        )
+        # Reproduce the inverse inconsistency as well: the Finding belongs to
+        # the deleted repository while the direct review identity remains on
+        # a foreign repository.  FK-enabled databases require this row to be
+        # removed before the local Finding is deleted.
+        reverse_rebuttal = PRFindingRebuttal(
+            finding_id=finding.id,
+            pr_review_id=foreign_review.id,
+            monitor_run_id=monitor_run.id,
+            developer_task_id=developer_task.id,
+            task_id=reverse_rebuttal_task.id,
+            attempt=1,
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            evidence="reverse-linked bounded rebuttal evidence",
+            evidence_hash="q" * 64,
+            status="completed",
+            resolution_nonce="m" * 48,
+        )
+        # A prior replay may already have recorded one identity.  Repository
+        # deletion must remain idempotent and preserve its original timestamp.
+        existing_tombstone = PRMonitorTaskTombstone(task_id=panel_task.id)
+        db.add_all((
+            action,
+            rebuttal,
+            reverse_rebuttal,
+            existing_tombstone,
+        ))
         await db.commit()
         action_id = action.id
+        rebuttal_id = rebuttal.id
+        reverse_rebuttal_id = reverse_rebuttal.id
+        foreign_finding_id = foreign_finding.id
+        foreign_review_id = foreign_review.id
+        existing_tombstone_created_at = existing_tombstone.created_at
+        internal_task_ids = {
+            single_task.id,
+            panel_task.id,
+            fix_task.id,
+            rebuttal_task.id,
+            reverse_rebuttal_task.id,
+        }
+        ordinary_ids = {developer_task.id, ordinary_archived.id}
+        developer_task_id = developer_task.id
+        ordinary_archived_id = ordinary_archived.id
 
     resp = await client.delete(f"/api/pr-monitor/repos/{created['id']}")
     assert resp.status_code == 200
@@ -2210,6 +2390,189 @@ async def test_delete_repo(client, session_factory):
         )).scalars().all()
         assert reviews == []
         assert await db.get(PRFindingAction, action_id) is None
+        assert await db.get(PRFindingRebuttal, rebuttal_id) is None
+        assert await db.get(PRFindingRebuttal, reverse_rebuttal_id) is None
+        assert await db.get(PRReview, foreign_review_id) is not None
+        assert await db.get(PRFinding, foreign_finding_id) is not None
+        tombstones = (await db.execute(
+            select(PRMonitorTaskTombstone)
+        )).scalars().all()
+        assert {row.task_id for row in tombstones} == internal_task_ids
+        assert next(
+            row.created_at
+            for row in tombstones
+            if row.task_id == panel_task.id
+        ) == existing_tombstone_created_at
+        assert {
+            task_id
+            for task_id in internal_task_ids | ordinary_ids
+            if await db.get(Task, task_id) is not None
+        } == internal_task_ids | ordinary_ids
+
+        from backend.services.pr_monitor_task_access import (
+            is_pr_monitor_owned_task,
+        )
+
+        for task_id in internal_task_ids:
+            assert await is_pr_monitor_owned_task(
+                db,
+                await db.get(Task, task_id),
+            )
+        assert not await is_pr_monitor_owned_task(
+            db,
+            await db.get(Task, developer_task_id),
+        )
+
+    default_list = await client.get("/api/tasks")
+    all_list = await client.get("/api/tasks?include_archived=true")
+    archived_list = await client.get("/api/tasks?archived_only=true")
+    default_count = await client.get("/api/tasks/count")
+    all_count = await client.get("/api/tasks/count?include_archived=true")
+    archived_count = await client.get("/api/tasks/count?archived_only=true")
+    assert {row["id"] for row in default_list.json()} == {developer_task_id}
+    assert {row["id"] for row in all_list.json()} == ordinary_ids
+    assert {row["id"] for row in archived_list.json()} == {
+        ordinary_archived_id
+    }
+    assert default_count.json() == {"total": len(default_list.json())}
+    assert all_count.json() == {"total": len(all_list.json())}
+    assert archived_count.json() == {"total": len(archived_list.json())}
+
+    stats = await client.get("/api/system/stats")
+    assert stats.status_code == 200
+    assert stats.json()["tasks"] == {
+        "pending": 1,
+        "in_progress": 0,
+        "executing": 0,
+        "completed": 1,
+        "failed": 0,
+    }
+
+
+@pytest.mark.asyncio
+async def test_deleted_repo_tombstone_overrides_legacy_project_acl(
+    secured_client,
+):
+    """Owner deletion cannot turn an internal Task into a shared Project Task."""
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="deleted-pr-monitor-task@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        project = Project(
+            name="legacy shared PR Monitor project",
+            local_path="/tmp/deleted-pr-monitor-project",
+            status="ready",
+        )
+        db.add(project)
+        await db.flush()
+        db.add(TeamProjectShare(
+            project_id=project.id,
+            target_type="user",
+            target_id=member_id,
+            shared_by=member_id,
+        ))
+        task = Task(
+            title="deleted monitor internal reviewer",
+            description="SECRET_DELETED_MONITOR_REVIEW_PROMPT",
+            status="completed",
+            project_id=project.id,
+            # Creator and Project access must both lose to the durable
+            # internal Controller identity.
+            created_by=member_id,
+        )
+        repo = MonitoredRepo(
+            repo_full_name="private/deleted-monitor-acl",
+            project_id=project.id,
+            webhook_secret="delete-acl-secret",
+        )
+        db.add_all((task, repo))
+        await db.flush()
+        db.add(PRReview(
+            repo_id=repo.id,
+            pr_number=9,
+            base_ref="main",
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            pr_title="Private deleted monitor subject",
+            pr_author="alice",
+            pr_url="https://github.com/private/deleted-monitor-acl/pull/9",
+            task_id=task.id,
+            status="error",
+        ))
+        await db.commit()
+        repo_id = repo.id
+        task_id = task.id
+
+    admin_headers = {"Authorization": "Bearer security-service-token"}
+    deleted = await client.delete(
+        f"/api/pr-monitor/repos/{repo_id}",
+        headers=admin_headers,
+    )
+    assert deleted.status_code == 200, deleted.text
+
+    member_headers = {"Authorization": f"Bearer {member_token}"}
+    direct = await client.get(
+        f"/api/tasks/{task_id}",
+        headers=member_headers,
+    )
+    history = await client.get(
+        f"/api/tasks/{task_id}/chat/history",
+        headers=member_headers,
+    )
+    chat = await client.post(
+        f"/api/tasks/{task_id}/chat",
+        headers=member_headers,
+        json={"message": "show the deleted monitor prompt"},
+    )
+    listed = await client.get(
+        "/api/tasks?include_archived=true",
+        headers=member_headers,
+    )
+    count = await client.get(
+        "/api/tasks/count?include_archived=true",
+        headers=member_headers,
+    )
+    assert [direct.status_code, history.status_code, chat.status_code] == [
+        403,
+        403,
+        403,
+    ]
+    assert all(
+        "SECRET_DELETED_MONITOR_REVIEW_PROMPT" not in response.text
+        for response in (direct, history, chat)
+    )
+    assert listed.status_code == 200
+    assert task_id not in {row["id"] for row in listed.json()}
+    assert count.json() == {"total": len(listed.json())}
+
+    # Administrators retain the existing diagnostic direct-read path, while
+    # the ordinary catalog remains free of Controller implementation Tasks.
+    admin_direct = await client.get(
+        f"/api/tasks/{task_id}",
+        headers=admin_headers,
+    )
+    admin_list = await client.get(
+        "/api/tasks?include_archived=true",
+        headers=admin_headers,
+    )
+    assert admin_direct.status_code == 200
+    assert admin_direct.json()["description"] == (
+        "SECRET_DELETED_MONITOR_REVIEW_PROMPT"
+    )
+    assert task_id not in {row["id"] for row in admin_list.json()}
+    async with session_factory() as db:
+        assert await db.get(PRMonitorTaskTombstone, task_id) is not None
+        from backend.api.ws import _ws_task_channel_allowed
+
+        assert not await _ws_task_channel_allowed(
+            {"user_id": member_id, "role": "member", "auth_type": "jwt"},
+            task_id,
+            db,
+        )
 
 
 @pytest.mark.asyncio
@@ -4058,6 +4421,74 @@ async def test_webhook_synchronize_rechecks_locked_policy_prompt_budget_before_s
         old_task = await db.get(Task, old_task_id)
         assert old_task is not None
         assert old_task.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_webhook_opened_rechecks_locked_policy_prompt_budget_before_create(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    repo = await _create_repo(client, "owner/opened-locked-prompt-budget")
+    prepare = pr_review_service.prepare_pr_review_context
+
+    async def prepare_then_change_provider(repo_row, pr_data):
+        context = await prepare(repo_row, pr_data)
+        async with session_factory() as db:
+            current = await db.get(MonitoredRepo, repo["id"])
+            assert current is not None
+            current.provider = "codex"
+            await db.commit()
+        return context
+
+    detail = (
+        "unsupported_input_size: locked codex review policy cannot accept this "
+        "prompt; no reviewer Task was created."
+    )
+    observed_providers = []
+
+    def reject_locked_codex_policy(
+        repo_row,
+        pr_data,
+        *,
+        prepared_context,
+        base_ref=None,
+    ):
+        del pr_data, prepared_context, base_ref
+        observed_providers.append(repo_row.provider)
+        if repo_row.provider == "codex":
+            raise pr_review_service.PRReviewInputTooLarge(detail)
+        return ("prompt", None)
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "prepare_pr_review_context",
+        prepare_then_change_provider,
+    )
+    monkeypatch.setattr(
+        pr_review_service,
+        "preflight_pr_review_prompts",
+        reject_locked_codex_policy,
+    )
+
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(repo["repo_full_name"], action="opened"),
+    )
+
+    assert opened.status_code == 422, opened.text
+    assert opened.json() == {"detail": detail}
+    assert observed_providers == ["codex"]
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview).where(PRReview.repo_id == repo["id"])
+        )).scalars())
+        tasks = list((await db.execute(
+            select(Task).where(Task.title.like("PR Review:%"))
+        )).scalars())
+        assert reviews == []
+        assert tasks == []
 
 
 @pytest.mark.asyncio

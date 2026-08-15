@@ -25,6 +25,7 @@ from backend.services.instance_capacity import (
     occupied_slot_predicate,
 )
 from backend.services.plan_pipeline_settings import effective_plan_pipeline_config
+from backend.services.cancellation import finish_awaitable
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -190,14 +191,9 @@ async def update_capacity_settings(
             )
             return response
 
-    update_task = asyncio.create_task(persist_apply_and_respond())
-    try:
-        return await asyncio.shield(update_task)
-    except asyncio.CancelledError:
-        # Let the DB/runtime pair finish converging before the request-scoped
-        # session is closed by dependency teardown.
-        await asyncio.shield(update_task)
-        raise
+    # Let the DB/runtime pair finish converging before the request-scoped
+    # session is closed by dependency teardown.
+    return await finish_awaitable(persist_apply_and_respond())
 
 
 @router.get("/runtime", response_model=RuntimeSettingsResponse)
@@ -288,12 +284,7 @@ async def update_runtime_settings(
             })
             return response
 
-    update_task = asyncio.create_task(persist_apply_and_respond())
-    try:
-        return await asyncio.shield(update_task)
-    except asyncio.CancelledError:
-        await asyncio.shield(update_task)
-        raise
+    return await finish_awaitable(persist_apply_and_respond())
 
 
 # --- Default Skills ---

@@ -18,6 +18,7 @@ from backend.models.pr_monitor import (
 from backend.models.task import Task
 from backend.models.worker import Worker
 from backend.services.pr_review_adjudication import (
+    _stop_resolution_lease_renewal,
     complete_adjudication,
     fail_adjudication,
     parse_adjudication_output,
@@ -32,6 +33,28 @@ from backend.tests.worker_termination_helpers import (
 
 BASE = "a" * 40
 HEAD = "b" * 40
+
+
+@pytest.mark.asyncio
+async def test_resolution_renewal_finalizer_settles_under_anyio_cancellation():
+    from anyio import CancelScope
+
+    stop = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def renewal():
+        await stop.wait()
+        await asyncio.sleep(0)
+        finished.set()
+
+    renewal_task = asyncio.create_task(renewal())
+    with CancelScope() as scope:
+        scope.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await _stop_resolution_lease_renewal(stop, renewal_task)
+
+    assert finished.is_set()
+    assert renewal_task.done()
 
 
 def _output(fingerprint: str, verdict: str = "accepted") -> str:

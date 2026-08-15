@@ -132,6 +132,184 @@ async def test_worker_deployment_token_chat_requires_exact_handoff(
     assert "exact turn handoff" in response.json()["detail"]
 
 
+async def _worker_plain_task_request(
+    client,
+    *,
+    method: str,
+    task_id: int,
+    incarnation_id: str | None,
+):
+    headers = {"Authorization": "Bearer worker-secret"}
+    if incarnation_id is not None:
+        headers["X-CCM-Task-Incarnation"] = incarnation_id
+    return await client.request(
+        method,
+        f"/api/tasks/{task_id}",
+        headers=headers,
+        json={"title": "worker-updated"} if method == "PUT" else None,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["GET", "PUT", "DELETE"])
+@pytest.mark.parametrize(
+    "incarnation_header",
+    [None, "not-an-incarnation", "b" * 32],
+    ids=["missing", "malformed", "wrong"],
+)
+async def test_worker_plain_task_routes_require_exact_incarnation_header(
+    client,
+    session_factory,
+    monkeypatch,
+    method,
+    incarnation_header,
+):
+    """The deployment credential alone cannot select a logical Task."""
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    monkeypatch.setattr(settings, "auth_token", "worker-secret")
+    async with session_factory() as db:
+        task = Task(
+            title="worker-original",
+            description="plain route identity",
+            status="completed",
+            incarnation_id="a" * 32,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    response = await _worker_plain_task_request(
+        client,
+        method=method,
+        task_id=task_id,
+        incarnation_id=incarnation_header,
+    )
+
+    assert response.status_code == 409, response.text
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current is not None
+    assert current.incarnation_id == "a" * 32
+    assert current.title == "worker-original"
+
+
+@pytest.mark.asyncio
+async def test_worker_plain_put_rejects_missing_header_before_body_parsing(
+    client,
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    monkeypatch.setattr(settings, "auth_token", "worker-secret")
+
+    response = await client.put(
+        "/api/tasks/42",
+        headers={
+            "Authorization": "Bearer worker-secret",
+            "Content-Type": "application/json",
+        },
+        content=b"{not valid JSON",
+    )
+
+    assert response.status_code == 409, response.text
+    assert "incarnation header" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["GET", "PUT", "DELETE"])
+async def test_worker_plain_task_routes_accept_exact_incarnation_header(
+    client,
+    session_factory,
+    monkeypatch,
+    method,
+):
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    monkeypatch.setattr(settings, "auth_token", "worker-secret")
+    incarnation_id = "c" * 32
+    async with session_factory() as db:
+        task = Task(
+            title="worker-original",
+            description="plain route identity",
+            status="completed",
+            incarnation_id=incarnation_id,
+        )
+        db.add(task)
+        await db.commit()
+        await db.refresh(task)
+        task_id = task.id
+
+    response = await _worker_plain_task_request(
+        client,
+        method=method,
+        task_id=task_id,
+        incarnation_id=incarnation_id,
+    )
+
+    assert response.status_code == 200, response.text
+    async with session_factory() as db:
+        current = await db.get(Task, task_id)
+    if method == "DELETE":
+        assert current is None
+    else:
+        assert current is not None
+        assert current.incarnation_id == incarnation_id
+        assert current.title == (
+            "worker-updated" if method == "PUT" else "worker-original"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["GET", "PUT", "DELETE"])
+async def test_worker_plain_task_routes_reject_stale_incarnation_after_id_aba(
+    client,
+    session_factory,
+    monkeypatch,
+    method,
+):
+    """A deleted/recreated integer id must not alias the former Task."""
+
+    monkeypatch.setattr(settings, "ccm_node_role", "worker")
+    monkeypatch.setattr(settings, "auth_token", "worker-secret")
+    stale_incarnation = "d" * 32
+    replacement_incarnation = "e" * 32
+    async with session_factory() as db:
+        old = Task(
+            title="old incarnation",
+            description="will be replaced",
+            status="completed",
+            incarnation_id=stale_incarnation,
+        )
+        db.add(old)
+        await db.commit()
+        await db.refresh(old)
+        task_id = old.id
+        await db.delete(old)
+        await db.commit()
+        db.add(Task(
+            id=task_id,
+            title="replacement incarnation",
+            description="must survive stale request",
+            status="completed",
+            incarnation_id=replacement_incarnation,
+        ))
+        await db.commit()
+
+    response = await _worker_plain_task_request(
+        client,
+        method=method,
+        task_id=task_id,
+        incarnation_id=stale_incarnation,
+    )
+
+    assert response.status_code == 409, response.text
+    async with session_factory() as db:
+        replacement = await db.get(Task, task_id)
+    assert replacement is not None
+    assert replacement.incarnation_id == replacement_incarnation
+    assert replacement.title == "replacement incarnation"
+
+
 def test_worker_plan_protocol_allowlist_is_exact():
     from backend.middleware.auth import TokenAuthMiddleware
 

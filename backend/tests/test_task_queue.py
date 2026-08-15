@@ -38,6 +38,7 @@ from backend.models.pr_monitor import (
     PRFindingAction,
     PRFindingRebuttal,
     PRMonitorRun,
+    PRMonitorTaskTombstone,
     PRReview,
     PRReviewerRun,
 )
@@ -66,8 +67,8 @@ from backend.services.task_queue import (
     TaskQueue,
     TaskWaitingCapabilityConflict,
     _effective_key_expr,
-    _pr_review_dispatch_predicate,
     ordinary_task_visibility_predicate,
+    pr_review_dispatch_predicate,
     task_delete_fence,
     task_generation_fence,
 )
@@ -3372,6 +3373,7 @@ async def test_ordinary_task_lists_hide_linked_pr_reviewer_tasks(queue):
     ("link_kind", "review_status", "run_status", "should_claim"),
     [
         ("none", None, None, True),
+        ("tombstone", None, None, False),
         ("single", "reviewing", None, True),
         ("single", "error", None, False),
         ("panel", "reviewing", "pending", True),
@@ -3381,6 +3383,7 @@ async def test_ordinary_task_lists_hide_linked_pr_reviewer_tasks(queue):
     ],
     ids=(
         "ordinary",
+        "deleted-owner-tombstone",
         "single-runnable",
         "single-parent-terminal",
         "panel-pending",
@@ -3403,7 +3406,10 @@ async def test_dequeue_requires_runnable_pr_review_owner(
         target_repo="/tmp",
     )
     task_id = task.id
-    if link_kind != "none":
+    if link_kind == "tombstone":
+        queue.db.add(PRMonitorTaskTombstone(task_id=task_id))
+        await queue.db.commit()
+    elif link_kind != "none":
         repo = MonitoredRepo(
             repo_full_name=f"example/dispatch-{link_kind}-{task_id}",
             webhook_secret="queue-secret",
@@ -3607,7 +3613,7 @@ def test_pr_review_task_predicates_compile_for_supported_database_dialects(
     )
     claim_statement = (
         update(Task)
-        .where(_pr_review_dispatch_predicate())
+        .where(pr_review_dispatch_predicate())
         .values(status="in_progress")
     )
 
@@ -3618,9 +3624,11 @@ def test_pr_review_task_predicates_compile_for_supported_database_dialects(
     assert "pr_reviewer_runs" in list_sql
     assert "pr_finding_actions" in list_sql
     assert "pr_finding_rebuttals" in list_sql
+    assert "pr_monitor_task_tombstones" in list_sql
     assert "NOT ((EXISTS" in list_sql
     assert "pr_reviews" in claim_sql
     assert "pr_reviewer_runs" in claim_sql
+    assert "pr_monitor_task_tombstones" in claim_sql
     assert "EXISTS" in claim_sql
 
 

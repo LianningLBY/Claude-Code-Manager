@@ -474,7 +474,11 @@ def _unsafe_git_config_key(key: str, value: str) -> bool:
     return key.startswith("tar.") and key.endswith(".command")
 
 
-async def _read_safe_git_config(config_path: Path) -> list[tuple[str, str]]:
+async def _read_safe_git_config(
+    config_path: Path,
+    *,
+    allowed_hooks_path: Path | None = None,
+) -> list[tuple[str, str]]:
     """Parse one repository-owned config file without executing includes."""
 
     if (
@@ -508,7 +512,12 @@ async def _read_safe_git_config(config_path: Path) -> list[tuple[str, str]]:
         key = key.lower()
         if not separator or not key:
             raise DeliveryWorkspaceConflict("Repository Git configuration is malformed")
-        if _unsafe_git_config_key(key, value):
+        canonical_default_hooks = (
+            key == "core.hookspath"
+            and allowed_hooks_path is not None
+            and os.path.abspath(value) == str(allowed_hooks_path)
+        )
+        if not canonical_default_hooks and _unsafe_git_config_key(key, value):
             category = "external Git filters" if key.startswith("filter.") else key
             raise DeliveryWorkspaceConflict(
                 f"Repository contains unsafe Git configuration: {category} ({key})"
@@ -585,12 +594,19 @@ async def _validate_controller_git_repository(
         or config_path.stat().st_size > _MAX_GIT_CONFIG_BYTES
     ):
         raise DeliveryWorkspaceConflict("Repository Git configuration is unsafe")
-    entries = await _read_safe_git_config(config_path)
+    allowed_hooks_path = common / "hooks"
+    entries = await _read_safe_git_config(
+        config_path,
+        allowed_hooks_path=allowed_hooks_path,
+    )
     worktree_config = git_dir / "config.worktree"
     if os.path.lexists(worktree_config):
         # Worktree-specific settings are legitimate, but receive the same
         # executable/credential/transport safety validation as common config.
-        await _read_safe_git_config(worktree_config)
+        await _read_safe_git_config(
+            worktree_config,
+            allowed_hooks_path=allowed_hooks_path,
+        )
 
     fetch_values = [value for key, value in entries if key == "remote.origin.url"]
     push_values = [value for key, value in entries if key == "remote.origin.pushurl"]
@@ -780,7 +796,10 @@ async def _validate_linked_worktree_control(repo: Path, workspace: Path) -> Path
         raise DeliveryWorkspaceConflict("Delivery Git ownership changed")
     worktree_config = git_dir / "config.worktree"
     if os.path.lexists(worktree_config):
-        await _read_safe_git_config(worktree_config)
+        await _read_safe_git_config(
+            worktree_config,
+            allowed_hooks_path=common / "hooks",
+        )
     return git_dir
 
 

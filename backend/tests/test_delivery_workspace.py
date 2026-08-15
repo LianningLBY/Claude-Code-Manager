@@ -78,6 +78,7 @@ async def test_prepare_is_idempotent_and_adopts_exact_workspace(tmp_path):
 @pytest.mark.asyncio
 async def test_prepare_allows_safe_controller_worktree_config(tmp_path):
     repo, _remote = _repository(tmp_path)
+    _git(repo, "config", "core.hooksPath", str(repo / ".git" / "hooks"))
     worktree_config = repo / ".git" / "config.worktree"
     _git(repo, "config", "--file", str(worktree_config), "user.name", "Local User")
 

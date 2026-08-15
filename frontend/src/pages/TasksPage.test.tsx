@@ -70,6 +70,7 @@ vi.mock('../components/Tasks/TaskList', () => ({
       id: number;
       status: string;
       background_active?: boolean;
+      active_sub_agents?: number;
       plan_stage?: string | null;
       plan_stage_round?: number | null;
       plan_stage_provider?: string | null;
@@ -98,6 +99,9 @@ vi.mock('../components/Tasks/TaskList', () => ({
           </span>
           <span data-testid={`attention-tag-${task.id}`}>
             {task.attention_tag ?? ''}
+          </span>
+          <span data-testid={`sub-agents-badge-${task.id}`}>
+            Sub-agents:{task.active_sub_agents ?? 0}
           </span>
         </div>
       ))}
@@ -130,8 +134,10 @@ vi.mock('../components/Tasks/TaskBadges', () => ({
   PluginsBadge: ({ task }: { task: { id: number } }) => (
     <span data-testid={`plugins-badge-${task.id}`}>Plugins</span>
   ),
-  SubAgentsBadge: ({ task }: { task: { id: number } }) => (
-    <span data-testid={`sub-agents-badge-${task.id}`}>Sub-agents</span>
+  SubAgentsBadge: ({ task }: { task: { id: number; active_sub_agents: number } }) => (
+    <span data-testid={`sub-agents-badge-${task.id}`}>
+      Sub-agents:{task.active_sub_agents}
+    </span>
   ),
 }));
 vi.mock('../components/TeamShareModal', () => ({
@@ -146,6 +152,7 @@ const task = {
   description: 'd',
   status: 'pending',
   background_active: false,
+  active_sub_agents: 0,
   priority: 0,
   project_id: null,
   starred: false,
@@ -318,6 +325,36 @@ describe('TasksPage realtime reconciliation', () => {
     });
 
     expect(await screen.findByText('7:plan_review:false')).toBeInTheDocument();
+    expect(api.countTasks).toHaveBeenCalledTimes(countCalls);
+  });
+
+  it('applies native sub-agent counts without waiting for polling', async () => {
+    render(
+      <TasksPage
+        chatTaskId={null}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByTestId('sub-agents-badge-7')).toHaveTextContent(
+      'Sub-agents:0',
+    );
+    const countCalls = vi.mocked(api.countTasks).mock.calls.length;
+
+    act(() => {
+      capturedGlobalWs?.({
+        channel: 'tasks',
+        data: {
+          event: 'sub_agent_count',
+          task_id: 7,
+          active_sub_agents: 3,
+        },
+      });
+    });
+
+    expect(await screen.findByTestId('sub-agents-badge-7')).toHaveTextContent(
+      'Sub-agents:3',
+    );
     expect(api.countTasks).toHaveBeenCalledTimes(countCalls);
   });
 

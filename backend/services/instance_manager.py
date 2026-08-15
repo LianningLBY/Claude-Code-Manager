@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Sequence
 
-from sqlalchemy import exists, or_, select, update
+from sqlalchemy import exists, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import settings
@@ -12211,20 +12211,38 @@ class InstanceManager:
                 )
             await db.commit()
 
-        # 原生子 agent（native-monitor 等）生命周期跟 session 走——
-        # session 退出/重建时一律标 completed，否则 UI 上永远显示 running。
+        # 原生子 agent（native-monitor 等）生命周期跟 session 走。Claude
+        # transcript children preserve the historical completed-on-exit
+        # behavior; a Codex child should already have emitted an authoritative
+        # terminal edge, so any row still running at adapter exit is failed
+        # closed（显式中断则 cancelled），不能伪报 completed。
         # CCM 自己的 monitor 子 agent（source="ccm"）有独立进程，不跟主
         # session 走，必须排除，否则 chat turn 结束就误杀 monitor。
         # 但如果有 native-monitor 在 running，说明 monitor 被进程退出打断，
         # 需要 auto-resume 让主 agent 处理积压的 <task-notification>。
         if task_id:
             from backend.models.sub_agent import SubAgentSession
-            has_pending_native = False
-            stale_native_ids: list[int] = []
+
+            native_retry_count = (
+                task_publication_generation["retry_count"]
+                if task_publication_generation is not None
+                else expected_retry_count
+            )
+            native_turn_generation = (
+                task_publication_generation["turn_generation"]
+                if task_publication_generation is not None
+                else expected_turn_generation
+            )
+            has_stale_native_candidate = False
+            has_pending_native_candidate = False
+            # Snapshot queue admission before terminalizing a Claude native
+            # monitor, but treat this first read only as a hint.  The exact
+            # Task generation is locked and every row is re-read below before
+            # the durable mutation.
             async with self.db_factory() as db:
-                stale = await db.execute(
+                candidates = await db.execute(
                     select(
-                        SubAgentSession.id,
+                        SubAgentSession.provider,
                         SubAgentSession.agent_type,
                     ).where(
                         SubAgentSession.task_id == task_id,
@@ -12232,14 +12250,22 @@ class InstanceManager:
                         SubAgentSession.source != "ccm",
                     )
                 )
-                for session_id, agent_type in stale.all():
-                    stale_native_ids.append(session_id)
-                    if agent_type in ("native-monitor", "monitor", "native-agent"):
-                        has_pending_native = True
+                for child_provider, agent_type in candidates.all():
+                    has_stale_native_candidate = True
+                    if (
+                        child_provider != "codex"
+                        and agent_type
+                        in ("native-monitor", "monitor", "native-agent")
+                    ):
+                        has_pending_native_candidate = True
 
             dispatcher = None
             queue_admission_fence = None
-            if has_pending_native and exit_code == 0 and chat_initiated:
+            if (
+                has_pending_native_candidate
+                and exit_code == 0
+                and chat_initiated
+            ):
                 from backend.main import dispatcher
                 from backend.services.dispatcher import TaskStartPausedError
 
@@ -12254,22 +12280,171 @@ class InstanceManager:
                         task_id,
                     )
 
-            if stale_native_ids:
+            has_pending_native = False
+            stale_native_by_status: dict[str, list[int]] = {
+                "completed": [],
+                "failed": [],
+                "cancelled": [],
+            }
+            stale_native_snapshots: dict[int, dict[str, Any]] = {}
+            active_sub_agent_count: int | None = None
+            if (
+                has_stale_native_candidate
+                and type(native_retry_count) is int
+                and type(native_turn_generation) is int
+            ):
                 async with self.db_factory() as db:
-                    await db.execute(
-                        update(SubAgentSession)
+                    generation_guard = await db.execute(
+                        update(Task)
                         .where(
-                            SubAgentSession.id.in_(stale_native_ids),
-                            SubAgentSession.task_id == task_id,
-                            SubAgentSession.status == "running",
-                            SubAgentSession.source != "ccm",
+                            Task.id == task_id,
+                            Task.retry_count == native_retry_count,
+                            Task.turn_generation == native_turn_generation,
+                            task_retry_not_superseded_predicate(),
+                            no_active_worker_task_termination_predicate(),
                         )
-                        .values(
-                            status="completed",
-                            completed_at=datetime.utcnow(),
-                        )
+                        .values(status=Task.status)
                     )
-                    await db.commit()
+                    if not generation_guard.rowcount:
+                        await db.rollback()
+                    else:
+                        stale = await db.execute(
+                            select(SubAgentSession)
+                            .where(
+                                SubAgentSession.task_id == task_id,
+                                SubAgentSession.status == "running",
+                                SubAgentSession.source != "ccm",
+                            )
+                            .with_for_update()
+                        )
+                        for native_session in stale.scalars():
+                            session_id = native_session.id
+                            agent_type = native_session.agent_type
+                            child_provider = (
+                                native_session.provider or "claude"
+                            )
+                            child_status = "completed"
+                            if child_provider == "codex":
+                                child_status = (
+                                    "cancelled"
+                                    if exit_code in (-2, 130)
+                                    else "failed"
+                                )
+                            native_sequence = None
+                            if child_provider == "codex":
+                                try:
+                                    child_meta = json.loads(
+                                        native_session.meta or "{}"
+                                    )
+                                except (TypeError, ValueError):
+                                    child_meta = None
+                                last_sequence = (
+                                    child_meta.get("last_sequence")
+                                    if isinstance(child_meta, dict)
+                                    else None
+                                )
+                                if type(last_sequence) is int:
+                                    native_sequence = last_sequence + 1
+                                    child_meta["last_sequence"] = (
+                                        native_sequence
+                                    )
+                                    native_session.meta = json.dumps(
+                                        child_meta,
+                                        ensure_ascii=False,
+                                        sort_keys=True,
+                                    )
+                                else:
+                                    logger.error(
+                                        "Codex native child %s lacks a valid "
+                                        "lifecycle sequence at process exit",
+                                        session_id,
+                                    )
+                            stale_native_by_status[child_status].append(
+                                session_id
+                            )
+                            stale_native_snapshots[session_id] = {
+                                "agent_type": agent_type,
+                                "source": "native",
+                                "native_mirror_version": 1,
+                                "provider": child_provider,
+                                "description": native_session.description,
+                                "model": native_session.model,
+                                "reasoning_effort": (
+                                    native_session.codex_effort_level
+                                ),
+                                "checks_done": native_session.checks_done,
+                                "last_summary": native_session.last_summary,
+                                "codex_thread_id": (
+                                    native_session.codex_thread_id
+                                ),
+                                "native_sequence": native_sequence,
+                            }
+                            if (
+                                child_provider != "codex"
+                                and agent_type
+                                in (
+                                    "native-monitor",
+                                    "monitor",
+                                    "native-agent",
+                                )
+                            ):
+                                has_pending_native = True
+
+                        for child_status, session_ids in (
+                            stale_native_by_status.items()
+                        ):
+                            if not session_ids:
+                                continue
+                            await db.execute(
+                                update(SubAgentSession)
+                                .where(
+                                    SubAgentSession.id.in_(session_ids),
+                                    SubAgentSession.task_id == task_id,
+                                    SubAgentSession.status == "running",
+                                    SubAgentSession.source != "ccm",
+                                )
+                                .values(
+                                    status=child_status,
+                                    completed_at=datetime.utcnow(),
+                                )
+                            )
+                        active_sub_agent_count = int((
+                            await db.execute(
+                                select(func.count(SubAgentSession.id)).where(
+                                    SubAgentSession.task_id == task_id,
+                                    SubAgentSession.status == "running",
+                                )
+                            )
+                        ).scalar_one())
+                        await db.commit()
+
+            stale_native_ids = [
+                session_id
+                for ids in stale_native_by_status.values()
+                for session_id in ids
+            ]
+            if stale_native_ids:
+                for child_status, session_ids in stale_native_by_status.items():
+                    for session_id in session_ids:
+                        await self.broadcaster.broadcast(
+                            f"task:{task_id}",
+                            {
+                                "event_type": "sub_agent_session_status",
+                                "sub_agent_session_id": session_id,
+                                "status": child_status,
+                                **stale_native_snapshots[session_id],
+                                "task_retry_count": native_retry_count,
+                                "task_turn_generation": native_turn_generation,
+                            },
+                        )
+                await self.broadcaster.broadcast("tasks", {
+                    "event": "sub_agent_count",
+                    "event_type": "sub_agent_count",
+                    "task_id": task_id,
+                    "active_sub_agents": active_sub_agent_count,
+                    "task_retry_count": native_retry_count,
+                    "task_turn_generation": native_turn_generation,
+                })
 
             # Auto-resume: native sub-agents (monitor/agent) 随进程退出，
             # resume 让主 agent 处理积压的结果并回复用户
@@ -13767,7 +13942,65 @@ class InstanceManager:
             # live bubble after a task-channel resubscription.
             event["item_id"] = str(item_id)
 
-        if codex_type == "item.agent_message.delta":
+        if codex_type == "native.subagent.lifecycle":
+            lifecycle_event = data.get("lifecycle_event")
+            native_agent_id = data.get("native_agent_id")
+            status = data.get("status")
+            sequence = data.get("sequence")
+            expected_statuses = {
+                "spawn": {"running"},
+                "progress": {"running"},
+                "done": {"completed", "failed", "cancelled"},
+            }
+            if (
+                data.get("provider") != "codex"
+                or lifecycle_event not in expected_statuses
+                or status not in expected_statuses[lifecycle_event]
+                or not isinstance(native_agent_id, str)
+                or not native_agent_id
+                or native_agent_id != native_agent_id.strip()
+                or len(native_agent_id) > 255
+                or type(sequence) is not int
+                or sequence <= 0
+            ):
+                return None
+
+            bounded_strings = {
+                "root_thread_id": 255,
+                "parent_native_agent_id": 255,
+                "description": 500,
+                "agent_path": 500,
+                "model": 100,
+                "reasoning_effort": 20,
+                "summary": 2000,
+            }
+            info: dict[str, Any] = {
+                "tool_use_id": f"codex:{native_agent_id}",
+                "native_agent_id": native_agent_id,
+                "provider": "codex",
+                "kind": "native-agent",
+                "status": status,
+                "sequence": sequence,
+            }
+            for key, limit in bounded_strings.items():
+                value = data.get(key)
+                if value is None:
+                    continue
+                if (
+                    not isinstance(value, str)
+                    or value != value.strip()
+                    or not value
+                    or len(value) > limit
+                ):
+                    return None
+                info[key] = value
+            event.update({
+                "event_type": f"subagent_{lifecycle_event}",
+                "role": "system",
+                "content": None,
+                "subagent": info,
+            })
+        elif codex_type == "item.agent_message.delta":
             event.update({
                 "event_type": "message_delta",
                 "role": "assistant",
@@ -14900,7 +15133,7 @@ class InstanceManager:
             await db.commit()
 
         # Native sub-agent lifecycle (model-spawned Agent/Monitor, observed by
-        # the PTY layer) — register only after the exact parent event
+        # the active provider adapter) — register only after the exact parent event
         # generation committed, so a late old callback cannot create lifecycle
         # state under a replacement turn.
         if (
@@ -15202,13 +15435,15 @@ class InstanceManager:
     ) -> None:
         """Mirror a native sub-agent lifecycle event into sub_agent_sessions.
 
-        Keyed by tool_use_id (stored in meta JSON): spawn inserts a running
-        record, progress bumps checks_done/last_summary, done completes it.
-        Broadcasts sub_agent_* WebSocket events for the frontend panel/badge.
+        Claude PTY events retain their historical ``tool_use_id`` identity.
+        Codex app-server events use the native child thread plus the exact
+        Task retry/turn generation, with a monotonic provider sequence stored
+        in meta.  This prevents replay, stale-turn aliasing, and thread reuse
+        from corrupting the generic SubAgentSession projection.
         """
         import json as _json
-        from sqlalchemy import select as _select
-        from backend.models.sub_agent import SubAgentSession
+        from sqlalchemy import func as _func, select as _select
+        from backend.models.sub_agent import SubAgentReport, SubAgentSession
 
         if (
             type(task_retry_count) is not int
@@ -15217,8 +15452,36 @@ class InstanceManager:
             return
 
         tool_use_id = info.get("tool_use_id")
-        if not tool_use_id:
+        if not isinstance(tool_use_id, str) or not tool_use_id:
             return
+
+        provider = info.get("provider") or "claude"
+        is_codex = provider == "codex"
+        native_agent_id = info.get("native_agent_id")
+        sequence = info.get("sequence")
+        requested_status = info.get("status")
+        if is_codex and (
+            not isinstance(native_agent_id, str)
+            or not native_agent_id
+            or native_agent_id != native_agent_id.strip()
+            or len(native_agent_id) > 255
+            or type(sequence) is not int
+            or sequence <= 0
+        ):
+            return
+        if is_codex and event_type == "subagent_done":
+            if requested_status not in {"completed", "failed", "cancelled"}:
+                return
+        elif is_codex and requested_status != "running":
+            return
+
+        terminal_status = (
+            requested_status
+            if is_codex and event_type == "subagent_done"
+            else "completed"
+        )
+        broadcasts: list[dict[str, Any]] = []
+        active_count: int | None = None
 
         async with self.db_factory() as db:
             node_fence = (
@@ -15226,7 +15489,7 @@ class InstanceManager:
                 if event_type == "subagent_spawn"
                 else _fence_worker_runtime_mutation
             )
-            if not await node_fence(db, producer="PTY native sub-agent event"):
+            if not await node_fence(db, producer="native sub-agent event"):
                 return
             termination_fence = (
                 no_active_worker_task_termination_predicate()
@@ -15250,48 +15513,157 @@ class InstanceManager:
             if not generation_guard.rowcount:
                 await db.rollback()
                 return
-            existing = (
-                await db.execute(
-                    _select(SubAgentSession).where(
-                        SubAgentSession.task_id == task_id,
-                        SubAgentSession.source == "native",
-                        SubAgentSession.meta.like(f'%"{tool_use_id}"%'),
-                    )
+            existing: SubAgentSession | None = None
+            stored_meta: dict[str, Any] = {}
+            if is_codex:
+                candidates = list(
+                    (
+                        await db.execute(
+                            _select(SubAgentSession)
+                            .where(
+                                SubAgentSession.task_id == task_id,
+                                SubAgentSession.source == "native",
+                                SubAgentSession.provider == "codex",
+                                SubAgentSession.codex_thread_id
+                                == native_agent_id,
+                            )
+                            .with_for_update()
+                        )
+                    ).scalars()
                 )
-            ).scalars().first()
+                exact: list[tuple[SubAgentSession, dict[str, Any]]] = []
+                for candidate in candidates:
+                    try:
+                        candidate_meta = _json.loads(candidate.meta or "{}")
+                    except (TypeError, ValueError):
+                        await db.rollback()
+                        return
+                    if (
+                        not isinstance(candidate_meta, dict)
+                        or type(candidate_meta.get("owner_retry_count"))
+                        is not int
+                        or type(candidate_meta.get("owner_turn_generation"))
+                        is not int
+                    ):
+                        await db.rollback()
+                        return
+                    if (
+                        candidate_meta.get("owner_retry_count")
+                        == task_retry_count
+                        and candidate_meta.get("owner_turn_generation")
+                        == task_turn_generation
+                    ):
+                        exact.append((candidate, candidate_meta))
+                if len(exact) > 1:
+                    await db.rollback()
+                    return
+                if exact:
+                    existing, stored_meta = exact[0]
+                    last_sequence = stored_meta.get("last_sequence")
+                    if type(last_sequence) is not int or sequence <= last_sequence:
+                        await db.rollback()
+                        return
+            else:
+                existing = (
+                    await db.execute(
+                        _select(SubAgentSession)
+                        .where(
+                            SubAgentSession.task_id == task_id,
+                            SubAgentSession.source == "native",
+                            SubAgentSession.meta.like(f'%"{tool_use_id}"%'),
+                        )
+                        .with_for_update()
+                    )
+                ).scalars().first()
 
-            if event_type == "subagent_spawn":
-                if existing:
-                    return  # replay safety
-                sa = SubAgentSession(
+            created = False
+            previous_status = existing.status if existing is not None else None
+            if existing is None:
+                if not is_codex and event_type != "subagent_spawn":
+                    await db.rollback()
+                    return
+                initial_status = (
+                    terminal_status
+                    if event_type == "subagent_done"
+                    else "running"
+                )
+                description = str(info.get("description") or "")[:500]
+                if not description and is_codex:
+                    description = f"Codex agent {str(native_agent_id)[:12]}"
+                existing = SubAgentSession(
                     task_id=task_id,
                     agent_type=info.get("kind") or "native-agent",
                     source="native",
-                    description=(info.get("description") or "")[:500],
-                    status="running",
-                    meta=_json.dumps(info, ensure_ascii=False),
+                    description=description,
+                    provider="codex" if is_codex else "claude",
+                    model=(str(info["model"])[:100] if info.get("model") else None),
+                    status=initial_status,
+                    codex_thread_id=native_agent_id if is_codex else None,
+                    codex_effort_level=(
+                        str(info["reasoning_effort"])[:20]
+                        if is_codex and info.get("reasoning_effort")
+                        else None
+                    ),
+                    completed_at=(
+                        datetime.utcnow()
+                        if initial_status != "running"
+                        else None
+                    ),
                 )
-                db.add(sa)
-                await db.commit()
-                await db.refresh(sa)
-                await self.broadcaster.broadcast(f"task:{task_id}", {
-                    "event_type": "sub_agent_session_created",
-                    "sub_agent_session_id": sa.id,
-                    "agent_type": sa.agent_type,
-                    "source": "native",
-                    "description": sa.description,
-                    "task_retry_count": task_retry_count,
-                    "task_turn_generation": task_turn_generation,
+                db.add(existing)
+                await db.flush()
+                created = True
+
+            if is_codex:
+                stored_meta.update(info)
+                stored_meta.update({
+                    "owner_retry_count": task_retry_count,
+                    "owner_turn_generation": task_turn_generation,
+                    "last_sequence": sequence,
                 })
-                return
+                existing.meta = _json.dumps(
+                    stored_meta,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                if info.get("description"):
+                    existing.description = str(info["description"])[:500]
+                if info.get("model"):
+                    existing.model = str(info["model"])[:100]
+                if info.get("reasoning_effort"):
+                    existing.codex_effort_level = str(
+                        info["reasoning_effort"]
+                    )[:20]
+            elif created:
+                existing.meta = _json.dumps(info, ensure_ascii=False)
 
-            if not existing:
-                return
+            if event_type == "subagent_spawn":
+                if not created and not is_codex:
+                    await db.rollback()
+                    return
+                if not created and existing.status != "running":
+                    existing.status = "running"
+                    existing.completed_at = None
+                event_name = (
+                    "sub_agent_session_created"
+                    if created
+                    else "sub_agent_session_status"
+                )
+                broadcasts.append({"event_type": event_name})
 
-            if event_type == "subagent_progress":
+            elif event_type == "subagent_progress":
+                if existing.status != "running":
+                    await db.rollback()
+                    return
                 existing.checks_done = (existing.checks_done or 0) + 1
                 if info.get("summary"):
-                    existing.last_summary = info["summary"][:2000]
+                    existing.last_summary = str(info["summary"])[:2000]
+                    db.add(SubAgentReport(
+                        session_id=existing.id,
+                        check_number=existing.checks_done,
+                        status="running",
+                        summary=existing.last_summary,
+                    ))
                 # Write progress as system_event in chat (like monitor checks)
                 summary_text = (existing.last_summary or "working...")[:300]
                 log_content = f"[Agent #{existing.id}] {existing.description}: {summary_text}"
@@ -15304,50 +15676,107 @@ class InstanceManager:
                     content=log_content,
                     is_error=False,
                 ))
-                # The sub-agent update and its chat audit row are one fenced
-                # durable mutation.  A commit between them would let a node
-                # drain claim win and leave a late post-proof LogEntry writer.
-                await db.commit()
-                await self.broadcaster.broadcast(f"task:{task_id}", {
-                    "event_type": "sub_agent_report",
-                    "sub_agent_session_id": existing.id,
-                    "agent_type": existing.agent_type,
-                    "check_number": existing.checks_done,
-                    "summary": existing.last_summary,
-                    "task_retry_count": task_retry_count,
-                    "task_turn_generation": task_turn_generation,
-                })
-                await self.broadcaster.broadcast(f"task:{task_id}", {
-                    "event_type": "system_event",
-                    "content": log_content,
-                    "task_retry_count": task_retry_count,
-                    "task_turn_generation": task_turn_generation,
-                })
+                broadcasts.extend([
+                    {
+                        "event_type": "sub_agent_session_created",
+                    } if created else {},
+                    {
+                        "event_type": "sub_agent_report",
+                        "check_number": existing.checks_done,
+                        "summary": existing.last_summary,
+                    },
+                    {
+                        "event_type": "system_event",
+                        "content": log_content,
+                    },
+                ])
             elif event_type == "subagent_done":
-                existing.status = "completed"
+                if (
+                    not created
+                    and existing.status in {"completed", "failed", "cancelled"}
+                ):
+                    await db.rollback()
+                    return
+                existing.status = terminal_status
                 existing.completed_at = datetime.utcnow()
+                if info.get("summary"):
+                    existing.last_summary = str(info["summary"])[:2000]
+                    existing.checks_done = (existing.checks_done or 0) + 1
+                    db.add(SubAgentReport(
+                        session_id=existing.id,
+                        check_number=existing.checks_done,
+                        status=terminal_status,
+                        summary=existing.last_summary,
+                    ))
                 if info.get("timed_out"):
                     existing.last_summary = (
                         (existing.last_summary or "") + " [timed out]"
                     ).strip()
-                await db.commit()
-                await self.broadcaster.broadcast(f"task:{task_id}", {
+                broadcasts.append({
                     "event_type": "sub_agent_session_status",
-                    "sub_agent_session_id": existing.id,
-                    "agent_type": existing.agent_type,
-                    "status": "completed",
-                    "task_retry_count": task_retry_count,
-                    "task_turn_generation": task_turn_generation,
                 })
-                # 绝不在这里 enqueue auto-resume：subagent_done 只来自 PTY 观测，
-                # 而 PTY 模式下 harness 自己的 task-notification 已在同一瞬间唤醒
-                # session（唤醒后的产出由 FullMirrorCCMBackend 镜像进聊天）。这里
-                # 再投递一条 prompt 必然和该通知 turn 赛跑，输了会被 CLI 当
+                # 绝不在这里 enqueue auto-resume：Claude PTY 的 harness 会用
+                # task-notification 唤醒 session；Codex app-server 则把 child
+                # 生命周期保留在同一个 root adapter 内。这里再投递一条 prompt
+                # 会和 provider 的原生通知/turn 赛跑，输了会被 CLI 当
                 # mid-turn steering 吸收（queue-op remove、无独立回显）→
                 # send_prompt 的回显锁定永不成立 → consumer 永挂 → 队列冻结 →
                 # 7200s 超时杀掉仍在干活的进程（2026-07-15 task 32/33 事故）。
                 # -p 模式的退出补唤醒走 _consume_output 的
                 # monitor:native-exit-resume，不受影响。
+            else:
+                await db.rollback()
+                return
+
+            # The lifecycle row, optional report, and chat audit entry are one
+            # fenced durable mutation.  Compute the public count in the same
+            # transaction so the global badge update cannot lead the DB.
+            active_count = int((
+                await db.execute(
+                    _select(_func.count(SubAgentSession.id)).where(
+                        SubAgentSession.task_id == task_id,
+                        SubAgentSession.status == "running",
+                    )
+                )
+            ).scalar_one())
+            await db.commit()
+
+            common = {
+                "sub_agent_session_id": existing.id,
+                "agent_type": existing.agent_type,
+                "source": "native",
+                "native_mirror_version": 1,
+                "provider": existing.provider,
+                "description": existing.description,
+                "model": existing.model,
+                "reasoning_effort": existing.codex_effort_level,
+                "status": existing.status,
+                "checks_done": existing.checks_done,
+                "last_summary": existing.last_summary,
+                "codex_thread_id": existing.codex_thread_id,
+                "native_sequence": (
+                    stored_meta.get("last_sequence") if is_codex else None
+                ),
+                "task_retry_count": task_retry_count,
+                "task_turn_generation": task_turn_generation,
+            }
+
+        for payload in broadcasts:
+            if not payload:
+                continue
+            await self.broadcaster.broadcast(
+                f"task:{task_id}",
+                {**common, **payload},
+            )
+        if active_count is not None and previous_status != common["status"]:
+            await self.broadcaster.broadcast("tasks", {
+                "event": "sub_agent_count",
+                "event_type": "sub_agent_count",
+                "task_id": task_id,
+                "active_sub_agents": active_count,
+                "task_retry_count": task_retry_count,
+                "task_turn_generation": task_turn_generation,
+            })
 
     # ---------------------------------------------------- PTY 权限透传
 

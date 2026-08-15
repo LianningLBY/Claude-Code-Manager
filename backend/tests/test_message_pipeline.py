@@ -285,6 +285,74 @@ def test_parse_codex_background_lifecycle_event():
     assert event["background_last_activity_at"] == "2026-08-13T12:01:00"
 
 
+def test_parse_codex_native_sub_agent_lifecycle_event():
+    im = InstanceManager(MagicMock(), MagicMock())
+
+    event = im._parse_codex_line(json.dumps({
+        "type": "native.subagent.lifecycle",
+        "lifecycle_event": "spawn",
+        "provider": "codex",
+        "native_agent_id": "thread-child",
+        "root_thread_id": "thread-root",
+        "parent_native_agent_id": "thread-root",
+        "description": "inspect the scheduler",
+        "agent_path": "/root/scheduler",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "status": "running",
+        "summary": None,
+        "sequence": 1,
+    }))
+
+    assert event is not None
+    assert event["event_type"] == "subagent_spawn"
+    assert event["role"] == "system"
+    assert event["content"] is None
+    assert event["subagent"] == {
+        "tool_use_id": "codex:thread-child",
+        "native_agent_id": "thread-child",
+        "provider": "codex",
+        "kind": "native-agent",
+        "status": "running",
+        "sequence": 1,
+        "root_thread_id": "thread-root",
+        "parent_native_agent_id": "thread-root",
+        "description": "inspect the scheduler",
+        "agent_path": "/root/scheduler",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+    }
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"provider": "claude"},
+        {"native_agent_id": ""},
+        {"native_agent_id": " child "},
+        {"sequence": 0},
+        {"sequence": True},
+        {"lifecycle_event": "done", "status": "running"},
+        {"lifecycle_event": "spawn", "status": "failed"},
+        {"description": "x" * 501},
+    ],
+)
+def test_parse_codex_native_sub_agent_lifecycle_rejects_malformed(override):
+    im = InstanceManager(MagicMock(), MagicMock())
+    payload = {
+        "type": "native.subagent.lifecycle",
+        "lifecycle_event": "spawn",
+        "provider": "codex",
+        "native_agent_id": "thread-child",
+        "description": "child",
+        "status": "running",
+        "sequence": 1,
+    }
+    payload.update(override)
+
+    assert im._parse_codex_line(json.dumps(payload)) is None
+
+
 def _make_mock_process_with_output(lines: list[str], exit_code: int = 0):
     """Create a mock process that yields NDJSON lines from stdout."""
     proc = MagicMock()

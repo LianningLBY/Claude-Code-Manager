@@ -185,9 +185,11 @@ async def test_spawn_progress_done_lifecycle(im, db_session):
     event_types = [d["event_type"] for _, d in im.broadcaster.events]
     assert event_types == [
         "sub_agent_session_created",
+        "sub_agent_count",
         "sub_agent_report",
         "system_event",  # subagent_progress 同时写入聊天 system_event
         "sub_agent_session_status",
+        "sub_agent_count",
     ]
     assert all(
         event["task_retry_count"] == task.retry_count
@@ -239,6 +241,291 @@ async def test_missing_tool_use_id_ignored(im, db_session):
     assert rows == []
 
 
+def _codex_lifecycle(
+    *,
+    sequence: int,
+    status: str,
+    summary: str | None = None,
+) -> dict:
+    return {
+        "tool_use_id": "codex:thread-child",
+        "native_agent_id": "thread-child",
+        "provider": "codex",
+        "kind": "native-agent",
+        "root_thread_id": "thread-root",
+        "parent_native_agent_id": "thread-root",
+        "description": "inspect scheduler",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "status": status,
+        "summary": summary,
+        "sequence": sequence,
+    }
+
+
+@pytest.mark.asyncio
+async def test_codex_native_thread_is_durable_and_sequence_idempotent(
+    im,
+    db_session,
+):
+    task = await _create_native_task(
+        db_session,
+        retry_count=7,
+        turn_generation=41,
+    )
+    generation = {
+        "task_retry_count": task.retry_count,
+        "task_turn_generation": task.turn_generation,
+    }
+
+    spawn = _codex_lifecycle(sequence=1, status="running")
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_spawn",
+        spawn,
+        **generation,
+    )
+    # An exact replay cannot create a second row or duplicate a WebSocket edge.
+    broadcast_count = len(im.broadcaster.events)
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_spawn",
+        spawn,
+        **generation,
+    )
+    assert len(im.broadcaster.events) == broadcast_count
+
+    row = (
+        await db_session.execute(
+            select(SubAgentSession).where(SubAgentSession.task_id == task.id)
+        )
+    ).scalar_one()
+    assert row.provider == "codex"
+    assert row.codex_thread_id == "thread-child"
+    assert row.codex_effort_level == "high"
+    assert row.model == "gpt-5.6-sol"
+    assert row.status == "running"
+    assert json.loads(row.meta)["owner_turn_generation"] == 41
+    assert json.loads(row.meta)["last_sequence"] == 1
+    await db_session.refresh(task)
+    assert task.active_sub_agents == 1
+
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_progress",
+        _codex_lifecycle(
+            sequence=2,
+            status="running",
+            summary="scheduler inspected",
+        ),
+        **generation,
+    )
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_done",
+        _codex_lifecycle(
+            sequence=3,
+            status="failed",
+            summary="child failed safely",
+        ),
+        **generation,
+    )
+    await db_session.refresh(row)
+    assert row.status == "failed"
+    assert row.completed_at is not None
+    assert row.last_summary == "child failed safely"
+    assert row.checks_done == 2
+    await db_session.refresh(task)
+    assert task.active_sub_agents == 0
+
+    reports = list((
+        await db_session.execute(
+            select(SubAgentReport)
+            .where(SubAgentReport.session_id == row.id)
+            .order_by(SubAgentReport.check_number)
+        )
+    ).scalars())
+    assert [(report.status, report.summary) for report in reports] == [
+        ("running", "scheduler inspected"),
+        ("failed", "child failed safely"),
+    ]
+    task_count_events = [
+        data
+        for channel, data in im.broadcaster.events
+        if channel == "tasks" and data.get("event") == "sub_agent_count"
+    ]
+    assert [event["active_sub_agents"] for event in task_count_events] == [1, 0]
+
+
+@pytest.mark.asyncio
+async def test_codex_terminal_only_observation_creates_history_row(
+    im,
+    db_session,
+):
+    task = await _create_native_task(
+        db_session,
+        retry_count=8,
+        turn_generation=43,
+    )
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_done",
+        _codex_lifecycle(
+            sequence=1,
+            status="cancelled",
+            summary="closed before listener attachment",
+        ),
+        task_retry_count=task.retry_count,
+        task_turn_generation=task.turn_generation,
+    )
+
+    row = (
+        await db_session.execute(
+            select(SubAgentSession).where(SubAgentSession.task_id == task.id)
+        )
+    ).scalar_one()
+    assert row.provider == "codex"
+    assert row.status == "cancelled"
+    assert row.completed_at is not None
+    assert row.last_summary == "closed before listener attachment"
+    task_events = [
+        data["event_type"]
+        for channel, data in im.broadcaster.events
+        if channel == f"task:{task.id}"
+    ]
+    assert task_events == ["sub_agent_session_status"]
+
+
+@pytest.mark.asyncio
+async def test_codex_native_thread_newer_spawn_reactivates_same_row(
+    im,
+    db_session,
+):
+    task = await _create_native_task(
+        db_session,
+        retry_count=8,
+        turn_generation=44,
+    )
+    generation = {
+        "task_retry_count": task.retry_count,
+        "task_turn_generation": task.turn_generation,
+    }
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_spawn",
+        _codex_lifecycle(sequence=1, status="running"),
+        **generation,
+    )
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_done",
+        _codex_lifecycle(sequence=2, status="completed"),
+        **generation,
+    )
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_spawn",
+        _codex_lifecycle(sequence=3, status="running"),
+        **generation,
+    )
+
+    row = (
+        await db_session.execute(
+            select(SubAgentSession).where(SubAgentSession.task_id == task.id)
+        )
+    ).scalar_one()
+    assert row.status == "running"
+    assert row.completed_at is None
+    assert json.loads(row.meta)["last_sequence"] == 3
+    count_events = [
+        data["active_sub_agents"]
+        for channel, data in im.broadcaster.events
+        if channel == "tasks" and data.get("event") == "sub_agent_count"
+    ]
+    assert count_events == [1, 0, 1]
+
+
+@pytest.mark.asyncio
+async def test_codex_thread_identity_is_scoped_to_owner_turn(
+    im,
+    db_session,
+):
+    task = await _create_native_task(
+        db_session,
+        retry_count=9,
+        turn_generation=47,
+    )
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_spawn",
+        _codex_lifecycle(sequence=1, status="running"),
+        task_retry_count=9,
+        task_turn_generation=47,
+    )
+
+    task.turn_generation = 48
+    await db_session.commit()
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_spawn",
+        _codex_lifecycle(sequence=1, status="running"),
+        task_retry_count=9,
+        task_turn_generation=48,
+    )
+
+    rows = list((
+        await db_session.execute(
+            select(SubAgentSession)
+            .where(SubAgentSession.task_id == task.id)
+            .order_by(SubAgentSession.id)
+        )
+    ).scalars())
+    assert len(rows) == 2
+    assert [
+        json.loads(row.meta)["owner_turn_generation"] for row in rows
+    ] == [47, 48]
+
+
+@pytest.mark.asyncio
+async def test_codex_native_identity_fails_closed_on_malformed_history(
+    im,
+    db_session,
+):
+    task = await _create_native_task(
+        db_session,
+        retry_count=10,
+        turn_generation=53,
+    )
+    malformed = SubAgentSession(
+        task_id=task.id,
+        agent_type="native-agent",
+        source="native",
+        provider="codex",
+        description="ambiguous history",
+        status="running",
+        codex_thread_id="thread-child",
+        meta="{}",
+    )
+    db_session.add(malformed)
+    await db_session.commit()
+
+    await im._upsert_native_sub_agent(
+        task.id,
+        "subagent_spawn",
+        _codex_lifecycle(sequence=1, status="running"),
+        task_retry_count=task.retry_count,
+        task_turn_generation=task.turn_generation,
+    )
+
+    rows = list((
+        await db_session.execute(
+            select(SubAgentSession).where(SubAgentSession.task_id == task.id)
+        )
+    ).scalars())
+    assert [row.id for row in rows] == [malformed.id]
+    assert im.broadcaster.events == []
+
+
 # ------------------------------------------------------------- summary API
 
 
@@ -271,6 +558,64 @@ async def test_summary_groups_by_agent_type(client, db_session):
     assert by_type["monitor"] == {"running": 1, "completed": 1}
     assert by_type["native-agent"] == {"running": 1, "completed": 0}
     assert by_type["native-monitor"] == {"running": 0, "completed": 1}
+
+
+@pytest.mark.asyncio
+async def test_unified_read_model_includes_native_sessions_and_reports(
+    client,
+    db_session,
+):
+    task = Task(title="unified sub-agent read model", description="d")
+    db_session.add(task)
+    await db_session.flush()
+    monitor = SubAgentSession(
+        task_id=task.id,
+        agent_type="monitor",
+        source="ccm",
+        provider="claude",
+        description="watch build",
+        status="running",
+    )
+    native = SubAgentSession(
+        task_id=task.id,
+        agent_type="native-agent",
+        source="native",
+        provider="codex",
+        description="inspect scheduler",
+        status="running",
+        checks_done=1,
+        last_summary="scheduler inspected",
+        codex_thread_id="thread-child",
+    )
+    db_session.add_all([monitor, native])
+    await db_session.flush()
+    db_session.add(SubAgentReport(
+        session_id=native.id,
+        check_number=1,
+        status="running",
+        summary="scheduler inspected",
+    ))
+    await db_session.commit()
+
+    sessions = await client.get(
+        f"/api/tasks/{task.id}/sub-agents/sessions"
+    )
+    assert sessions.status_code == 200
+    by_id = {row["id"]: row for row in sessions.json()}
+    assert set(by_id) == {monitor.id, native.id}
+    assert by_id[native.id]["agent_type"] == "native-agent"
+    assert by_id[native.id]["source"] == "native"
+    assert by_id[native.id]["provider"] == "codex"
+    assert by_id[native.id]["last_summary"] == "scheduler inspected"
+
+    reports = await client.get(
+        f"/api/tasks/{task.id}/sub-agents/sessions/{native.id}/reports"
+    )
+    assert reports.status_code == 200
+    assert [
+        (row["check_number"], row["status"], row["summary"])
+        for row in reports.json()
+    ] == [(1, "running", "scheduler inspected")]
 
 
 # ------------------------------------------------- no auto-resume on done

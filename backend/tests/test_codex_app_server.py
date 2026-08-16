@@ -9021,13 +9021,30 @@ async def test_collab_agent_notifications_are_tool_items_not_terminal_noise():
         lines.append(json.loads(line))
 
     assert [line["type"] for line in lines] == [
+        "native.subagent.lifecycle",
         "item.started",
         "item.completed",
         "background.lifecycle",
+        "native.subagent.lifecycle",
         "background.lifecycle",
         "turn.completed",
     ]
-    assert lines[0]["item"] == {
+    assert lines[0] == {
+        "type": "native.subagent.lifecycle",
+        "lifecycle_event": "spawn",
+        "provider": "codex",
+        "native_agent_id": "child-1",
+        "root_thread_id": "thread-1",
+        "parent_native_agent_id": "thread-1",
+        "description": "Codex agent child-1",
+        "agent_path": None,
+        "model": None,
+        "reasoning_effort": None,
+        "status": "running",
+        "summary": None,
+        "sequence": 1,
+    }
+    assert lines[1]["item"] == {
         "type": "collab_agent_tool_call",
         "id": "collab-1",
         "tool": "wait",
@@ -9038,13 +9055,259 @@ async def test_collab_agent_notifications_are_tool_items_not_terminal_noise():
         "reasoning_effort": None,
         "agents_states": {},
     }
-    assert lines[1]["item"]["type"] == "collab_agent_tool_call"
-    assert lines[1]["item"]["status"] == "completed"
-    assert lines[2]["state"] == "running"
-    assert lines[2]["active_thread_ids"] == ["child-1"]
-    assert lines[3]["state"] == "completed"
-    assert lines[4]["type"] == "turn.completed"
+    assert lines[2]["item"]["type"] == "collab_agent_tool_call"
+    assert lines[2]["item"]["status"] == "completed"
+    assert lines[3]["state"] == "running"
+    assert lines[3]["active_thread_ids"] == ["child-1"]
+    assert lines[4]["lifecycle_event"] == "done"
+    assert lines[4]["status"] == "completed"
+    assert lines[4]["sequence"] == 2
+    assert lines[5]["state"] == "completed"
+    assert lines[6]["type"] == "turn.completed"
     assert "child-1" not in server._contexts_by_descendant
+
+
+@pytest.mark.asyncio
+async def test_codex_child_lifecycle_is_deduplicated_and_preserves_failure():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-root", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-root"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="coordinate agents",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=10,
+    )
+    await process.stdout.readline()
+
+    running_item = {
+        "type": "collabAgentToolCall",
+        "id": "spawn-1",
+        "tool": "spawnAgent",
+        "status": "completed",
+        "senderThreadId": "thread-root",
+        "receiverThreadIds": ["thread-child"],
+        "prompt": "inspect scheduler",
+        "model": "gpt-5.6-sol",
+        "reasoningEffort": "high",
+        "agentsStates": {
+            "thread-child": {"status": "running", "message": "booting"},
+        },
+    }
+    # App-server can repeat the same item snapshot across started/completed.
+    # It must remain one generic spawn edge.
+    for method in ("item/started", "item/completed"):
+        server._handle_notification(method, {
+            "threadId": "thread-root",
+            "turnId": "turn-root",
+            "item": running_item,
+        })
+    server._handle_notification("item/completed", {
+        "threadId": "thread-root",
+        "turnId": "turn-root",
+        "item": {
+            **running_item,
+            "id": "wait-1",
+            "tool": "wait",
+            "agentsStates": {
+                "thread-child": {
+                    "status": "errored",
+                    "message": "child failed safely",
+                },
+            },
+        },
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-root",
+        "turn": {"id": "turn-root", "status": "completed", "error": None},
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+
+    rows = []
+    while line := await process.stdout.readline():
+        rows.append(json.loads(line))
+    lifecycle = [
+        row for row in rows if row["type"] == "native.subagent.lifecycle"
+    ]
+    assert lifecycle == [
+        {
+            "type": "native.subagent.lifecycle",
+            "lifecycle_event": "spawn",
+            "provider": "codex",
+            "native_agent_id": "thread-child",
+            "root_thread_id": "thread-root",
+            "parent_native_agent_id": "thread-root",
+            "description": "inspect scheduler",
+            "agent_path": None,
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
+            "status": "running",
+            "summary": "booting",
+            "sequence": 1,
+        },
+        {
+            "type": "native.subagent.lifecycle",
+            "lifecycle_event": "done",
+            "provider": "codex",
+            "native_agent_id": "thread-child",
+            "root_thread_id": "thread-root",
+            "parent_native_agent_id": "thread-root",
+            "description": "inspect scheduler",
+            "agent_path": None,
+            "model": "gpt-5.6-sol",
+            "reasoning_effort": "high",
+            "status": "failed",
+            "summary": "child failed safely",
+            "sequence": 2,
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_child_final_message_becomes_report_progress_not_root_output():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-root", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-root"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="coordinate agents",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=10,
+    )
+    await process.stdout.readline()
+
+    server._handle_notification("item/completed", {
+        "threadId": "thread-root",
+        "turnId": "turn-root",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-child",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/smoke_child",
+            "kind": "started",
+        },
+    })
+    child_message = {
+        "threadId": "thread-child",
+        "turnId": "turn-child",
+        "item": {
+            "type": "agentMessage",
+            "id": "child-message",
+            "text": "CCM_NATIVE_SUBAGENT_CHILD_OK",
+            "phase": "final_answer",
+        },
+    }
+    server._handle_notification("item/completed", child_message)
+    # Exact notification replay must not create a second progress report.
+    server._handle_notification("item/completed", child_message)
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child",
+        "status": {"type": "idle"},
+    })
+    # A late message cannot reactivate a child with terminal proof.
+    server._handle_notification("item/completed", {
+        **child_message,
+        "item": {**child_message["item"], "text": "late replay"},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-root",
+        "turn": {"id": "turn-root", "status": "completed", "error": None},
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+
+    rows = []
+    while line := await process.stdout.readline():
+        rows.append(json.loads(line))
+    lifecycle = [
+        row for row in rows if row["type"] == "native.subagent.lifecycle"
+    ]
+    assert [row["lifecycle_event"] for row in lifecycle] == [
+        "spawn",
+        "progress",
+        "done",
+    ]
+    assert [row["sequence"] for row in lifecycle] == [1, 2, 3]
+    assert lifecycle[1]["summary"] == "CCM_NATIVE_SUBAGENT_CHILD_OK"
+    assert lifecycle[2]["status"] == "completed"
+    assert all(row.get("type") != "item.completed" for row in rows)
+
+
+@pytest.mark.asyncio
+async def test_codex_child_thread_reactivation_emits_newer_spawn_sequence():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-root", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-root"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="reuse one child",
+        cwd="/tmp",
+        model="gpt-5.6-sol",
+        effort="high",
+        resume_session_id=None,
+        git_env=None,
+        task_id=10,
+    )
+    await process.stdout.readline()
+
+    activity = {
+        "type": "subAgentActivity",
+        "id": "activity-child",
+        "agentThreadId": "thread-child",
+        "agentPath": "/root/child",
+        "kind": "started",
+    }
+    for _ in range(2):
+        server._handle_notification("item/completed", {
+            "threadId": "thread-root",
+            "turnId": "turn-root",
+            "item": activity,
+        })
+        server._handle_notification("thread/status/changed", {
+            "threadId": "thread-child",
+            "status": {"type": "idle"},
+        })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-root",
+        "turn": {"id": "turn-root", "status": "completed", "error": None},
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+
+    rows = []
+    while line := await process.stdout.readline():
+        rows.append(json.loads(line))
+    lifecycle = [
+        row for row in rows if row["type"] == "native.subagent.lifecycle"
+    ]
+    assert [row["lifecycle_event"] for row in lifecycle] == [
+        "spawn",
+        "done",
+        "spawn",
+        "done",
+    ]
+    assert [row["status"] for row in lifecycle] == [
+        "running",
+        "completed",
+        "running",
+        "completed",
+    ]
+    assert [row["sequence"] for row in lifecycle] == [1, 2, 3, 4]
 
 
 @pytest.mark.asyncio
@@ -9095,6 +9358,13 @@ async def test_parent_completed_waits_for_active_child_and_preserves_late_output
     assert process.returncode is None
     assert server.has_active_thread("thread-parent") is True
 
+    spawned = json.loads(await process.stdout.readline())
+    assert spawned["type"] == "native.subagent.lifecycle"
+    assert spawned["lifecycle_event"] == "spawn"
+    assert spawned["native_agent_id"] == "thread-child"
+    assert spawned["description"] == "child"
+    assert spawned["sequence"] == 1
+
     lifecycle = json.loads(await process.stdout.readline())
     assert lifecycle == {
         "type": "background.lifecycle",
@@ -9127,11 +9397,14 @@ async def test_parent_completed_waits_for_active_child_and_preserves_late_output
         lines.append(json.loads(line))
     assert [line["type"] for line in lines] == [
         "item.agent_message.delta",
+        "native.subagent.lifecycle",
         "background.lifecycle",
         "turn.completed",
     ]
     assert lines[0]["delta"] == "late but valid"
-    assert lines[1]["state"] == "completed"
+    assert lines[1]["lifecycle_event"] == "done"
+    assert lines[1]["status"] == "completed"
+    assert lines[2]["state"] == "completed"
     assert server._contexts_by_descendant == {}
 
 
@@ -9264,6 +9537,20 @@ async def test_parent_completed_waits_for_nested_descendant_lineage():
         "status": {"type": "idle"},
     })
     assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+    rows = []
+    while line := await process.stdout.readline():
+        rows.append(json.loads(line))
+    spawned = {
+        row["native_agent_id"]: row
+        for row in rows
+        if row.get("type") == "native.subagent.lifecycle"
+        and row.get("lifecycle_event") == "spawn"
+    }
+    assert spawned["thread-child"]["parent_native_agent_id"] == "thread-root"
+    assert (
+        spawned["thread-grandchild"]["parent_native_agent_id"]
+        == "thread-child"
+    )
 
 
 @pytest.mark.asyncio
@@ -9586,14 +9873,20 @@ async def test_descendant_terminal_deadline_holds_adapter_until_proven(
     while line := await process.stdout.readline():
         lines.append(json.loads(line))
     assert [line["type"] for line in lines] == [
+        "native.subagent.lifecycle",
         "background.lifecycle",
+        "native.subagent.lifecycle",
         "background.lifecycle",
         "turn.failed",
     ]
-    assert lines[0]["state"] == "running"
-    assert lines[1]["state"] == "completed"
+    assert lines[0]["lifecycle_event"] == "spawn"
+    assert lines[2]["lifecycle_event"] == "done"
+    assert lines[0]["status"] == "running"
+    assert lines[1]["state"] == "running"
+    assert lines[2]["status"] == "completed"
+    assert lines[3]["state"] == "completed"
     assert "could not prove all native sub-agents terminal" in (
-        lines[2]["error"]["message"]
+        lines[4]["error"]["message"]
     )
 
 

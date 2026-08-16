@@ -3004,6 +3004,12 @@ export const api = {
     ),
   getSubAgentSummary: (taskId: number) =>
     request<SubAgentSummary>(`/api/tasks/${taskId}/sub-agents/summary`),
+  listAllSubAgentSessions: (taskId: number) =>
+    request<MonitorSession[]>(`/api/tasks/${taskId}/sub-agents/sessions`),
+  getSubAgentReports: (taskId: number, sessionId: number) =>
+    request<MonitorCheck[]>(
+      `/api/tasks/${taskId}/sub-agents/sessions/${sessionId}/reports`,
+    ),
 
   // Browser Review demo
   getBrowserReviewConfig: () =>

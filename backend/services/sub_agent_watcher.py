@@ -80,6 +80,10 @@ class SubAgentWatcher:
                 .where(
                     SubAgentSession.source == "native",
                     SubAgentSession.status == "running",
+                    # Codex native children are observed authoritatively from
+                    # app-server thread notifications.  They have no Claude
+                    # transcript path and must not enter the idle-file poller.
+                    SubAgentSession.provider != "codex",
                     SubAgentSession.agent_type.in_(["native-agent", "native-monitor"]),
                 )
             )

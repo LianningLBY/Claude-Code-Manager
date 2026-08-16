@@ -14366,6 +14366,177 @@ async def test_native_exit_resume_carries_precommit_queue_fence(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_codex_adapter_exit_fails_unsettled_native_child(db_factory):
+    from backend.models.sub_agent import SubAgentSession
+
+    async with db_factory() as db:
+        inst = Instance(name="codex-native-exit")
+        task = Task(
+            title="codex native exit",
+            description="d",
+            status="executing",
+            provider="codex",
+        )
+        db.add_all([inst, task])
+        await db.flush()
+        native = SubAgentSession(
+            task_id=task.id,
+            source="native",
+            agent_type="native-agent",
+            provider="codex",
+            description="background child",
+            status="running",
+            codex_thread_id="thread-child",
+            meta=json.dumps({
+                "owner_retry_count": 0,
+                "owner_turn_generation": 0,
+                "last_sequence": 1,
+            }),
+        )
+        db.add(native)
+        await db.commit()
+        instance_id = inst.id
+        task_id = task.id
+        native_id = native.id
+
+    process = _make_mock_process(returncode=1)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    manager.processes[instance_id] = process
+
+    await _consume_tracked_output(
+        manager,
+        db_factory,
+        instance_id,
+        task_id,
+        process,
+        chat_initiated=True,
+        provider="codex",
+    )
+
+    async with db_factory() as db:
+        native = await db.get(SubAgentSession, native_id)
+    assert native.status == "failed"
+    assert native.completed_at is not None
+    assert json.loads(native.meta)["last_sequence"] == 2
+    native_status_events = [
+        call.args[1]
+        for call in broadcaster.broadcast.await_args_list
+        if call.args[0] == f"task:{task_id}"
+        and call.args[1].get("event_type")
+        == "sub_agent_session_status"
+    ]
+    assert [event["native_sequence"] for event in native_status_events] == [2]
+    broadcaster.broadcast.assert_any_await(
+        "tasks",
+        {
+            "event": "sub_agent_count",
+            "event_type": "sub_agent_count",
+            "task_id": task_id,
+            "active_sub_agents": 0,
+            "task_retry_count": 0,
+            "task_turn_generation": 0,
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_native_exit_cleanup_rejects_turn_generation_aba(db_factory):
+    from backend.models.sub_agent import SubAgentSession
+
+    async with db_factory() as db:
+        inst = Instance(name="native-exit-generation-aba")
+        task = Task(
+            title="native exit generation ABA",
+            description="d",
+            status="executing",
+            provider="codex",
+        )
+        db.add_all([inst, task])
+        await db.flush()
+        monitor = SubAgentSession(
+            task_id=task.id,
+            source="native",
+            agent_type="native-monitor",
+            provider="claude",
+            description="old monitor",
+            status="running",
+        )
+        child = SubAgentSession(
+            task_id=task.id,
+            source="native",
+            agent_type="native-agent",
+            provider="codex",
+            description="child handed to the next turn",
+            status="running",
+            codex_thread_id="thread-next-turn",
+            meta=json.dumps({
+                "owner_retry_count": 0,
+                "owner_turn_generation": 0,
+                "last_sequence": 1,
+            }),
+        )
+        db.add_all([monitor, child])
+        await db.commit()
+        instance_id = inst.id
+        task_id = task.id
+        monitor_id = monitor.id
+        child_id = child.id
+
+    process = _make_mock_process(returncode=0)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    manager.processes[instance_id] = process
+    dispatcher = MagicMock()
+    queue_fence = object()
+
+    async def advance_generation(_task_id):
+        assert _task_id == task_id
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            child = await db.get(SubAgentSession, child_id)
+            task.turn_generation = 1
+            task.status = "executing"
+            child.meta = json.dumps({
+                "owner_retry_count": 0,
+                "owner_turn_generation": 1,
+                "last_sequence": 1,
+            })
+            await db.commit()
+        return queue_fence
+
+    dispatcher.snapshot_queue_admission = AsyncMock(
+        side_effect=advance_generation
+    )
+    dispatcher.enqueue_message = AsyncMock(return_value=True)
+
+    with patch("backend.main.dispatcher", dispatcher):
+        await _consume_tracked_output(
+            manager,
+            db_factory,
+            instance_id,
+            task_id,
+            process,
+            chat_initiated=True,
+            provider="codex",
+        )
+
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        monitor = await db.get(SubAgentSession, monitor_id)
+        child = await db.get(SubAgentSession, child_id)
+    assert task.turn_generation == 1
+    assert monitor.status == "running"
+    assert child.status == "running"
+    dispatcher.enqueue_message.assert_not_awaited()
+    assert not any(
+        call.args[0] == "tasks"
+        and call.args[1].get("event") == "sub_agent_count"
+        for call in broadcaster.broadcast.await_args_list
+    )
+
+
+@pytest.mark.asyncio
 async def test_admitted_exact_source_empty_reply_is_never_reenqueued(
     db_factory,
 ):

@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { ChatView } from './ChatView';
-import type { ChatMessage, PlanResource, PlanVersion, Project, Task, TestHarnessRun, UploadResult, WorkspaceReviewRun } from '../../api/client';
+import type { ChatMessage, MonitorSession, PlanResource, PlanVersion, Project, Task, TestHarnessRun, UploadResult, WorkspaceReviewRun } from '../../api/client';
 
 // Mock dependencies
 vi.mock('../../api/client', () => ({
@@ -79,7 +79,7 @@ vi.mock('../../api/client', () => ({
     listForkAnchors: vi.fn().mockResolvedValue([]),
     forkTask: vi.fn().mockResolvedValue({}),
     uploadImages: vi.fn().mockResolvedValue([]),
-    listMonitorSessions: vi.fn().mockResolvedValue([]),
+    listAllSubAgentSessions: vi.fn().mockResolvedValue([]),
     listTaskBrowserReviews: vi.fn().mockResolvedValue([]),
     getTaskBrowserReviewArtifact: vi.fn().mockResolvedValue(new Blob()),
     getAskUserPending: vi.fn().mockResolvedValue({ pending: [] }),
@@ -108,8 +108,9 @@ vi.mock('../../api/client', () => ({
     updateQuickPhrase: vi.fn().mockResolvedValue({}),
     deleteQuickPhrase: vi.fn().mockResolvedValue({}),
     getMessageDetail: vi.fn().mockResolvedValue({}),
-    getMonitorChecks: vi.fn().mockResolvedValue([]),
+    getSubAgentReports: vi.fn().mockResolvedValue([]),
     deleteMonitorSession: vi.fn().mockResolvedValue({}),
+    deleteSubAgentSession: vi.fn().mockResolvedValue({}),
     resolvePermission: vi.fn().mockResolvedValue({}),
     submitAskUser: vi.fn().mockResolvedValue({}),
     starTask: vi.fn().mockResolvedValue({}),
@@ -185,8 +186,11 @@ vi.mock('../Secrets/SecretPicker', () => ({
 }));
 
 vi.mock('./SubAgentIndicator', () => ({
-  SubAgentIndicator: ({ onNavigate }: { onNavigate?: () => void }) => (
-    <button onClick={onNavigate}>Open monitors</button>
+  SubAgentIndicator: ({ onNavigate, count }: { onNavigate?: () => void; count: number }) => (
+    <button aria-label="Open monitors" onClick={onNavigate}>
+      Open monitors
+      <span data-testid="sub-agent-indicator-count">{count}</span>
+    </button>
   ),
 }));
 
@@ -383,6 +387,55 @@ describe('ChatView', () => {
       available: true,
       reason: null,
       repo_path: '/repo',
+    });
+  });
+
+  it('refreshes the Task projection when a native sub-agent changes state', async () => {
+    render(
+      <ChatView
+        task={makeTask({ id: 73, active_sub_agents: 0 })}
+        projects={projects}
+        onBack={onBack}
+        onTaskUpdated={onTaskUpdated}
+      />,
+    );
+
+    await waitFor(() => expect(capturedOnMessage).toBeTypeOf('function'));
+    act(() => {
+      capturedOnMessage?.({
+        channel: 'task:73',
+        data: {
+          event_type: 'sub_agent_session_created',
+          sub_agent_session_id: 9,
+          source: 'native',
+          provider: 'codex',
+          status: 'running',
+        },
+      });
+    });
+
+    await waitFor(() => {
+      expect(api.listAllSubAgentSessions).toHaveBeenCalledWith(73);
+      expect(onTaskUpdated).toHaveBeenCalled();
+    });
+  });
+
+  it('counts provider-native children in the chat header indicator', async () => {
+    (api.listAllSubAgentSessions as ReturnType<typeof vi.fn>)
+      .mockResolvedValueOnce([
+        { status: 'running', source: 'native' } as MonitorSession,
+      ]);
+
+    render(
+      <ChatView
+        task={makeTask({ id: 74, active_sub_agents: 1 })}
+        projects={projects}
+        onBack={onBack}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByTestId('sub-agent-indicator-count')).toHaveTextContent('1');
     });
   });
 

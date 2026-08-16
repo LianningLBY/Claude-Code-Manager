@@ -5929,6 +5929,249 @@ async def test_relay_preserves_native_sub_agent_notification_namespace(
     assert broadcaster.sent == [(f"task:{task.id}", native_event)]
 
 
+@pytest.mark.parametrize(
+    "invalid_fields",
+    [
+        {"native_mirror_version": 2},
+        {"native_mirror_version": 1, "source": "ccm"},
+        {
+            "native_mirror_version": 1,
+            "native_sequence": 1,
+            "status": [],
+        },
+    ],
+)
+async def test_relay_drops_invalid_declared_native_sub_agent_snapshot(
+    relay,
+    broadcaster,
+    session_factory,
+    invalid_fields,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    relay._tasks[worker.id] = {task.id}
+    event = {
+        "event_type": "sub_agent_session_status",
+        "sub_agent_session_id": 45,
+        "agent_type": "native-agent",
+        "source": "native",
+        "provider": "codex",
+        "description": "invalid declared snapshot",
+        "status": "completed",
+        "checks_done": 0,
+        "last_summary": None,
+        "codex_thread_id": "thread-invalid",
+        **_relay_generation(task),
+        **invalid_fields,
+    }
+
+    await relay._handle(
+        {"channel": f"task:{task.id}", "data": event},
+        worker,
+    )
+
+    async with session_factory() as db:
+        mirrors = list((
+            await db.execute(
+                select(MonitorSession).where(
+                    MonitorSession.task_id == task.id,
+                    MonitorSession.remote_id == 45,
+                )
+            )
+        ).scalars())
+    assert mirrors == []
+    assert broadcaster.sent == []
+
+
+async def test_relay_mirrors_versioned_native_sub_agent_lifecycle(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    relay._tasks[worker.id] = {task.id}
+    base = {
+        "sub_agent_session_id": 44,
+        "agent_type": "native-agent",
+        "source": "native",
+        "native_mirror_version": 1,
+        "provider": "codex",
+        "description": "inspect scheduler",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "codex_thread_id": "thread-child",
+        **_relay_generation(task),
+    }
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                **base,
+                "event_type": "sub_agent_session_created",
+                "status": "running",
+                "checks_done": 0,
+                "last_summary": None,
+                "native_sequence": 1,
+            },
+        },
+        worker,
+    )
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                **base,
+                "event_type": "sub_agent_report",
+                "status": "running",
+                "checks_done": 1,
+                "check_number": 1,
+                "last_summary": "scheduler inspected",
+                "native_sequence": 2,
+            },
+        },
+        worker,
+    )
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                **base,
+                "event_type": "sub_agent_session_status",
+                "status": "failed",
+                "checks_done": 1,
+                "last_summary": "scheduler inspected",
+                "native_sequence": 3,
+            },
+        },
+        worker,
+    )
+
+    async with session_factory() as db:
+        mirror = (
+            await db.execute(
+                select(MonitorSession).where(
+                    MonitorSession.task_id == task.id,
+                    MonitorSession.remote_id == 44,
+                )
+            )
+        ).scalar_one()
+        reports = list((
+            await db.execute(
+                select(MonitorCheck).where(
+                    MonitorCheck.monitor_session_id == mirror.id,
+                )
+            )
+        ).scalars())
+    assert mirror.source == "native"
+    assert mirror.provider == "codex"
+    assert mirror.codex_thread_id == "thread-child"
+    assert mirror.status == "failed"
+    assert mirror.checks_done == 1
+    assert mirror.last_summary == "scheduler inspected"
+    assert [(report.check_number, report.summary) for report in reports] == [
+        (1, "scheduler inspected"),
+    ]
+    assert [
+        event["event_type"] for _, event in broadcaster.sent
+    ] == [
+        "sub_agent_session_created",
+        "sub_agent_report",
+        "sub_agent_session_status",
+    ]
+    assert all(
+        event["sub_agent_session_id"] == mirror.id
+        for _, event in broadcaster.sent
+    )
+
+
+async def test_relay_reactivates_codex_child_only_with_newer_sequence(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    relay._tasks[worker.id] = {task.id}
+    base = {
+        "event_type": "sub_agent_session_status",
+        "sub_agent_session_id": 46,
+        "agent_type": "native-agent",
+        "source": "native",
+        "native_mirror_version": 1,
+        "provider": "codex",
+        "description": "reused child thread",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high",
+        "codex_thread_id": "thread-reused",
+        "checks_done": 0,
+        "last_summary": None,
+        **_relay_generation(task),
+    }
+
+    for status, sequence in (
+        ("completed", 1),
+        ("running", 2),
+        # Delayed terminal replay must not close the newer activation.
+        ("completed", 1),
+    ):
+        await relay._handle(
+            {
+                "channel": f"task:{task.id}",
+                "data": {
+                    **base,
+                    "status": status,
+                    "native_sequence": sequence,
+                },
+            },
+            worker,
+        )
+
+    async with session_factory() as db:
+        mirror = (
+            await db.execute(
+                select(MonitorSession).where(
+                    MonitorSession.task_id == task.id,
+                    MonitorSession.remote_id == 46,
+                )
+            )
+        ).scalar_one()
+    assert mirror.status == "running"
+    assert mirror.completed_at is None
+    assert [event["status"] for _, event in broadcaster.sent] == [
+        "completed",
+        "running",
+    ]
+
+
+async def test_relay_drops_stale_sub_agent_count_projection(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(session_factory, worker_id=worker.id)
+    relay._tasks[worker.id] = {task.id}
+
+    await relay._handle(
+        {
+            "channel": "tasks",
+            "data": {
+                "event": "sub_agent_count",
+                "event_type": "sub_agent_count",
+                "task_id": task.id,
+                "active_sub_agents": 2,
+                "task_retry_count": task.retry_count,
+                "task_turn_generation": task.turn_generation + 1,
+            },
+        },
+        worker,
+    )
+
+    assert broadcaster.sent == []
+
+
 async def test_relay_context_usage_syncs(relay, session_factory):
     w = await _mk_worker(session_factory)
     t = await _mk_task(session_factory, worker_id=w.id)

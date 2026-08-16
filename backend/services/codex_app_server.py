@@ -2164,6 +2164,19 @@ class _TurnContext:
     ) = None
     descendant_thread_ids: set[str] = field(default_factory=set)
     active_descendant_thread_ids: set[str] = field(default_factory=set)
+    # Codex native collaboration has its own thread lifecycle, while CCM's
+    # generic SubAgentSession projection is driven by the task output stream.
+    # Keep the provider facts on the exact root turn and emit a small,
+    # provider-neutral lifecycle envelope into that stream.  The maps also
+    # make repeated app-server notifications idempotent without treating a
+    # later child turn as a brand-new child identity.
+    descendant_parent_thread_ids: dict[str, str] = field(default_factory=dict)
+    descendant_lifecycle_details: dict[str, dict[str, Any]] = field(
+        default_factory=dict
+    )
+    descendant_lifecycle_states: dict[str, str] = field(default_factory=dict)
+    descendant_lifecycle_sequences: dict[str, int] = field(default_factory=dict)
+    descendant_lifecycle_summaries: dict[str, str] = field(default_factory=dict)
     descendant_state_changed: asyncio.Event | None = None
     descendant_interrupt_lock: asyncio.Lock | None = None
     descendant_guard_task: asyncio.Task | None = None
@@ -2441,6 +2454,16 @@ class CodexAppServer:
             context.descendant_thread_ids.clear()
         if hasattr(context, "active_descendant_thread_ids"):
             context.active_descendant_thread_ids.clear()
+        for attribute in (
+            "descendant_parent_thread_ids",
+            "descendant_lifecycle_details",
+            "descendant_lifecycle_states",
+            "descendant_lifecycle_sequences",
+            "descendant_lifecycle_summaries",
+        ):
+            mapping = getattr(context, attribute, None)
+            if mapping is not None:
+                mapping.clear()
         if self._contexts_by_thread.get(context.thread_id) is context:
             self._contexts_by_thread.pop(context.thread_id, None)
         for turn_id, candidate in list(self._contexts_by_turn.items()):
@@ -3021,15 +3044,151 @@ class CodexAppServer:
         if changed is not None:
             changed.set()
 
+    @staticmethod
+    def _bounded_descendant_text(value: Any, limit: int) -> str | None:
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if not value:
+            return None
+        return value[:limit]
+
+    def _remember_descendant_lifecycle_details(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+        *,
+        parent_thread_id: str | None = None,
+        item: dict[str, Any] | None = None,
+        state: dict[str, Any] | None = None,
+    ) -> None:
+        """Retain only bounded public metadata for one native child thread."""
+
+        if parent_thread_id:
+            context.descendant_parent_thread_ids[thread_id] = parent_thread_id
+        details = context.descendant_lifecycle_details.setdefault(thread_id, {})
+        item = item if isinstance(item, dict) else {}
+        state = state if isinstance(state, dict) else {}
+
+        agent_path = self._bounded_descendant_text(
+            item.get("agentPath") or item.get("agent_path"),
+            500,
+        )
+        if agent_path:
+            details["agent_path"] = agent_path
+        description = self._bounded_descendant_text(
+            item.get("prompt")
+            or state.get("description")
+            or state.get("name"),
+            500,
+        )
+        if not description and agent_path:
+            description = agent_path.rstrip("/").rsplit("/", 1)[-1]
+        if description:
+            details["description"] = description
+        model = self._bounded_descendant_text(
+            item.get("model") or state.get("model"),
+            100,
+        )
+        if model:
+            details["model"] = model
+        effort = self._bounded_descendant_text(
+            item.get("reasoningEffort")
+            or item.get("reasoning_effort")
+            or state.get("reasoningEffort")
+            or state.get("reasoning_effort"),
+            20,
+        )
+        if effort:
+            details["reasoning_effort"] = effort
+
+    @staticmethod
+    def _descendant_terminal_status(status: str | None) -> str:
+        normalized = str(status or "").replace("_", "").lower()
+        if normalized in {"errored", "error", "failed", "systemerror", "notfound"}:
+            return "failed"
+        if normalized in {"interrupted", "cancelled", "canceled", "shutdown", "notloaded"}:
+            return "cancelled"
+        return "completed"
+
+    def _publish_native_sub_agent_lifecycle(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+        *,
+        status: str,
+        summary: str | None = None,
+    ) -> None:
+        """Feed one deduplicated child lifecycle edge to InstanceManager."""
+
+        if not self._context_is_current(context):
+            return
+        if status not in {"running", "completed", "failed", "cancelled"}:
+            return
+        previous = context.descendant_lifecycle_states.get(thread_id)
+        bounded_summary = self._bounded_descendant_text(summary, 2000)
+        previous_summary = context.descendant_lifecycle_summaries.get(thread_id)
+
+        if status == "running":
+            lifecycle_event = "spawn" if previous != "running" else "progress"
+            if lifecycle_event == "progress" and (
+                bounded_summary is None or bounded_summary == previous_summary
+            ):
+                return
+        else:
+            # First terminal proof wins.  A later thread/closed notification
+            # must not rewrite a completed child as cancelled.
+            if previous in {"completed", "failed", "cancelled"}:
+                return
+            lifecycle_event = "done"
+
+        sequence = context.descendant_lifecycle_sequences.get(thread_id, 0) + 1
+        context.descendant_lifecycle_sequences[thread_id] = sequence
+        context.descendant_lifecycle_states[thread_id] = status
+        if bounded_summary is not None:
+            context.descendant_lifecycle_summaries[thread_id] = bounded_summary
+        elif lifecycle_event == "spawn":
+            context.descendant_lifecycle_summaries.pop(thread_id, None)
+
+        details = context.descendant_lifecycle_details.get(thread_id, {})
+        description = details.get("description")
+        if not description:
+            description = f"Codex agent {thread_id[:12]}"
+        context.process.feed({
+            "type": "native.subagent.lifecycle",
+            "lifecycle_event": lifecycle_event,
+            "provider": "codex",
+            "native_agent_id": thread_id,
+            "root_thread_id": context.thread_id,
+            "parent_native_agent_id": (
+                context.descendant_parent_thread_ids.get(thread_id)
+            ),
+            "description": description,
+            "agent_path": details.get("agent_path"),
+            "model": details.get("model"),
+            "reasoning_effort": details.get("reasoning_effort"),
+            "status": status,
+            "summary": bounded_summary,
+            "sequence": sequence,
+        })
+
     def _mark_descendant_active(
         self,
         context: _TurnContext,
         thread_id: str,
+        *,
+        summary: str | None = None,
     ) -> None:
         if not self._context_is_current(context):
             return
         changed = thread_id not in context.active_descendant_thread_ids
         context.active_descendant_thread_ids.add(thread_id)
+        self._publish_native_sub_agent_lifecycle(
+            context,
+            thread_id,
+            status="running",
+            summary=summary,
+        )
         if changed:
             self._publish_background_lifecycle_activity(context)
         self._signal_descendant_state_change(context)
@@ -3038,12 +3197,53 @@ class CodexAppServer:
         self,
         context: _TurnContext,
         thread_id: str,
+        *,
+        status: str = "completed",
+        summary: str | None = None,
     ) -> None:
+        if not self._context_is_current(context):
+            return
         changed = thread_id in context.active_descendant_thread_ids
         context.active_descendant_thread_ids.discard(thread_id)
+        self._publish_native_sub_agent_lifecycle(
+            context,
+            thread_id,
+            status=status,
+            summary=summary,
+        )
         if changed:
             self._publish_background_lifecycle_activity(context)
         self._signal_descendant_state_change(context)
+
+    def _publish_descendant_message_summary(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+        item: Any,
+    ) -> None:
+        """Mirror a child's completed public answer as lifecycle progress.
+
+        Child-thread messages must never be rendered as root assistant output,
+        but the generic SubAgent report should still expose the child's public
+        result.  Stdio notifications are ordered, so accept the message only
+        while the exact child lifecycle is running; a late replay must not
+        reactivate a terminal child.
+        """
+
+        if not isinstance(item, dict):
+            return
+        if item.get("type") not in {"agentMessage", "agent_message"}:
+            return
+        if context.descendant_lifecycle_states.get(thread_id) != "running":
+            return
+        summary = self._bounded_descendant_text(item.get("text"), 2000)
+        if summary is None:
+            return
+        self._mark_descendant_active(
+            context,
+            thread_id,
+            summary=summary,
+        )
 
     def _publish_background_lifecycle(
         self,
@@ -3143,13 +3343,18 @@ class CodexAppServer:
             if status_type == "active":
                 self._mark_descendant_active(context, thread_id)
             elif terminal:
-                self._mark_descendant_terminal(context, thread_id)
+                self._mark_descendant_terminal(
+                    context,
+                    thread_id,
+                    status=self._descendant_terminal_status(status_type),
+                )
 
     def _record_thread_turn_lifecycle(
         self,
         method: str,
         thread_id: str,
         turn_id: str | None,
+        turn_status: str | None = None,
     ) -> None:
         runtime = self._runtime_state_for(thread_id)
         if method == "turn/started":
@@ -3169,7 +3374,11 @@ class CodexAppServer:
             # attachment.
             runtime.status_type = "idle"
             for context in self._contexts_tracking_descendant(thread_id):
-                self._mark_descendant_terminal(context, thread_id)
+                self._mark_descendant_terminal(
+                    context,
+                    thread_id,
+                    status=self._descendant_terminal_status(turn_status),
+                )
 
     def _record_child_relation(
         self,
@@ -3194,6 +3403,8 @@ class CodexAppServer:
         thread_id: str,
         *,
         active: bool | None,
+        terminal_status: str = "completed",
+        summary: str | None = None,
         _seen: set[str] | None = None,
     ) -> None:
         if not thread_id or thread_id == context.thread_id:
@@ -3219,9 +3430,18 @@ class CodexAppServer:
 
         runtime = self._thread_runtime.get(thread_id)
         if active is True:
-            self._mark_descendant_active(context, thread_id)
+            self._mark_descendant_active(
+                context,
+                thread_id,
+                summary=summary,
+            )
         elif active is False:
-            self._mark_descendant_terminal(context, thread_id)
+            self._mark_descendant_terminal(
+                context,
+                thread_id,
+                status=terminal_status,
+                summary=summary,
+            )
         elif runtime is None:
             # A discovered child with no status proof is a blocker, not an
             # implicit success.
@@ -3232,11 +3452,19 @@ class CodexAppServer:
         ):
             self._mark_descendant_active(context, thread_id)
         elif self._thread_status_is_terminal(runtime.status_type):
-            self._mark_descendant_terminal(context, thread_id)
+            self._mark_descendant_terminal(
+                context,
+                thread_id,
+                status=self._descendant_terminal_status(runtime.status_type),
+            )
         else:
             self._mark_descendant_active(context, thread_id)
 
         for child_id in self._children_by_thread.get(thread_id, set()):
+            context.descendant_parent_thread_ids.setdefault(
+                child_id,
+                thread_id,
+            )
             self._attach_descendant(
                 context,
                 child_id,
@@ -3259,22 +3487,37 @@ class CodexAppServer:
                 return
             child_id = str(child_id)
             self._record_child_relation(event_thread_id, child_id)
+            self._remember_descendant_lifecycle_details(
+                context,
+                child_id,
+                parent_thread_id=event_thread_id,
+                item=item,
+            )
             kind = str(item.get("kind") or "")
             if kind == "interrupted":
                 active: bool | None = False
+                terminal_status = "cancelled"
             elif kind == "interacted":
                 # MultiAgentV2 uses the same item for queue-only send_message
                 # and turn-starting followup_task.  Do not guess: block first,
                 # then thread/status or thread/read supplies the proof.
                 active = True
+                terminal_status = "completed"
             elif kind == "started":
                 # This item is newer than any cached idle observation.  A
                 # delayed child turn/status notification must not let stale
                 # runtime state publish the parent as complete.
                 active = True
+                terminal_status = "completed"
             else:
                 active = None
-            self._attach_descendant(context, child_id, active=active)
+                terminal_status = "completed"
+            self._attach_descendant(
+                context,
+                child_id,
+                active=active,
+                terminal_status=terminal_status,
+            )
             return
 
         if item_type not in {
@@ -3322,13 +3565,29 @@ class CodexAppServer:
                 if isinstance(state, dict)
                 else ""
             )
+            state_dict = state if isinstance(state, dict) else None
+            self._remember_descendant_lifecycle_details(
+                context,
+                child_id,
+                parent_thread_id=sender_id,
+                item=item,
+                state=state_dict,
+            )
+            summary = (
+                self._bounded_descendant_text(state.get("message"), 2000)
+                if isinstance(state, dict)
+                else None
+            )
             active: bool | None
+            terminal_status = "completed"
             if agent_status in active_agent_statuses:
                 active = True
             elif agent_status in terminal_agent_statuses:
                 active = False
+                terminal_status = self._descendant_terminal_status(agent_status)
             elif tool == "closeAgent" and call_status == "completed":
                 active = False
+                terminal_status = "cancelled"
             elif (
                 tool in {"spawnAgent", "sendInput", "resumeAgent"}
                 and call_status != "failed"
@@ -3336,7 +3595,13 @@ class CodexAppServer:
                 active = True
             else:
                 active = None
-            self._attach_descendant(context, child_id, active=active)
+            self._attach_descendant(
+                context,
+                child_id,
+                active=active,
+                terminal_status=terminal_status,
+                summary=summary,
+            )
 
     async def _read_descendant_status(
         self,
@@ -7773,6 +8038,12 @@ class CodexAppServer:
                     self._record_child_relation(parent_id, child_id)
                     lineage_context = self._lineage_context_for_thread(parent_id)
                     if lineage_context is not None:
+                        self._remember_descendant_lifecycle_details(
+                            lineage_context,
+                            child_id,
+                            parent_thread_id=parent_id,
+                            item=thread,
+                        )
                         status_type = self._thread_status_type(
                             thread.get("status")
                         )
@@ -7957,6 +8228,11 @@ class CodexAppServer:
                 method,
                 thread_id_str,
                 turn_id,
+                (
+                    str((params.get("turn") or {}).get("status") or "")
+                    if isinstance(params.get("turn"), dict)
+                    else None
+                ),
             )
         if context is None and thread_id_str:
             candidate = self._contexts_by_thread.get(thread_id_str)
@@ -8020,8 +8296,10 @@ class CodexAppServer:
             context = candidate
         if context is None:
             # Child-thread output is intentionally not rendered as if it were
-            # the root assistant's answer.  Its collaboration lifecycle still
-            # extends the exact root generation and may discover grandchildren.
+            # the root assistant's answer.  Its completed public answer is
+            # instead projected as a bounded SubAgent report, while its
+            # collaboration lifecycle still extends the exact root generation
+            # and may discover grandchildren.
             lineage_context = (
                 self._contexts_by_descendant.get(thread_id_str)
                 if thread_id_str is not None
@@ -8032,10 +8310,17 @@ class CodexAppServer:
                 and self._context_is_current(lineage_context)
                 and method in {"item/started", "item/completed"}
             ):
+                item = params.get("item")
+                if method == "item/completed":
+                    self._publish_descendant_message_summary(
+                        lineage_context,
+                        thread_id_str,
+                        item,
+                    )
                 self._track_collaboration_item(
                     lineage_context,
                     thread_id_str,
-                    params.get("item"),
+                    item,
                 )
             return
         if turn_id and method == "turn/started":

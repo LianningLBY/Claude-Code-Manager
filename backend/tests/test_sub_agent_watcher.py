@@ -18,6 +18,42 @@ from backend.services.sub_agent_watcher import (
 
 
 @pytest.mark.asyncio
+async def test_codex_native_agent_is_not_polled_as_claude_transcript(
+    db_factory,
+):
+    async with db_factory() as db:
+        task = Task(
+            title="codex-native",
+            status="executing",
+            session_id="thread-root",
+        )
+        db.add(task)
+        await db.flush()
+        sub_agent = SubAgentSession(
+            task_id=task.id,
+            agent_type="native-agent",
+            source="native",
+            provider="codex",
+            description="Codex child",
+            status="running",
+            codex_thread_id="thread-child",
+            meta=json.dumps({"tool_use_id": "codex:thread-child"}),
+        )
+        db.add(sub_agent)
+        await db.commit()
+
+    watcher = SubAgentWatcher(db_factory, AsyncMock())
+    watcher._resolve_paths = AsyncMock(
+        side_effect=AssertionError("Codex child has no Claude transcript"),
+    )
+
+    await watcher._tick()
+
+    watcher._resolve_paths.assert_not_called()
+    assert watcher._tracked == {}
+
+
+@pytest.mark.asyncio
 async def test_silent_live_agent_is_not_inferred_complete(
     db_factory,
     tmp_path,

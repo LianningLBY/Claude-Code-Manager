@@ -120,6 +120,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       && (
         event === 'status_change'
         || event === 'background_activity'
+        || event === 'sub_agent_count'
         || event === 'plan_stage_change'
         || event === 'plan_ready'
       )
@@ -138,6 +139,11 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         );
       const backgroundActive = typeof data.background_active === 'boolean'
         ? data.background_active
+        : undefined;
+      const activeSubAgents = event === 'sub_agent_count'
+        && Number.isSafeInteger(Number(data.active_sub_agents))
+        && Number(data.active_sub_agents) >= 0
+        ? Number(data.active_sub_agents)
         : undefined;
       const planStage = event === 'plan_stage_change'
         && typeof data.plan_stage === 'string'
@@ -168,6 +174,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       if (
         newStatus === undefined
         && backgroundActive === undefined
+        && activeSubAgents === undefined
         && planStage === undefined
         && planStageRound === undefined
         && planStageProvider === undefined
@@ -182,6 +189,10 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         const backgroundChanged = (
           backgroundActive !== undefined
           && task.background_active !== backgroundActive
+        );
+        const subAgentCountChanged = (
+          activeSubAgents !== undefined
+          && task.active_sub_agents !== activeSubAgents
         );
         const planStageChanged = (
           planStage !== undefined
@@ -200,6 +211,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
         if (
           !statusChanged
           && !backgroundChanged
+          && !subAgentCountChanged
           && !planStageChanged
           && !planStageRoundChanged
           && !planRouteChanged
@@ -208,6 +220,7 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
           ...task,
           ...(newStatus !== undefined ? { status: newStatus } : {}),
           ...(backgroundActive !== undefined ? { background_active: backgroundActive } : {}),
+          ...(activeSubAgents !== undefined ? { active_sub_agents: activeSubAgents } : {}),
           ...(planStage !== undefined ? { plan_stage: planStage } : {}),
           ...(planStageRound !== undefined ? { plan_stage_round: planStageRound } : {}),
           ...(planStageProvider !== undefined ? { plan_stage_provider: planStageProvider } : {}),

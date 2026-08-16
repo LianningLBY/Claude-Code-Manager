@@ -12,7 +12,7 @@ vi.mock('../PlanReview/PlanInputForm', () => ({ PlanInputForm: ({ request }: { r
 describe('DeliveryRunDialog', () => {
   afterEach(() => { cleanup(); vi.clearAllMocks(); });
   it('expands authoritative Plan and Task links without duplicating their data', async () => {
-    vi.mocked(api.getDeliveryRun).mockResolvedValue({ id: 7, title: 'Ship', phase: 'coding', activity: 'waiting', outcome: null, terminal: 'ready_to_merge', developer_task_id: 12, pr_monitor_run_id: null, cycles: [{ id: 1, cycle_number: 1, plan_version_id: 31 }], turns: [{ id: 2, generation: 1, status: 'completed', attempts: 1, last_error: null }], delivery_branch: 'ccm/delivery/7', turn_count: 1, head_sha: 'a'.repeat(40), wait_reason: null } as never);
+    vi.mocked(api.getDeliveryRun).mockResolvedValue({ id: 7, title: 'Ship', requirements: 'Ship the actual Delivery request', phase: 'coding', activity: 'waiting', outcome: null, terminal: 'ready_to_merge', developer_task_id: 12, pr_monitor_run_id: null, cycles: [{ id: 1, cycle_number: 1, plan_version_id: 31 }], turns: [{ id: 2, generation: 1, status: 'completed', attempts: 1, last_error: null }], delivery_branch: 'ccm/delivery/7', turn_count: 1, head_sha: 'a'.repeat(40), wait_reason: null } as never);
     vi.mocked(api.getDeliveryProgress).mockResolvedValue({
       run_id: 7,
       state_version: 3,
@@ -51,6 +51,8 @@ describe('DeliveryRunDialog', () => {
     await userEvent.click(screen.getByRole('button', { name: /Open Plan conversation/ }));
     expect(await screen.findByRole('region', { name: 'Plan conversation' })).toBeInTheDocument();
     expect(screen.getByText('Delivery #7 / Plan')).toBeInTheDocument();
+    expect(screen.getByText('Ship the actual Delivery request')).toBeInTheDocument();
+    expect(screen.queryByText('Ship the change')).not.toBeInTheDocument();
     expect(onOpenPlan).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole('button', { name: 'Back to Delivery #7' }));
     await userEvent.click(screen.getByRole('button', { name: /Development/ }));

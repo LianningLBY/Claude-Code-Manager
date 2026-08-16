@@ -34,6 +34,7 @@ interface Props {
   onNavigateDelivery?: (runId: number) => void;
   embedded?: boolean;
   contextLabel?: string;
+  conversationRequest?: string;
 }
 
 function uploadPayload(results: UploadResult[]) {
@@ -87,7 +88,7 @@ function uniqueRunError(run: PlanRun) {
   return normalized;
 }
 
-function PlanConversation({ plan, runs }: { plan: PlanResource; runs: PlanRun[] }) {
+function PlanConversation({ plan, runs, request }: { plan: PlanResource; runs: PlanRun[]; request?: string }) {
   const orderedRuns = [...runs].sort((left, right) => left.id - right.id);
   return (
     <section aria-label="Plan conversation" className="mt-4 space-y-3 rounded-xl border border-gray-800 bg-gray-950/35 p-3 sm:p-4">
@@ -101,7 +102,7 @@ function PlanConversation({ plan, runs }: { plan: PlanResource; runs: PlanRun[] 
       <div className="space-y-4">
         <div className="ml-auto max-w-[88%] rounded-2xl rounded-br-sm bg-indigo-600 px-3.5 py-3 text-sm text-white">
           <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-indigo-200">Request</div>
-          <div className="whitespace-pre-wrap leading-6">{plan.initial_request}</div>
+          <div className="whitespace-pre-wrap leading-6">{request || plan.initial_request}</div>
         </div>
         {orderedRuns.map((run) => (
           <div key={run.id} className="space-y-3">
@@ -131,7 +132,7 @@ function PlanConversation({ plan, runs }: { plan: PlanResource; runs: PlanRun[] 
   );
 }
 
-export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], onToggleVersion, onAttachVersion, onNavigateTask, onNavigateDelivery, embedded = false, contextLabel }: Props) {
+export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], onToggleVersion, onAttachVersion, onNavigateTask, onNavigateDelivery, embedded = false, contextLabel, conversationRequest }: Props) {
   const [versions, setVersions] = useState<PlanVersion[]>([]);
   const [runs, setRuns] = useState<PlanRun[]>([]);
   const [versionId, setVersionId] = useState<number | null>(plan.current_version_id);
@@ -359,7 +360,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       {showStaleness && staleness?.hard_conflict && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"><span className="font-semibold">This action is blocked.</span> {hardConflictMessages.join(' ')}</div>}
       {!plan.read_only && <CollapsiblePlanningRequest content={plan.initial_request} />}
 
-      <PlanConversation plan={plan} runs={runs} />
+      <PlanConversation plan={plan} runs={runs} request={conversationRequest} />
 
       {activeRun?.status === 'waiting_user' && plan.open_input_request && <div className="mt-4"><PlanInputForm key={plan.open_input_request.id} run={activeRun} request={plan.open_input_request} onAnswered={answered} /></div>}
       {activeRun && <PlanRunInputAudit run={activeRun} title={`v${candidateVersionNumber} ${activeRun.run_type === 'user_revision' ? 'revision & input history' : 'input history'}`} defaultOpen />}

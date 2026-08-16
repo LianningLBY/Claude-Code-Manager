@@ -894,6 +894,7 @@ export function DeliveryRunDialog({
                 onNavigateTask={onOpenTask}
                 embedded
                 contextLabel={`Delivery #${runId}`}
+                conversationRequest={run?.requirements}
               />
             ) : null}
           </div>

@@ -8113,8 +8113,14 @@ class GlobalDispatcher:
         a single discovered home is only used to bootstrap older tasks.
         """
         pool = self.codex_pool
-        if not (pool and pool.enabled):
+        if not pool:
             return None
+        if not pool.enabled:
+            raise CodexAccountRoutingError(
+                "Codex account pool is paused by an administrator; refusing "
+                "to fall back to the service's default CODEX_HOME",
+                permanent=True,
+            )
         await self._require_task_lifecycle_active(expected_generation)
 
         # ``select`` only knows account health and quota. Exclude homes held by
@@ -16469,6 +16475,10 @@ Do NOT create a new PR. Push fixes to the existing branch."""
         model = str(snapshot["model"])
         tier = str(snapshot["codex_service_tier"] or "default")
         pool = self.codex_pool
+        if pool is not None and not pool.enabled:
+            raise RuntimeError(
+                "Codex Monitor cannot start while the account pool is paused"
+            )
         if not (pool and pool.enabled):
             if persisted_account is not None:
                 raise RuntimeError(
@@ -18183,6 +18193,10 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
 
         codex_home: str | None = None
         pool = self.codex_pool
+        if pool is not None and not pool.enabled:
+            raise RuntimeError(
+                "Codex sub-agent cannot start while the account pool is paused"
+            )
         if pool and pool.enabled:
             bound_id = task_metadata.get("codex_account_id")
             bound_home = pool.home_for_account(bound_id) if bound_id else None

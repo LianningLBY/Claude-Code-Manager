@@ -22,6 +22,8 @@ vi.mock('../../api/client', () => ({
     deleteCloudRouterAccount: vi.fn(),
     getCodexPoolStatus: vi.fn(),
     getCodexPoolUsage: vi.fn(),
+    getCodexPoolSettings: vi.fn(),
+    putCodexPoolSettings: vi.fn(),
     clearCodexPoolCooldown: vi.fn(),
     setCodexPoolPreferred: vi.fn(),
     codexPoolDeleteAccount: vi.fn(),
@@ -1286,6 +1288,49 @@ describe('PoolDrawer', () => {
       await user.click(within(card).getByRole('button', { name: '查看额度与有效期' }));
       expect(card).toHaveTextContent('剩余 无限');
       expect(card).not.toHaveTextContent('-$1');
+    });
+  });
+
+  describe('Codex pool settings', () => {
+    it('edits and persists runtime settings', async () => {
+      const settings = {
+        enabled: true,
+        cooldown_seconds: 300,
+        quota_switch_threshold_percent: 90,
+        routing_policy: 'api_first' as const,
+        preferred_account_id: null,
+      };
+      enableCodexPool({
+        enabled: true,
+        total: 0,
+        available: 0,
+        cooldown: 0,
+        disabled: 0,
+        preferred: null,
+        settings,
+        accounts: [],
+      });
+      vi.mocked(api.putCodexPoolSettings).mockResolvedValue(settings);
+      const user = userEvent.setup();
+
+      await renderAndWaitForPro();
+      await openDrawer(user);
+      await user.click(screen.getByRole('button', { name: 'Codex' }));
+      await user.click(await screen.findByTitle('Codex 号池设置'));
+      await user.clear(screen.getByLabelText('撞限冷却时间（秒）'));
+      await user.type(screen.getByLabelText('撞限冷却时间（秒）'), '600');
+      await user.clear(screen.getByLabelText('主动换号阈值（%）'));
+      await user.type(screen.getByLabelText('主动换号阈值（%）'), '80');
+      await user.selectOptions(screen.getByLabelText('新会话路由顺序'), 'native_first');
+      await user.click(screen.getByRole('button', { name: '保存并生效' }));
+
+      await waitFor(() => expect(api.putCodexPoolSettings).toHaveBeenCalledWith({
+        ...settings,
+        cooldown_seconds: 600,
+        quota_switch_threshold_percent: 80,
+        routing_policy: 'native_first',
+      }));
+      expect(api.getCodexPoolUsage).toHaveBeenLastCalledWith(false);
     });
   });
 

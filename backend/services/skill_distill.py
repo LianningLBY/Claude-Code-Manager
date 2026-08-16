@@ -200,6 +200,11 @@ def _select_codex_distill_home(
     """Pick a healthy account for an ephemeral run without changing task binding."""
     if codex_pool is None:
         return None
+    if not codex_pool.enabled:
+        raise CodexDistillAccountUnavailableError(
+            "Codex pool is paused; distillation cannot use the default account",
+            provider="codex",
+        )
 
     bound_home = (
         codex_pool.home_for_account(bound_account_id)

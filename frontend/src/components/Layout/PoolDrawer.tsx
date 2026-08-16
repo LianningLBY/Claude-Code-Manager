@@ -13,6 +13,7 @@ import type {
   CodexLoginMethod,
   CodexLoginStatus,
   CodexPoolAccountUsage,
+  CodexPoolSettings,
   CodexPoolUsageStatus,
   PoolAccountUsage,
   PoolUsageStatus,
@@ -1473,6 +1474,110 @@ function CcSettingsModal({ onClose }: { onClose: () => void }) {
   );
 }
 
+function CodexPoolSettingsModal({
+  initial,
+  onClose,
+  onSaved,
+}: {
+  initial: CodexPoolSettings;
+  onClose: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const [form, setForm] = useState(initial);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSave = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      await api.putCodexPoolSettings(form);
+      await onSaved();
+      onClose();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="absolute inset-0 bg-gray-900/80 z-10 flex items-start justify-center pt-12">
+      <div className="bg-gray-800 rounded-lg shadow-xl w-full max-w-xs">
+        <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+          <h3 className="text-sm font-semibold text-foreground">Codex 号池设置</h3>
+          <button onClick={onClose} className="text-gray-400 hover:text-foreground"><X size={14} /></button>
+        </div>
+        <div className="p-4 space-y-4">
+          <label className="flex items-start justify-between gap-3 text-xs text-gray-300">
+            <span>
+              <span className="block font-medium text-foreground">启用账号路由</span>
+              <span className="mt-1 block text-[10px] text-gray-500">关闭后阻止新的 Codex 回合，不会中断正在执行的回合。</span>
+            </span>
+            <input
+              type="checkbox"
+              checked={form.enabled}
+              onChange={(e) => setForm((value) => ({ ...value, enabled: e.target.checked }))}
+              className="mt-0.5 accent-emerald-500"
+            />
+          </label>
+          <label className="block text-xs text-gray-300">
+            撞限冷却时间（秒）
+            <input
+              type="number"
+              min={1}
+              max={691200}
+              value={form.cooldown_seconds}
+              onChange={(e) => setForm((value) => ({ ...value, cooldown_seconds: Number(e.target.value) }))}
+              className="mt-1 w-full rounded bg-gray-900 border border-gray-700 px-2.5 py-1.5 text-xs text-foreground outline-none focus:border-emerald-500"
+            />
+          </label>
+          <label className="block text-xs text-gray-300">
+            主动换号阈值（%）
+            <input
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              value={form.quota_switch_threshold_percent}
+              onChange={(e) => setForm((value) => ({ ...value, quota_switch_threshold_percent: Number(e.target.value) }))}
+              className="mt-1 w-full rounded bg-gray-900 border border-gray-700 px-2.5 py-1.5 text-xs text-foreground outline-none focus:border-emerald-500"
+            />
+          </label>
+          <label className="block text-xs text-gray-300">
+            新会话路由顺序
+            <select
+              value={form.routing_policy}
+              onChange={(e) => setForm((value) => ({
+                ...value,
+                routing_policy: e.target.value as CodexPoolSettings['routing_policy'],
+              }))}
+              className="mt-1 w-full rounded bg-gray-900 border border-gray-700 px-2.5 py-1.5 text-xs text-foreground outline-none focus:border-emerald-500"
+            >
+              <option value="api_first">API 优先，OAuth 回退</option>
+              <option value="native_first">OAuth 优先，API 回退</option>
+            </select>
+          </label>
+          <p className="text-[10px] leading-relaxed text-gray-500">
+            设置与账号列表一起安全持久化，保存后立即生效；服务器配置路径仍由部署环境管理。
+          </p>
+          {error && <div className="text-xs text-red-400">{error}</div>}
+        </div>
+        <div className="flex justify-end gap-2 px-4 py-3 border-t border-gray-700">
+          <button onClick={onClose} className="px-3 py-1.5 text-xs rounded bg-gray-700 text-gray-300 hover:bg-gray-600">取消</button>
+          <button
+            onClick={handleSave}
+            disabled={saving || !Number.isFinite(form.cooldown_seconds) || !Number.isFinite(form.quota_switch_threshold_percent)}
+            className="px-3 py-1.5 text-xs bg-emerald-600 text-white rounded hover:bg-emerald-500 disabled:opacity-50"
+          >
+            {saving ? '保存中…' : '保存并生效'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 type PoolTab = 'claude' | 'codex';
 
 export function PoolDrawer() {
@@ -1584,6 +1689,7 @@ export function PoolDrawer() {
   const [showCodexAdd, setShowCodexAdd] = useState(false);
   const [showApiAdd, setShowApiAdd] = useState(false);
   const [showCcSettings, setShowCcSettings] = useState(false);
+  const [showCodexSettings, setShowCodexSettings] = useState(false);
   const [apiDeleting, setApiDeleting] = useState<Record<string, boolean>>({});
 
   const handleClaudeRelogin = useCallback(async (accountId: string) => {
@@ -1846,6 +1952,15 @@ export function PoolDrawer() {
                     <Settings size={14} />
                   </button>
                 )}
+                {codexEnabled && tab === 'codex' && codexStatus?.settings && (
+                  <button
+                    onClick={() => setShowCodexSettings(true)}
+                    className="p-1.5 rounded text-gray-400 hover:text-foreground hover:bg-gray-800"
+                    title="Codex 号池设置"
+                  >
+                    <Settings size={14} />
+                  </button>
+                )}
                 {hasActivePool && (
                   <button
                     onClick={() => tab === 'claude' ? setShowAdd(true) : setShowCodexAdd(true)}
@@ -1919,6 +2034,13 @@ export function PoolDrawer() {
                 />
               )}
               {showCcSettings && <CcSettingsModal onClose={() => setShowCcSettings(false)} />}
+              {showCodexSettings && codexStatus?.settings && (
+                <CodexPoolSettingsModal
+                  initial={codexStatus.settings}
+                  onClose={() => setShowCodexSettings(false)}
+                  onSaved={() => loadCodexUsage(false)}
+                />
+              )}
 
               {!hasActivePool && (
                 <div className="rounded-lg border border-sky-700/40 bg-sky-950/20 p-3 text-xs leading-relaxed text-gray-400">
@@ -1978,6 +2100,11 @@ export function PoolDrawer() {
                 <>
                   {codexError && <div className="text-xs text-red-400">{codexError}</div>}
                   {codexLoading && !codexStatus && <div className="text-xs text-gray-500">加载中…</div>}
+                  {codexStatus?.settings && !codexStatus.settings.enabled && (
+                    <div className="rounded border border-amber-500/40 bg-amber-500/10 p-2 text-xs text-amber-300">
+                      Codex 账号路由已暂停；新的 Codex 回合会被明确拒绝，且不会回落到默认账号。
+                    </div>
+                  )}
                   {codexStatus?.accounts.map((a) => (
                     <CodexAccountCard
                       key={`${a.id}:${a.codex_home}`}

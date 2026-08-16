@@ -1187,3 +1187,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：统一在服务端列表边界按 durable ownership 过滤，而不是前端逐卡片隐藏。Task 列表/计数/搜索排除 `delivery_run_id`/`delivery_loop` Developer shell，并沿 `CodeReviewRun → developer Task` 排除其 Reviewer Task；Plan 列表与 count 同时识别 Delivery target Task 和 `DeliveryCycle.plan_version_id`；PR Review 列表只识别 Publisher 保留的不可变 `delivery:` namespace。Delivery 详情仍通过自己的 Progress 投影和精确资源链接展示完整 Plan、Development、Review 与 PR 状态。
 - **避免复发**：任何 Controller 派生资源必须在创建时留下 durable owner edge，公共 catalog 必须在数据库查询阶段过滤，不能先分页再由前端隐藏。PR Review 归属禁止通过“同 repo + PR number”或可复用 Monitor 关系猜测；测试已证明这种模糊匹配会误隐藏普通 Review，且 nullable marker 必须使用 NULL-safe 条件。
 - **验证**：新增精确回归 `5 passed`；Task Queue、Plan Resources、PR Monitor、Delivery API 四个受影响模块完整回归 `400 passed`。覆盖 Delivery Plan 在 detail/Progress 仍可读但 catalog/count 不出现、Developer Task 不出现在普通 Task API、Delivery PR Review 不出现在 Review catalog、普通 Review 与 NULL marker 保持可见，以及 SQL 在 SQLite/PostgreSQL/MySQL 三种方言可编译。Python compile、`git diff --check`、服务重启与 HTTP 健康检查在部署提交后复核。
+
+## 2026-08-16 — Delivery 可信 CI 只等待当前 PR 实际触发项（commit 2d313306）
+
+- **问题**：可信模式把默认分支某次提交上出现过的全部 GitHub Check Run 固化为每个 Delivery PR 的 required checks。路径过滤、矩阵和发布条件导致大量任务在普通 PR 上缺失或 skipped，使实际 CI 已通过的 Delivery 永久停在 `Waiting CI`。
+- **解决**：可信模式持久化一个明确的“当前 PR 精确 head 上实际触发检查”策略标记；Gate 每次从精确 head 动态展开 GitHub 实际创建的 Check Run/Status，只等待其中 pending 项、阻断真实失败项，并把 `skipped`/`neutral` 视为正常结束。严格模式仍使用 Branch Protection 的固定 producer identity，行为不变。旧的可信观察列表在下次 Delivery setup 时自动收敛为新策略标记。
+- **避免复发**：不得用默认分支或历史提交上的 CI 名称集合推断任意 PR 必须运行的检查；可信模式的检查集合必须绑定当前不可变 head，且在至少一个实际检查成功前不能放行，避免 GitHub 尚未创建 checks 时误判通过。
+- **验证**：Delivery setup、PR Panel、Delivery/PR Monitor integration、PR publication 与 Merge Queue 受影响矩阵 `291 passed`；新增“成功 + skipped 条件任务”和“checks 尚未出现”回归；Ruff check 与 `git diff --check` 通过。

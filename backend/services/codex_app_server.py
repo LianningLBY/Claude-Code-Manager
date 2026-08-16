@@ -5659,7 +5659,12 @@ class CodexAppServer:
                 service_tier=service_tier,
             )
         launch_started = time.perf_counter()
-        if git_env or task_ssh_protected_paths or network_isolated:
+        if (
+            (task_id is not None and not restricted_tools)
+            or git_env
+            or task_ssh_protected_paths
+            or network_isolated
+        ):
             # Per-project git credentials must remain thread-scoped.  A global
             # app-server environment would leak one project's identity into
             # every other concurrently running task.
@@ -5667,11 +5672,7 @@ class CodexAppServer:
                 task_model_tool_environment,
             )
 
-            core_shell_environment = (
-                task_model_tool_environment(os.environ)
-                if task_ssh_protected_paths or network_isolated
-                else {}
-            )
+            core_shell_environment = task_model_tool_environment(os.environ)
             shell_environment = dict(core_shell_environment)
             shell_environment.update(dict(git_env or {}))
             if task_ssh_disable_network:

@@ -1148,7 +1148,7 @@ async def test_task_ssh_profile_denies_host_keys_and_direct_network(
             "GOOGLE_*",
         ]
     assert shell_policy["set"] == {
-            "PATH": os.defpath,
+            "PATH": os.pathsep.join((str(Path.home() / ".local" / "bin"), str(Path.home() / ".cargo" / "bin"), os.defpath)),
             "HOME": str(Path.home()),
             **({"LANG": os.environ["LANG"]} if os.environ.get("LANG") else {}),
             **({"LANGUAGE": os.environ["LANGUAGE"]} if os.environ.get("LANGUAGE") else {}),
@@ -3256,7 +3256,12 @@ async def test_start_turn_uses_native_resume_and_turn_start():
     assert resume_call.args[1]["sandbox"] == "danger-full-access"
     assert resume_call.args[1]["serviceTier"] is None
     assert resume_call.args[1]["config"]["shell_environment_policy"]["set"] == {
-        "GIT_AUTHOR_NAME": "CCM"
+        "PATH": os.pathsep.join((str(Path.home() / ".local" / "bin"), str(Path.home() / ".cargo" / "bin"), os.defpath)),
+        "HOME": str(Path.home()),
+        **({"LANG": os.environ["LANG"]} if os.environ.get("LANG") else {}),
+        **({"LANGUAGE": os.environ["LANGUAGE"]} if os.environ.get("LANGUAGE") else {}),
+        **({"TZ": os.environ["TZ"]} if os.environ.get("TZ") else {}),
+        "GIT_AUTHOR_NAME": "CCM",
     }
     assert resume_call.args[1]["config"]["mcp_servers"]["ccm_skills"] == {
         "command": "python",
@@ -6954,7 +6959,13 @@ async def test_start_turn_keeps_native_project_trust_behavior_by_default():
 
     thread_call = server._request.await_args_list[0]
     assert thread_call.args[0] == "thread/start"
-    assert "config" not in thread_call.args[1]
+    assert thread_call.args[1]["config"]["shell_environment_policy"]["set"] == {
+        "PATH": os.pathsep.join((str(Path.home() / ".local" / "bin"), str(Path.home() / ".cargo" / "bin"), os.defpath)),
+        "HOME": str(Path.home()),
+        **({"LANG": os.environ["LANG"]} if os.environ.get("LANG") else {}),
+        **({"LANGUAGE": os.environ["LANGUAGE"]} if os.environ.get("LANGUAGE") else {}),
+        **({"TZ": os.environ["TZ"]} if os.environ.get("TZ") else {}),
+    }
 
 
 @pytest.mark.asyncio

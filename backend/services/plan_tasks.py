@@ -586,6 +586,7 @@ async def capture_repo_revision(path: str | None) -> dict | None:
             if head_rc == 0
             else None
         ),
+        "dirty": bool(status_raw) if status_rc == 0 else None,
         "dirty_sha256": (
             hashlib.sha256(
                 status_raw

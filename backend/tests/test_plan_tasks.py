@@ -1160,6 +1160,9 @@ async def test_repo_fingerprint_detects_repeated_edits_to_same_dirty_path(
         check=True,
     )
 
+    clean = await capture_repo_revision(str(tmp_path))
+    assert clean["dirty"] is False
+
     tracked.write_text("edit-one\n", encoding="utf-8")
     first_mtime = tracked.stat().st_mtime_ns
     first = await capture_repo_revision(str(tmp_path))
@@ -1173,6 +1176,8 @@ async def test_repo_fingerprint_detects_repeated_edits_to_same_dirty_path(
     )
     second = await capture_repo_revision(str(tmp_path))
 
+    assert first["dirty"] is True
+    assert second["dirty"] is True
     assert first["head"] == second["head"]
     assert first["dirty_sha256"] != second["dirty_sha256"]
 

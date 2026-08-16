@@ -22,6 +22,7 @@ from backend.models.plan_agent import (
     PlanAgentRuntimeReceipt,
     PlanAgentStep,
 )
+from backend.services import process_identity
 from backend.services.process_safety import require_safe_process_group_id
 
 
@@ -75,53 +76,17 @@ def _darwin_libproc():
 
 @lru_cache(maxsize=1)
 def _darwin_boot_session_uuid() -> str:
-    library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
-    library.sysctlbyname.argtypes = [
-        ctypes.c_char_p,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_size_t),
-        ctypes.c_void_p,
-        ctypes.c_size_t,
-    ]
-    library.sysctlbyname.restype = ctypes.c_int
-    name = b"kern.bootsessionuuid"
-    length = ctypes.c_size_t()
-    ctypes.set_errno(0)
-    if library.sysctlbyname(
-        name,
-        None,
-        ctypes.byref(length),
-        None,
-        0,
-    ) != 0:
-        error = ctypes.get_errno()
-        raise PlanRuntimeReceiptError(
-            f"Could not read Darwin boot identity: {os.strerror(error)}"
-        )
-    if not 1 <= length.value <= 128:
-        raise PlanRuntimeReceiptError("Darwin boot identity has an invalid size")
-    payload = ctypes.create_string_buffer(length.value)
-    ctypes.set_errno(0)
-    if library.sysctlbyname(
-        name,
-        payload,
-        ctypes.byref(length),
-        None,
-        0,
-    ) != 0:
-        error = ctypes.get_errno()
-        raise PlanRuntimeReceiptError(
-            f"Could not read Darwin boot identity: {os.strerror(error)}"
-        )
+    """Delegate to the shared boot-identity primitive.
+
+    ``process_identity`` owns the ``kern.bootsessionuuid`` read for every
+    caller. Only the error taxonomy is translated here so durable Plan
+    runtime callers keep failing closed on ``PlanRuntimeReceiptError``.
+    """
+
     try:
-        value = payload.raw[: length.value].rstrip(b"\0").decode("ascii").lower()
-    except UnicodeDecodeError as exc:
-        raise PlanRuntimeReceiptError(
-            "Darwin boot identity is not ASCII"
-        ) from exc
-    if not _is_canonical_boot_id(value):
-        raise PlanRuntimeReceiptError("Darwin boot identity has an invalid format")
-    return value
+        return process_identity.darwin_boot_session_uuid()
+    except process_identity.ProcessIdentityError as exc:
+        raise PlanRuntimeReceiptError(str(exc)) from exc
 
 
 class PlanRuntimeReceiptError(RuntimeError):
@@ -192,12 +157,7 @@ def _is_int_at_least(value: object, minimum: int) -> bool:
 
 
 def _is_canonical_boot_id(value: object) -> bool:
-    if not isinstance(value, str) or len(value) != 36:
-        return False
-    try:
-        return str(uuid.UUID(value)) == value
-    except (ValueError, AttributeError):
-        return False
+    return process_identity.is_canonical_boot_id(value)
 
 
 def _is_runtime_token(value: object) -> bool:

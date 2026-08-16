@@ -11879,7 +11879,7 @@ async def test_reconcile_dead_reverse_owner_preserves_current_task_generation(
     broadcaster = MagicMock(broadcast=AsyncMock())
     manager = InstanceManager(db_factory, broadcaster)
     with patch(
-        "backend.services.instance_manager.os.kill",
+        "backend.services.process_identity.os.kill",
         side_effect=ProcessLookupError,
     ):
         reconciled = await manager.reconcile_dead_reverse_task_owner(
@@ -11913,6 +11913,69 @@ async def test_reconcile_dead_reverse_owner_preserves_current_task_generation(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_dead_reverse_owner_accepts_previous_boot_identity(
+    db_factory,
+):
+    """A live reused PID cannot pin a superseded reverse owner forever."""
+
+    from backend.services.process_identity import (
+        ProcessIdentity,
+        encode_process_identity,
+    )
+
+    stale_started_at = datetime(2026, 8, 15, 12, 0, 0)
+    live_pid = os.getpid()
+    previous_boot_identity = encode_process_identity(
+        ProcessIdentity(
+            pid=live_pid,
+            start_ticks=1234,
+            boot_id="11111111-1111-4111-8111-111111111111",
+        )
+    )
+    async with db_factory() as db:
+        stale = Instance(
+            name="previous-boot-reverse-owner",
+            status="running",
+            pid=live_pid,
+            process_identity=previous_boot_identity,
+            started_at=stale_started_at,
+        )
+        live = Instance(name="current-owner", status="running")
+        db.add_all([stale, live])
+        await db.flush()
+        task = Task(
+            title="retry moved to another slot",
+            status="executing",
+            instance_id=live.id,
+        )
+        db.add(task)
+        await db.flush()
+        stale.current_task_id = task.id
+        live.current_task_id = task.id
+        await db.commit()
+        stale_id, task_id = stale.id, task.id
+
+    manager = InstanceManager(
+        db_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    reconciled = await manager.reconcile_dead_reverse_task_owner(
+        stale_id,
+        expected_task_id=task_id,
+        expected_pid=live_pid,
+        expected_started_at=stale_started_at,
+    )
+
+    assert reconciled is True
+    async with db_factory() as db:
+        stale = await db.get(Instance, stale_id)
+        assert stale.status == "idle"
+        assert stale.pid is None
+        assert stale.process_identity is None
+        assert stale.current_task_id is None
+
+
+@pytest.mark.asyncio
 async def test_reconcile_reverse_owner_refuses_a_live_pid(db_factory):
     started_at = datetime(2026, 8, 2, 7, 36, 23)
     async with db_factory() as db:
@@ -11940,7 +12003,7 @@ async def test_reconcile_reverse_owner_refuses_a_live_pid(db_factory):
         db_factory,
         MagicMock(broadcast=AsyncMock()),
     )
-    with patch("backend.services.instance_manager.os.kill") as probe:
+    with patch("backend.services.process_identity.os.kill") as probe:
         reconciled = await manager.reconcile_dead_reverse_task_owner(
             stale_id,
             expected_task_id=task_id,

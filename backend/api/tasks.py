@@ -69,6 +69,9 @@ from backend.services.pr_review_runtime import (
     is_pr_review_task,
     is_pr_sandbox_task,
 )
+from backend.services.process_identity import (
+    persisted_process_liveness,
+)
 from backend.services.task_skill_overrides import (
     clear_temporary_skills_marker,
 )
@@ -5236,29 +5239,29 @@ async def _retry_local_task_under_harness_owner_fence(
                         "generation; stop it before retrying"
                     ),
                 )
-
             pid = instance.pid
             if pid is not None:
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    pass
-                except OSError:
-                    # Permission errors and platform-specific failures do not
-                    # prove death. Keep all ownership evidence fail-closed.
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            f"Unmanaged process PID {pid} may still be alive; "
-                            "stop or reconcile it before retrying"
-                        ),
-                    )
-                else:
+                # Compare the whole recorded identity, not just the PID number:
+                # after PID reuse or a host restart an unrelated process can
+                # answer to it and pin this task as un-retryable forever.
+                liveness = persisted_process_liveness(
+                    pid,
+                    instance.process_identity,
+                )
+                if liveness == "alive":
                     raise HTTPException(
                         status_code=409,
                         detail=(
                             f"Unmanaged process PID {pid} is still alive; "
                             "stop it before retrying"
+                        ),
+                    )
+                if liveness != "dead":
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Unmanaged process PID {pid} may still be alive; "
+                            "stop or reconcile it before retrying"
                         ),
                     )
             elif instance.status == "running":
@@ -5276,6 +5279,11 @@ async def _retry_local_task_under_harness_owner_fence(
                 Instance.status == instance.status,
                 (Instance.pid.is_(None) if pid is None else Instance.pid == pid),
                 (
+                    Instance.process_identity.is_(None)
+                    if instance.process_identity is None
+                    else Instance.process_identity == instance.process_identity
+                ),
+                (
                     Instance.started_at.is_(None)
                     if instance.started_at is None
                     else Instance.started_at == instance.started_at
@@ -5284,7 +5292,12 @@ async def _retry_local_task_under_harness_owner_fence(
             cleared = await db.execute(
                 sa_update(Instance)
                 .where(*instance_predicates)
-                .values(status="error", current_task_id=None, pid=None)
+                .values(
+                    status="error",
+                    current_task_id=None,
+                    pid=None,
+                    process_identity=None,
+                )
             )
             if not cleared.rowcount:
                 await db.rollback()

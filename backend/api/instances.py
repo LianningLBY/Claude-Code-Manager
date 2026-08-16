@@ -18,8 +18,10 @@ from backend.services.instance_capacity import (
     instance_capacity_lock,
     occupied_slot_predicate,
 )
-from backend.services.task_queue import persisted_pid_is_definitively_dead
 from backend.services.pr_review_runtime import is_pr_sandbox_task
+from backend.services.process_identity import (
+    persisted_process_is_definitively_dead,
+)
 
 router = APIRouter(
     prefix="/api/instances",
@@ -51,6 +53,11 @@ def _instance_generation_predicates(instance: Instance) -> list:
             Instance.pid.is_(None)
             if instance.pid is None
             else Instance.pid == instance.pid
+        ),
+        (
+            Instance.process_identity.is_(None)
+            if instance.process_identity is None
+            else Instance.process_identity == instance.process_identity
         ),
         (
             Instance.started_at.is_(None)
@@ -96,15 +103,26 @@ async def _reconcile_dead_terminal_pid(
     The caller must hold InstanceManager's lifecycle lock. The exact status,
     PID and task owner predicates keep a stale cleanup request from clearing a
     newer generation that changed while the OS probe was in progress.
+
+    Death is proven from the full recorded identity (PID, start ticks and boot
+    id) so a reused PID number cannot keep a dead generation pinned forever.
     """
 
     pid = instance.pid
-    if pid is None or not persisted_pid_is_definitively_dead(pid):
+    if pid is None or not persisted_process_is_definitively_dead(
+        pid,
+        instance.process_identity,
+    ):
         return False
     predicates = [
         Instance.id == instance.id,
         Instance.status == instance.status,
         Instance.pid == pid,
+        (
+            Instance.process_identity.is_(None)
+            if instance.process_identity is None
+            else Instance.process_identity == instance.process_identity
+        ),
     ]
     if instance.current_task_id is None:
         predicates.append(Instance.current_task_id.is_(None))
@@ -124,7 +142,12 @@ async def _reconcile_dead_terminal_pid(
     reconciled = await db.execute(
         update(Instance)
         .where(*predicates)
-        .values(pid=None, current_task_id=None, current_plan_run_id=None)
+        .values(
+            pid=None,
+            process_identity=None,
+            current_task_id=None,
+            current_plan_run_id=None,
+        )
     )
     await db.commit()
     return bool(reconciled.rowcount)

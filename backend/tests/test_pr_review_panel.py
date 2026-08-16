@@ -1712,6 +1712,67 @@ async def test_fetch_exact_head_ci_combines_checks_and_statuses():
 
 
 @pytest.mark.asyncio
+async def test_fetch_exact_head_ci_trusted_mode_uses_only_triggered_checks():
+    from backend.services.delivery_setup import TRUSTED_OBSERVED_CI_POLICY
+
+    responses = [
+        {
+            "total_count": 3,
+            "check_runs": [
+                {"id": 21, "name": "tests", "status": "completed", "conclusion": "success", "app": {"id": 15368, "slug": "github-actions"}},
+                {"id": 22, "name": "conditional deploy", "status": "completed", "conclusion": "skipped", "app": {"id": 15368, "slug": "github-actions"}},
+                {"id": 23, "name": "lint", "status": "completed", "conclusion": "success", "app": {"id": 15368, "slug": "github-actions"}},
+            ],
+        },
+        {"state": "success", "statuses": []},
+    ]
+    with patch(
+        "backend.services.pr_review_service._gh_api_json",
+        AsyncMock(side_effect=responses),
+    ):
+        status, summary, details = await pr_review_panel.fetch_exact_head_ci(
+            "owner/repo",
+            HEAD_SHA,
+            [TRUSTED_OBSERVED_CI_POLICY],
+        )
+
+    assert status == "passed"
+    assert summary == "2 triggered exact-head CI checks passed; 1 skipped"
+    assert details["required"] == [
+        {"kind": "check_run", "name": "conditional deploy", "app_slug": "github-actions"},
+        {"kind": "check_run", "name": "lint", "app_slug": "github-actions"},
+        {"kind": "check_run", "name": "tests", "app_slug": "github-actions"},
+    ]
+    assert [item["state"] for item in details["observed"]] == [
+        "skipped",
+        "passed",
+        "passed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_exact_head_ci_trusted_mode_waits_for_checks_to_appear():
+    from backend.services.delivery_setup import TRUSTED_OBSERVED_CI_POLICY
+
+    with patch(
+        "backend.services.pr_review_service._gh_api_json",
+        AsyncMock(side_effect=[
+            {"total_count": 0, "check_runs": []},
+            {"state": "pending", "statuses": []},
+        ]),
+    ):
+        status, summary, details = await pr_review_panel.fetch_exact_head_ci(
+            "owner/repo",
+            HEAD_SHA,
+            [TRUSTED_OBSERVED_CI_POLICY],
+        )
+
+    assert status == "pending"
+    assert summary == "Waiting for CI checks to appear on the exact PR head"
+    assert details == {"head_sha": HEAD_SHA, "required": [], "observed": []}
+
+
+@pytest.mark.asyncio
 async def test_exact_base_guide_manifest_adds_only_declared_regular_files():
     from backend.services import pr_review_service
 

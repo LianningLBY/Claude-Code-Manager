@@ -17,6 +17,7 @@ from backend.services.delivery_setup import (
     DeliverySetupUnavailableError,
     discover_delivery_required_checks,
     ensure_default_delivery_monitor,
+    TRUSTED_OBSERVED_CI_POLICY,
 )
 
 
@@ -88,18 +89,7 @@ async def test_ci_discovery_uses_observed_checks_in_trusted_mode(
         "main",
     )
 
-    assert policies == [
-        {
-            "kind": "check_run",
-            "name": "lint",
-            "app_slug": "github-actions",
-        },
-        {
-            "kind": "check_run",
-            "name": "tests",
-            "app_slug": "github-actions",
-        },
-    ]
+    assert policies == [TRUSTED_OBSERVED_CI_POLICY]
     assert source == "trusted_observed_checks"
 
 
@@ -123,13 +113,7 @@ async def test_ci_discovery_uses_single_observed_check_in_trusted_mode(monkeypat
         "main",
     )
 
-    assert policies == [
-        {
-            "kind": "check_run",
-            "name": "tests",
-            "app_slug": "github-actions",
-        }
-    ]
+    assert policies == [TRUSTED_OBSERVED_CI_POLICY]
     assert source == "trusted_observed_checks"
 
 
@@ -173,18 +157,7 @@ async def test_ci_discovery_allows_plan_gate_in_trusted_mode(monkeypatch):
         strict_branch_protection=False,
     )
 
-    assert policies == [
-        {
-            "kind": "check_run",
-            "name": "lint",
-            "app_slug": "github-actions",
-        },
-        {
-            "kind": "check_run",
-            "name": "tests",
-            "app_slug": "github-actions",
-        },
-    ]
+    assert policies == [TRUSTED_OBSERVED_CI_POLICY]
     assert source == "trusted_observed_checks"
 
 

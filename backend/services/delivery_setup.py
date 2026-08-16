@@ -37,6 +37,13 @@ from backend.services.pr_review_service import GhError, _gh_api_json
 logger = logging.getLogger(__name__)
 
 
+TRUSTED_OBSERVED_CI_POLICY = {
+    "kind": "check_run",
+    "name": "Triggered checks on exact PR head",
+    "app_slug": "ccm-trusted",
+}
+
+
 class DeliverySetupError(RuntimeError):
     """Stable project-to-Monitor bootstrap error."""
 
@@ -501,9 +508,12 @@ async def discover_delivery_required_checks(
             code="required_checks_unresolved",
         )
     if not strict_branch_protection and candidates:
-        return [
-            _public_policy(candidate) for candidate in candidates
-        ], "trusted_observed_checks"
+        # Trusted mode deliberately does not freeze the checks observed on the
+        # default branch. Workflow path filters and job-level conditions mean
+        # that set is commonly much larger than the checks triggered by a
+        # particular PR. Store one explicit policy marker; the exact-head Gate
+        # expands it to the checks GitHub actually created for that PR head.
+        return [dict(TRUSTED_OBSERVED_CI_POLICY)], "trusted_observed_checks"
     # A repository with no observed CI still receives Panel review, but direct
     # auto-merge remains disabled because there is no exact check identity to
     # prove on the PR head.
@@ -539,8 +549,9 @@ async def ensure_default_delivery_monitor(
                 )
             await db.commit()
             return DeliveryMonitorSetup(existing, False, None)
-        if not strict_branch_protection and (
-            existing.required_checks
+        if (
+            not strict_branch_protection
+            and existing.required_checks == [TRUSTED_OBSERVED_CI_POLICY]
         ):
             await db.commit()
             return DeliveryMonitorSetup(existing, False, None)

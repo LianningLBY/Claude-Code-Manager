@@ -756,6 +756,9 @@ async def fetch_exact_head_ci(
             "No required CI checks are configured",
             {"head_sha": head_sha, "required": [], "observed": []},
         )
+    from backend.services.delivery_setup import TRUSTED_OBSERVED_CI_POLICY
+
+    trusted_observed = policies == [TRUSTED_OBSERVED_CI_POLICY]
     normalized: list[dict] = []
     seen: set[tuple[str, str, str]] = set()
     for policy in policies:
@@ -815,6 +818,30 @@ async def fetch_exact_head_ci(
         if previous is None or status_id > previous["id"]:
             latest_statuses[key] = status
 
+    if trusted_observed:
+        normalized = [
+            {
+                "kind": "check_run",
+                "name": name,
+                "app_slug": app_slug,
+            }
+            for name, app_slug in sorted(latest_checks)
+        ] + [
+            {
+                "kind": "status",
+                "name": name,
+                "app_slug": app_slug,
+            }
+            for name, app_slug in sorted(latest_statuses)
+        ]
+        if not normalized:
+            return (
+                "pending",
+                "Waiting for CI checks to appear on the exact PR head",
+                {"head_sha": head_sha, "required": [], "observed": []},
+            )
+
+    skipped: list[str] = []
     for policy in normalized:
         key = (policy["name"], policy["app_slug"])
         item = (
@@ -840,6 +867,9 @@ async def fetch_exact_head_ci(
                 pending.append(label)
             elif conclusion == "success":
                 state_value = "passed"
+            elif trusted_observed and conclusion in {"skipped", "neutral"}:
+                state_value = "skipped"
+                skipped.append(label)
             else:
                 state_value = "failed"
                 failed.append(label)
@@ -887,6 +917,20 @@ async def fetch_exact_head_ci(
         return "failed", "Failed: " + ", ".join(sorted(failed)), details
     if missing:
         return "missing", "Missing: " + ", ".join(sorted(missing)), details
+    passed_count = sum(item.get("state") == "passed" for item in observed)
+    if trusted_observed and passed_count == 0:
+        return (
+            "pending",
+            "Waiting for at least one triggered CI check to pass",
+            details,
+        )
+    if trusted_observed:
+        suffix = f"; {len(skipped)} skipped" if skipped else ""
+        return (
+            "passed",
+            f"{passed_count} triggered exact-head CI checks passed{suffix}",
+            details,
+        )
     return "passed", f"{len(normalized)} required exact-head CI checks passed", details
 
 

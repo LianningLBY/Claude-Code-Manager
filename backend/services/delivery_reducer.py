@@ -347,7 +347,7 @@ def reduce_delivery_state(
         next_state = _terminal_state(state, outcome="success")
     elif kind == "developer_no_progress":
         _require_state(state, event, ("coding", "running"))
-        next_state = _active_state(state, phase="planning", activity="ready")
+        next_state = _active_state(state, phase="coding", activity="ready")
     elif kind == "review_requested":
         _require_state(state, event, ("pre_review", "ready"))
         next_state = _active_state(

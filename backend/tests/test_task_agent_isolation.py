@@ -32,6 +32,7 @@ from backend.services.task_agent_isolation import (
     require_claude_apply_seccomp,
     require_task_security_boundary_configured,
     scrub_task_model_environment,
+    task_model_tool_environment,
     validate_claude_delivery_isolation_settings,
     validate_claude_task_isolation_settings,
     validate_claude_unrestricted_task_settings,
@@ -66,6 +67,16 @@ from backend.services.mcp_config import (
 _COLLECTED_CLAUDE_TASK_ISOLATION_VALIDATOR = (
     task_agent_isolation_module.validate_claude_task_isolation_settings
 )
+
+
+def test_task_model_tool_environment_includes_standard_user_tool_directories():
+    environment = task_model_tool_environment({"LANG": "C.UTF-8"})
+
+    path_entries = environment["PATH"].split(os.pathsep)
+    assert str(Path.home() / ".local" / "bin") in path_entries
+    assert str(Path.home() / ".cargo" / "bin") in path_entries
+    assert environment["HOME"] == str(Path.home())
+    assert environment["LANG"] == "C.UTF-8"
 
 
 def test_claude_task_isolation_validator_does_not_leak_between_modules():

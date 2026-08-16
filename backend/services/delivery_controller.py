@@ -1464,6 +1464,12 @@ class DeliveryController:
             "for the final repository-state audit, and satisfy repository instructions "
             "through read-only fixed-revision sources. Do not invent implementation or "
             "test work that contradicts the Requirements.\n\n"
+            "The managed worktree and Delivery branch already exist. The Developer "
+            "must leave changes uncommitted; the Delivery Controller alone commits, "
+            "pushes, and creates or updates the pull request. Do not put branch "
+            "creation, git commit, push, or pull-request operations in the plan. "
+            "Do not require the Developer to stop merely because ignored or "
+            "controller-managed files exist outside the intended diff.\n\n"
             f"Requirements:\n{context.requirements}\n\n"
             f"Cycle trigger (JSON):\n{trigger}"
         )
@@ -1661,6 +1667,12 @@ class DeliveryController:
             "uncommitted: the Delivery Controller exclusively creates the fenced "
             "commit, pushes it, and creates or updates the pull request. Do not run "
             "git commit, push, create, merge, or modify a pull request.\n\n"
+            "These Delivery Controller boundaries override any conflicting step in "
+            "the approved plan. Do not stop merely because the plan mentions a "
+            "prohibited Git or pull-request operation; skip that operation and "
+            "implement, test, and review the repository change. Ignore pre-existing "
+            "ignored or controller-managed files unless they overlap the intended "
+            "diff.\n\n"
             "If the approved plan is intentionally report-only and the Requirements "
             "are fully satisfied without repository changes, finish your final response "
             f"with the exact standalone line `{_REPORT_COMPLETE_MARKER}`. Do not emit "
@@ -2081,6 +2093,7 @@ class DeliveryController:
                 task.completed_at = _utcnow()
                 task.error_message = failure_message
             elif not progressed:
+                approved_plan_version_id = cycle.plan_version_id
                 complete_cycle(cycle)
                 await apply_run_event(
                     db,
@@ -2095,7 +2108,7 @@ class DeliveryController:
                         "no_progress_count": run.no_progress_count,
                     },
                 )
-                await start_next_cycle(
+                next_cycle = await start_next_cycle(
                     db,
                     run=run,
                     trigger_kind="developer_no_progress",
@@ -2106,6 +2119,8 @@ class DeliveryController:
                         "no_progress_count": run.no_progress_count,
                     },
                 )
+                next_cycle.status = "coding"
+                next_cycle.plan_version_id = approved_plan_version_id
             else:
                 cycle.status = "pre_review"
                 cycle.state_version += 1

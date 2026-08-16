@@ -100,7 +100,7 @@ def test_blocking_evidence_starts_a_fresh_plan_cycle(blocking_event, phase):
     assert reduction.effects == ("request_plan",)
 
 
-def test_developer_no_progress_starts_a_fresh_plan_cycle():
+def test_developer_no_progress_retries_development():
     state = DeliveryState(
         phase="coding",
         activity="running",
@@ -110,11 +110,11 @@ def test_developer_no_progress_starts_a_fresh_plan_cycle():
     reduction = _reduce(state, "developer_no_progress")
 
     assert reduction.state == DeliveryState(
-        phase="planning",
+        phase="coding",
         activity="ready",
         state_version=9,
     )
-    assert reduction.effects == ("request_plan",)
+    assert reduction.effects == ("dispatch_code",)
 
 
 def test_report_completion_ends_delivery_successfully():

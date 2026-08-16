@@ -2663,7 +2663,7 @@ async def test_review_changes_requested_starts_fresh_plan_cycle(
 
 
 @pytest.mark.asyncio
-async def test_developer_no_progress_replans_then_fails_at_threshold(
+async def test_developer_no_progress_retries_development_then_fails_at_threshold(
     db_session,
     db_factory,
 ):
@@ -2683,19 +2683,20 @@ async def test_developer_no_progress_replans_then_fails_at_threshold(
     assert await controller.reconcile_run(run.id)
 
     async with db_factory() as db:
-        replanning = await db.get(DeliveryRun, run.id)
+        retrying = await db.get(DeliveryRun, run.id)
         first_cycle = await db.get(DeliveryCycle, first_cycle_id)
-        current_cycle = await db.get(DeliveryCycle, replanning.current_cycle_id)
-        assert (replanning.phase, replanning.activity) == ("planning", "ready")
-        assert replanning.no_progress_count == 1
-        assert replanning.cycle_count == 2
+        current_cycle = await db.get(DeliveryCycle, retrying.current_cycle_id)
+        assert (retrying.phase, retrying.activity) == ("coding", "ready")
+        assert retrying.no_progress_count == 1
+        assert retrying.cycle_count == 2
         assert first_cycle.status == "completed"
+        assert current_cycle.status == "coding"
+        assert current_cycle.plan_version_id == first_cycle.plan_version_id
+        assert current_cycle.plan_invocation_id is None
         assert current_cycle.trigger_kind == "developer_no_progress"
         assert current_cycle.trigger_payload["no_progress_count"] == 1
     assert len(capabilities.created) == 1
 
-    assert await controller.reconcile_run(run.id)  # create next Plan
-    assert await controller.reconcile_run(run.id)  # consume next Plan
     assert await controller.reconcile_run(run.id)  # dispatch next code turn
     await _complete_code(db_factory, workspace, run.id, BASE_SHA, workspace.tree_sha)
     assert await controller.reconcile_run(run.id)
@@ -2711,7 +2712,7 @@ async def test_developer_no_progress_replans_then_fails_at_threshold(
         assert failed.no_progress_count == 2
         assert failed.error_code == "delivery_no_progress"
         assert task.status == "failed"
-    assert len(capabilities.created) == 2
+    assert len(capabilities.created) == 1
 
 
 @pytest.mark.asyncio
@@ -2784,13 +2785,13 @@ async def test_report_marker_from_an_older_turn_does_not_complete_current_turn(
 
     assert await controller.reconcile_run(run.id)
     async with db_factory() as db:
-        replanning = await db.get(DeliveryRun, run.id)
-        assert (replanning.phase, replanning.activity, replanning.outcome) == (
-            "planning",
+        retrying = await db.get(DeliveryRun, run.id)
+        assert (retrying.phase, retrying.activity, retrying.outcome) == (
+            "coding",
             "ready",
             None,
         )
-        assert replanning.no_progress_count == 1
+        assert retrying.no_progress_count == 1
 
 
 @pytest.mark.asyncio

@@ -181,6 +181,8 @@ def test_versioned_prompts_do_not_turn_unavailable_repo_facts_into_questions():
     assert "not be converted into a user question" in reviewer
     assert "instruction_manifest" in planner
     assert "manifested symlink" in reviewer
+    assert "shortest sufficient" in planner
+    assert "byte identity of unrelated" in reviewer
 
 
 def test_repository_instruction_manifest_records_agents_symlink(tmp_path):

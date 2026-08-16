@@ -85,6 +85,12 @@ class Settings(BaseSettings):
     plan_max_interactions: int = 3
     plan_planner_timeout: int = 1800
     plan_reviewer_timeout: int = 900
+    # Claude CLI has no max-turns flag. Bound read-only exploration so a
+    # Planner cannot silently spend dozens of tool rounds before producing
+    # its structured result. Exceeding this budget is a typed route timeout,
+    # allowing the configured fallback provider to take over immediately.
+    plan_planner_tool_call_limit: int = 12
+    plan_reviewer_tool_call_limit: int = 8
     # Once a Codex Reviewer has started streaming agent/reasoning deltas, a
     # longer silent interval indicates a stuck Responses stream. Initial
     # xhigh reasoning is deliberately governed by plan_reviewer_timeout.

@@ -136,6 +136,8 @@ def test_claude_plan_command_is_read_only():
     )
 
     assert command[0] == settings.claude_binary
+    assert command[command.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in command
     assert command[command.index("--permission-mode") + 1] == "default"
     assert "--no-session-persistence" in command
     assert "--safe-mode" in command
@@ -203,6 +205,26 @@ def test_structured_output_parsers_accept_native_provider_envelopes():
     claude_content = _extract_provider_content("claude", claude_raw)
     assert _validate_structured("planner", claude_content) == {
         "plan": "Do the work safely"
+    }
+
+    claude_stream_raw = "\n".join([
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "content": [{"type": "tool_use", "name": "Read"}],
+            },
+        }),
+        json.dumps({
+            "type": "result",
+            "structured_output": {"plan": "Use the streamed result"},
+        }),
+    ])
+    claude_stream_content = _extract_provider_content(
+        "claude", claude_stream_raw
+    )
+    assert _validate_structured("planner", claude_stream_content) == {
+        "plan": "Use the streamed result"
     }
 
     codex_raw = "\n".join([

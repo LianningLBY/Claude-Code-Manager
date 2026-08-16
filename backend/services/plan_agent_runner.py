@@ -856,10 +856,19 @@ def _extract_provider_content(provider: str, raw: str) -> str:
                 content = item["text"]
         return content if saw_event else raw.strip()
 
-    try:
-        envelope = json.loads(raw)
-    except ValueError:
-        return raw.strip()
+    envelope = None
+    for line in raw.splitlines():
+        try:
+            candidate = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(candidate, dict) and candidate.get("type") == "result":
+            envelope = candidate
+    if envelope is None:
+        try:
+            envelope = json.loads(raw)
+        except ValueError:
+            return raw.strip()
     if not isinstance(envelope, dict):
         return raw.strip()
     structured = envelope.get("structured_output")
@@ -985,7 +994,8 @@ def _build_command(
         "-p",
         "-",
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         "--permission-mode",
         # Claude 2.1.168 forces subprocesses hardened with
         # CLAUDE_CODE_SUBPROCESS_ENV_SCRUB into effective default mode.  Keep
@@ -2518,12 +2528,100 @@ class PlanAgentRunner:
                     self.claude_pool.record_routed_account(admitted_home)
                 if spawn_cancel is not None:
                     raise spawn_cancel
-                communicate_task = asyncio.create_task(
-                    process.communicate(input=prompt.encode("utf-8"))
-                )
+                async def collect_claude_stream():
+                    assert process is not None
+                    assert process.stdin is not None
+                    assert process.stdout is not None
+                    assert process.stderr is not None
+                    process.stdin.write(prompt.encode("utf-8"))
+                    await process.stdin.drain()
+                    process.stdin.close()
+                    stdout_parts: list[bytes] = []
+                    tool_calls = 0
+                    streamed_chars = 0
+                    last_event_type: str | None = None
+                    tool_call_limit = (
+                        settings.plan_planner_tool_call_limit
+                        if step_type == "planner"
+                        else settings.plan_reviewer_tool_call_limit
+                    )
+
+                    async def read_stdout() -> bytes:
+                        nonlocal tool_calls, streamed_chars, last_event_type
+                        while True:
+                            line = await process.stdout.readline()
+                            if not line:
+                                break
+                            stdout_parts.append(line)
+                            streamed_chars += len(
+                                line.decode("utf-8", errors="replace")
+                            )
+                            try:
+                                event = json.loads(line)
+                            except ValueError:
+                                continue
+                            if not isinstance(event, dict):
+                                continue
+                            last_event_type = str(event.get("type") or "event")
+                            if event.get("type") == "assistant":
+                                message = event.get("message")
+                                content_blocks = (
+                                    message.get("content", [])
+                                    if isinstance(message, dict)
+                                    else []
+                                )
+                                for block in content_blocks:
+                                    if not isinstance(block, dict):
+                                        continue
+                                    if block.get("type") != "tool_use":
+                                        continue
+                                    tool_calls += 1
+                                    tool_name = str(block.get("name") or "unknown")
+                                    last_event_type = f"tool_use:{tool_name}"
+                                    if tool_calls > tool_call_limit:
+                                        raise PlanAgentTimeout(
+                                            "Claude Plan Agent exceeded the "
+                                            f"{step_type} tool-call budget "
+                                            f"({tool_calls}>{tool_call_limit}; "
+                                            f"last_event_type={last_event_type})",
+                                            provider="claude",
+                                        )
+                            if step_id is not None:
+                                async with self.db_factory() as telemetry_db:
+                                    telemetry_step = await telemetry_db.get(
+                                        PlanAgentStep, step_id
+                                    )
+                                    if telemetry_step is not None:
+                                        telemetry_step.last_delta_at = datetime.now()
+                                        telemetry_step.streamed_output_chars = (
+                                            streamed_chars
+                                        )
+                                        telemetry_step.last_event_type = last_event_type
+                                        await telemetry_db.commit()
+                        return b"".join(stdout_parts)
+
+                    stdout_task = asyncio.create_task(read_stdout())
+                    stderr_task = asyncio.create_task(process.stderr.read())
+                    wait_task = asyncio.create_task(process.wait())
+                    try:
+                        stdout_value, stderr_value, _ = await asyncio.gather(
+                            stdout_task, stderr_task, wait_task
+                        )
+                        return stdout_value, stderr_value
+                    finally:
+                        for task in (stdout_task, stderr_task, wait_task):
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(
+                            stdout_task,
+                            stderr_task,
+                            wait_task,
+                            return_exceptions=True,
+                        )
+
+                communicate_task = asyncio.create_task(collect_claude_stream())
                 stdout, stderr = await asyncio.wait_for(
-                    asyncio.shield(communicate_task),
-                    timeout=max(1, timeout),
+                    asyncio.shield(communicate_task), timeout=max(1, timeout)
                 )
                 await _shielded_terminate(
                     token,
@@ -2554,6 +2652,14 @@ class PlanAgentRunner:
                     f"{provider.title()} Plan Agent timed out",
                     provider=provider,
                 ) from exc
+            except PlanAgentTimeout:
+                if token is not None and retained is not None:
+                    await _shielded_terminate(
+                        token,
+                        retained,
+                        communicate_task,
+                    )
+                raise
             except PlanAgentError:
                 raise
             except Exception as exc:

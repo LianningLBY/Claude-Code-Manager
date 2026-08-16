@@ -36,6 +36,7 @@ from backend.services.plan_agent_runner import (
     PlanAgentRunner,
     PlanAgentTimeout,
     PlanRouteUnavailable,
+    _CLAUDE_STREAM_READER_LIMIT_BYTES,
     _StructuredJsonWhitespaceGuard,
     _build_command,
     _extract_provider_content,
@@ -1100,7 +1101,8 @@ async def test_claude_missing_binary_before_spawn_is_route_unavailable(
     async def runtime_admission(**_kwargs):
         yield None, None
 
-    async def missing_binary(*_args, **_kwargs):
+    async def missing_binary(*_args, **kwargs):
+        assert kwargs["limit"] == _CLAUDE_STREAM_READER_LIMIT_BYTES
         raise FileNotFoundError("No such file or directory: 'claude'")
 
     runner._runtime_admission = runtime_admission

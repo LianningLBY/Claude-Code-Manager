@@ -76,6 +76,7 @@ logger = logging.getLogger(__name__)
 
 _CLEANUP_TIMEOUT_SECONDS = 5.0
 _CODEX_TELEMETRY_PERSIST_INTERVAL_SECONDS = 2.0
+_CLAUDE_STREAM_READER_LIMIT_BYTES = 1024 * 1024
 _CLAUDE_AUTH_ENV_KEYS = (
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -2535,6 +2536,7 @@ class PlanAgentRunner:
                     "stderr": asyncio.subprocess.PIPE,
                     "cwd": cwd,
                     "env": env,
+                    "limit": _CLAUDE_STREAM_READER_LIMIT_BYTES,
                 }
                 if os.name == "posix":
                     spawn_kwargs["start_new_session"] = True
@@ -2589,7 +2591,14 @@ class PlanAgentRunner:
                     async def read_stdout() -> bytes:
                         nonlocal tool_calls, streamed_chars, last_event_type
                         while True:
-                            line = await process.stdout.readline()
+                            try:
+                                line = await process.stdout.readline()
+                            except ValueError as exc:
+                                raise PlanAgentOutputRunaway(
+                                    "Claude Plan Agent emitted an NDJSON event "
+                                    "larger than the stream safety limit",
+                                    provider="claude",
+                                ) from exc
                             if not line:
                                 break
                             stdout_parts.append(line)

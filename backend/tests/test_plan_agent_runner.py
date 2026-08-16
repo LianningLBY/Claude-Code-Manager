@@ -40,6 +40,7 @@ from backend.services.plan_agent_runner import (
     _build_command,
     _extract_provider_content,
     _plan_request_with_attachments,
+    _repository_instruction_manifest,
     _validate_structured,
     _validate_structured_v2,
 )
@@ -177,6 +178,18 @@ def test_versioned_prompts_do_not_turn_unavailable_repo_facts_into_questions():
     assert "not user decisions" in planner
     assert "header must be at most 20 characters" in reviewer
     assert "not be converted into a user question" in reviewer
+    assert "instruction_manifest" in planner
+    assert "manifested symlink" in reviewer
+
+
+def test_repository_instruction_manifest_records_agents_symlink(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("rules", encoding="utf-8")
+    (tmp_path / "AGENTS.md").symlink_to("CLAUDE.md")
+
+    assert _repository_instruction_manifest(str(tmp_path)) == {
+        "AGENTS.md": {"kind": "symlink", "target": "CLAUDE.md"},
+        "CLAUDE.md": {"kind": "file"},
+    }
 
 
 def test_claude_plan_host_unrestricted_command_keeps_read_only_tools():

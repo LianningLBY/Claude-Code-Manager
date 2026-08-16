@@ -12,6 +12,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select, update
@@ -1157,6 +1158,11 @@ Each question header must be at most 20 characters. Repository paths, symbols,
 and commands that are not present in the supplied repository-state audit are
 not user decisions: leave their exact discovery to an explicit read-only
 inspection step in the implementation plan instead of requesting user input.
+The repository-state audit's instruction_manifest is authoritative identity
+evidence for top-level instruction files. Glob tools may omit symlinks, so do
+not claim an instruction file is absent when the manifest records it. A
+symlinked AGENTS.md governs under that name even when its content is read from
+the recorded target such as CLAUDE.md.
 
 Every response must include action, plan, reason, and questions. For propose,
 set reason to an empty string and questions to an empty array. For
@@ -1215,6 +1221,10 @@ the supplied repository-state audit. A concrete implementation step that
 inspects and follows existing repository conventions is reviewable and must
 not be converted into a user question merely because this tool-free role
 cannot inspect those facts.
+Use the repository-state audit's instruction_manifest as the shared identity
+evidence for top-level instruction files. Do not demand that the Plan reject a
+manifested symlink merely because a provider's file-discovery tool omitted it;
+the recorded target is the content source for that governing instruction.
 
 Every response must include action, feedback, reason, and questions. For
 approve or revise, set reason to an empty string and questions to an empty
@@ -1238,6 +1248,36 @@ before review can continue.
 {plan_content}
 
 Return only the structured JSON required by the response schema."""
+
+
+def _repository_instruction_manifest(cwd: str) -> dict[str, dict[str, object]]:
+    """Describe exact top-level instruction identities without reading content."""
+
+    root = Path(cwd).absolute()
+    manifest: dict[str, dict[str, object]] = {}
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        path = root / name
+        try:
+            path.lstat()
+        except OSError:
+            continue
+        entry: dict[str, object] = {
+            "kind": "symlink" if path.is_symlink() else "file",
+        }
+        if path.is_symlink():
+            try:
+                target = os.readlink(path)
+            except OSError:
+                target = ""
+            if (
+                target
+                and not os.path.isabs(target)
+                and "\x00" not in target
+                and Path(target).name == target
+            ):
+                entry["target"] = target
+        manifest[name] = entry
+    return manifest
 
 
 class PlanAgentRunner:
@@ -3528,6 +3568,7 @@ class PlanAgentRunner:
             {
                 "run_start": run.repo_revision,
                 "current": current_repo_revision,
+                "instruction_manifest": _repository_instruction_manifest(cwd),
                 "changed_since_run_start": (
                     run.repo_revision is not None
                     and current_repo_revision != run.repo_revision

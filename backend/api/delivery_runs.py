@@ -94,12 +94,7 @@ def _retry_available(
     has_active_controller_capability: bool = False,
     has_active_delivery_action: bool = False,
 ) -> bool:
-    """Expose only the restart path whose external subject is still local.
-
-    A published PR has a separate durable Monitor lifecycle and cannot be
-    safely rewound by this pre-publication command. Retrying here starts a new
-    Plan cycle in the same Run, so all earlier attempts remain auditable.
-    """
+    """Expose stage retry only when no external effect remains active."""
 
     return bool(
         settings.delivery_loop_enabled
@@ -111,11 +106,88 @@ def _retry_available(
         and run.developer_task_id is not None
         and run.cycle_count < run.max_cycles
         and run.error_code != "delivery_max_cycles"
-        and run.pr_number is None
-        and run.pr_monitor_run_id is None
         and not has_active_controller_capability
         and not has_active_delivery_action
     )
+
+
+_RETRY_PHASES = {
+    "planning": ("planning", "ready"),
+    "coding": ("coding", "ready"),
+    "pre_review": ("pre_review", "ready"),
+    "frontend_review": ("frontend_review", "ready"),
+    "publishing": ("publishing", "ready"),
+    "monitoring": ("monitoring", "waiting"),
+}
+
+
+def _retry_target(transition: DeliveryTransition) -> tuple[str, str]:
+    before = (
+        transition.before_state if isinstance(transition.before_state, dict) else {}
+    )
+    phase = before.get("phase")
+    target = _RETRY_PHASES.get(phase)
+    if target is None:
+        raise DeliveryConflictError("Delivery retry cannot prove which stage failed")
+    return target
+
+
+def _copy_retry_evidence(
+    failed_cycle: DeliveryCycle,
+    next_cycle: DeliveryCycle,
+    *,
+    phase: str,
+    run: DeliveryRun,
+) -> None:
+    if phase != "planning" and failed_cycle.plan_version_id is None:
+        raise DeliveryConflictError(
+            f"Cannot retry {phase}: the approved Plan evidence is missing"
+        )
+    if phase in {"pre_review", "frontend_review", "publishing", "monitoring"}:
+        if failed_cycle.result_head_sha is None or run.head_sha is None:
+            raise DeliveryConflictError(
+                f"Cannot retry {phase}: the Development result is missing"
+            )
+    if phase in {"frontend_review", "publishing", "monitoring"}:
+        if (
+            failed_cycle.review_result_id is None
+            or failed_cycle.review_verdict != "approved"
+        ):
+            raise DeliveryConflictError(
+                f"Cannot retry {phase}: the approved Code Review evidence is missing"
+            )
+    if phase in {"publishing", "monitoring"}:
+        frontend_passed = failed_cycle.frontend_review_verdict == "passed"
+        frontend_skipped = bool(failed_cycle.frontend_review_skip_reason)
+        if not frontend_passed and not frontend_skipped:
+            raise DeliveryConflictError(
+                f"Cannot retry {phase}: the Frontend Review result is missing"
+            )
+    if phase == "monitoring" and (
+        run.pr_number is None or run.pr_url is None or run.pr_monitor_run_id is None
+    ):
+        raise DeliveryConflictError(
+            "Cannot resume monitoring: the exact PR Monitor binding is missing"
+        )
+
+    for field in (
+        "plan_version_id",
+        "result_head_sha",
+        "result_head_tree_sha",
+        "result_patch_sha256",
+        "review_result_id",
+        "review_verdict",
+        "review_summary",
+        "frontend_review_config_snapshot",
+        "frontend_review_profile_ids",
+        "frontend_review_profile_index",
+        "frontend_review_results",
+        "frontend_review_verdict",
+        "frontend_review_summary",
+        "frontend_review_skip_reason",
+    ):
+        setattr(next_cycle, field, getattr(failed_cycle, field))
+    next_cycle.status = "publishing" if phase == "monitoring" else phase
 
 
 def _allowed_actions(
@@ -276,7 +348,7 @@ def _response(
                 run,
                 has_active_controller_capability=has_active_controller_capability,
                 has_active_delivery_action=has_active_delivery_action,
-            )
+            ),
         }
     )
 
@@ -305,23 +377,25 @@ def _public_delivery_text(value: object, run: DeliveryRun) -> str | None:
     return result
 
 
-_PUBLIC_FINDING_KEYS = frozenset({
-    "severity",
-    "category",
-    "title",
-    "summary",
-    "message",
-    "file",
-    "path",
-    "line",
-    "column",
-    "route",
-    "locator",
-    "expected",
-    "actual",
-    "reproduction",
-    "evidence",
-})
+_PUBLIC_FINDING_KEYS = frozenset(
+    {
+        "severity",
+        "category",
+        "title",
+        "summary",
+        "message",
+        "file",
+        "path",
+        "line",
+        "column",
+        "route",
+        "locator",
+        "expected",
+        "actual",
+        "reproduction",
+        "evidence",
+    }
+)
 
 
 def _public_finding(value: object, run: DeliveryRun) -> dict | None:
@@ -460,8 +534,7 @@ def _public_progress_response(
     stages = [
         stage.model_copy(
             update={
-                "summary": _public_delivery_text(stage.summary, run)
-                or "Delivery stage"
+                "summary": _public_delivery_text(stage.summary, run) or "Delivery stage"
             }
         )
         for stage in progress.stages
@@ -805,9 +878,7 @@ async def count_attention_runs(
 ):
     candidates = list(
         (
-            await db.execute(
-                select(DeliveryRun).order_by(DeliveryRun.id.desc())
-            )
+            await db.execute(select(DeliveryRun).order_by(DeliveryRun.id.desc()))
         ).scalars()
     )
     total = 0
@@ -872,17 +943,10 @@ async def read_run(
     return DeliveryRunDetail.model_validate(
         {
             **base,
-            "cycles": [
-                _public_cycle_response(cycle, run)
-                for cycle in cycles
-            ],
-            "turns": [
-                _public_turn_response(turn, run)
-                for turn in turns
-            ],
+            "cycles": [_public_cycle_response(cycle, run) for cycle in cycles],
+            "turns": [_public_turn_response(turn, run) for turn in turns],
             "transitions": [
-                _public_transition_response(transition)
-                for transition in transitions
+                _public_transition_response(transition) for transition in transitions
             ],
         }
     )
@@ -920,10 +984,7 @@ async def _command(
                         .execution_options(populate_existing=True)
                     )
                 ).scalar_one_or_none()
-                if (
-                    cycle is not None
-                    and cycle.status in DELIVERY_CYCLE_ACTIVE_STATUSES
-                ):
+                if cycle is not None and cycle.status in DELIVERY_CYCLE_ACTIVE_STATUSES:
                     complete_cycle(cycle, status="cancelled")
             if run.developer_task_id is not None:
                 task = (
@@ -1031,7 +1092,7 @@ async def retry_failed_run(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Restart a failed pre-publication Run from Plan without recreating it."""
+    """Retry only the failed Delivery stage while preserving prior evidence."""
 
     accessible = await _accessible_run(request, db, run_id)
     accessible_run_id = accessible.id
@@ -1056,9 +1117,8 @@ async def retry_failed_run(
             has_active_delivery_action=has_action,
         ):
             raise DeliveryConflictError(
-                "This Delivery failure cannot be retried from Plan: it must be "
-                "failed before PR publication, have remaining cycle budget, "
-                "and own no active effect"
+                "This Delivery failure cannot be retried: it must have remaining "
+                "cycle budget and own no active effect"
             )
 
         failed_cycle = await lock_current_cycle(db, run)
@@ -1067,9 +1127,7 @@ async def retry_failed_run(
                 "Delivery retry requires an exact failed terminal cycle"
             )
         active_turn_id = await db.scalar(
-            select(DeliveryTurn.id)
-            .where(DeliveryTurn.active_run_id == run.id)
-            .limit(1)
+            select(DeliveryTurn.id).where(DeliveryTurn.active_run_id == run.id).limit(1)
         )
         if active_turn_id is not None:
             raise DeliveryConflictError(
@@ -1121,10 +1179,25 @@ async def retry_failed_run(
                 "graph is terminal and cleanup is proven"
             )
 
+        failure_transition = await db.scalar(
+            select(DeliveryTransition)
+            .where(
+                DeliveryTransition.run_id == run.id,
+                DeliveryTransition.cause == "fail",
+                DeliveryTransition.state_version == run.state_version,
+            )
+            .limit(1)
+        )
+        if failure_transition is None:
+            raise DeliveryConflictError(
+                "Delivery retry cannot prove the exact failed stage"
+            )
+        retry_phase, retry_activity = _retry_target(failure_transition)
+
         previous_error_code = run.error_code
         previous_error_message = run.error_message
         requested_by = get_current_user_id(request)
-        reason = body.reason or "Operator requested retry from Plan"
+        reason = body.reason or f"Operator requested retry of {retry_phase}"
         next_cycle = await start_next_cycle(
             db,
             run=run,
@@ -1136,12 +1209,23 @@ async def retry_failed_run(
                 "previous_error_message": previous_error_message,
                 "reason": reason,
                 "requested_by": requested_by,
+                "resume_phase": retry_phase,
+                "resume_activity": retry_activity,
             },
+        )
+        _copy_retry_evidence(
+            failed_cycle,
+            next_cycle,
+            phase=retry_phase,
+            run=run,
         )
         await apply_run_event(
             db,
             run=run,
-            event=DeliveryReducerEvent("retry"),
+            event=DeliveryReducerEvent(
+                "retry",
+                {"phase": retry_phase, "activity": retry_activity},
+            ),
             actor_kind="user",
             actor_id=(str(requested_by) if requested_by is not None else None),
             metadata={
@@ -1149,6 +1233,7 @@ async def retry_failed_run(
                 "previous_cycle_id": failed_cycle.id,
                 "next_cycle_id": next_cycle.id,
                 "previous_error_code": previous_error_code,
+                "resume_phase": retry_phase,
             },
         )
         task.status = "delivery_waiting"

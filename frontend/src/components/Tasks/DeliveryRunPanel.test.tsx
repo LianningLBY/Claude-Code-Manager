@@ -210,15 +210,15 @@ describe('DeliveryRunPanel', () => {
     render(<DeliveryRunPanel runId={7} />);
 
     await userEvent.click(
-      await screen.findByRole('button', { name: 'Retry from Plan' }),
+      await screen.findByRole('button', { name: 'Retry failed step' }),
     );
-    expect(screen.getByRole('button', { name: 'Confirm Retry from Plan' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Confirm Retry failed step' })).toBeEnabled();
     await userEvent.type(
-      screen.getByLabelText('Retry from Plan reason (optional)'),
+      screen.getByLabelText('Retry failed step reason (optional)'),
       'Provider routes recovered',
     );
     await userEvent.click(
-      screen.getByRole('button', { name: 'Confirm Retry from Plan' }),
+      screen.getByRole('button', { name: 'Confirm Retry failed step' }),
     );
 
     await waitFor(() => {

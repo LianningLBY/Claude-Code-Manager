@@ -231,7 +231,18 @@ def test_fail_records_bounded_failure_metadata():
     assert "worktree" in (result.error_message or "")
 
 
-def test_failed_terminal_run_can_restart_from_planning_only_explicitly():
+@pytest.mark.parametrize(
+    ("phase", "activity", "effect"),
+    [
+        ("planning", "ready", "request_plan"),
+        ("coding", "ready", "dispatch_code"),
+        ("pre_review", "ready", "request_code_review"),
+        ("frontend_review", "ready", "request_frontend_review"),
+        ("publishing", "ready", "ensure_pull_request"),
+        ("monitoring", "waiting", "observe_pr_monitor"),
+    ],
+)
+def test_failed_terminal_run_retries_exact_failed_stage(phase, activity, effect):
     failed = _reduce(
         DeliveryState(
             phase="planning",
@@ -244,18 +255,29 @@ def test_failed_terminal_run_can_restart_from_planning_only_explicitly():
         error_message="Both reviewer routes were temporarily unavailable",
     ).state
 
-    retried = _reduce(failed, "retry")
+    retried = _reduce(failed, "retry", phase=phase, activity=activity)
 
-    assert retried.state == DeliveryState(
-        phase="planning",
-        activity="ready",
-        state_version=9,
+    assert (retried.state.phase, retried.state.activity) == (phase, activity)
+    assert retried.state.wait_reason == (
+        "pr_monitor" if phase == "monitoring" else None
     )
-    assert retried.effects == ("request_plan",)
+    assert retried.state.state_version == 9
+    assert retried.effects == (effect,)
 
     successful = replace(failed, outcome="success", error_code=None, error_message=None)
     with pytest.raises(DeliveryTransitionError, match="Only a failed"):
-        _reduce(successful, "retry")
+        _reduce(successful, "retry", phase=phase, activity=activity)
+
+
+def test_retry_rejects_an_unbounded_target_state():
+    failed = DeliveryState(
+        phase="done",
+        activity="terminal",
+        outcome="failed",
+    )
+
+    with pytest.raises(DeliveryTransitionError, match="exact supported"):
+        _reduce(failed, "retry", phase="coding", activity="running")
 
 
 def test_monitor_refresh_advances_version_without_changing_wait_subject():

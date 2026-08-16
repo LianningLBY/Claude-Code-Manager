@@ -252,10 +252,25 @@ def reduce_delivery_state(
         _require_state(state, event, ("done", "terminal"))
         if state.outcome != "failed":
             raise DeliveryTransitionError("Only a failed DeliveryRun can be retried")
+        retry_phase = event.payload.get("phase")
+        retry_activity = event.payload.get("activity")
+        allowed_retry_states = {
+            ("planning", "ready"),
+            ("coding", "ready"),
+            ("pre_review", "ready"),
+            ("frontend_review", "ready"),
+            ("publishing", "ready"),
+            ("monitoring", "waiting"),
+        }
+        if (retry_phase, retry_activity) not in allowed_retry_states:
+            raise DeliveryTransitionError(
+                "Retry requires an exact supported Delivery phase and activity"
+            )
         next_state = _active_state(
             state,
-            phase="planning",
-            activity="ready",
+            phase=retry_phase,
+            activity=retry_activity,
+            wait_reason=("pr_monitor" if retry_phase == "monitoring" else None),
         )
     elif kind == "pause":
         if state.activity == "paused":

@@ -247,9 +247,7 @@ async def test_quick_start_monitor_create_revalidates_cached_admin_authority(
         fence["calls"] += 1
         async with session_factory() as competing_db:
             changed = await competing_db.execute(
-                update(User)
-                .where(User.id == admin_id)
-                .values(is_active=False)
+                update(User).where(User.id == admin_id).values(is_active=False)
             )
             fence["disabled"] += changed.rowcount
             await competing_db.commit()
@@ -413,21 +411,27 @@ async def test_delivery_effect_rejects_group_revoked_at_final_project_fence(
             assert run.cycle_count == before_cycle_count
             if effect == "resume":
                 assert run.activity == "paused"
-                assert await db.scalar(
-                    select(func.count(DeliveryTransition.id)).where(
-                        DeliveryTransition.run_id == run.id,
-                        DeliveryTransition.cause == "resume",
+                assert (
+                    await db.scalar(
+                        select(func.count(DeliveryTransition.id)).where(
+                            DeliveryTransition.run_id == run.id,
+                            DeliveryTransition.cause == "resume",
+                        )
                     )
-                ) == 0
+                    == 0
+                )
             else:
                 assert (run.activity, run.outcome) == ("terminal", "failed")
                 assert task.status == "failed"
-                assert await db.scalar(
-                    select(func.count(DeliveryTransition.id)).where(
-                        DeliveryTransition.run_id == run.id,
-                        DeliveryTransition.cause == "retry",
+                assert (
+                    await db.scalar(
+                        select(func.count(DeliveryTransition.id)).where(
+                            DeliveryTransition.run_id == run.id,
+                            DeliveryTransition.cause == "retry",
+                        )
                     )
-                ) == 0
+                    == 0
+                )
 
 
 @pytest.mark.asyncio
@@ -633,9 +637,7 @@ async def test_create_is_atomic_and_detail_exposes_public_evidence(
     assert len(detail_body["cycles"]) == 1
     assert detail_body["cycles"][0]["trigger_kind"] == "initial_request"
     assert detail_body["turns"] == []
-    assert [item["cause"] for item in detail_body["transitions"]] == [
-        "created"
-    ]
+    assert [item["cause"] for item in detail_body["transitions"]] == ["created"]
 
     task_response = await client.get(f"/api/tasks/{body['developer_task_id']}")
     assert task_response.status_code == 200, task_response.text
@@ -704,9 +706,7 @@ async def test_progress_projection_and_attention_count_are_api_authoritative(
     )
     assert paused.status_code == 200, paused.text
     attention = await client.get("/api/delivery-runs/attention-count")
-    paused_progress = await client.get(
-        f"/api/delivery-runs/{run_id}/progress"
-    )
+    paused_progress = await client.get(f"/api/delivery-runs/{run_id}/progress")
     assert attention.json() == {"total": 1}
     assert paused_progress.json()["attention_required"] is True
     assert paused_progress.json()["attention_kind"] == "paused"
@@ -722,9 +722,7 @@ async def test_progress_projection_and_attention_count_are_api_authoritative(
         await db.commit()
 
     terminal_count = await client.get("/api/delivery-runs/attention-count")
-    terminal_progress = await client.get(
-        f"/api/delivery-runs/{run_id}/progress"
-    )
+    terminal_progress = await client.get(f"/api/delivery-runs/{run_id}/progress")
     assert terminal_count.json() == {"total": 0}
     assert terminal_progress.json()["attention_required"] is True
     assert terminal_progress.json()["attention_kind"] == "terminal_error"
@@ -797,8 +795,7 @@ async def test_failed_prepublication_run_retries_in_place_with_a_new_cycle(
         next_cycle = await db.get(DeliveryCycle, run.current_cycle_id)
         task = await db.get(Task, run.developer_task_id)
         transition = await db.scalar(
-            select(DeliveryTransition)
-            .where(
+            select(DeliveryTransition).where(
                 DeliveryTransition.run_id == run_id,
                 DeliveryTransition.cause == "retry",
             )
@@ -819,6 +816,95 @@ async def test_failed_prepublication_run_retries_in_place_with_a_new_cycle(
     )
     assert stale_retry.status_code == 409
     assert "changed before retry" in stale_retry.text
+
+
+@pytest.mark.asyncio
+async def test_failed_development_retries_from_development_with_approved_plan(
+    client,
+    session_factory,
+    delivery_enabled,
+):
+    project, repo = await _scope(session_factory, suffix="development-retry")
+    created = await client.post(
+        "/api/delivery-runs",
+        json=_payload(project, repo),
+    )
+    assert created.status_code == 201, created.text
+    run_id = created.json()["id"]
+
+    async with session_factory() as db:
+        run = await db.get(DeliveryRun, run_id)
+        cycle = await db.get(DeliveryCycle, run.current_cycle_id)
+        task = await db.get(Task, run.developer_task_id)
+        plan = Plan(
+            title="Approved Delivery Plan",
+            initial_request="Implement the Delivery",
+            project_id=project.id,
+            pipeline_config=default_plan_pipeline_config().model_dump(),
+        )
+        db.add(plan)
+        await db.flush()
+        version = PlanVersion(
+            plan_id=plan.id,
+            version_number=1,
+            content="# Approved Delivery Plan",
+        )
+        db.add(version)
+        await db.flush()
+        plan.current_version_id = version.id
+        cycle.plan_version_id = version.id
+        cycle.status = "coding"
+        await delivery_service.apply_run_event(
+            db,
+            run=run,
+            event=DeliveryReducerEvent("plan_requested"),
+            actor_kind="controller",
+        )
+        await delivery_service.apply_run_event(
+            db,
+            run=run,
+            event=DeliveryReducerEvent("plan_ready"),
+            actor_kind="capability",
+        )
+        delivery_service.complete_cycle(cycle, status="failed")
+        await delivery_service.apply_run_event(
+            db,
+            run=run,
+            event=DeliveryReducerEvent(
+                "fail",
+                {
+                    "error_code": "developer_turn_failed",
+                    "error_message": "Developer transport was interrupted",
+                },
+            ),
+            actor_kind="controller",
+        )
+        task.status = "failed"
+        task.completed_at = datetime.utcnow()
+        task.error_message = run.error_message
+        await db.commit()
+        failed_version = run.state_version
+        failed_cycle_id = cycle.id
+        plan_version_id = version.id
+
+    retried = await client.post(
+        f"/api/delivery-runs/{run_id}/retry",
+        json={"expected_state_version": failed_version},
+    )
+
+    assert retried.status_code == 200, retried.text
+    body = retried.json()
+    assert (body["phase"], body["activity"]) == ("coding", "ready")
+    assert body["cycle_count"] == 2
+
+    async with session_factory() as db:
+        run = await db.get(DeliveryRun, run_id)
+        next_cycle = await db.get(DeliveryCycle, run.current_cycle_id)
+        assert next_cycle.id != failed_cycle_id
+        assert next_cycle.status == "coding"
+        assert next_cycle.plan_version_id == plan_version_id
+        assert next_cycle.plan_invocation_id is None
+        assert next_cycle.trigger_payload["resume_phase"] == "coding"
 
 
 @pytest.mark.asyncio
@@ -1090,9 +1176,7 @@ async def test_create_projects_frozen_auto_merge_terminal(
     assert created.status_code == 201, created.text
     body = created.json()
     assert body["terminal"] == "merged"
-    task_response = await client.get(
-        f"/api/tasks/{body['developer_task_id']}"
-    )
+    task_response = await client.get(f"/api/tasks/{body['developer_task_id']}")
     assert task_response.status_code == 200, task_response.text
     assert task_response.json()["delivery_terminal"] == "merged"
 
@@ -1177,9 +1261,7 @@ async def test_active_run_freezes_monitor_policy_disable_secret_and_delete(
             json={"enabled": False},
         ),
         await client.post(f"/api/pr-monitor/repos/{repo.id}/toggle"),
-        await client.post(
-            f"/api/pr-monitor/repos/{repo.id}/regenerate-secret"
-        ),
+        await client.post(f"/api/pr-monitor/repos/{repo.id}/regenerate-secret"),
         await client.delete(f"/api/pr-monitor/repos/{repo.id}"),
     ]
 
@@ -1728,7 +1810,9 @@ async def test_ready_run_rejects_commands_after_publication_side_effect(
     assert before.json()["allowed_actions"] == []
     assert paused.status_code == 409, paused.text
     assert cancelled.status_code == 409, cancelled.text
-    expected = "side-effect fence" if fence_kind == "pr_number" else "publication action"
+    expected = (
+        "side-effect fence" if fence_kind == "pr_number" else "publication action"
+    )
     assert expected in paused.text
     assert expected in cancelled.text
 
@@ -1955,17 +2039,13 @@ async def test_delivery_human_projection_omits_machine_identity_and_host_paths(
     assert created.status_code == 201, created.text
     run_id = created.json()["id"]
     private_root = "/srv/private/delivery-public-projection"
-    private_workspace = (
-        f"{private_root}/.claude-manager/worktrees/delivery-{run_id}"
-    )
+    private_workspace = f"{private_root}/.claude-manager/worktrees/delivery-{run_id}"
 
     async with session_factory() as db:
         run = await db.get(DeliveryRun, run_id)
         cycle = await db.get(DeliveryCycle, run.current_cycle_id)
         transition = await db.scalar(
-            select(DeliveryTransition).where(
-                DeliveryTransition.run_id == run_id
-            )
+            select(DeliveryTransition).where(DeliveryTransition.run_id == run_id)
         )
         run.workspace_path = private_workspace
         run.head_tree_sha = "1" * 40
@@ -1981,12 +2061,14 @@ async def test_delivery_human_projection_omits_machine_identity_and_host_paths(
             "review_result_id": 771,
             "test_harness_run_id": "f" * 32,
             "turn_id": 772,
-            "findings": [{
-                "title": "Visible finding",
-                "path": f"{private_workspace}/src/app.py",
-                "severity": "high",
-                "internal_receipt": "must-not-cross-human-api",
-            }],
+            "findings": [
+                {
+                    "title": "Visible finding",
+                    "path": f"{private_workspace}/src/app.py",
+                    "severity": "high",
+                    "internal_receipt": "must-not-cross-human-api",
+                }
+            ],
         }
         cycle.result_head_tree_sha = "3" * 40
         cycle.result_patch_sha256 = "4" * 64
@@ -2050,9 +2132,7 @@ async def test_delivery_human_projection_omits_machine_identity_and_host_paths(
         "next_reconcile_at",
     ):
         assert field not in body
-    assert body["wait_reason"] == (
-        "waiting under [delivery-workspace]/controller.sock"
-    )
+    assert body["wait_reason"] == ("waiting under [delivery-workspace]/controller.sock")
     assert body["error_message"] == "failed under [delivery-workspace]/secret.txt"
 
     cycle_body = body["cycles"][0]
@@ -2066,11 +2146,13 @@ async def test_delivery_human_projection_omits_machine_identity_and_host_paths(
         assert field not in cycle_body
     assert cycle_body["trigger_payload"] == {
         "summary": "reviewed [delivery-workspace]/src/app.py",
-        "findings": [{
-            "severity": "high",
-            "title": "Visible finding",
-            "path": "[delivery-workspace]/src/app.py",
-        }],
+        "findings": [
+            {
+                "severity": "high",
+                "title": "Visible finding",
+                "path": "[delivery-workspace]/src/app.py",
+            }
+        ],
     }
 
     turn_body = body["turns"][0]
@@ -2084,9 +2166,7 @@ async def test_delivery_human_projection_omits_machine_identity_and_host_paths(
         "checkpoint_status",
     ):
         assert field not in turn_body
-    assert turn_body["last_error"].startswith(
-        "turn failed at [delivery-workspace]/"
-    )
+    assert turn_body["last_error"].startswith("turn failed at [delivery-workspace]/")
 
     transition_body = body["transitions"][0]
     for field in ("actor_id", "before_state", "after_state", "metadata"):
@@ -2222,8 +2302,11 @@ async def test_chat_only_task_share_cannot_read_or_control_delivery_run(
         run = await db.get(DeliveryRun, run_id)
         assert run.state_version == state_version
         assert (run.phase, run.activity) == ("planning", "ready")
-        assert await db.scalar(
-            select(func.count(DeliveryTransition.id)).where(
-                DeliveryTransition.run_id == run_id
+        assert (
+            await db.scalar(
+                select(func.count(DeliveryTransition.id)).where(
+                    DeliveryTransition.run_id == run_id
+                )
             )
-        ) == 1
+            == 1
+        )

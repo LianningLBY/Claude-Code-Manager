@@ -41,7 +41,7 @@ const actionLabels: Record<DeliveryAction, string> = {
   pause: 'Pause',
   resume: 'Resume',
   cancel: 'Cancel',
-  retry: 'Retry from Plan',
+  retry: 'Retry failed step',
 };
 
 function actionRequiresReason(action: DeliveryAction): boolean {
@@ -50,10 +50,11 @@ function actionRequiresReason(action: DeliveryAction): boolean {
 
 function isObservationOnly(run: DeliveryRun): boolean {
   return (
-    run.phase === 'publishing'
-    || run.phase === 'monitoring'
-    || run.pr_number != null
-    || run.pr_monitor_run_id != null
+    run.activity !== 'terminal'
+    && (run.phase === 'publishing'
+      || run.phase === 'monitoring'
+      || run.pr_number != null
+      || run.pr_monitor_run_id != null)
   );
 }
 
@@ -299,7 +300,7 @@ export function DeliveryRunPanel({
                 onClick={() => chooseAction('retry')}
                 className="inline-flex items-center gap-1 rounded bg-indigo-600/20 px-2 py-1 text-xs font-medium text-indigo-300 hover:bg-indigo-600/30"
               >
-                <RefreshCw size={13} /> Retry from Plan
+                <RefreshCw size={13} /> Retry failed step
               </button>
             )}
             {allowedActions.length === 0

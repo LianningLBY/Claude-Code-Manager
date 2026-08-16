@@ -1188,7 +1188,7 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **避免复发**：任何 Controller 派生资源必须在创建时留下 durable owner edge，公共 catalog 必须在数据库查询阶段过滤，不能先分页再由前端隐藏。PR Review 归属禁止通过“同 repo + PR number”或可复用 Monitor 关系猜测；测试已证明这种模糊匹配会误隐藏普通 Review，且 nullable marker 必须使用 NULL-safe 条件。
 - **验证**：新增精确回归 `5 passed`；Task Queue、Plan Resources、PR Monitor、Delivery API 四个受影响模块完整回归 `400 passed`。覆盖 Delivery Plan 在 detail/Progress 仍可读但 catalog/count 不出现、Developer Task 不出现在普通 Task API、Delivery PR Review 不出现在 Review catalog、普通 Review 与 NULL marker 保持可见，以及 SQL 在 SQLite/PostgreSQL/MySQL 三种方言可编译。Python compile、`git diff --check`、服务重启与 HTTP 健康检查在部署提交后复核。
 
-## 2026-08-16 — Delivery 可信 CI 只等待当前 PR 实际触发项（commit 2d313306）
+## 2026-08-16 — Delivery 可信 CI 只等待当前 PR 实际触发项（commit f3f40ae8）
 
 - **问题**：可信模式把默认分支某次提交上出现过的全部 GitHub Check Run 固化为每个 Delivery PR 的 required checks。路径过滤、矩阵和发布条件导致大量任务在普通 PR 上缺失或 skipped，使实际 CI 已通过的 Delivery 永久停在 `Waiting CI`。
 - **解决**：可信模式持久化一个明确的“当前 PR 精确 head 上实际触发检查”策略标记；Gate 每次从精确 head 动态展开 GitHub 实际创建的 Check Run/Status，只等待其中 pending 项、阻断真实失败项，并把 `skipped`/`neutral` 视为正常结束。严格模式仍使用 Branch Protection 的固定 producer identity，行为不变。旧的可信观察列表在下次 Delivery setup 时自动收敛为新策略标记。

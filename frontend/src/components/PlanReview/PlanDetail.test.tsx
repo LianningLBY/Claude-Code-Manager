@@ -366,7 +366,39 @@ describe('PlanDetail', () => {
       created_at: '2026-08-03T08:00:00Z',
       updated_at: '2026-08-03T08:00:08Z',
       finished_at: null,
-      steps: [],
+      steps: [{
+        id: 30,
+        step_type: 'planner',
+        round: 1,
+        provider: 'claude',
+        model: 'claude-opus-4-6',
+        effort: 'high',
+        route_slot: 'primary',
+        status: 'completed',
+        output: 'I prepared the rollout candidate.',
+        error: null,
+        last_delta_at: '2026-08-03T11:07:00Z',
+        streamed_output_chars: 34,
+        last_event_type: 'assistant.message',
+        started_at: '2026-08-03T11:06:48Z',
+        finished_at: '2026-08-03T11:07:00Z',
+      }, {
+        id: 31,
+        step_type: 'reviewer',
+        round: 1,
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+        route_slot: 'primary',
+        status: 'running',
+        output: null,
+        error: null,
+        last_delta_at: '2026-08-03T11:07:57Z',
+        streamed_output_chars: 120,
+        last_event_type: 'item.agent_message.delta',
+        started_at: '2026-08-03T11:07:01Z',
+        finished_at: null,
+      }],
       input_requests: [],
     } satisfies PlanRun;
     const resource = plan(current, prior);
@@ -383,6 +415,11 @@ describe('PlanDetail', () => {
 
     expect(await screen.findByRole('status')).toHaveTextContent('Creating v1 draft');
     expect(screen.queryByRole('region', { name: 'Plan activity' })).not.toBeInTheDocument();
+    const conversation = screen.getByRole('region', { name: 'Plan conversation' });
+    expect(within(conversation).getByText('Design the migration')).toBeVisible();
+    expect(within(conversation).getByText('I prepared the rollout candidate.')).toBeVisible();
+    expect(within(conversation).getByText(/Working · item\.agent_message\.delta · 120 visible characters/)).toBeVisible();
+    expect(within(conversation).getByText('Live')).toBeVisible();
 
     const debug = screen.getByText('Technical details').closest('details');
     expect(debug).not.toHaveAttribute('open');

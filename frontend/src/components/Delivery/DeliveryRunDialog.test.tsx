@@ -4,7 +4,7 @@ import userEvent from '@testing-library/user-event';
 import { api } from '../../api/client';
 import { DeliveryRunDialog } from './DeliveryRunDialog';
 
-vi.mock('../../api/client', async (importOriginal) => { const actual = await importOriginal<typeof import('../../api/client')>(); return { ...actual, api: { ...actual.api, getDeliveryRun: vi.fn(), getDeliveryProgress: vi.fn(), getTask: vi.fn(), getPlanVersion: vi.fn(), getPRMonitorRun: vi.fn(), getTestRun: vi.fn(), getTestRunEvidence: vi.fn() } }; });
+vi.mock('../../api/client', async (importOriginal) => { const actual = await importOriginal<typeof import('../../api/client')>(); return { ...actual, api: { ...actual.api, getDeliveryRun: vi.fn(), getDeliveryProgress: vi.fn(), getTask: vi.fn(), getPlan: vi.fn(), getPlanVersion: vi.fn(), listPlanVersions: vi.fn(), listPlanResourceRuns: vi.fn(), getPRMonitorRun: vi.fn(), getTestRun: vi.fn(), getTestRunEvidence: vi.fn() } }; });
 vi.mock('../../hooks/useWebSocket', () => ({ useWebSocket: vi.fn() }));
 vi.mock('../Tasks/DeliveryRunPanel', () => ({ DeliveryRunPanel: ({ runId, compact }: { runId: number; compact?: boolean }) => <div>{compact ? 'Actions' : 'Full controls'} for {runId}</div> }));
 vi.mock('../PlanReview/PlanInputForm', () => ({ PlanInputForm: ({ request }: { request: { questions: Array<{ question: string }> } }) => <div>Inline plan input: {request.questions[0]?.question}</div> }));
@@ -38,6 +38,9 @@ describe('DeliveryRunDialog', () => {
     });
     vi.mocked(api.getTask).mockResolvedValue({ id: 12 } as never);
     vi.mocked(api.getPlanVersion).mockResolvedValue({ id: 31, plan_id: 21, version_number: 2, content: '# Real Plan' } as never);
+    vi.mocked(api.getPlan).mockResolvedValue({ id: 21, title: 'Delivery Plan', initial_request: 'Ship the change', display_state: 'approved', current_version_id: 31, active_run_id: null, current_version: { id: 31, plan_id: 21, version_number: 2, content: '# Real Plan', display_state: 'approved', human_decision: 'approved', applied: false }, active_run: null, read_only: true, ownership: 'capability', applications: [], application_attempts: [], latest_run_status: 'completed', latest_run_error: null, pipeline_config: { planner: { primary: {}, fallback: {} }, reviewer: { enabled: true, primary: {}, fallback: {} } } } as never);
+    vi.mocked(api.listPlanVersions).mockResolvedValue([{ id: 31, plan_id: 21, version_number: 2, content: '# Real Plan', display_state: 'approved', human_decision: 'approved', applied: false }] as never);
+    vi.mocked(api.listPlanResourceRuns).mockResolvedValue([]);
     const onOpenTask = vi.fn(); const onOpenPlan = vi.fn();
     render(<DeliveryRunDialog runId={7} onClose={() => {}} onOpenTask={onOpenTask} onOpenPlan={onOpenPlan} onOpenPRMonitor={() => {}} />);
     expect(await screen.findByText('Actions for 7')).toBeInTheDocument();
@@ -45,8 +48,11 @@ describe('DeliveryRunDialog', () => {
     expect(screen.queryByText('Full controls for 7')).not.toBeInTheDocument();
     await userEvent.click(await screen.findByRole('button', { name: /Plan/ }));
     expect(await screen.findByText('Real Plan')).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: /Open in Plans/ }));
-    expect(onOpenPlan).toHaveBeenCalledWith(21);
+    await userEvent.click(screen.getByRole('button', { name: /Open Plan conversation/ }));
+    expect(await screen.findByRole('region', { name: 'Plan conversation' })).toBeInTheDocument();
+    expect(screen.getByText('Delivery #7 / Plan')).toBeInTheDocument();
+    expect(onOpenPlan).not.toHaveBeenCalled();
+    await userEvent.click(screen.getByRole('button', { name: 'Back to Delivery #7' }));
     await userEvent.click(screen.getByRole('button', { name: /Development/ }));
     await userEvent.click(screen.getByRole('button', { name: /Open real Task Chat/ }));
     expect(onOpenTask).toHaveBeenCalledWith(12);
@@ -95,13 +101,17 @@ describe('DeliveryRunDialog', () => {
       frontend_review: { policy: 'auto', run_id: null, status: null, stage: null, verdict: null, report: null, error: null, cleanup_status: null, evidence_archive_state: null, finding_count: 0, evidence_count: 0, skip_reason: null },
     } as never);
     vi.mocked(api.getTask).mockResolvedValue({ id: 1005 } as never);
+    vi.mocked(api.getPlan).mockResolvedValue({ id: 2, title: 'Preparing Plan', initial_request: 'Prepare rollout', display_state: 'planner', current_version_id: null, active_run_id: null, current_version: null, active_run: null, read_only: true, ownership: 'capability', applications: [], application_attempts: [], latest_run_status: 'running', latest_run_error: null, pipeline_config: { planner: { primary: {}, fallback: {} }, reviewer: { enabled: true, primary: {}, fallback: {} } } } as never);
+    vi.mocked(api.listPlanVersions).mockResolvedValue([]);
+    vi.mocked(api.listPlanResourceRuns).mockResolvedValue([]);
     const onOpenPlan = vi.fn();
 
     render(<DeliveryRunDialog runId={18} onClose={() => {}} onOpenTask={() => {}} onOpenPlan={onOpenPlan} onOpenPRMonitor={() => {}} />);
 
     expect(await screen.findByText('Plan #2 is being prepared')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Open Plan #2' }));
-    expect(onOpenPlan).toHaveBeenCalledWith(2);
+    expect(await screen.findByRole('region', { name: 'Plan conversation' })).toBeInTheDocument();
+    expect(onOpenPlan).not.toHaveBeenCalled();
   });
 
   it('fails closed when a Plan choice has an unknown requester', async () => {
@@ -129,7 +139,7 @@ describe('DeliveryRunDialog', () => {
 
     expect(await screen.findByText(/invalid Plan input requester/)).toBeInTheDocument();
     expect(screen.queryByText(/Inline plan input:/)).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Open full Plan' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Open Plan conversation' })).toBeInTheDocument();
   });
 
   it('shows Browser Agent findings and archived report in the frontend stage', async () => {

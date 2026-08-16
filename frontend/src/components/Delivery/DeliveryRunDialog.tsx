@@ -9,6 +9,7 @@ import {
   type DeliveryStageProgress,
   type DeliveryTimelineEvent,
   type PlanInputRequest,
+  type PlanResource,
   type PlanVersion,
   type PRMonitorRun,
   type Project,
@@ -19,6 +20,7 @@ import { useWebSocket } from '../../hooks/useWebSocket';
 import { formatDateTime, parseBackendTimestamp } from '../../config/timezone';
 import { MarkdownRenderer } from '../Markdown/MarkdownRenderer';
 import { PlanInputForm } from '../PlanReview/PlanInputForm';
+import { PlanDetail } from '../PlanReview/PlanDetail';
 import {
   Activity,
   Bot,
@@ -313,13 +315,15 @@ export function DeliveryRunDialog({
   embedded = false,
   onClose,
   onOpenTask,
-  onOpenPlan,
   onOpenPRMonitor,
 }: Props) {
   const [run, setRun] = useState<DeliveryRunDetail | null>(null);
   const [progress, setProgress] = useState<DeliveryProgress | null>(null);
   const [task, setTask] = useState<Task | null>(null);
   const [plans, setPlans] = useState<Record<number, PlanVersion>>({});
+  const [openedPlan, setOpenedPlan] = useState<PlanResource | null>(null);
+  const [openedPlanLoading, setOpenedPlanLoading] = useState(false);
+  const [openedPlanError, setOpenedPlanError] = useState('');
   const [monitor, setMonitor] = useState<PRMonitorRun | null>(null);
   const [harness, setHarness] = useState<TestHarnessRun | null>(null);
   const [harnessScreenshotUrl, setHarnessScreenshotUrl] = useState<string | null>(null);
@@ -376,6 +380,23 @@ export function DeliveryRunDialog({
       }
     }
   }, [runId]);
+
+  const openPlan = useCallback(async (planId: number) => {
+    setOpenedPlanLoading(true);
+    setOpenedPlanError('');
+    try {
+      setOpenedPlan(await api.getPlan(planId));
+    } catch (reason) {
+      setOpenedPlanError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setOpenedPlanLoading(false);
+    }
+  }, []);
+
+  const refreshOpenedPlan = useCallback(async () => {
+    if (!openedPlan) return;
+    setOpenedPlan(await api.getPlan(openedPlan.id));
+  }, [openedPlan]);
 
   useEffect(() => { void load(true); }, [load]);
   useEffect(() => {
@@ -540,7 +561,7 @@ export function DeliveryRunDialog({
                   <p className="text-sm font-semibold text-amber-200">The Loop needs your choice</p>
                   <p className="mt-1 text-xs text-amber-100/60">Answer here; you do not need to switch to the Plans page.</p>
                 </div>
-                <button type="button" onClick={() => onOpenPlan(planInput.plan_id)} className="text-xs text-indigo-300 hover:underline">Open full Plan</button>
+                <button type="button" onClick={() => void openPlan(planInput.plan_id)} className="text-xs text-indigo-300 hover:underline">Open Plan conversation</button>
               </div>
               {planInputRequest ? (
                 <PlanInputForm
@@ -563,7 +584,7 @@ export function DeliveryRunDialog({
                 <span className="text-xs font-medium text-gray-300">
                   Round {selectedCycle.cycle_number} · Plan #{plan.plan_id} v{plan.version_number}
                 </span>
-                <button type="button" onClick={() => onOpenPlan(plan.plan_id)} className="text-xs text-indigo-300 hover:underline">Open in Plans</button>
+                <button type="button" onClick={() => void openPlan(plan.plan_id)} className="text-xs text-indigo-300 hover:underline">Open Plan conversation</button>
               </div>
               <div className="prose prose-invert mt-3 max-w-none text-xs text-gray-300"><MarkdownRenderer content={plan.content} /></div>
             </article>
@@ -573,7 +594,7 @@ export function DeliveryRunDialog({
                 <p className="text-sm font-medium text-gray-200">Plan #{currentPlanId} is being prepared</p>
                 <p className="mt-1 text-xs text-gray-500">The Plan exists. Its first approved Version is not ready yet.</p>
               </div>
-              <button type="button" onClick={() => onOpenPlan(currentPlanId)} className="text-xs font-medium text-indigo-300 hover:text-indigo-200">Open Plan #{currentPlanId}</button>
+              <button type="button" onClick={() => void openPlan(currentPlanId)} className="text-xs font-medium text-indigo-300 hover:text-indigo-200">Open Plan #{currentPlanId}</button>
             </div>
           ) : selectedCycle.error_message ? (
             <Notice tone="red" text={selectedCycle.error_message} />
@@ -839,8 +860,8 @@ export function DeliveryRunDialog({
         aria-modal={embedded ? undefined : true}
         aria-label={`Delivery #${runId}`}
         className={embedded
-          ? 'flex min-h-[calc(100dvh-8rem)] w-full flex-col overflow-hidden rounded-xl border border-gray-800 bg-gray-900/70'
-          : 'flex h-[94dvh] w-full max-w-6xl flex-col overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl sm:h-[90vh] sm:rounded-2xl'}
+          ? 'relative flex min-h-[calc(100dvh-8rem)] w-full flex-col overflow-hidden rounded-xl border border-gray-800 bg-gray-900/70'
+          : 'relative flex h-[94dvh] w-full max-w-6xl flex-col overflow-hidden border border-gray-700 bg-gray-900 shadow-2xl sm:h-[90vh] sm:rounded-2xl'}
       >
         <header className="flex shrink-0 items-start justify-between gap-3 border-b border-gray-800 px-4 py-3 sm:px-5">
           <div className="min-w-0">
@@ -858,6 +879,25 @@ export function DeliveryRunDialog({
             <button type="button" onClick={onClose} className="inline-flex items-center gap-1.5 rounded px-2 py-1.5 text-xs text-gray-500 hover:bg-gray-800 hover:text-gray-200" aria-label={embedded ? 'Back to Deliveries' : 'Close Delivery'}>{embedded ? <ChevronLeft size={16} /> : <X size={16} />}{embedded && 'Back'}</button>
           </div>
         </header>
+
+        {(openedPlan || openedPlanLoading || openedPlanError) && (
+          <div className="absolute inset-0 z-30 flex min-h-0 flex-col bg-gray-900">
+            {openedPlanLoading && !openedPlan ? (
+              <div className="flex h-full items-center justify-center gap-2 text-sm text-gray-500"><Loader2 size={17} className="animate-spin" /> Loading Plan…</div>
+            ) : openedPlanError && !openedPlan ? (
+              <div className="m-5 space-y-3"><Notice tone="red" text={openedPlanError} /><button type="button" onClick={() => setOpenedPlanError('')} className="text-xs text-indigo-300">Back to Delivery</button></div>
+            ) : openedPlan ? (
+              <PlanDetail
+                plan={openedPlan}
+                onRefresh={refreshOpenedPlan}
+                onClose={() => { setOpenedPlan(null); setOpenedPlanError(''); }}
+                onNavigateTask={onOpenTask}
+                embedded
+                contextLabel={`Delivery #${runId}`}
+              />
+            ) : null}
+          </div>
+        )}
 
         {progress && runSucceeded && run ? (
           <section data-testid="delivery-outcome-summary" className="shrink-0 border-b border-emerald-500/20 bg-gradient-to-r from-emerald-500/10 via-emerald-500/5 to-gray-950/30 px-4 py-4 sm:px-5">

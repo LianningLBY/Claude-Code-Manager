@@ -209,9 +209,21 @@ function cycleContext(cycle: DeliveryCycle): CycleContext {
     case 'operator_retry': {
       const reason = textValue(payload.reason);
       const previousError = textValue(payload.previous_error_message);
+      const resumePhase = textValue(payload.resume_phase);
+      const stageLabel = resumePhase === 'coding'
+        ? 'Development'
+        : resumePhase === 'pre_review'
+          ? 'Code review'
+          : resumePhase === 'frontend_review'
+            ? 'Frontend review'
+            : resumePhase === 'publishing'
+              ? 'Publish PR'
+              : resumePhase === 'monitoring'
+                ? 'CI & PR review'
+                : 'Plan';
       return {
-        label: 'Retried from Plan',
-        detail: shorten(reason || previousError || 'An operator restarted the failed Delivery from Plan.'),
+        label: `Retried from ${stageLabel}`,
+        detail: shorten(reason || previousError || `An operator restarted the failed Delivery from ${stageLabel}.`),
         findingCount: 0,
       };
     }

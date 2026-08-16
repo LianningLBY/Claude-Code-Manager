@@ -1195,9 +1195,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **避免复发**：不得用默认分支或历史提交上的 CI 名称集合推断任意 PR 必须运行的检查；可信模式的检查集合必须绑定当前不可变 head，且在至少一个实际检查成功前不能放行，避免 GitHub 尚未创建 checks 时误判通过。
 - **验证**：Delivery setup、PR Panel、Delivery/PR Monitor integration、PR publication 与 Merge Queue 受影响矩阵 `291 passed`；新增“成功 + skipped 条件任务”和“checks 尚未出现”回归；Ruff check 与 `git diff --check` 通过。
 
-## 2026-08-16 — Delivery 内嵌 Plan 对话子页面（commit 3b6cb918）
+## 2026-08-16 — Delivery 内嵌 Plan 对话子页面（commits 3b6cb918 / 4614ac20）
 
 - **问题**：Delivery 创建的 Plan 已从全局 Plans catalog 隐藏，但 Delivery 内的 `Open Plan` 仍跳转到全局 Plans 详情，形成“列表里不存在、只能靠深链打开”的孤儿页面；详情只突出最终方案和技术记录，用户也看不到 Planner 与 Reviewer 的公开工作过程。
-- **解决**：Delivery 的全部 Plan 入口改为在当前 Delivery 工作区内打开覆盖式子页面，并提供明确的 `Delivery #N / Plan` 上下文与返回入口。Plan 详情新增按 Run/Step 顺序组织的对话视图，展示用户请求、Planner/Reviewer 公开输出、角色、模型、轮次、状态、错误和实时活动摘要；运行中的 Plan 每 2 秒刷新一次，输入请求仍由原有表单处理，生命周期操作继续由 Delivery 控制。
+- **解决**：Delivery 的全部 Plan 入口改为在当前 Delivery 工作区内打开覆盖式子页面，并提供明确的 `Delivery #N / Plan` 上下文与返回入口。Plan 详情新增按 Run/Step 顺序组织的对话视图，首条消息使用 Delivery 原始需求而不是 Controller 内部编排 prompt，并展示 Planner/Reviewer 公开输出、角色、模型、轮次、状态、错误和实时活动摘要；运行中的 Plan 每 2 秒刷新一次，输入请求仍由原有表单处理，生命周期操作继续由 Delivery 控制。
 - **避免复发**：Capability 派生资源的导航必须跟随其 owner workspace，不能把已从公共 catalog 隐藏的资源再导航到公共 catalog shell；工作过程视图必须使用后端持久化的公开 output/event 证据，并覆盖运行中刷新，禁止伪造或暴露隐藏推理。
 - **验证**：Delivery/Plan Detail 定向前端测试 `26 passed`；新增内嵌导航、返回 Delivery、公开 Planner 输出、Reviewer live activity 回归。TypeScript 与 Vite production build（4764 modules）通过，相关四个文件 ESLint 0 errors，`git diff --check` 通过；整库 ESLint 的 49 个既有错误不属于本次改动。

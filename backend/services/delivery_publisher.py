@@ -111,6 +111,7 @@ class _PublishingSubject:
     workspace_path: str
     repo_full_name: str
     project_git_url: str
+    git_ssh_key_path: str | None
     title: str
     requirements: str
     base_branch: str
@@ -253,8 +254,32 @@ def _github_repo_from_url(value: object) -> str | None:
     return path
 
 
-def _git_environment() -> dict[str, str]:
-    return _controller_git_environment()
+def _git_environment(ssh_key_path: str | None = None) -> dict[str, str]:
+    env = _controller_git_environment()
+    if ssh_key_path:
+        key = Path(ssh_key_path)
+        try:
+            stat_result = key.stat()
+            resolved = key.resolve(strict=True)
+        except OSError as exc:
+            raise DeliveryGitAuthenticationError(
+                "Delivery Project SSH key is unavailable"
+            ) from exc
+        if (
+            not resolved.is_file()
+            or resolved != key.absolute()
+            or stat_result.st_uid != os.geteuid()
+            or stat_result.st_mode & 0o077
+        ):
+            raise DeliveryGitAuthenticationError(
+                "Delivery Project SSH key does not satisfy the private-key boundary"
+            )
+        env["GIT_SSH_COMMAND"] = (
+            f"ssh -i {shlex.quote(str(resolved))} -F /dev/null "
+            "-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new "
+            "-o BatchMode=yes"
+        )
+    return env
 
 
 def _github_credential_config(remote_url: str) -> tuple[str, ...]:
@@ -384,6 +409,7 @@ async def _run_git(
     cwd: str,
     *args: str,
     timeout: float = 120,
+    ssh_key_path: str | None = None,
 ) -> tuple[int, bytes, bytes]:
     """Run a bounded argv-only Git process with cancellation-safe reaping."""
 
@@ -393,7 +419,7 @@ async def _run_git(
             *_SAFE_GIT_CONFIG,
             *args,
             cwd=cwd,
-            env=_git_environment(),
+            env=_git_environment(ssh_key_path),
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -610,6 +636,7 @@ class GitDeliveryGateway:
             "--refs",
             fetch_url,
             ref,
+            ssh_key_path=subject.git_ssh_key_path,
         )
         if returncode != 0:
             diagnostic = (stdout + b"\n" + stderr).decode(
@@ -646,6 +673,7 @@ class GitDeliveryGateway:
             "--receive-pack=git-receive-pack",
             push_url,
             refspec,
+            ssh_key_path=subject.git_ssh_key_path,
         )
         if returncode == 0:
             return
@@ -975,6 +1003,11 @@ class GitHubDeliveryPublisher:
                 workspace_path=str(Path(run.workspace_path).absolute()),
                 repo_full_name=repo.repo_full_name,
                 project_git_url=project.git_url,
+                git_ssh_key_path=(
+                    project.git_ssh_key_path
+                    if project.git_credential_type == "ssh"
+                    else None
+                ),
                 title=run.title,
                 requirements=run.requirements,
                 base_branch=run.base_branch,

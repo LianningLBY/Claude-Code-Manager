@@ -1069,6 +1069,31 @@ def test_github_https_credential_helper_is_fixed_and_tokenless(
     assert "token" not in config[3].lower()
 
 
+def test_delivery_git_environment_projects_private_ssh_key(tmp_path):
+    key = tmp_path / "delivery_key"
+    key.write_text("test-only-key", encoding="utf-8")
+    key.chmod(0o600)
+
+    env = delivery_publisher_service._git_environment(str(key))
+
+    assert env["GIT_SSH_COMMAND"] == (
+        f"ssh -i {key} -F /dev/null -o IdentitiesOnly=yes "
+        "-o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+    )
+
+
+def test_delivery_git_environment_rejects_group_readable_key(tmp_path):
+    key = tmp_path / "delivery_key"
+    key.write_text("test-only-key", encoding="utf-8")
+    key.chmod(0o640)
+
+    with pytest.raises(
+        DeliveryGitAuthenticationError,
+        match="private-key boundary",
+    ):
+        delivery_publisher_service._git_environment(str(key))
+
+
 def test_github_ssh_transport_does_not_require_https_credential_helper(
     monkeypatch,
 ):

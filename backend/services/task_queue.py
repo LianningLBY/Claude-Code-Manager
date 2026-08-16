@@ -147,19 +147,46 @@ def _task_kind_predicate(task_kind: str):
 
 
 def ordinary_task_visibility_predicate():
-    """Keep Controller-owned PR Monitor Tasks out of ordinary task lists.
+    """Keep workflow-owned execution Tasks out of ordinary task lists.
 
     Older deployments created reviewer, finding-fix, and rebuttal Tasks as
     unarchived rows, so filtering on ``Task.archived`` alone can leak raw
-    Controller protocol into the normal Tasks/Chat UI.  Durable owner links
-    classify both legacy and current workflows.
+    Controller protocol into the normal Tasks/Chat UI. Delivery developer
+    shells and their pre-PR reviewer Tasks are likewise implementation records
+    of the Delivery graph, not independent user Tasks. Durable owner links
+    classify both legacy and current workflows without relying on titles/tags.
     """
 
+    from backend.models.code_review import CodeReviewRun
     from backend.services.pr_monitor_task_access import (
         pr_monitor_owned_task_predicate,
     )
 
-    return ~pr_monitor_owned_task_predicate(Task.id)
+    delivery_developer = Task.__table__.alias("delivery_developer_task")
+    delivery_code_review_task = (
+        select(CodeReviewRun.id)
+        .select_from(
+            CodeReviewRun.__table__.join(
+                delivery_developer,
+                delivery_developer.c.id == CodeReviewRun.developer_task_id,
+            )
+        )
+        .where(
+            CodeReviewRun.reviewer_task_id == Task.id,
+            or_(
+                delivery_developer.c.mode == "delivery_loop",
+                delivery_developer.c.delivery_run_id.is_not(None),
+            ),
+        )
+        .correlate(Task)
+        .exists()
+    )
+    return and_(
+        Task.mode != "delivery_loop",
+        Task.delivery_run_id.is_(None),
+        ~pr_monitor_owned_task_predicate(Task.id),
+        ~delivery_code_review_task,
+    )
 
 
 def _ordinary_task_visibility_predicate():

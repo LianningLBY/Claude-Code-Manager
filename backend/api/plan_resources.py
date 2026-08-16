@@ -46,6 +46,7 @@ from backend.models.plan_agent import (
     PlanAgentWorkerDispatchReceipt,
     PlanAgentWorkerImportReceipt,
 )
+from backend.models.delivery import DeliveryCycle
 from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.models.project import Project
@@ -647,7 +648,26 @@ def _plan_collection_query(
     q: str | None,
     display_states: set[str],
 ):
-    query = select(Plan)
+    delivery_target_task = (
+        select(Task.id)
+        .where(
+            Task.id == Plan.target_task_id,
+            or_(
+                Task.mode == "delivery_loop",
+                Task.delivery_run_id.isnot(None),
+            ),
+        )
+        .correlate(Plan)
+        .exists()
+    )
+    delivery_version = (
+        select(DeliveryCycle.id)
+        .join(PlanVersion, PlanVersion.id == DeliveryCycle.plan_version_id)
+        .where(PlanVersion.plan_id == Plan.id)
+        .correlate(Plan)
+        .exists()
+    )
+    query = select(Plan).where(~or_(delivery_target_task, delivery_version))
     if target_task_id is not None:
         query = query.where(Plan.target_task_id == target_task_id)
     if project_id is not None:

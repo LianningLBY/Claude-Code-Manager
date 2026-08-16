@@ -3625,6 +3625,9 @@ def test_pr_review_task_predicates_compile_for_supported_database_dialects(
     assert "pr_finding_actions" in list_sql
     assert "pr_finding_rebuttals" in list_sql
     assert "pr_monitor_task_tombstones" in list_sql
+    assert "code_review_runs" in list_sql
+    assert "delivery_developer_task" in list_sql
+    assert "delivery_run_id" in list_sql
     assert "NOT ((EXISTS" in list_sql
     assert "pr_reviews" in claim_sql
     assert "pr_reviewer_runs" in claim_sql

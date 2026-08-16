@@ -1127,6 +1127,10 @@ async def test_delivery_plan_projection_uses_cycle_version_relationship(
     run_id = created.json()["id"]
 
     async with session_factory() as db:
+        delivery = await db.get(DeliveryRun, run_id)
+        assert delivery is not None
+        developer_task_id = delivery.developer_task_id
+        assert developer_task_id is not None
         plan = Plan(
             title="Delivery Plan",
             initial_request="Plan the Delivery",
@@ -1151,9 +1155,20 @@ async def test_delivery_plan_projection_uses_cycle_version_relationship(
         plan_id = plan.id
 
     response = await client.get(f"/api/plans/{plan_id}")
+    catalog = await client.get("/api/plans", params={"q": "Delivery Plan"})
+    catalog_count = await client.get(
+        "/api/plans/count", params={"q": "Delivery Plan"}
+    )
+    tasks = await client.get("/api/tasks", params={"limit": 1000})
 
     assert response.status_code == 200, response.text
     assert response.json()["delivery_run_id"] == run_id
+    assert catalog.status_code == 200, catalog.text
+    assert all(item["id"] != plan_id for item in catalog.json())
+    assert catalog_count.status_code == 200, catalog_count.text
+    assert catalog_count.json() == {"total": 0}
+    assert tasks.status_code == 200, tasks.text
+    assert all(item["id"] != developer_task_id for item in tasks.json())
 
 
 @pytest.mark.asyncio

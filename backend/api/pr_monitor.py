@@ -1592,9 +1592,17 @@ async def list_reviews(
     await _require_pr_monitor_access(request, db, repo)
 
     offset = (page - 1) * size
+    # ``delivery:`` is the immutable namespace reserved by the Delivery
+    # publisher. Do not infer presentation ownership from mutable repository,
+    # PR-number, or Monitor relationships: those identities can be reused by
+    # ordinary PR Monitor workflows after a Delivery completes.
+    ordinary_review = or_(
+        PRReview.delivery_id.is_(None),
+        ~PRReview.delivery_id.like("delivery:%"),
+    )
     result = await db.execute(
         select(PRReview)
-        .where(PRReview.repo_id == repo_id)
+        .where(PRReview.repo_id == repo_id, ordinary_review)
         .order_by(desc(PRReview.created_at))
         .offset(offset)
         .limit(size)

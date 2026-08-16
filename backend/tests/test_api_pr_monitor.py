@@ -5745,3 +5745,38 @@ async def test_update_repo_provider(client):
     body = resp.json()
     assert body["provider"] == "codex"
     assert body["review_model"] is None  # 显式 null 清空旧模型（防跨家族残留）
+
+
+@pytest.mark.asyncio
+async def test_review_catalog_hides_delivery_owned_reviews(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(
+        client,
+        "owner/delivery-hidden-review",
+        review_mode="single",
+        wait_for_ci=False,
+    )
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/delivery-hidden-review"),
+    )
+    assert opened.status_code == 200, opened.text
+    review_id = opened.json()["review_id"]
+
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        assert review is not None
+        review.delivery_id = f"delivery:999:{HEAD_SHA_1}"
+        await db.commit()
+
+    listed = await client.get(f"/api/pr-monitor/repos/{repo['id']}/reviews")
+    assert listed.status_code == 200, listed.text
+    assert all(item["id"] != review_id for item in listed.json())
+
+    # Delivery owns presentation, but the exact resource remains available to
+    # internal workflows and direct evidence links.
+    detail = await client.get(f"/api/pr-monitor/reviews/{review_id}")
+    assert detail.status_code == 200, detail.text

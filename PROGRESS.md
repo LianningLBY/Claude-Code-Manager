@@ -1201,3 +1201,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：Delivery 的全部 Plan 入口改为在当前 Delivery 工作区内打开覆盖式子页面，并提供明确的 `Delivery #N / Plan` 上下文与返回入口。Plan 详情新增按 Run/Step 顺序组织的对话视图，首条消息使用 Delivery 原始需求而不是 Controller 内部编排 prompt，并展示 Planner/Reviewer 公开输出、角色、模型、轮次、状态、错误和实时活动摘要；运行中的 Plan 每 2 秒刷新一次，输入请求仍由原有表单处理，生命周期操作继续由 Delivery 控制。
 - **避免复发**：Capability 派生资源的导航必须跟随其 owner workspace，不能把已从公共 catalog 隐藏的资源再导航到公共 catalog shell；工作过程视图必须使用后端持久化的公开 output/event 证据，并覆盖运行中刷新，禁止伪造或暴露隐藏推理。
 - **验证**：Delivery/Plan Detail 定向前端测试 `26 passed`；新增内嵌导航、返回 Delivery、公开 Planner 输出、Reviewer live activity 回归。TypeScript 与 Vite production build（4764 modules）通过，相关四个文件 ESLint 0 errors，`git diff --check` 通过；整库 ESLint 的 49 个既有错误不属于本次改动。
+
+## 2026-08-16 — Codex 号池运行策略在线配置（commit 04f9b6a3）
+
+- **问题**：Codex 号池启停、冷却和换号阈值只能依赖部署环境变量，首选账号又仅存于进程内存；管理员无法从账号面板在线调整，服务重启后也会丢失选择。
+- **解决**：在账号私有 JSON 中原子持久化 `pool_settings`，新增管理员设置 API 和 Codex 面板表单，支持启停、冷却、阈值、API/OAuth 路由顺序及首选账号。暂停对主任务、Monitor、Sub-Agent 和 Distill 全部 fail closed；Worker 写入参加 node account-mutation fence。
+- **避免复发**：部署级开关/路径与日常运行策略分层；涉及账号文件的新增写入口必须复用私有原子写和 Worker 围栏，禁用号池时不得隐式使用 ambient `CODEX_HOME`。
+- **验证**：Codex Pool/Distill `95 passed`，Worker/Monitor/Resume 相关矩阵除独立 worktree 缺 `.venv` 导致一个既有 Claude relogin fixture 501 外 `137 passed`；PoolDrawer `49 passed`，TypeScript 与 production build（4764 modules）通过，`git diff --check` 通过。

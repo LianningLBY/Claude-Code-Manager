@@ -80,7 +80,7 @@ class Settings(BaseSettings):
     plan_reviewer_fallback_provider: str = "claude"
     plan_reviewer_fallback_model: str = "claude-sonnet-5"
     plan_reviewer_fallback_effort: str = "high"
-    plan_max_revision_cycles: int = 2
+    plan_max_revision_cycles: int = 3
     # Pause/resume rounds per PlanRun. This never limits questions per request.
     plan_max_interactions: int = 3
     plan_planner_timeout: int = 1800

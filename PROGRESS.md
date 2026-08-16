@@ -1158,3 +1158,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：从终态 `fail` transition 的 `before_state` 精确恢复失败阶段。新 Round 只用于保留审计历史，并复制此前已批准的 Plan、开发结果、Code Review、Frontend Review 与 PR Monitor 绑定；每个恢复点都验证所需证据，缺失时明确拒绝而不猜测。Monitoring 原地恢复 observer，Publishing/Monitoring 不再因已有 PR 被笼统排除。
 - **避免复发**：Retry reducer 只接受六个固定安全恢复状态，API 必须从持久化 transition 证明目标阶段；新增 Development 失败 API 回归，证明已批准 Plan 被复用且新 Round 直接进入 `coding/ready`，并对全部阶段 reducer 路径和非法目标做参数化覆盖。
 - **验证**：Delivery reducer/API `86 passed`；Retry 面板 `7 passed`；TypeScript 与 Vite production build（4764 modules）通过；Ruff check 与 `git diff --check` 通过。
+
+## 2026-08-16 — Claude Planner 流式监督与探索预算（commit baaf7e0f）
+
+- **问题**：真实 Delivery E2E 的 Claude Planner 在只读仓库中连续执行 69 个 Glob/Grep/Read 回合，约 15 分钟仍未生成最终 Plan；`--output-format json` 又让 CCM 在结束前看不到任何活动，页面错误显示 0 输出。人工终止产生普通 exit 143，既不会触发同一 Plan Run 的 Codex fallback，又会被 Capability 第二次 attempt 从 Claude primary 完整重跑，合计成本约 9.42 美元。
+- **解决**：Claude Plan 路由改用 `stream-json --verbose`，逐行消费事件并持久化最后活动、累计输出量及最近工具名；Planner/Reviewer 分别冻结 12/8 次只读工具调用预算。超限时只终止该精确 runtime，并抛出 typed `PlanAgentTimeout`，由 Stage 立即切换配置的 fallback，而不进入同 route transient retry。
+- **避免复发**：任何可调用工具的独立 Agent 都必须同时具备实时可观察性和确定性工作预算；总超时不能替代工具回合上限，终止原因也必须保留为可驱动 fallback 的类型，不能统一折叠为普通非零退出。
+- **验证**：Plan Agent Runner 定向测试 `42 passed`；新增 Claude NDJSON terminal `structured_output` 解析与命令参数回归；Ruff check、Python 编译和 `git diff --check` 通过。真实 Delivery E2E 在生产重启后继续验证。

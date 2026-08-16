@@ -1151,3 +1151,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **安全与恢复**：未跟踪文件读取移到线程，并以目录 FD 逐层 `O_NOFOLLOW`、叶子 `O_NONBLOCK` 拒绝祖先 symlink、FIFO 与超限文件；重启可证明尚未物化任何 Workspace/child/attempt/lease 的 admitted Run 已完成 cleanup。Worker migration rollback 修复为 operation lock → owner fence → node-control → Task，避免与 Harness 物化形成锁反序；新增确定性顺序回归。
 - **前端节流**：轮询改为前一请求 settle 后递归调度，同 Task/generation 只允许一个 in-flight；活跃/等待 Run 保持 1 秒，普通执行 Task 的发现轮询降为 5 秒，失败指数退避至 30 秒。Task 切换或卸载后的旧响应不能覆盖新状态。
 - **验证**：锁文件精确环境下后端整库 `7709 passed, 6 skipped`（0 failed）；Task API、Harness、Workspace 受影响矩阵 `360 passed`，新增连接释放、single-flight、route/config CAS、慢 snapshot 取消胜出、symlink/FIFO 与 rollback 锁序测试全部通过。前端全量 `66 files / 820 passed, 7 skipped`，TypeScript 与 Vite production build（4764 modules）通过；Python compile、Ruff（本次相关文件）、`uv lock --check`、Alembic 唯一 head `f4c7a9d2e610`、冲突/secret/whitespace 审计通过。两轮独立只读审查未发现剩余正确性、跨数据库或死锁 blocker。首次整库暴露共享 `.venv` 的 PTY revision 漂移与 worktree umask 权限污染；按 `uv.lock@d5ff119` 和 Git `100755` 重建环境后相关单项及上述整库均通过，未改依赖锁或放宽测试。
+
+## 2026-08-16 — Delivery 按失败阶段重试（commit a76ce4a9）
+
+- **问题**：人工 Retry 把任何失败统一重置到 Plan，导致 Development、Code Review、Frontend Review、Publishing 或 PR Monitoring 的暂时故障都会重复已经通过的阶段；已有 PR 的失败还被完全禁止 Retry。
+- **解决**：从终态 `fail` transition 的 `before_state` 精确恢复失败阶段。新 Round 只用于保留审计历史，并复制此前已批准的 Plan、开发结果、Code Review、Frontend Review 与 PR Monitor 绑定；每个恢复点都验证所需证据，缺失时明确拒绝而不猜测。Monitoring 原地恢复 observer，Publishing/Monitoring 不再因已有 PR 被笼统排除。
+- **避免复发**：Retry reducer 只接受六个固定安全恢复状态，API 必须从持久化 transition 证明目标阶段；新增 Development 失败 API 回归，证明已批准 Plan 被复用且新 Round 直接进入 `coding/ready`，并对全部阶段 reducer 路径和非法目标做参数化覆盖。
+- **验证**：Delivery reducer/API `86 passed`；Retry 面板 `7 passed`；TypeScript 与 Vite production build（4764 modules）通过；Ruff check 与 `git diff --check` 通过。

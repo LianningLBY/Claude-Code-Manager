@@ -1165,3 +1165,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：Claude Plan 路由改用 `stream-json --verbose`，逐行消费事件并持久化最后活动、累计输出量及最近工具名；Planner/Reviewer 分别冻结 12/8 次只读工具调用预算。超限时只终止该精确 runtime，并抛出 typed `PlanAgentTimeout`，由 Stage 立即切换配置的 fallback，而不进入同 route transient retry。
 - **避免复发**：任何可调用工具的独立 Agent 都必须同时具备实时可观察性和确定性工作预算；总超时不能替代工具回合上限，终止原因也必须保留为可驱动 fallback 的类型，不能统一折叠为普通非零退出。
 - **验证**：Plan Agent Runner 定向测试 `42 passed`；新增 Claude NDJSON terminal `structured_output` 解析与命令参数回归；Ruff check、Python 编译和 `git diff --check` 通过。真实 Delivery E2E 在生产重启后继续验证。
+
+## 2026-08-16 — Delivery Retry 阶段标签与 Publisher SSH 凭据（commits d33a54fa / b60220d5）
+
+- **问题**：阶段级 Retry 已正确从 Development 恢复，但 Round 标签仍固定显示 `Retried from Plan`；同时 Publishing 的 hardened Git 清除了 ambient 配置，却没有投影 Project 已绑定的 SSH key，导致有效凭据存在时仍反复报 `Unable to read the exact remote ref`。
+- **解决**：Round 标签从冻结的 `trigger_payload.resume_phase` 映射真实恢复阶段；Publisher subject 冻结 Project SSH key 路径，仅接受当前 UID 拥有、非 symlink、权限不宽于 `0600` 的普通文件，并只通过 Git 子进程环境投影 `ssh -F /dev/null -i <key> -o IdentitiesOnly=yes -o BatchMode=yes`。
+- **避免复发**：Retry 展示必须使用与 reducer 相同的 durable resume evidence，不能从 trigger kind 猜阶段；hardened Git 清空 ambient credential 后，必须显式投影已审核的 Project credential，且路径验证、权限边界和无交互 SSH 参数必须有回归测试。
+- **验证**：真实 E2E 证明 Development 失败后新 Cycle 复用同一 `plan_version_id=3`、`plan_invocation_id=NULL`，状态直接 `coding/ready → coding/running`，没有新 Plan；Publisher 完整测试 `60 passed`，Delivery 对话框 `9 passed`，前端 production build（4764 modules）通过。绑定 key 的 GitHub SSH 认证和只读 main ref 成功；旧冻结 base 在 main 前进后被正确 fail closed。三个测试 Delivery/Task/Plan/worktree/本地分支均已清理，GitHub 无测试 PR/远端分支，`foreign_key_check` 通过。

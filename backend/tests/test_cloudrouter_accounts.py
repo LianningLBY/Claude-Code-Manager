@@ -232,6 +232,49 @@ async def test_legacy_codex_only_apex_account_adds_safe_claude_runtime(
 
 
 @pytest.mark.asyncio
+async def test_legacy_apex_migration_preflights_codex_before_writing(
+    tmp_path, monkeypatch,
+):
+    store = CloudRouterAccountStore(tmp_path / "accounts")
+    monkeypatch.setattr(
+        store,
+        "probe_models",
+        AsyncMock(return_value={"claude": [], "codex": ["gpt-5.4"]}),
+    )
+    account = await store.add_account(
+        "Apex", "lck-test-secret", api_provider="apex",
+    )
+    settings_path = account.root / "claude" / "settings.json"
+    onboarding_path = account.root / "claude" / ".claude.json"
+    settings_path.unlink()
+    onboarding_path.unlink()
+    metadata_path = account.root / "account.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["endpoints"] = dict(
+        cloudrouter_module.LEGACY_APEX_CODEX_ONLY_ENDPOINTS,
+    )
+    metadata_path.write_text(json.dumps(metadata))
+    metadata_before = metadata_path.read_bytes()
+    codex_path = account.root / "codex" / "config.toml"
+    codex_path.write_text(
+        codex_path.read_text().replace(
+            APEX_CODEX_BASE_URL,
+            "https://attacker.invalid/v1",
+        ),
+    )
+
+    with pytest.raises(
+        CloudRouterUnsafePathError,
+        match="Modified Codex API routing",
+    ):
+        store.reload()
+
+    assert not settings_path.exists()
+    assert not onboarding_path.exists()
+    assert metadata_path.read_bytes() == metadata_before
+
+
+@pytest.mark.asyncio
 async def test_legacy_codex_only_apex_rejects_existing_claude_redirect(
     tmp_path, monkeypatch,
 ):

@@ -1906,7 +1906,20 @@ class CloudRouterAccountStore:
                 ("account.json", 0o600), ("api.key", 0o600), ("key-helper", 0o700),
             ):
                 _require_owned_regular(path / file_name, expected_mode)
+            _require_owned_regular(path / "codex" / "config.toml", 0o600)
             if migrate_apex_claude_runtime:
+                # A failed legacy migration must not leave a partially
+                # materialized Claude home. Validate every existing Claude
+                # artifact and the Codex runtime before the first write.
+                self._migrate_apex_claude_runtime(
+                    account,
+                    write_missing=False,
+                )
+                self._validate_runtime_configuration(
+                    account,
+                    validate_claude=False,
+                    apply_migrations=False,
+                )
                 self._migrate_apex_claude_runtime(account)
             if spec.claude_base_url is not None:
                 _require_owned_regular(
@@ -1916,7 +1929,6 @@ class CloudRouterAccountStore:
                 _converge_cli_mutable_private_file(
                     path / "claude" / ".claude.json",
                 )
-            _require_owned_regular(path / "codex" / "config.toml", 0o600)
             self._validate_runtime_configuration(account)
         if migrate_legacy_apex_endpoints or migrate_apex_claude_runtime:
             data["endpoints"] = dict(spec.endpoints)
@@ -1935,7 +1947,11 @@ class CloudRouterAccountStore:
         return account
 
     @staticmethod
-    def _migrate_apex_claude_runtime(account: CloudRouterAccount) -> None:
+    def _migrate_apex_claude_runtime(
+        account: CloudRouterAccount,
+        *,
+        write_missing: bool = True,
+    ) -> None:
         """Materialize the newly supported Claude runtime for legacy Apex.
 
         The migration is admitted only from an exact CCM-owned endpoint
@@ -1974,7 +1990,8 @@ class CloudRouterAccountStore:
                         f"Modified legacy Apex Claude config: {account.id}",
                     )
                 continue
-            _atomic_private_json(path, expected)
+            if write_missing:
+                _atomic_private_json(path, expected)
 
     @staticmethod
     def _converge_claude_runtime_settings(
@@ -2015,7 +2032,12 @@ class CloudRouterAccountStore:
             _atomic_private_json(settings_path, settings)
 
     @staticmethod
-    def _validate_runtime_configuration(account: CloudRouterAccount) -> None:
+    def _validate_runtime_configuration(
+        account: CloudRouterAccount,
+        *,
+        validate_claude: bool = True,
+        apply_migrations: bool = True,
+    ) -> None:
         """Fail closed if a CLI config could redirect or replace API auth."""
 
         helper_path = account.root / "key-helper"
@@ -2033,7 +2055,7 @@ class CloudRouterAccountStore:
             )
 
         spec = API_PROVIDER_SPECS[account.api_provider]
-        if spec.claude_base_url is not None:
+        if spec.claude_base_url is not None and validate_claude:
             try:
                 settings = json.loads(_open_regular_nofollow(
                     account.root / "claude" / "settings.json",
@@ -2183,7 +2205,7 @@ class CloudRouterAccountStore:
             raise CloudRouterUnsafePathError(
                 f"Modified Codex API routing: {account.id}",
             )
-        if (
+        if apply_migrations and (
             projects is not None
             or migrate_legacy_apex
             or migrate_legacy_apex_endpoint

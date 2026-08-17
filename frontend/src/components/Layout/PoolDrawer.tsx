@@ -1114,7 +1114,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
               className="w-full bg-gray-700 text-foreground text-xs rounded px-2.5 py-1.5 outline-none focus:ring-1 focus:ring-sky-500"
               value={name}
               onChange={(event) => setName(event.target.value)}
-              placeholder={apiProvider === 'apex' ? '例如：ApexRouter Codex' : apiProvider === 'apibest' ? '例如：APIBest' : '例如：CloudRouter Claude'}
+              placeholder={apiProvider === 'apex' ? '例如：ApexRouter' : apiProvider === 'apibest' ? '例如：APIBest' : '例如：CloudRouter Claude'}
               autoComplete="off"
               required
             />
@@ -1138,7 +1138,7 @@ function AddApiAccountModal({ onClose, onAdded }: {
               <p>系统通过 /v1/models 自动识别该 Key 可用于 Claude、Codex 或两者。CloudRouter 通常一把 Key 对应一个模型分组；同时使用两类模型时通常需要分别添加两把 Key。</p>
             ) : apiProvider === 'apex' ? (
               <>
-                <p>ApexRouter 仅用于 Codex；系统会通过 /v1/models 验证 Key 并读取支持的模型。</p>
+                <p>系统通过 ApexRouter /v1/models 自动识别该 Key 可用于 Claude、Codex 或两者，并分别配置 Anthropic Messages 与 OpenAI Responses 协议。</p>
                 <p>额度通过 /v1/usage 获取：“已用”为当前 Key 用量，剩余、上限与并发限制由同组 Key 共享。</p>
                 <p>ApexRouter 当前不返回到期时间，因此到期时间和剩余天数会显示为无法确认。</p>
               </>

@@ -1218,3 +1218,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **Delivery 与迁移收口**：普通 `synchronize`/`reopened`/`ready_for_review` 在 exact Delivery owner 或 adoption pre-bind evidence 存在时均 409，不能清终态或替换 current Review；权威 attach guard 与 webhook Repo/Run 写屏障双重验证，保留既有 DeliveryRun→PRMonitorRun 锁序。迁移 downgrade 的旧 subject 冲突审计改为只检查全非 NULL key，避免把生产中合法的 NULL subject 重复误判为 rerun；attempt/lineage CHECK 同时覆盖首次 ready-for-review 与父行删除后的历史形状。
 - **避免复发**：凡外部 publication 都必须把“模型是否产出结论”“副作用是否执行”“当前资源生命周期”“失败发生阶段”分开建模；浏览器/模型工具登录态不能替代服务端凭据 evidence。Controller 派生的可执行资源与面向用户的只读结果必须通过 durable owner edge和公共 projection 解耦，禁止为展示方便放宽内部 Task ACL。
 - **验证**：自动化回归覆盖 verdict/publication/lifecycle 组合、immutable publisher evidence、COMMENT 语义、result feed 字段白名单与 Panel 聚合、terminal/reopen webhook fencing、exact-head rerun 幂等/漂移拒绝，以及 Tasks/PR detail 的只读交互；完整测试与构建结果记录在本次变更的最终验证中。
+## 2026-08-17 — Delivery Plan 页面信息层级收敛（commit：本提交）
+
+- **问题**：Plan 子页面首屏被重复容器、冗长 Capability 说明、重复的 Delivery 导航和过大的对话卡片占满；用户请求、Agent 状态和技术信息没有清晰主次。
+- **解决**：标题区只保留 Delivery 上下文、Plan 标题和当前状态；Capability 归属改为单行弱提示；对话区改为无外层卡片的紧凑时间线；Delivery 子页面隐藏重复的 `Open Delivery` 操作；无版本状态改为简短空状态，保留技术详情在折叠区。
+- **避免复发**：首屏只放用户当前决策所需信息；生命周期、路由、审计和内部运行标识必须进入折叠或次级区域，避免把诊断信息当成主内容展示。
+- **验证**：Delivery/Plan Detail 定向前端测试 `26 passed`；TypeScript、Vite production build（4764 modules）和 PlanDetail ESLint 通过，`git diff --check` 通过。

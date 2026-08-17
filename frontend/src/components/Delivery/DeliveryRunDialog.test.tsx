@@ -50,7 +50,7 @@ describe('DeliveryRunDialog', () => {
     expect(await screen.findByText('Real Plan')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: /Open Plan conversation/ }));
     expect(await screen.findByRole('region', { name: 'Plan conversation' })).toBeInTheDocument();
-    expect(screen.getByText('Delivery #7 / Plan')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Delivery #7' })).toBeInTheDocument();
     expect(screen.getByText('Ship the actual Delivery request')).toBeInTheDocument();
     expect(screen.queryByText('Ship the change')).not.toBeInTheDocument();
     expect(onOpenPlan).not.toHaveBeenCalled();

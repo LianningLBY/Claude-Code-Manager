@@ -477,7 +477,7 @@ describe('PlanDetail', () => {
     expect(screen.queryByRole('button', { name: 'Cancel planning' })).not.toBeInTheDocument();
     expect(screen.queryByText('Planning request')).not.toBeInTheDocument();
     expect(screen.queryByText('Technical details')).not.toBeInTheDocument();
-    expect(screen.getByText('No Version yet.')).toBeInTheDocument();
+    expect(screen.getByText('No version has been produced yet.')).toBeInTheDocument();
   });
 
   it('keeps Capability input writable while all ordinary Plan controls stay read-only', async () => {
@@ -567,7 +567,7 @@ describe('PlanDetail', () => {
 
     render(<PlanDetail plan={resource} onRefresh={vi.fn()} />);
     expect(await screen.findByTestId('capability-plan-read-only')).toHaveTextContent(
-      'You can inspect it and answer an open input request here',
+      'Delivery-owned plan',
     );
     expect(screen.getByRole('button', { name: 'Submit answers' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Cancel planning' })).not.toBeInTheDocument();

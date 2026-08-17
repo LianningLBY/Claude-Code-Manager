@@ -91,18 +91,17 @@ function uniqueRunError(run: PlanRun) {
 function PlanConversation({ plan, runs, request }: { plan: PlanResource; runs: PlanRun[]; request?: string }) {
   const orderedRuns = [...runs].sort((left, right) => left.id - right.id);
   return (
-    <section aria-label="Plan conversation" className="mt-4 space-y-3 rounded-xl border border-gray-800 bg-gray-950/35 p-3 sm:p-4">
+    <section aria-label="Plan conversation" className="mt-3 space-y-3 border-t border-gray-800 pt-3 sm:mt-4 sm:pt-4">
       <div className="flex items-center justify-between gap-3">
         <div>
-          <h3 className="text-sm font-semibold text-gray-100">Plan conversation</h3>
-          <p className="mt-0.5 text-[11px] text-gray-500">Planner and reviewer work, questions, and visible results in order.</p>
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-gray-400">Conversation</h3>
         </div>
         {orderedRuns.some((run) => ACTIVE_RUN_STATUSES.has(run.status)) && <span className="inline-flex items-center gap-1.5 rounded-full bg-indigo-500/10 px-2 py-1 text-[10px] text-indigo-300"><Loader2 size={11} className="animate-spin" /> Live</span>}
       </div>
       <div className="space-y-4">
-        <div className="ml-auto max-w-[88%] rounded-2xl rounded-br-sm bg-indigo-600 px-3.5 py-3 text-sm text-white">
-          <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-indigo-200">Request</div>
-          <div className="whitespace-pre-wrap leading-6">{request || plan.initial_request}</div>
+        <div className="ml-auto max-w-[min(72ch,88%)] rounded-2xl rounded-br-sm bg-indigo-600 px-3.5 py-2.5 text-sm text-white">
+          <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-indigo-200">You</div>
+          <div className="whitespace-pre-wrap leading-5">{request || plan.initial_request}</div>
         </div>
         {orderedRuns.map((run) => (
           <div key={run.id} className="space-y-3">
@@ -110,7 +109,7 @@ function PlanConversation({ plan, runs, request }: { plan: PlanResource; runs: P
               const role = step.step_type === 'reviewer' ? 'Reviewer' : 'Planner';
               const active = ['queued', 'running'].includes(step.status);
               return (
-                <div key={step.id} className="max-w-[92%] rounded-2xl rounded-bl-sm border border-gray-800 bg-gray-900 px-3.5 py-3 text-sm text-gray-300">
+                <div key={step.id} className="max-w-[min(76ch,92%)] rounded-2xl rounded-bl-sm border border-gray-800 bg-gray-900 px-3.5 py-2.5 text-sm text-gray-300">
                   <div className="mb-2 flex flex-wrap items-center gap-2 text-[10px]">
                     <span className="font-semibold uppercase tracking-wide text-indigo-300">{role}</span>
                     <span className="text-gray-600">Round {step.round}</span>
@@ -314,10 +313,10 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
   const hardConflictMessages = planHardConflictMessages(staleness);
   const showStaleness = Boolean(shown && !shown.applied && !plan.read_only);
   return <div className="flex h-full min-h-0 min-w-0 flex-col overflow-x-hidden">
-    <header className="flex items-start gap-3 border-b border-gray-800 px-4 py-3">
+    <header className="flex items-start gap-3 border-b border-gray-800 px-4 py-2.5 sm:px-5">
       <div className="min-w-0 flex-1">
-        {contextLabel && <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wide text-indigo-300">{contextLabel} / Plan</div>}
-        <div className="truncate text-sm font-semibold text-gray-100">Plan #{plan.id} · {plan.title}</div>
+        {contextLabel && <div className="mb-0.5 text-[10px] font-medium uppercase tracking-wide text-indigo-300">{contextLabel}</div>}
+        <div className="truncate text-base font-semibold text-gray-100">{plan.title}</div>
         <div role={activeRun ? 'status' : undefined} aria-live={activeRun ? 'polite' : undefined} className="mt-1 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-gray-400">
           {activeRun && activeRun.status !== 'waiting_user' && <Loader2 size={11} className="animate-spin text-indigo-300" />}
           <span className={activeRun ? 'text-indigo-300' : ''}>{planStatusText(plan, candidateVersionNumber, activeRun)}</span>
@@ -333,7 +332,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
     <div className="min-h-0 min-w-0 flex-1 overflow-x-hidden overflow-y-auto p-4 sm:p-6">
       {error && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">{error}</div>}
       {busyLabel && <div role="status" aria-live="polite" className="mb-4 flex items-center gap-2 rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-xs text-indigo-300"><Loader2 size={13} className="animate-spin" /> {busyLabel}…</div>}
-      {plan.read_only && <div data-testid="capability-plan-read-only" className="mb-4 rounded-lg border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-xs text-indigo-200">This Plan belongs to its Delivery. You can inspect it and answer an open input request here; its conversation and evidence are shown below, while lifecycle actions remain controlled by Delivery.</div>}
+      {plan.read_only && <div data-testid="capability-plan-read-only" className="mb-3 flex items-center gap-2 text-[11px] text-gray-500"><span className="h-1.5 w-1.5 rounded-full bg-indigo-400" />Delivery-owned plan · actions are managed from the Delivery flow</div>}
       {plan.latest_run_status === 'failed' && plan.latest_run_error && <div role="alert" className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300"><span className="font-semibold">Latest planning attempt failed.</span> {plan.read_only ? 'Capability Core controls retry and terminal handling.' : 'You can retry it; technical details are available below.'}</div>}
       {uncertainApplications.map((application) => <div key={application.application_receipt_key} role="alert" className="mb-4 rounded-lg border border-red-500/40 bg-red-500/10 px-3.5 py-3 text-sm text-red-100">
         <div className="flex items-start gap-2.5">
@@ -384,7 +383,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
         </div>
         {shown.review_feedback && <div className="mt-3 rounded-xl border border-gray-700 bg-gray-800/60 p-3 text-sm text-gray-300"><div className="mb-1 text-xs font-semibold text-gray-500">Reviewer feedback</div>{shown.review_feedback}</div>}
         <PlanRunInputAudit runs={runs} version={shown} />
-      </> : <p className="mt-4 text-sm text-gray-500">No Version yet.</p>}
+      </> : <p className="mt-3 text-xs text-gray-500">No version has been produced yet.</p>}
 
       {!plan.read_only && <details className="mt-4 rounded-lg border border-gray-800 bg-gray-950/30 px-3 py-2 text-xs text-gray-400">
         <summary className="cursor-pointer font-medium text-gray-500">Technical details</summary>
@@ -436,7 +435,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       </div>}
 
       <div className="mt-4 flex flex-wrap gap-2">
-        {plan.target_task_id != null && onNavigateTask && <button type="button" disabled={busy} onClick={() => { if (plan.delivery_run_id != null) { onNavigateDelivery?.(plan.delivery_run_id); return; } onNavigateTask(plan.target_task_id!); onClose?.(); }} className="rounded-lg border border-indigo-500/40 px-3 py-2 text-xs text-indigo-300 transition-colors hover:border-indigo-400/60 hover:bg-indigo-500/10 disabled:pointer-events-none disabled:opacity-40">{plan.delivery_run_id != null ? `Open Delivery DLV-${plan.delivery_run_id}` : `Open related Task #${plan.target_task_id}`}</button>}
+        {plan.target_task_id != null && onNavigateTask && (plan.delivery_run_id == null || !embedded) && <button type="button" disabled={busy} onClick={() => { if (plan.delivery_run_id != null) { onNavigateDelivery?.(plan.delivery_run_id); return; } onNavigateTask(plan.target_task_id!); onClose?.(); }} className="rounded-lg border border-indigo-500/40 px-3 py-2 text-xs text-indigo-300 transition-colors hover:border-indigo-400/60 hover:bg-indigo-500/10 disabled:pointer-events-none disabled:opacity-40">{plan.delivery_run_id != null ? `Open Delivery DLV-${plan.delivery_run_id}` : `Open related Task #${plan.target_task_id}`}</button>}
         {!plan.read_only && !plan.active_run_id && latestFailedRun && <button type="button" disabled={busy} onClick={() => void mutate('Retrying planning', () => api.createPlanRun(plan.id, { run_type: 'retry', request: latestFailedRun.request_text || plan.initial_request, base_version_id: latestFailedRun.base_version_id || undefined, expected_current_version_id: plan.current_version_id || undefined, source_run_id: latestFailedRun.id }))} className="flex items-center gap-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-indigo-500 disabled:pointer-events-none disabled:opacity-40"><RefreshCw size={12} /> Retry planning</button>}
         {!plan.read_only && shown && current && plan.display_state === 'awaiting_review' && plan.target_task_id != null && <><button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void decide('approve', true)} className="flex items-center gap-1 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-emerald-500 disabled:pointer-events-none disabled:opacity-40"><Check size={12} /> Approve & attach v{shown.version_number}</button><button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void decide('approve')} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 transition-colors hover:border-emerald-400/60 hover:bg-emerald-500/10 disabled:pointer-events-none disabled:opacity-40">Approve v{shown.version_number} only</button><button type="button" disabled={busy} onClick={() => void decide('reject')} className="rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-300 transition-colors hover:border-red-400/60 hover:bg-red-500/10 disabled:pointer-events-none disabled:opacity-40">Reject v{shown.version_number}</button></>}
         {!plan.read_only && shown && current && plan.display_state === 'awaiting_review' && plan.target_task_id == null && <><button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void createExecution(true)} className="flex items-center gap-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-indigo-500 disabled:pointer-events-none disabled:opacity-40"><Play size={12} /> Approve v{shown.version_number} & create execution Task</button><button type="button" disabled={busy || staleness?.hard_conflict} onClick={() => void decide('approve')} className="rounded-lg border border-emerald-500/40 px-3 py-2 text-xs text-emerald-300 transition-colors hover:border-emerald-400/60 hover:bg-emerald-500/10 disabled:pointer-events-none disabled:opacity-40">Approve v{shown.version_number} only</button><button type="button" disabled={busy} onClick={() => void decide('reject')} className="rounded-lg border border-red-500/40 px-3 py-2 text-xs text-red-300 transition-colors hover:border-red-400/60 hover:bg-red-500/10 disabled:pointer-events-none disabled:opacity-40">Reject v{shown.version_number}</button></>}

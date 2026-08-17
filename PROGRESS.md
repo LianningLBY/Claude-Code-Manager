@@ -1224,3 +1224,9 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **解决**：标题区只保留 Delivery 上下文、Plan 标题和当前状态；Capability 归属改为单行弱提示；对话区改为无外层卡片的紧凑时间线；Delivery 子页面隐藏重复的 `Open Delivery` 操作；无版本状态改为简短空状态，保留技术详情在折叠区。
 - **避免复发**：首屏只放用户当前决策所需信息；生命周期、路由、审计和内部运行标识必须进入折叠或次级区域，避免把诊断信息当成主内容展示。
 - **验证**：Delivery/Plan Detail 定向前端测试 `26 passed`；TypeScript、Vite production build（4764 modules）和 PlanDetail ESLint 通过，`git diff --check` 通过。
+
+## 2026-08-17 — Delivery Plan 补回实时 Agent 活动（commit：本提交）
+
+- **问题**：首屏精简后只剩用户请求和 `Live`，Planner 没有公开输出时用户无法知道当前正在做什么。
+- **解决**：Delivery 将当前 headline、detail、角色、Provider/Model 和最近活动时间传入 Plan 子页；对话时间线在没有 Step 输出时展示紧凑的 Agent 活动消息，有输出时与现有 Planner/Reviewer 消息并存。
+- **验证**：Delivery/Plan Detail 定向前端测试 `26 passed`；TypeScript、Vite production build（4766 modules）通过，相关组件 ESLint 0 errors（仅保留既有 Hook warnings）。

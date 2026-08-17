@@ -895,6 +895,7 @@ export function DeliveryRunDialog({
                 embedded
                 contextLabel={`Delivery #${runId}`}
                 conversationRequest={run?.requirements}
+                activity={progress ? { headline: progress.headline, detail: progress.detail, last_activity_at: progress.last_activity_at, active_agent: progress.active_agent } : undefined}
               />
             ) : null}
           </div>

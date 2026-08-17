@@ -31,7 +31,7 @@ describe('DeliveryRunDialog', () => {
         { key: 'publishing', label: 'Publish PR', state: 'pending', summary: '', started_at: null, completed_at: null },
         { key: 'monitoring', label: 'CI & PR review', state: 'pending', summary: '', started_at: null, completed_at: null },
       ],
-      active_agent: null,
+      active_agent: { role: 'planner', provider: 'claude', model: 'claude-opus-4-6', effort: 'high', service_tier: null, status: 'running', activity_kind: 'planning', headline: 'Planner is reviewing the repository', detail: 'Reading the fixed revision and preparing the first draft.', started_at: null, first_output_at: null, last_activity_at: '2026-08-17T03:00:00Z', output_chars: 128 },
       events: [],
       plan_input: null,
       frontend_review: { policy: 'auto', run_id: null, status: null, stage: null, verdict: null, report: null, error: null, cleanup_status: null, evidence_archive_state: null, finding_count: 0, evidence_count: 0, skip_reason: null },

@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   isApiRequestError,
+  type DeliveryAgentActivity,
   type PlanInputRequest,
   type PlanResource,
   type PlanRun,
@@ -35,6 +36,12 @@ interface Props {
   embedded?: boolean;
   contextLabel?: string;
   conversationRequest?: string;
+  activity?: {
+    headline: string;
+    detail: string | null;
+    last_activity_at: string | null;
+    active_agent: DeliveryAgentActivity | null;
+  };
 }
 
 function uploadPayload(results: UploadResult[]) {
@@ -88,7 +95,7 @@ function uniqueRunError(run: PlanRun) {
   return normalized;
 }
 
-function PlanConversation({ plan, runs, request }: { plan: PlanResource; runs: PlanRun[]; request?: string }) {
+function PlanConversation({ plan, runs, request, activity }: { plan: PlanResource; runs: PlanRun[]; request?: string; activity?: Props['activity'] }) {
   const orderedRuns = [...runs].sort((left, right) => left.id - right.id);
   return (
     <section aria-label="Plan conversation" className="mt-3 space-y-3 border-t border-gray-800 pt-3 sm:mt-4 sm:pt-4">
@@ -103,6 +110,15 @@ function PlanConversation({ plan, runs, request }: { plan: PlanResource; runs: P
           <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide text-indigo-200">You</div>
           <div className="whitespace-pre-wrap leading-5">{request || plan.initial_request}</div>
         </div>
+        {activity && (activity.headline || activity.active_agent) && <div className="max-w-[min(76ch,92%)] rounded-2xl rounded-bl-sm border border-gray-800 bg-gray-900 px-3.5 py-2.5 text-sm text-gray-300">
+          <div className="mb-1 flex flex-wrap items-center gap-2 text-[10px]">
+            <span className="font-semibold uppercase tracking-wide text-indigo-300">{activity.active_agent ? activity.active_agent.role.replaceAll('_', ' ') : 'Planner'}</span>
+            {activity.active_agent?.provider && <span className="text-gray-500">{activity.active_agent.provider}{activity.active_agent.model ? ` · ${activity.active_agent.model}` : ''}</span>}
+            {activity.last_activity_at && <span className="text-gray-600">{activity.last_activity_at}</span>}
+          </div>
+          <p className="text-sm text-gray-200">{activity.headline}</p>
+          {activity.detail && <p className="mt-1 whitespace-pre-wrap text-xs leading-5 text-gray-500">{activity.detail}</p>}
+        </div>}
         {orderedRuns.map((run) => (
           <div key={run.id} className="space-y-3">
             {run.steps.map((step) => {
@@ -131,7 +147,7 @@ function PlanConversation({ plan, runs, request }: { plan: PlanResource; runs: P
   );
 }
 
-export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], onToggleVersion, onAttachVersion, onNavigateTask, onNavigateDelivery, embedded = false, contextLabel, conversationRequest }: Props) {
+export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], onToggleVersion, onAttachVersion, onNavigateTask, onNavigateDelivery, embedded = false, contextLabel, conversationRequest, activity }: Props) {
   const [versions, setVersions] = useState<PlanVersion[]>([]);
   const [runs, setRuns] = useState<PlanRun[]>([]);
   const [versionId, setVersionId] = useState<number | null>(plan.current_version_id);
@@ -359,7 +375,7 @@ export function PlanDetail({ plan, onRefresh, onClose, selectedVersionIds = [], 
       {showStaleness && staleness?.hard_conflict && <div className="mb-4 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300"><span className="font-semibold">This action is blocked.</span> {hardConflictMessages.join(' ')}</div>}
       {!plan.read_only && <CollapsiblePlanningRequest content={plan.initial_request} />}
 
-      <PlanConversation plan={plan} runs={runs} request={conversationRequest} />
+      <PlanConversation plan={plan} runs={runs} request={conversationRequest} activity={activity} />
 
       {activeRun?.status === 'waiting_user' && plan.open_input_request && <div className="mt-4"><PlanInputForm key={plan.open_input_request.id} run={activeRun} request={plan.open_input_request} onAnswered={answered} /></div>}
       {activeRun && <PlanRunInputAudit run={activeRun} title={`v${candidateVersionNumber} ${activeRun.run_type === 'user_revision' ? 'revision & input history' : 'input history'}`} defaultOpen />}

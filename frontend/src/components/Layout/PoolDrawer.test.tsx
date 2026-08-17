@@ -499,19 +499,19 @@ describe('PoolDrawer', () => {
       expect(api.getCodexPoolUsage).toHaveBeenCalledWith(false);
     });
 
-    it('adds an ApexRouter key as a Codex-only API account', async () => {
+    it('adds an ApexRouter key as a dual-provider API account', async () => {
       vi.mocked(api.createCloudRouterAccount).mockResolvedValue({
         ...apiAccount,
         id: 'apex-1',
-        name: 'Apex Codex',
+        name: 'Apex',
         api_provider: 'apex',
         auth_kind: 'apex_api',
         models: {
-          claude: [],
+          claude: ['claude-opus-4-8'],
           codex: ['gpt-5.4'],
         },
-        providers: ['codex'],
-        supported_models: ['gpt-5.4'],
+        providers: ['claude', 'codex'],
+        supported_models: ['claude-opus-4-8', 'gpt-5.4'],
         api_quota: {
           state: 'active',
           mode: 'shared_group',
@@ -541,19 +541,19 @@ describe('PoolDrawer', () => {
       await user.selectOptions(screen.getByLabelText('API 渠道'), 'apex');
 
       expect(screen.getByLabelText('ApexRouter API Key')).toBeInTheDocument();
-      expect(screen.getByText(/ApexRouter 仅用于 Codex/)).toBeInTheDocument();
-      expect(screen.getByText(/通过 \/v1\/models 验证 Key/)).toBeInTheDocument();
+      expect(screen.getByText(/自动识别该 Key 可用于 Claude、Codex 或两者/)).toBeInTheDocument();
+      expect(screen.getByText(/Anthropic Messages 与 OpenAI Responses/)).toBeInTheDocument();
       expect(screen.getByText(/额度通过 \/v1\/usage 获取/)).toBeInTheDocument();
       expect(screen.getByText(/剩余、上限与并发限制由同组 Key 共享/)).toBeInTheDocument();
       expect(screen.getByText(/当前不返回到期时间/)).toBeInTheDocument();
 
-      await user.type(screen.getByLabelText('账号名称'), 'Apex Codex');
+      await user.type(screen.getByLabelText('账号名称'), 'Apex');
       await user.type(screen.getByLabelText('ApexRouter API Key'), 'lck_test_only_not_real');
       await user.click(screen.getByRole('button', { name: '验证并添加' }));
 
       await waitFor(() => {
         expect(api.createCloudRouterAccount).toHaveBeenCalledWith({
-          name: 'Apex Codex',
+          name: 'Apex',
           api_key: 'lck_test_only_not_real',
           api_provider: 'apex',
         });

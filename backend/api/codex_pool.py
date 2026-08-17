@@ -1564,8 +1564,16 @@ def _persist_pool_settings(pool, values: dict) -> dict:
         data = {"accounts": []}
     data["pool_settings"] = values
     _write_private_json(pool_path, data)
-    pool.reload()
-    effective = pool.settings()
+    try:
+        pool.reload()
+        effective = pool.settings()
+    except Exception:
+        _restore_private_file(snapshot)
+        try:
+            pool.reload()
+        except Exception:
+            pass
+        raise
     if effective != values:
         _restore_private_file(snapshot)
         pool.reload()
@@ -1588,15 +1596,15 @@ async def codex_update_pool_settings(
     require_admin(request)
     pool = _get_pool()
     values = body.model_dump()
-    preferred = values["preferred_account_id"]
-    if preferred is not None:
-        account = pool.account(preferred)
-        if account is None or getattr(account, "retired", False):
-            raise HTTPException(404, f"Unknown account: {preferred}")
     if _login_lock.locked():
         raise HTTPException(409, "另一个 Codex 账号或号池配置操作正在进行中")
     await fence_worker_node_account_mutation(db)
     async with _login_lock:
+        preferred = values["preferred_account_id"]
+        if preferred is not None:
+            account = pool.account(preferred)
+            if account is None or getattr(account, "retired", False):
+                raise HTTPException(404, f"Unknown account: {preferred}")
         try:
             effective = _persist_pool_settings(pool, values)
             await db.commit()
@@ -2597,16 +2605,16 @@ async def codex_set_preferred(
     require_admin(request)
     pool = _get_pool()
     account_id = body.get("account_id")
-    if account_id is not None:
-        account = pool.account(account_id)
-        if account is None or getattr(account, "retired", False):
-            raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
     if _login_lock.locked():
         raise HTTPException(409, "另一个 Codex 账号或号池配置操作正在进行中")
     await fence_worker_node_account_mutation(db)
-    values = pool.settings()
-    values["preferred_account_id"] = account_id
     async with _login_lock:
+        if account_id is not None:
+            account = pool.account(account_id)
+            if account is None or getattr(account, "retired", False):
+                raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
+        values = pool.settings()
+        values["preferred_account_id"] = account_id
         try:
             effective = _persist_pool_settings(pool, values)
             await db.commit()

@@ -752,6 +752,9 @@ Agent、未知 PID、权限不足或清后仍达到触发线都会阻止新容�
 | `POOL_ENABLED` | `true` | 启用 Claude 账号池 |
 | `POOL_CONFIG_PATH` | `~/.claude-pool/accounts.json` | 账号池配置文件路径 |
 | `POOL_COOLDOWN_SECONDS` | `300` | 撞限账号的冷却时长（秒） |
+| `CODEX_POOL_ENABLED` | `true` | Codex 原生号池部署级总开关 |
+| `CODEX_POOL_CONFIG_PATH` | `~/.codex-pool/accounts.json` | Codex 账号与运行策略的私有持久化路径 |
+| `CODEX_POOL_COOLDOWN_SECONDS` | `300` | 旧配置未保存在线策略时的 Codex 冷却默认值 |
 
 号池默认启用。首次启动时，如果 `accounts.json` 不存在但 `~/.claude/.credentials.json` 有有效凭证，系统会自动将默认账号加入号池。
 
@@ -760,6 +763,12 @@ Agent、未知 PID、权限不足或清后仍达到触发线都会阻止新容�
 - 点击 **+** 添加新账号（需要邮箱 + 接码 token）
 - 刷新 OAuth Token / 重新登录
 - 手动切换首选账号
+
+Codex 页签右上角的设置按钮可在线修改并立即生效：启用/暂停账号路由、撞限冷却时间、
+主动换号阈值，以及新会话使用 API 优先或 OAuth 优先。在线策略和首选账号保存在
+`CODEX_POOL_CONFIG_PATH` 指向的 `0600` 私有 JSON 中，重启后继续生效；配置文件路径和
+部署级总开关仍由环境变量管理。暂停只阻止后续 Codex 回合，不中断正在执行的进程，
+也不会绕过号池回落到默认 `CODEX_HOME`。
 
 多账号时，撞限或认证失败会自动换号，通过硬链接 session 目录实现无缝 `--resume`。
 

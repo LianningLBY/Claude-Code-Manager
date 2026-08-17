@@ -146,6 +146,21 @@ def test_task_distill_prompt_treats_conversation_as_data():
     assert "--- 对话记录 ---" in prompt
 
 
+def test_codex_distill_refuses_default_account_when_pool_is_paused():
+    pool = MagicMock()
+    pool.enabled = False
+
+    with pytest.raises(
+        skill_distill_module.CodexDistillAccountUnavailableError,
+        match="paused",
+    ):
+        skill_distill_module._select_codex_distill_home(
+            pool,
+            bound_account_id=None,
+            model="gpt-5.5",
+        )
+
+
 @pytest.mark.asyncio
 async def test_claude_task_distill_keeps_existing_json_result_path(monkeypatch):
     monkeypatch.setenv(

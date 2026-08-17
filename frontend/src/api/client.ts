@@ -2017,7 +2017,16 @@ export interface CodexPoolUsageStatus {
   disabled: number;
   preferred: string | null;
   last_selected?: string | null;
+  settings: CodexPoolSettings;
   accounts: CodexPoolAccountUsage[];
+}
+
+export interface CodexPoolSettings {
+  enabled: boolean;
+  cooldown_seconds: number;
+  quota_switch_threshold_percent: number;
+  routing_policy: 'api_first' | 'native_first';
+  preferred_account_id: string | null;
 }
 
 export type CodexLoginStatusName =
@@ -3294,6 +3303,9 @@ export const api = {
   // Codex Pool
   getCodexPoolStatus: () => request<CodexPoolUsageStatus>('/api/codex-pool/status'),
   getCodexPoolUsage: (force?: boolean) => request<CodexPoolUsageStatus>('/api/codex-pool/usage' + (force ? '?force=true' : '')),
+  getCodexPoolSettings: () => request<CodexPoolSettings>('/api/codex-pool/settings'),
+  putCodexPoolSettings: (settings: CodexPoolSettings) =>
+    request<CodexPoolSettings>('/api/codex-pool/settings', { method: 'PUT', body: JSON.stringify(settings) }),
   clearCodexPoolCooldown: (accountId: string) =>
     request<{ ok: boolean }>(`/api/codex-pool/accounts/${accountId}/clear-cooldown`, { method: 'POST' }),
   setCodexPoolPreferred: (accountId: string | null) =>

@@ -15,11 +15,14 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import require_admin
+from backend.database import get_db
 from backend.services.codex_app_server import CodexAppServerBusyError
 from backend.services.cancellation import (
     await_task_completion,
@@ -34,6 +37,9 @@ from backend.services.login_runtime import (
 from backend.services.process_safety import (
     UnsafeProcessGroupError,
     require_safe_process_group_id,
+)
+from backend.services.worker_node_control import (
+    fence_worker_node_account_mutation,
 )
 
 router = APIRouter(prefix="/api/codex-pool", tags=["codex-pool"])
@@ -1505,6 +1511,13 @@ def _disabled_pool_status() -> dict:
         "disabled": 0,
         "preferred": None,
         "last_selected": None,
+        "settings": {
+            "enabled": False,
+            "cooldown_seconds": 300,
+            "quota_switch_threshold_percent": 90.0,
+            "routing_policy": "api_first",
+            "preferred_account_id": None,
+        },
         "accounts": [],
     }
 
@@ -1527,6 +1540,78 @@ def _get_dispatcher():
 async def codex_pool_status():
     pool = _get_optional_pool()
     return pool.status() if pool else _disabled_pool_status()
+
+
+class CodexPoolSettingsBody(BaseModel):
+    enabled: bool = True
+    cooldown_seconds: int = Field(ge=1, le=8 * 24 * 60 * 60)
+    quota_switch_threshold_percent: float = Field(ge=1, le=100)
+    routing_policy: Literal["api_first", "native_first"] = "api_first"
+    preferred_account_id: str | None = None
+
+
+def _persist_pool_settings(pool, values: dict) -> dict:
+    """Atomically persist validated policy beside the native account list."""
+
+    pool_path = _pool_config_path(pool)
+    snapshot = _snapshot_private_file(pool_path)
+    if snapshot["existed"]:
+        original_bytes = base64.b64decode(snapshot["content_b64"], validate=True)
+        data = json.loads(original_bytes.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise RuntimeError("Invalid Codex pool config")
+    else:
+        data = {"accounts": []}
+    data["pool_settings"] = values
+    _write_private_json(pool_path, data)
+    try:
+        pool.reload()
+        effective = pool.settings()
+    except Exception:
+        _restore_private_file(snapshot)
+        try:
+            pool.reload()
+        except Exception:
+            pass
+        raise
+    if effective != values:
+        _restore_private_file(snapshot)
+        pool.reload()
+        raise RuntimeError("Codex pool settings could not be activated")
+    return effective
+
+
+@router.get("/settings")
+async def codex_pool_settings(request: Request):
+    require_admin(request)
+    return _get_pool().settings()
+
+
+@router.put("/settings")
+async def codex_update_pool_settings(
+    request: Request,
+    body: CodexPoolSettingsBody,
+    db: AsyncSession = Depends(get_db),
+):
+    require_admin(request)
+    pool = _get_pool()
+    values = body.model_dump()
+    if _login_lock.locked():
+        raise HTTPException(409, "另一个 Codex 账号或号池配置操作正在进行中")
+    await fence_worker_node_account_mutation(db)
+    async with _login_lock:
+        preferred = values["preferred_account_id"]
+        if preferred is not None:
+            account = pool.account(preferred)
+            if account is None or getattr(account, "retired", False):
+                raise HTTPException(404, f"Unknown account: {preferred}")
+        try:
+            effective = _persist_pool_settings(pool, values)
+            await db.commit()
+            return effective
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            logger.exception("Failed to update Codex pool settings")
+            raise HTTPException(500, "Codex 号池配置保存失败") from exc
 
 
 @router.get("/usage")
@@ -2505,7 +2590,11 @@ async def codex_delete_account(request: Request, account_id: str):
 # ---------------------------------------------------------------------------
 
 @router.post("/preferred")
-async def codex_set_preferred(request: Request, body: dict):
+async def codex_set_preferred(
+    request: Request,
+    body: dict,
+    db: AsyncSession = Depends(get_db),
+):
     """Pin a Codex route, or clear it to restore automatic selection.
 
     A compatible available pin takes effect on the next turn. Existing native
@@ -2516,6 +2605,20 @@ async def codex_set_preferred(request: Request, body: dict):
     require_admin(request)
     pool = _get_pool()
     account_id = body.get("account_id")
-    if not pool.set_preferred(account_id):
-        raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
-    return {"ok": True, "preferred": pool.preferred_account_id}
+    if _login_lock.locked():
+        raise HTTPException(409, "另一个 Codex 账号或号池配置操作正在进行中")
+    await fence_worker_node_account_mutation(db)
+    async with _login_lock:
+        if account_id is not None:
+            account = pool.account(account_id)
+            if account is None or getattr(account, "retired", False):
+                raise HTTPException(status_code=404, detail=f"Unknown account: {account_id}")
+        values = pool.settings()
+        values["preferred_account_id"] = account_id
+        try:
+            effective = _persist_pool_settings(pool, values)
+            await db.commit()
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            logger.exception("Failed to persist preferred Codex account")
+            raise HTTPException(500, "Codex 优先账号保存失败") from exc
+    return {"ok": True, "preferred": effective["preferred_account_id"]}

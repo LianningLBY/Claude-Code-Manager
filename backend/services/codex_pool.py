@@ -66,6 +66,11 @@ DEFAULT_COOLDOWN_SECONDS = 300
 QUOTA_CACHE_TTL = 120  # seconds
 QUOTA_SWITCH_THRESHOLD_PERCENT = 90.0
 PROACTIVE_QUOTA_MAX_COOLDOWN_SECONDS = 8 * 24 * 60 * 60
+MIN_COOLDOWN_SECONDS = 1
+MAX_COOLDOWN_SECONDS = 8 * 24 * 60 * 60
+MIN_QUOTA_SWITCH_THRESHOLD_PERCENT = 1.0
+MAX_QUOTA_SWITCH_THRESHOLD_PERCENT = 100.0
+ROUTING_POLICIES = frozenset({"api_first", "native_first"})
 _SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _MODELS_CACHE_MAX_BYTES = 4 * 1024 * 1024
 _MODELS_CACHE_MAX_MODELS = 2048
@@ -426,7 +431,11 @@ class CodexPool:
             self._config_path = Path(os.path.expandvars(os.path.expanduser(str(config_path))))
         else:
             self._config_path = DEFAULT_CONFIG_PATH
+        self._default_cooldown_seconds = cooldown_seconds
         self._cooldown_seconds = cooldown_seconds
+        self._enabled = True
+        self._quota_switch_threshold_percent = QUOTA_SWITCH_THRESHOLD_PERCENT
+        self._routing_policy = "api_first"
         self._accounts: list[CodexPoolAccount] = []
         self._cooldowns: dict[str, float] = {}
         self._terminal_failures: set[str] = set()
@@ -449,7 +458,63 @@ class CodexPool:
 
     @property
     def enabled(self) -> bool:
-        return True
+        return self._enabled
+
+    def settings(self) -> dict:
+        """Return the effective, non-secret runtime pool policy."""
+
+        return {
+            "enabled": self._enabled,
+            "cooldown_seconds": self._cooldown_seconds,
+            "quota_switch_threshold_percent": self._quota_switch_threshold_percent,
+            "routing_policy": self._routing_policy,
+            "preferred_account_id": self._preferred_account_id,
+        }
+
+    def _load_settings(self, data: dict) -> None:
+        raw = data.get("pool_settings") or {}
+        if not isinstance(raw, dict):
+            raise ValueError("Codex pool_settings must be an object")
+
+        enabled = raw.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise ValueError("Codex pool enabled must be a boolean")
+
+        cooldown = raw.get("cooldown_seconds", self._default_cooldown_seconds)
+        if isinstance(cooldown, bool) or not isinstance(cooldown, int):
+            raise ValueError("Codex pool cooldown_seconds must be an integer")
+        if not MIN_COOLDOWN_SECONDS <= cooldown <= MAX_COOLDOWN_SECONDS:
+            raise ValueError("Codex pool cooldown_seconds is outside the supported range")
+
+        threshold = raw.get(
+            "quota_switch_threshold_percent",
+            QUOTA_SWITCH_THRESHOLD_PERCENT,
+        )
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+            raise ValueError("Codex pool quota_switch_threshold_percent must be numeric")
+        threshold = float(threshold)
+        if not math.isfinite(threshold) or not (
+            MIN_QUOTA_SWITCH_THRESHOLD_PERCENT
+            <= threshold
+            <= MAX_QUOTA_SWITCH_THRESHOLD_PERCENT
+        ):
+            raise ValueError(
+                "Codex pool quota_switch_threshold_percent is outside the supported range"
+            )
+
+        routing_policy = raw.get("routing_policy", "api_first")
+        if routing_policy not in ROUTING_POLICIES:
+            raise ValueError(f"Unsupported Codex pool routing policy: {routing_policy!r}")
+
+        preferred = raw.get("preferred_account_id", self._preferred_account_id)
+        if preferred is not None and not isinstance(preferred, str):
+            raise ValueError("Codex pool preferred_account_id must be a string or null")
+
+        self._enabled = enabled
+        self._cooldown_seconds = cooldown
+        self._quota_switch_threshold_percent = threshold
+        self._routing_policy = routing_policy
+        self._preferred_account_id = preferred or None
 
     def _load(self):
         if self._include_native and not self._config_path.exists():
@@ -463,10 +528,12 @@ class CodexPool:
         try:
             data = (
                 json.loads(self._config_path.read_text(encoding="utf-8"))
-                if self._include_native and self._config_path.exists()
+                if self._config_path.exists()
                 else {"accounts": []}
             )
-            accounts = [CodexPoolAccount(a) for a in data.get("accounts", [])]
+            self._load_settings(data)
+            native_records = data.get("accounts", []) if self._include_native else []
+            accounts = [CodexPoolAccount(a) for a in native_records]
             if self._cloudrouter_store is not None:
                 known_ids = {account.id for account in accounts}
                 known_homes = {account.codex_home for account in accounts}
@@ -789,6 +856,7 @@ class CodexPool:
             "preferred": self._preferred_account_id,
             "last_selected": self._last_selected_id,
             "last_selected_at": self._last_selected_at or None,
+            "settings": self.settings(),
             "accounts": accounts,
         }
 
@@ -815,6 +883,8 @@ class CodexPool:
         service_tier: str = "default",
     ) -> str | None:
         """Pick an available CODEX_HOME. Returns None if all exhausted."""
+        if not self.enabled:
+            return None
         now = time.time()
         excluded = exclude or set()
         requested_tier = _normalize_service_tier(service_tier)
@@ -877,11 +947,12 @@ class CodexPool:
             for account in candidates
             if not _is_api_auth_kind(account.auth_kind)
         ]
-        for group in (
-            verified_api_candidates,
-            native_candidates,
-            unknown_api_candidates,
-        ):
+        groups = (
+            (native_candidates, verified_api_candidates, unknown_api_candidates)
+            if self._routing_policy == "native_first"
+            else (verified_api_candidates, native_candidates, unknown_api_candidates)
+        )
+        for group in groups:
             chosen = self._round_robin_candidate(group)
             if chosen is not None:
                 return self._record_selection(chosen, now)
@@ -1279,7 +1350,7 @@ class CodexPool:
         self,
         current_home: str,
         *,
-        threshold: float = QUOTA_SWITCH_THRESHOLD_PERCENT,
+        threshold: float | None = None,
         model: str | None = None,
         service_tier: str = "default",
     ) -> str | None:
@@ -1291,6 +1362,10 @@ class CodexPool:
         with no usable alternative simply continues on the current account.
         """
 
+        if not self.enabled:
+            return None
+        if threshold is None:
+            threshold = self._quota_switch_threshold_percent
         current_id = self.account_id_for_home(current_home)
         if not current_id:
             return None

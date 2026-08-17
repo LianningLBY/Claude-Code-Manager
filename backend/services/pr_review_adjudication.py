@@ -22,6 +22,8 @@ from backend.models.pr_monitor import (
     PRFindingRebuttal,
     PRMonitorRun,
     PRReview,
+    pr_monitor_run_has_terminal_intent,
+    pr_monitor_run_no_terminal_intent_predicate,
 )
 from backend.models.task import Task
 from backend.services.cancellation import finish_awaitable
@@ -1186,17 +1188,65 @@ async def _claim_fixed_resolution(
     finding_id: int,
 ) -> _ResolutionClaim | None:
     async with db_factory() as db:
-        run = await db.get(PRMonitorRun, run_id, populate_existing=True)
-        current = await db.get(
-            PRReview, current_review_id, populate_existing=True
+        run_probe = await db.get(PRMonitorRun, run_id)
+        finding_probe = await db.get(PRFinding, finding_id)
+        if run_probe is None or finding_probe is None:
+            await db.rollback()
+            return None
+        repo_id = run_probe.repo_id
+        source_review_id = finding_probe.pr_review_id
+        await db.rollback()
+
+        # Every terminal webhook takes the repository boundary before the Run.
+        # The no-op UPDATE gives SQLite the same portable writer fence that row
+        # locks provide on PostgreSQL/MySQL, then all policy rows follow the
+        # shared Repo -> Run -> Review -> Finding order.
+        guarded = await db.execute(
+            update(MonitoredRepo)
+            .where(MonitoredRepo.id == repo_id)
+            .values(updated_at=MonitoredRepo.updated_at)
+            .execution_options(synchronize_session=False)
         )
-        finding = await db.get(PRFinding, finding_id, populate_existing=True)
-        source_review = await db.get(
-            PRReview, finding.pr_review_id, populate_existing=True
-        ) if finding is not None else None
-        repo = await db.get(
-            MonitoredRepo, run.repo_id, populate_existing=True
-        ) if run is not None else None
+        if guarded.rowcount != 1:
+            await db.rollback()
+            return None
+        repo = (await db.execute(
+            select(MonitoredRepo)
+            .where(MonitoredRepo.id == repo_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        run = (await db.execute(
+            select(PRMonitorRun)
+            .where(PRMonitorRun.id == run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalar_one_or_none()
+        review_rows = list((await db.execute(
+            select(PRReview)
+            .where(PRReview.id.in_({current_review_id, source_review_id}))
+            .order_by(PRReview.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalars())
+        reviews = {item.id: item for item in review_rows}
+        current = reviews.get(current_review_id)
+        source_review = reviews.get(source_review_id)
+        finding_rows = list((await db.execute(
+            select(PRFinding)
+            .where(or_(
+                PRFinding.id == finding_id,
+                and_(
+                    PRFinding.pr_review_id == current_review_id,
+                    PRFinding.severity.in_(("critical", "high", "medium")),
+                ),
+            ))
+            .order_by(PRFinding.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )).scalars())
+        finding_by_id = {item.id: item for item in finding_rows}
+        finding = finding_by_id.get(finding_id)
         if (
             run is None
             or current is None
@@ -1205,6 +1255,7 @@ async def _claim_fixed_resolution(
             or repo is None
             or repo.enabled is not True
             or repo.review_mode != "panel"
+            or pr_monitor_run_has_terminal_intent(run)
             or run.status != "resolving_fixed_threads"
             or run.current_review_id != current.id
             or run.current_head_sha != current.head_sha
@@ -1225,10 +1276,12 @@ async def _claim_fixed_resolution(
             )
         ):
             return None
-        current_blockers = list((await db.execute(select(PRFinding).where(
-            PRFinding.pr_review_id == current.id,
-            PRFinding.severity.in_(("critical", "high", "medium")),
-        ))).scalars())
+        current_blockers = [
+            item
+            for item in finding_rows
+            if item.pr_review_id == current.id
+            and item.severity in ("critical", "high", "medium")
+        ]
         if any(
             item.status == "open" or item.thread_status != "resolved"
             for item in current_blockers
@@ -1285,6 +1338,15 @@ async def _claim_rebuttal_resolution(
         # The discovery query takes no row locks.  Restart the transaction and
         # acquire every policy row in the shared Repo→Run→Review→Finding order.
         await db.rollback()
+        guarded = await db.execute(
+            update(MonitoredRepo)
+            .where(MonitoredRepo.id == repo_id)
+            .values(updated_at=MonitoredRepo.updated_at)
+            .execution_options(synchronize_session=False)
+        )
+        if guarded.rowcount != 1:
+            await db.rollback()
+            return None
         repo = (await db.execute(
             select(MonitoredRepo)
             .where(MonitoredRepo.id == repo_id)
@@ -1320,11 +1382,21 @@ async def _claim_rebuttal_resolution(
             .with_for_update()
         )).scalar_one_or_none()
         if (
+            run is not None
+            and rebuttal is not None
+            and pr_monitor_run_has_terminal_intent(run)
+        ):
+            rebuttal.status = "superseded"
+            rebuttal.completed_at = datetime.utcnow()
+            await db.commit()
+            return None
+        if (
             finding is None
             or review is None
             or run is None
             or repo is None
             or rebuttal is None
+            or pr_monitor_run_has_terminal_intent(run)
             or rebuttal.status != "accepted"
             or rebuttal.finding_id != finding.id
             or rebuttal.pr_review_id != review.id
@@ -1817,6 +1889,7 @@ async def _finish_fixed_resolution_gate(
             or current is None
             or repo.enabled is not True
             or repo.review_mode != "panel"
+            or pr_monitor_run_has_terminal_intent(run)
             or run.repo_id != repo.id
             or run.status != "resolving_fixed_threads"
             or run.current_review_id != current.id
@@ -1938,6 +2011,7 @@ async def reconcile_fixed_finding_resolutions(db_factory) -> int:
     async with db_factory() as db:
         run_ids = list((await db.execute(
             select(PRMonitorRun.id).where(
+                pr_monitor_run_no_terminal_intent_predicate(),
                 PRMonitorRun.status.in_((
                     "resolving_fixed_threads",
                     # Upgrade recovery for a run released by an older Manager

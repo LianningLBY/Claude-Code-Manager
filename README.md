@@ -61,7 +61,7 @@ Web 端调度和管理多个 Claude Code 实例并行工作。灵感来自胡渊
 
 ### 项目与协作
 - **项目管理** — 支持 clone 已有仓库（有 remote）和本地 git init（无 remote），创建任务时可直接新建项目
-- **PR Monitor** — 以 exact-head CI 和隔离 Reviewer Panel 审核 GitHub PR；每条 Finding 可审计记录忽略/人工建议，或由 tool-free Task 生成限定范围的候选 diff。AI 候选必须先经后端下载回执绑定用户、Action 与 patch hash，再由用户明确确认，后端才会对仍匹配的 PR 源分支执行 exact-old compare-and-swap push；任何 Finding 操作都不能绕过 Panel Gate
+- **PR Monitor** — 以 exact-head CI 和隔离 Reviewer Panel 审核 GitHub PR；内部 Reviewer/Fix/Rebuttal Task 始终隐藏，Tasks 页面改为展示一张按 `PRMonitorRun` 聚合的只读结果卡，可直接看到代码 verdict、GitHub 发布状态、PR 生命周期和后端发布身份，并进入完整 Review History。每条 Finding 可审计记录忽略/人工建议，或由 tool-free Task 生成限定范围的候选 diff。AI 候选必须先经后端下载回执绑定用户、Action 与 patch hash，再由用户明确确认，后端才会对仍匹配的 PR 源分支执行 exact-old compare-and-swap push；任何 Finding 操作都不能绕过 Panel Gate
 - **PWA** — 手机浏览器 Add to Home Screen，原生 App 体验
 - **Android App** — 通过 Capacitor 打包原生 APK，App 内可配置远程服务器地址
 - **主题切换** — v2 主题系统：现代深色（默认，Multica 风格）/ 现代浅色（tonal zinc 灰调分层）/ 飞书（官方色板 + 真实 App 截图取色实证：白底为主 + 经典飞书蓝 #3370FF + N 系中性色 + 低边框风，与浅色主题以「白 vs 灰」区分，飞书客户端式窄图标 rail + IconPark 双色图标集）/ 苹果（apple-design skill 驱动：iOS systemGray 中性色 + apple.com CTA 蓝 #0071E3 + 系统字体优先 + 毛玻璃顶栏 + 按压反馈 + macOS Settings 式侧栏与 Ionicons 图标集，尊重 reduced-motion/transparency），v1 的经典深色、海蓝、森林、莓红完整保留为 Legacy 组，偏好持久化
@@ -468,6 +468,7 @@ cd frontend && npm run build && cd ..  # 4. 重建前端
 3. 点击任务的 **Chat** 按钮，可以对已完成的任务继续追问
 4. 启用 Monitor 的任务中，Agent 可自主创建持久监控子 Agent，Task 列表显示活跃子 Agent 数量
 5. 可在任务卡片菜单添加一个关注标签，或直接点击任务卡片/Chat 顶栏中的标签修改；清空并保存即可移除
+6. PR Monitor 接管的 PR 会在 Tasks 中显示独立的只读 **PR Review Result** 卡；Panel 只显示一张聚合卡，点击后进入 PR Monitor 详情或 GitHub。该卡不是可执行 Task，没有 Chat、Task Retry、中断、分享或内部 prompt/session 日志
 
 ### Interactive Plans
 
@@ -504,7 +505,8 @@ API key、access token 和 private key 等高置信凭据必须存入 Settings �
 
 ### PR Monitor 前置条件
 
-PR Monitor 的审核流程会在后端 shell out 调用 `gh pr view` / `gh pr review` / `gh pr merge`，使用前需满足：
+PR Monitor 的审核流程会由后端通过 `gh pr view` / `gh api` 读取 exact-head PR 状态、
+发布 `COMMENT` Review，并在显式开启自动合并时执行受保护的 exact-ref fast-forward，使用前需满足：
 
 1. **gh CLI 已认证**：运行后端的系统用户必须先执行 `gh auth login` 完成 GitHub 认证
 2. **账号权限**：该 GitHub 账号需要对被监控仓库有 push / review 权限（auto-merge 还需要 merge 权限）
@@ -514,6 +516,22 @@ PR Monitor 的审核流程会在后端 shell out 调用 `gh pr view` / `gh pr re
 Delivery 推送分支和创建 PR 需要相应的 PR 与仓库写权限；只有启用自动合并时，
 才额外要求 CCM 登录账号可被证明为 `write`、`maintain` 或 `admin` collaborator，
 并满足目标分支保护门禁。
+
+这里的“GitHub 账号”专指**运行 CCM 后端的系统用户**在 `gh` 中登录的账号。浏览器中的 GitHub
+Connector、当前 Codex 会话或 Reviewer thread 的登录状态与它互相独立，也不会被拿来发布 Review。
+Reviewer 始终 tool-free；GitHub 写操作由后端执行并保存实际 actor、发布时间、GitHub Review 链接与
+`COMMENT` event 证据。内部 verdict 为 pass 不代表 GitHub `APPROVED`：CCM 新建的 GitHub Review 恒为
+head-pinned `COMMENT`。
+
+代码结论、发布状态和 PR 生命周期会分别显示。例如 Reviewer 已给出 Changes required，但 PR 在发布前
+被外部合并时，结果仍保留 Changes required，并显示“PR 已合并 · 结果未发布（不再适用）”，不会误报
+`Infrastructure error`。详情页可用 **重新审查** 对当前 exact head 创建新 attempt；head 已变化、PR 已关闭/
+合并或进入 draft 时会拒绝，旧 Review History 不会被覆盖。升级前没有可靠 Run 快照的历史 Single Review
+会以只读 `review:<id>` 结果保留，不能重新审查；只有绑定 current Run、并通过远端 open/non-draft/exact-head
+复验的 `run:<id>` 结果才允许该操作。`closed` Webhook 只负责按 GitHub 远端事实收口为 closed 或 merged，
+不会把已关闭 PR 重新送入审核；之后只有 GitHub 实际 `reopened`/`ready_for_review` 才会重新准入 current subject。
+若该 Run 已由 Delivery Loop 的 durable owner edge 接管，上述 reopen/ready 以及 `synchronize` 都会返回 409，
+不会替换 current Review、清除终态证据或把 Delivery 冻结策略降级成可变的普通 PR Monitor 配置。
 
 ### Delivery Loop 快速启动
 
@@ -610,6 +628,9 @@ Worker 系统支持将任务分发到远程 EC2 实例执行，适合需要更�
 | | `POST /api/tasks/{id}/monitor-sessions/{sid}/checks` | 子 agent 报告状态 |
 | | `POST /api/tasks/{id}/monitor-sessions/{sid}/complete` | 子 agent 标记完成 |
 | Sub-Agents | `GET /api/tasks/{id}/sub-agents/summary` | 子 agent 按类型汇总 |
+| PR Monitor | `GET /api/pr-monitor/results?page=&size=` | Tasks 使用的只读 Run 聚合结果 feed |
+| | `GET /api/pr-monitor/runs/{id}` | PR 生命周期、Review History 与公开 evidence 详情 |
+| | `POST /api/pr-monitor/reviews/{review_id}/rerun` | 携 `expected_head_sha` 与 `idempotency_key` 重审 current exact head |
 | Workers | `GET/POST /api/workers` | Worker 列表/创建 |
 | | `GET /api/workers/{id}` | Worker 详情 |
 | | `GET /api/workers/{id}/logs` | Bootstrap 日志 |

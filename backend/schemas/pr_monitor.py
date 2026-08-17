@@ -5,6 +5,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 from backend.config import settings
+from backend.pr_review_evidence import PR_REVIEW_INPUT_ERROR_MAX_SAFE_INTEGER
 
 _GITHUB_REPO_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 
@@ -241,6 +242,8 @@ class MonitoredRepoSecretResponse(MonitoredRepoResponse):
 
 class PRReviewResponse(BaseModel):
     id: int
+    attempt: int = 1
+    rerun_of_review_id: int | None = None
     monitor_run_id: int | None = None
     repo_id: int
     pr_number: int
@@ -257,6 +260,7 @@ class PRReviewResponse(BaseModel):
     # instead of treating the legacy first Task as the whole review.
     task_ids: list[int] = Field(default_factory=list)
     status: str
+    code_verdict: Literal["pass", "changes_required"] | None = None
     review_summary: str | None
     display_status: str | None = None
     display_summary: str | None = None
@@ -267,6 +271,56 @@ class PRReviewResponse(BaseModel):
         "lifecycle",
     ] = "in_progress"
     aggregate_verdict: Literal["pass", "changes_required"] | None = None
+    verdict_state: Literal["pending", "complete", "unavailable"] = "pending"
+    publication_state: Literal[
+        "not_started",
+        "publishing",
+        "reconciling",
+        "published",
+        "failed",
+        "not_applicable",
+    ] = "not_started"
+    lifecycle_state: Literal[
+        "unknown",
+        "reviewing",
+        "superseding",
+        "superseded",
+        "cancelled",
+        "merged",
+        "closed",
+        "failed",
+    ] = "reviewing"
+    failure_stage: Literal[
+        "reviewer",
+        "ci",
+        "github_identity",
+        "publication",
+        "merge",
+        "recovery",
+        "lifecycle",
+    ] | None = None
+    publication_error: str | None = None
+    error_category: Literal["unsupported_input_size"] | None = None
+    error_measured: int | None = Field(
+        default=None,
+        ge=1,
+        le=PR_REVIEW_INPUT_ERROR_MAX_SAFE_INTEGER,
+    )
+    error_limit: int | None = Field(
+        default=None,
+        ge=1,
+        le=PR_REVIEW_INPUT_ERROR_MAX_SAFE_INTEGER,
+    )
+    error_unit: Literal["characters", "UTF-8 bytes"] | None = None
+    published_actor: str | None = None
+    published_at: datetime | None = None
+    github_review_id: int | None = None
+    github_review_url: str | None = None
+    github_state: str | None = None
+    # CCM always emits informational, exact-head GitHub Reviews.  A passing
+    # code verdict must never be presented as a GitHub APPROVE mutation.
+    github_event: Literal["COMMENT"] | None = None
+    can_rerun: bool = False
     reviewer_count: int = 0
     reviewer_status_counts: dict[str, int] = Field(default_factory=dict)
     reviewer_verdict_counts: dict[str, int] = Field(default_factory=dict)
@@ -432,6 +486,115 @@ class PRReviewerRunResponse(BaseModel):
 class PRReviewDetailResponse(PRReviewResponse):
     reviewer_runs: list[PRReviewerRunResponse] = Field(default_factory=list)
     is_current_snapshot: bool = False
+
+
+class PRReviewRerunRequest(BaseModel):
+    expected_head_sha: str = Field(pattern=r"[0-9a-fA-F]{40}")
+    idempotency_key: str = Field(min_length=8, max_length=64)
+
+    @field_validator("expected_head_sha")
+    @classmethod
+    def normalize_expected_head_sha(cls, value: str) -> str:
+        return value.lower()
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def validate_rerun_idempotency_key(cls, value: str) -> str:
+        if re.fullmatch(r"[A-Za-z0-9._:-]+", value) is None:
+            raise ValueError("idempotency_key contains unsafe characters")
+        return value
+
+    model_config = {"extra": "forbid"}
+
+
+class PRReviewRerunResponse(BaseModel):
+    """Narrow receipt for a newly admitted exact-head review attempt.
+
+    The ordinary Tasks result surface may invoke this mutation, so the
+    response must not reuse ``PRReviewResponse`` and accidentally disclose
+    internal Reviewer Task identities or execution metadata.
+    """
+
+    id: int
+    attempt: int = Field(ge=1)
+    rerun_of_review_id: int
+    monitor_run_id: int
+    status: str
+    head_sha: str = Field(pattern=r"[0-9a-f]{40}")
+
+
+class PRResultFeedItem(BaseModel):
+    # Stable across pagination and suitable for React/Map identity. Historical
+    # Single reviews created before PRMonitorRun attachment use ``review:<id>``.
+    result_key: str = Field(pattern=r"^(run|review):[1-9][0-9]*$")
+    run_id: int | None
+    repo_id: int
+    repo_full_name: str
+    pr_number: int
+    pr_title: str
+    pr_url: str
+    review_id: int
+    base_ref: str | None
+    base_sha: str | None
+    head_sha: str | None
+    verdict_state: Literal["pending", "complete", "unavailable"]
+    aggregate_verdict: Literal["pass", "changes_required"] | None
+    publication_state: Literal[
+        "not_started",
+        "publishing",
+        "reconciling",
+        "published",
+        "failed",
+        "not_applicable",
+    ]
+    lifecycle_state: Literal[
+        "unknown",
+        "reviewing",
+        "superseding",
+        "superseded",
+        "cancelled",
+        "merged",
+        "closed",
+        "failed",
+    ]
+    failure_stage: Literal[
+        "reviewer",
+        "ci",
+        "github_identity",
+        "publication",
+        "merge",
+        "recovery",
+        "lifecycle",
+    ] | None
+    error_category: Literal["unsupported_input_size"] | None
+    error_measured: int | None = Field(
+        ge=1,
+        le=PR_REVIEW_INPUT_ERROR_MAX_SAFE_INTEGER,
+    )
+    error_limit: int | None = Field(
+        ge=1,
+        le=PR_REVIEW_INPUT_ERROR_MAX_SAFE_INTEGER,
+    )
+    error_unit: Literal["characters", "UTF-8 bytes"] | None
+    display_status: str
+    display_summary: str | None
+    published_actor: str | None
+    published_at: datetime | None
+    github_review_id: int | None
+    github_review_url: str | None
+    github_state: str | None
+    github_event: Literal["COMMENT"] | None
+    created_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+    can_rerun: bool
+
+
+class GitHubPublisherIdentityResponse(BaseModel):
+    available: bool
+    actor: str | None
+    error: str | None
+    checked_at: datetime
 
 
 class PRMonitorBindRequest(BaseModel):

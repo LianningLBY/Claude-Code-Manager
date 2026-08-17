@@ -1,8 +1,8 @@
 # CCM PR Monitor：从 CI、AI Review 到自动修复与合并
 
 - 文档状态：闭环主体已编码，并通过本地假 GitHub 回归及个人私有 GitHub PR 的 CI失败反馈、原Agent自动修复、Reviewer反馈、再次自动修复和Thread清零联调；真实 Merge Queue 待组织仓库验证
-- 版本：v1.3
-- 更新日期：2026-08-13
+- 版本：v1.4
+- 更新日期：2026-08-16
 - 适用范围：已有 PR 从 CI/AI Review 到修复、重新验证和合并的完整 Monitor Loop
 - 文档定位：本文件是 PR Monitor 唯一权威设计与实现说明；状态机、Prompt、运维和验收均以此为准
 
@@ -101,7 +101,8 @@ required CI；普通 PR Monitor 的 single/panel 继续使用 repo 级开关。
 
 当前工作分支已经具备：
 
-- GitHub webhook 验签、delivery/subject 去重和 `opened`/`synchronize` 处理。
+- GitHub webhook 验签、delivery/subject 去重，以及 `opened`/`synchronize`/`ready_for_review`/`reopened`/
+  `closed` 生命周期处理；`closed` payload 中的 `merged=true` 以远端事实终态化为 merged。
 - `(base_ref, base_sha, head_sha)` exact-subject 快照与新 head/base target supersede。
 - exact-head CI 等待和持久 Reconciler。
 - repo 级 required-check identity policy，按 `kind + name + app_slug` 精确匹配当前 head。
@@ -109,11 +110,15 @@ required CI；普通 PR Monitor 的 single/panel 继续使用 repo 级开关。
 - 三个角色共享七条 Engineering Design Standard，并分别执行 system/implementation/QA litmus。
 - exact-base、按角色显式授权的 Guide Pack，完整 patch、紧凑文件清单、strict JSON、`PRReviewerRun` 和 `PRFinding`。
 - Direct Reviewer prompt 在任何 Review/Run/Task 入库前统一做 provider admission 预算；`waiting_ci` 只先保存
-  无模型输入的 Review，CI PASS 后在 Run/Task 前预算，确定性超限一次性收口为 infrastructure error。完整 patch
-  不截断，也不留下半创建 ReviewerRun/Task。
+  无模型输入的 Review，CI PASS 后在 Run/Task 前预算，确定性超限一次性收口为 `verdict_state=unavailable`、
+  `failure_stage=reviewer`。完整 patch 不截断，也不留下半创建 ReviewerRun/Task。2026-08-15 前的历史 Review
+  曾重复注入 changed-file base/head 全文和隐式根文档，可能超过 Codex 1,048,576 字符输入上限；当前契约已删除
+  这些重复输入并把 Codex prompt 限为 786,432 字符，为 runtime envelope 预留 262,144 字符。
 - Reviewer Task 属于内部执行记录：创建即归档，普通 Tasks/Chat 列表与 Dashboard Task 统计不展示；Single
-  成功终态把去除协议 marker 的 Reviewer 正文保存为可读摘要。PR Monitor 列表只返回有界预览，detail 返回
-  完整摘要，并展示结构化状态、角色摘要、Finding 与高级诊断。
+  成功终态把去除协议 marker 的 Reviewer 正文保存为可读摘要。普通 Tasks 页面改为展示一张只读的
+  `PR Review Result` 工作项：一张卡对应一个 `PRMonitorRun`，聚合 Panel 三个 Reviewer，并链接到 PR Monitor
+  精确详情或 GitHub PR；它不是 Task，不能 Chat、Retry Task、中断、分享或读取 prompt/session/日志。新 head
+  更新同一张 Run 卡，旧 Review 仍留在 Review History。
 - Reviewer、Panel、AI Fix 与 Rebut Adjudicator Task 的内部身份以四类 durable owner link 为权威；member
   不能凭 creator、同名 Project share 或 Task share 读取 prompt/patch、续聊、订阅 WS 或启动 Harness。
   Synthetic Project 使用内部 marker 且不可分享；legacy 同名普通 Project 只有保持完整默认形状且没有普通
@@ -122,6 +127,11 @@ required CI；普通 PR Monitor 的 single/panel 继续使用 repo 级开关。
   Review 锁外按 exact local/Worker generation 主动终止已经 launch 的 sibling。
 - blocking Finding Gate、GitHub publication outbox、逐 Finding nonce inline comment（不能定位时降级为独立
   PR comment，blocker 不消失）和 Panel UI。
+- 代码 verdict、publication、PR lifecycle 与 `failure_stage` 分离投影；GitHub publication 成功后保存不可变的
+  actor/time/review id/URL/state evidence。页面明确说明新 Review 恒为 `COMMENT`，内部 pass 不显示成 GitHub
+  `APPROVED`，发布因 head/PR 生命周期变化而不再适用时也不会抹掉已经完成的代码 verdict。
+- 当前 exact head 可从 Review detail 触发独立重新审核；该操作创建新的审核 attempt、保留旧 history，并在写入前
+  重新验证 open、非 draft、base/head/repo 完全一致。它不复用内部 Task retry，也不能重放 stale head。
 - Finding 的幂等审计操作：忽略、人工建议，以及 tool-free AI 候选补丁；三类操作都不直接改变 Panel Gate。
 - AI 候选采用每 Finding 唯一 active slot、后端下载回执和显式确认；只有 exact-base/head 校验仍成立时才由
   后端创建 commit 并以 captured head 为 expected-old 做 CAS push，未知远端结果走 durable outbox 对账。
@@ -218,6 +228,26 @@ CI 失败只证明某个 check/step/test 失败，不一定直接证明代码根
 
 CI 失败由 Controller 收集机器证据并恢复原 Developer诊断；Reviewer 只在 CI 通过后启动。CI 输出是
 失败证据，不等同于后端已经确定根因。
+
+### 2.8 代码结论、发布和 PR 生命周期分离
+
+同一 Review 至少有四个正交维度，任何一个维度都不能覆盖另一个维度：
+
+| 维度 | 公开值 | 权威来源 |
+|---|---|---|
+| verdict | `pending / complete / unavailable`，完成时再带 `pass / changes_required` | exact-subject Reviewer 聚合 |
+| publication | `not_started / publishing / reconciling / published / failed / not_applicable` | durable outbox 与 GitHub evidence |
+| lifecycle | `unknown / reviewing / superseding / superseded / cancelled / merged / closed / failed` | Controller + 当前 GitHub PR 事实；仅 legacy orphan 可为 unknown |
+| failure stage | `reviewer / ci / github_identity / publication / merge / recovery / lifecycle` 或空 | 首个可定位失败阶段 |
+
+因此，Reviewer 已给出 `changes_required`，但 PR 在发布前被合并时，公开结果应是“Changes required · PR 已合并 ·
+结果未发布（PR 在审查期间合并）”，不能显示 `Infrastructure error` 或“No code verdict was produced”。只有
+Reviewer 本身未能产生可验证聚合结果时，verdict 才是 `unavailable`。
+
+CCM 的 GitHub 身份是运行后端的系统用户执行 `gh auth status` / `gh api user` 得到的身份，与浏览器的 GitHub
+Connector、Reviewer Codex thread 或当前开发会话是否登录无关。Reviewer 继续保持 tool-free，绝不注入 GitHub
+Token。实际发布者、发布时间、GitHub Review ID/URL 和 event state 只由后端 publication 路径在远端写成功或
+恢复对账成功后固化；瞬时 `publishing_actor` 不能当成历史发布证据。
 
 ## 3. 总体架构
 
@@ -385,6 +415,18 @@ opened/synchronize
 任何阶段发现 PR 当前 head 已变化，都先 supersede 旧 subject 的非终态工作，再从新 subject 的
 `observing → waiting_ci` 开始。
 
+`ready_for_review` 对从 draft 转为可审的 PR 执行与 opened 相同的 exact-subject admission；`reopened` 为当前
+远端 subject 新建或恢复 Run，不复活已终态的旧 Reviewer Task。`closed` 先持久化 terminal intent，立即阻止新的
+Reviewer、publication、Repair 和 Merge Queue effect；尚未 dispatch 的工作事务性取消，已经跨过外部副作用边界的
+generation 则保守等待其确认、对账或租约恢复后再收口。payload/远端事实为 merged 时进入 `merged`，否则进入
+`closed`。迟到的 Reviewer 回调、publication ACK 或旧 head webhook 都必须因 Run/subject fence 被拒绝，不能把终态
+PR 翻回 reviewing/paused。
+
+普通签名 webhook 仍属于 legacy PR Monitor writer。若 Run 已由 exact Delivery edge 接管，或仍处于 Delivery
+adoption 的 active subject + reserved `delivery:` marker 窗口，`synchronize`、`reopened` 与
+`ready_for_review` 都必须在 Repo/Run 写屏障及 lifecycle attach authority 两层拒绝；不得替换 current Review、
+清 terminal evidence，或从 Run 可见性中过滤结果后却继续执行普通 GitHub effect。
+
 ## 5. 数据模型
 
 以下模型均已落地；字段是数据库恢复、幂等和审计协议的一部分。
@@ -423,10 +465,44 @@ created_at / updated_at / completed_at
 - `PRReviewerRun`：某 subject 下单个 required role 的执行结果。
 - `PRFinding`：单个 subject 的结构化 Finding。
 
+`PRReview` 的公开状态与发布证据至少包含：
+
+```text
+verdict_state                 # pending | complete | unavailable
+aggregate_verdict             # pass | changes_required | null
+publication_state             # not_started | publishing | reconciling |
+                              # published | failed | not_applicable
+publication_error
+lifecycle_state               # unknown | reviewing | superseding | superseded |
+                              # cancelled | merged | closed | failed
+failure_stage                 # reviewer | ci | github_identity | publication |
+                              # merge | recovery | lifecycle | null
+published_actor / published_at
+github_review_id / github_review_url
+github_review_state           # GitHub 返回的远端 state；API 名为 github_state
+github_event                  # API 由当前 publication 路径派生；新写入恒为 COMMENT
+```
+
+`published_*` 与 `github_*` 是成功写入或恢复对账后冻结的历史 evidence，后续失败、PR 关闭/合并、repo 配置变化
+或新 head 都不得清空或改写。`publication_state=not_applicable` 表示代码结论仍有效，但当前 PR 生命周期已经不允许
+再发布；它不是基础设施故障。
+
 `PRReview.monitor_run_id` 把 immutable subject 关联到跨 head Run。不能为了接 Repair Loop 而让
 Reviewer 获得写代码能力。
 
-### 5.3 `PRRepairWake`
+### 5.3 Tasks 公开结果投影
+
+`PR Review Result` 是从 `PRMonitorRun + current PRReview` 生成的字段白名单 DTO，不创建 Task 行，也不返回任何
+内部 Task owner link。投影只包含 repo/PR、标题、URL、current exact head、四维状态、可读摘要、有界错误、
+GitHub publication evidence 和构造 PR Monitor detail route 所需的公开 ID；严禁返回 prompt、patch、Guide、session、Instance、
+Worker 路由、内部 Task ID、nonce、pending body 或原始协议 JSON。
+
+结果 feed 先把 Run-backed 与兼容 legacy Single 候选合并，再按 Run 更新时间和 Review ID 做全局稳定分页；当前
+API 只提供 `page` / `size`，不承诺筛选或总数。Panel 三个角色不能膨胀成三张卡。新 head 继续更新同一个 Run
+item，用户从 PR Monitor detail 的 Review History 查看旧 exact-subject 记录。普通 Task 行为和结果工作项行为必须
+使用不同组件与 API，避免未来误加 Chat/Retry/Cancel/Share 等 mutation。
+
+### 5.4 `PRRepairWake`
 
 ```text
 id
@@ -562,8 +638,10 @@ Agent 回合结束不代表修复成功：
    active，UI 显示“等待 PR Gate”，不能让模型进程 sleep/poll。
 3. **自动化默认值**：推荐 repo 级 `auto_repair` opt-in；未开启时只生成 Shadow Repair 包并展示将要
    唤醒的 Task/Worker，不实际投递。
-4. **唤醒时机与聚合**：CI 失败可形成 CI Repair Wake；Review 必须等 required Panel 得出稳定 Gate 后
-   一次聚合所有 blocker。同一 `head_sha + evidence_hash` 最多一个 Wake。
+4. **唤醒时机与聚合**：只有带结构化、exact-head CI details 的 Panel CI 失败可形成 CI Repair Wake；
+   单 Reviewer 的非结构化失败只进入 `waiting_for_fix`，不能生成没有可定位修复证据的空 Wake。
+   Review 必须等 required Panel 得出稳定 Gate 后一次聚合所有 blocker。同一
+   `head_sha + evidence_hash` 最多一个 Wake。
 5. **正在运行的 Task**：推荐不 live steer 大段反馈；持久 Wake 排在当前 turn 之后，终态时重新验证
    subject 再投递。
 6. **可唤醒反馈来源**：必须明确是否只接受 required CI 与 CCM Finding，还是也接受受信任人类的
@@ -780,13 +858,23 @@ maintainer 复制 nonce 的 merge 不能被接受，也不能跳过 fresh CI 或
 核心控制接口：
 
 ```text
+GET  /api/pr-monitor/results?page={page}&size={size}
 GET  /api/pr-monitor/runs/{id}
+POST /api/pr-monitor/reviews/{review_id}/rerun
 POST /api/pr-monitor/runs/{id}/bind-developer
 POST /api/pr-monitor/runs/{id}/unbind-developer
 POST /api/pr-monitor/runs/{id}/pause
 POST /api/pr-monitor/runs/{id}/resume
 POST /api/pr-monitor/runs/{id}/enqueue-merge
 ```
+
+`POST /reviews/{review_id}/rerun` 必须携带 `{expected_head_sha, idempotency_key}`。后端锁定 repo/Run 后重新读取
+GitHub，只有 PR open、非 draft，且 repo/base/head 与用户看到的 current Review 完全一致时，才创建新的审核
+attempt；相同 key 幂等返回同一结果。旧 Review、旧 ReviewerRun 和 GitHub evidence 永久保留，不调用公共
+Task retry，也不沿用 stale publication outbox。缺少可靠 Run 快照的历史 Single Review 只投影为
+`review:<id>` 且 `can_rerun=false`；只有绑定 current Run 的 `run:<id>` 结果可进入上述准入。`closed`
+Webhook 只按远端事实将 current subject 收口为 closed/merged，不创建新 attempt；只有随后真实的
+`reopened`/`ready_for_review` 才能重新准入。
 
 UI detail 以 REST snapshot 为事实来源，WebSocket 只提示刷新。至少展示：
 
@@ -795,6 +883,12 @@ UI detail 以 REST snapshot 为事实来源，WebSocket 只提示刷新。至少
 - Repair Wake 状态、触发证据、尝试次数和最后错误。
 - Reviewer Worker 与 Developer Worker 分列显示，避免造成必须共机的误解。
 - Merge policy、queue/merge-group 状态和所有人工操作审计。
+- 代码 verdict、publication 和 lifecycle 分栏展示；`github_event=COMMENT` 必须显示为“已发布评论式 Review”，
+  不能把内部 pass 文案或 recommendation 显示成 GitHub Approved。
+- 后端 `gh` 发布身份、发布时间与 GitHub Review 链接；没有 immutable evidence 时显示“尚未发布/无法确认”，
+  不用浏览器 Connector 登录态或 Reviewer Codex 登录态代填。
+- Tasks 页面使用独立只读结果卡；点击卡片进入本 detail 或 GitHub；结果卡 mutation 只保留 exact-head“重新审查”和
+  “创建跟进 Task”，后者创建新的普通 Task 而不是解封内部 Reviewer Task。
 
 ## 13. 实施记录
 
@@ -905,6 +999,15 @@ Task/session/cwd 多次 Wake 并 push 同一 PR；无效 Rebut 被独立 Adjudic
 - `auto_merge=false` 的 publication 测试必须证明只有 COMMENT review、没有 ref/merge API；`true` 必须证明
   只对 frozen base ref 发出 `force=false` fast-forward，且 ref update 与最终 comment 分别可在 ACK 丢失、
   重启和重复 reconcile 下幂等恢复，永不创建新 `merge/squash` publication。
+- aggregate verdict 已完成但 publication 因 PR merged/closed 或 subject stale 而不再适用时，verdict 保持
+  `complete`，UI 不得同时出现 `Infrastructure error` / `No code verdict`；只有 Reviewer 未产出有效聚合时才是
+  `unavailable`，并保存准确 `failure_stage`。
+- 新 publication 必须保存 actor/time/GitHub Review ID/URL/`COMMENT` evidence，普通成功收尾和后续 reconcile
+  不得清空；CCM 后端 `gh` 身份与浏览器 Connector/Codex thread 身份分别测试，后两者不得冒充 publisher。
+- result feed 一 Run 一项，Panel 不展开，字段白名单不含内部 Task/prompt/patch/session/nonce；普通 Task mutation
+  不适用于结果卡。rerun 要求 exact current head + idempotency key，重复请求不双建，head/PR 生命周期漂移拒绝。
+- `closed(merged=false)`、`closed(merged=true)`、`reopened` 与 `ready_for_review` webhook 覆盖终态取消、重新
+  admission 和迟到 callback fencing；merged/closed Run 不得残留为 `paused`。
 
 ### 14.2 绑定与 Repair
 

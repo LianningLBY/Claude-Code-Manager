@@ -26,6 +26,8 @@ import { filterDeliveryRepos } from './deliveryCompatibility';
 
 interface TaskFormProps {
   onCreated: () => void;
+  /** One-shot draft supplied by a safe, read-only result surface. */
+  prefill?: { key: string; description: string } | null;
 }
 
 const NEW_PROJECT_VALUE = '__new__';
@@ -56,7 +58,7 @@ function readStoredTaskDefaults(): StoredTaskDefaults | null {
   }
 }
 
-export function TaskForm({ onCreated }: TaskFormProps) {
+export function TaskForm({ onCreated, prefill = null }: TaskFormProps) {
   const ccUser = JSON.parse(localStorage.getItem('cc_user') || '{}');
   const isAdmin = ccUser.role === 'admin' || ccUser.role === 'super_admin' || !ccUser.id;
   const [description, setDescription] = useState('');
@@ -124,6 +126,25 @@ export function TaskForm({ onCreated }: TaskFormProps) {
   const [contextTasks, setContextTasks] = useState<Task[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
+  const prefillKey = prefill?.key;
+  const prefillDescription = prefill?.description;
+  const handledPrefillKeyRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!prefillKey || prefillDescription == null || handledPrefillKeyRef.current === prefillKey) return;
+    handledPrefillKeyRef.current = prefillKey;
+    if (
+      description.trim()
+      && description !== prefillDescription
+      && !window.confirm('Replace your unsaved Task draft with this PR follow-up?')
+    ) {
+      return;
+    }
+    setDescription(prefillDescription);
+    setError('');
+    formRef.current?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+    formRef.current?.querySelector<HTMLTextAreaElement>('textarea')?.focus();
+  }, [description, prefillDescription, prefillKey]);
 
   const applyStoredDefaults = (
     stored: StoredTaskDefaults | null,

@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -56,6 +56,19 @@ HEAD_SHA_1 = "a" * 40
 HEAD_SHA_2 = "b" * 40
 HEAD_SHA_3 = "c" * 40
 _WORKER_TERMINATION_TIME = "2026-08-07T01:02:03.000000"
+
+
+def _canonical_input_rejection_detail(
+    measured: int,
+    limit: int,
+    unit: str,
+) -> str:
+    return pr_review_service.PRReviewInputTooLarge(
+        "untrusted diagnostic must not become public",
+        measured=measured,
+        limit=limit,
+        unit=unit,
+    ).public_detail
 
 
 def _worker_termination_success_receipt(
@@ -895,6 +908,1778 @@ async def _post_webhook(
     return await client.post("/api/github/webhook", content=body, headers=headers)
 
 
+async def _seed_public_pr_result(
+    session_factory,
+    *,
+    repo_id: int,
+    pr_number: int,
+    head_sha: str,
+    review_status: str = "commented",
+    run_status: str | None = "observing",
+    code_verdict: str | None = None,
+    publication_state: str = "not_started",
+    failure_stage: str | None = None,
+    completed_at: datetime | None = None,
+    delivery_id: str | None = None,
+    reviewers: tuple[tuple[str, str, str | None], ...] = (),
+):
+    """Seed one public result without creating an internal Reviewer Task."""
+
+    async with session_factory() as db:
+        review = PRReview(
+            repo_id=repo_id,
+            pr_number=pr_number,
+            base_ref="main",
+            base_sha=BASE_SHA_1,
+            head_sha=head_sha,
+            delivery_id=delivery_id,
+            pr_title=f"PR result {pr_number}",
+            pr_author="alice",
+            pr_url=f"https://github.com/owner/result/pull/{pr_number}",
+            status=review_status,
+            code_verdict=code_verdict,
+            review_summary=(
+                "One blocking correctness issue remains."
+                if code_verdict == "changes_required"
+                else "The exact head passed code review."
+                if code_verdict == "pass"
+                else None
+            ),
+            publication_state=publication_state,
+            failure_stage=failure_stage,
+            completed_at=completed_at,
+        )
+        db.add(review)
+        await db.flush()
+        monitor_run = None
+        if run_status is not None:
+            monitor_run = PRMonitorRun(
+                repo_id=repo_id,
+                pr_number=pr_number,
+                status=run_status,
+                current_base_sha=BASE_SHA_1,
+                current_head_sha=head_sha,
+                current_review_id=review.id,
+                head_repo_full_name="owner/result",
+                head_branch=f"feature/result-{pr_number}",
+                completed_at=(
+                    completed_at if run_status in {"merged", "closed"} else None
+                ),
+            )
+            db.add(monitor_run)
+            await db.flush()
+            review.monitor_run_id = monitor_run.id
+        for index, (status, verdict, error_message) in enumerate(reviewers):
+            db.add(PRReviewerRun(
+                pr_review_id=review.id,
+                role=(
+                    "principal_engineer",
+                    "senior_engineer",
+                    "qa_engineer",
+                )[index],
+                provider="codex",
+                status=status,
+                verdict=verdict,
+                result_body=(
+                    f"Reviewer {index + 1} result"
+                    if verdict is not None else None
+                ),
+                prompt_policy_hash=str(index + 1) * 64,
+                guide_pack_hash=str(index + 4) * 64,
+                error_message=error_message,
+                completed_at=(
+                    completed_at
+                    if status not in {"pending", "running"} else None
+                ),
+            ))
+        await db.commit()
+        return review.id, monitor_run.id if monitor_run is not None else None
+
+
+@pytest.mark.asyncio
+async def test_public_result_feed_is_one_safe_item_per_panel_run(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/result-feed-panel")
+    completed_at = datetime.utcnow()
+    review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=113,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        publication_state="not_applicable",
+        completed_at=completed_at,
+        reviewers=(
+            ("changes_required", "changes_required", None),
+            ("changes_required", "changes_required", None),
+            ("passed", "pass", None),
+        ),
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        review.action_nonce = "a" * 48
+        review.pending_review_body = "PRIVATE_PENDING_BODY_SENTINEL"
+        review.publishing_lease_token = "PRIVATE_LEASE_SENTINEL"
+        review.publication_error = "PRIVATE_PUBLICATION_ERROR_SENTINEL"
+        await db.commit()
+
+    response = await client.get("/api/pr-monitor/results")
+
+    assert response.status_code == 200, response.text
+    assert len(response.json()) == 1
+    item = response.json()[0]
+    assert set(item) == {
+        "result_key",
+        "run_id",
+        "repo_id",
+        "repo_full_name",
+        "pr_number",
+        "pr_title",
+        "pr_url",
+        "review_id",
+        "base_ref",
+        "base_sha",
+        "head_sha",
+        "verdict_state",
+        "aggregate_verdict",
+        "publication_state",
+        "lifecycle_state",
+        "failure_stage",
+        "error_category",
+        "error_measured",
+        "error_limit",
+        "error_unit",
+        "display_status",
+        "display_summary",
+        "published_actor",
+        "published_at",
+        "github_review_id",
+        "github_review_url",
+        "github_state",
+        "github_event",
+        "created_at",
+        "updated_at",
+        "completed_at",
+        "can_rerun",
+    }
+    assert item["result_key"] == f"run:{run_id}"
+    assert item["review_id"] == review_id
+    assert item["verdict_state"] == "complete"
+    assert item["aggregate_verdict"] == "changes_required"
+    assert item["error_category"] is None
+    assert item["error_measured"] is None
+    assert item["error_limit"] is None
+    assert item["error_unit"] is None
+    serialized = response.text
+    assert "PRIVATE_PENDING_BODY_SENTINEL" not in serialized
+    assert "PRIVATE_LEASE_SENTINEL" not in serialized
+    assert "PRIVATE_PUBLICATION_ERROR_SENTINEL" not in serialized
+    assert "task_id" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_partial_publication_evidence_is_not_exposed_as_a_receipt(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/partial-publication-evidence")
+    review_id, _ = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=121,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        code_verdict="changes_required",
+        publication_state="published",
+        completed_at=datetime.utcnow(),
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        review.github_review_url = (
+            "https://github.com/owner/partial-publication-evidence/"
+            "pull/121#pullrequestreview-771"
+        )
+        await db.commit()
+
+    feed = await client.get("/api/pr-monitor/results")
+    detail = await client.get(f"/api/pr-monitor/reviews/{review_id}")
+
+    assert feed.status_code == 200, feed.text
+    assert detail.status_code == 200, detail.text
+    for item in (feed.json()[0], detail.json()):
+        assert item["publication_state"] == "reconciling"
+        assert item["published_actor"] is None
+        assert item["published_at"] is None
+        assert item["github_review_id"] is None
+        assert item["github_review_url"] is None
+        assert item["github_state"] is None
+        assert item["github_event"] is None
+    assert "pullrequestreview-771" not in feed.text
+    assert "pullrequestreview-771" not in detail.text
+
+
+@pytest.mark.asyncio
+async def test_public_result_feed_projects_review_113_as_three_independent_axes(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/result-feed-113")
+    review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=113,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="merged",
+        code_verdict="changes_required",
+        publication_state="not_applicable",
+        completed_at=datetime.utcnow(),
+        reviewers=(
+            ("changes_required", "changes_required", None),
+            ("changes_required", "changes_required", None),
+            ("passed", "pass", None),
+        ),
+    )
+
+    response = await client.get("/api/pr-monitor/results")
+
+    assert response.status_code == 200, response.text
+    item = response.json()[0]
+    assert item["result_key"] == f"run:{run_id}"
+    assert item["review_id"] == review_id
+    assert item["verdict_state"] == "complete"
+    assert item["aggregate_verdict"] == "changes_required"
+    assert item["publication_state"] == "not_applicable"
+    assert item["lifecycle_state"] == "merged"
+    assert item["failure_stage"] is None
+    assert item["display_status"] == "Changes required"
+    assert item["can_rerun"] is False
+
+
+@pytest.mark.asyncio
+async def test_reviewer_failure_does_not_claim_pr_lifecycle_failed(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/result-feed-reviewer-error")
+    await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=114,
+        head_sha=HEAD_SHA_1,
+        review_status="error",
+        run_status="observing",
+        publication_state="not_started",
+        failure_stage="reviewer",
+        completed_at=datetime.utcnow(),
+        reviewers=(
+            ("passed", "pass", None),
+            ("passed", "pass", None),
+            ("error", None, "provider unavailable"),
+        ),
+    )
+
+    response = await client.get("/api/pr-monitor/results")
+
+    assert response.status_code == 200, response.text
+    item = response.json()[0]
+    assert item["verdict_state"] == "unavailable"
+    assert item["aggregate_verdict"] is None
+    assert item["publication_state"] == "not_started"
+    assert item["lifecycle_state"] == "reviewing"
+    assert item["failure_stage"] == "reviewer"
+    assert item["display_status"] == "Infrastructure error"
+
+
+@pytest.mark.asyncio
+async def test_explicit_publication_failure_is_not_reclassified_by_review_prose(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/publication-marker-prose")
+    review_id, _ = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=119,
+        head_sha=HEAD_SHA_1,
+        review_status="error",
+        run_status="observing",
+        code_verdict="pass",
+        publication_state="failed",
+        failure_stage="publication",
+        completed_at=datetime.utcnow(),
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        assert review is not None
+        review.action_taken = "error"
+        review.pending_action = "lgtm_comment"
+        review.review_summary = (
+            "The reviewer discusses a regression where a PR was closed, "
+            "but this exact publication failed for another reason."
+        )
+        await db.commit()
+
+    listed = await client.get(f"/api/pr-monitor/repos/{repo['id']}/reviews")
+    detail = await client.get(f"/api/pr-monitor/reviews/{review_id}")
+    feed = await client.get("/api/pr-monitor/results")
+
+    assert listed.status_code == 200, listed.text
+    assert detail.status_code == 200, detail.text
+    assert feed.status_code == 200, feed.text
+    projections = [
+        next(row for row in listed.json() if row["id"] == review_id),
+        detail.json(),
+        next(row for row in feed.json() if row["review_id"] == review_id),
+    ]
+    for projection in projections:
+        assert projection["aggregate_verdict"] == "pass"
+        assert projection["publication_state"] == "failed"
+        assert projection["failure_stage"] == "publication"
+        assert projection["lifecycle_state"] == "reviewing"
+
+
+@pytest.mark.asyncio
+async def test_legacy_lifecycle_publication_failure_matches_detail_and_feed(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/legacy-lifecycle-publication")
+    review_id, _ = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=124,
+        head_sha=HEAD_SHA_1,
+        review_status="error",
+        run_status="observing",
+        code_verdict="pass",
+        publication_state="failed",
+        completed_at=datetime.utcnow(),
+    )
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        review.action_taken = "error"
+        review.pending_action = "lgtm_comment"
+        review.review_summary = "PR was closed before publication completed"
+        review.failure_stage = None
+        await db.commit()
+
+    detail = await client.get(f"/api/pr-monitor/reviews/{review_id}")
+    feed = await client.get("/api/pr-monitor/results")
+
+    assert detail.status_code == 200, detail.text
+    assert feed.status_code == 200, feed.text
+    feed_item = next(
+        row for row in feed.json() if row["review_id"] == review_id
+    )
+    assert detail.json()["aggregate_verdict"] == "pass"
+    assert detail.json()["publication_state"] == "not_applicable"
+    assert feed_item["aggregate_verdict"] == "pass"
+    assert feed_item["publication_state"] == "not_applicable"
+    assert feed_item["failure_stage"] == "lifecycle"
+
+
+@pytest.mark.asyncio
+async def test_result_feed_deduplicates_legacy_orphans_without_delivery_shadowing(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/result-feed-orphans")
+    first_id, _ = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=115,
+        head_sha=HEAD_SHA_1,
+        review_status="approved",
+        run_status=None,
+        code_verdict="pass",
+        completed_at=datetime.utcnow() - timedelta(minutes=3),
+    )
+    latest_ordinary_id, _ = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=115,
+        head_sha=HEAD_SHA_2,
+        review_status="commented",
+        run_status=None,
+        code_verdict="changes_required",
+        completed_at=datetime.utcnow() - timedelta(minutes=2),
+    )
+    delivery_id, _ = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=115,
+        head_sha=HEAD_SHA_3,
+        review_status="approved",
+        run_status=None,
+        code_verdict="pass",
+        completed_at=datetime.utcnow() - timedelta(minutes=1),
+        delivery_id=f"delivery:999:{HEAD_SHA_3}",
+    )
+
+    response = await client.get("/api/pr-monitor/results")
+
+    assert response.status_code == 200, response.text
+    assert len(response.json()) == 1
+    assert response.json()[0]["result_key"] == f"review:{latest_ordinary_id}"
+    assert response.json()[0]["review_id"] == latest_ordinary_id
+    assert first_id != latest_ordinary_id != delivery_id
+
+
+@pytest.mark.asyncio
+async def test_legacy_orphan_unknown_lifecycle_does_not_fabricate_infrastructure_error(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/result-feed-legacy-unknown")
+    review_id, _ = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=122,
+        head_sha=HEAD_SHA_1,
+        review_status="approved",
+        run_status=None,
+        code_verdict="pass",
+        publication_state="not_started",
+        completed_at=datetime.utcnow(),
+    )
+
+    response = await client.get("/api/pr-monitor/results")
+
+    assert response.status_code == 200, response.text
+    assert len(response.json()) == 1
+    item = response.json()[0]
+    assert item["result_key"] == f"review:{review_id}"
+    assert item["aggregate_verdict"] == "pass"
+    assert item["lifecycle_state"] == "unknown"
+    assert item["publication_state"] == "reconciling"
+    assert item["failure_stage"] is None
+    assert item["display_status"] == "Passed"
+
+
+@pytest.mark.asyncio
+async def test_result_feed_rejects_uppercase_nonce_as_single_verdict_evidence(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(client, "owner/result-feed-uppercase-nonce")
+    review_id, _ = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=123,
+        head_sha=HEAD_SHA_1,
+        review_status="error",
+        run_status="observing",
+        publication_state="failed",
+        completed_at=datetime.utcnow(),
+    )
+    started_at = datetime.utcnow() - timedelta(minutes=2)
+    async with session_factory() as db:
+        task = Task(
+            title="Forged legacy publisher",
+            description="must not authorize a result",
+            status="completed",
+            retry_count=0,
+            started_at=started_at,
+            completed_at=started_at + timedelta(minutes=1),
+        )
+        db.add(task)
+        await db.flush()
+        review = await db.get(PRReview, review_id)
+        review.task_id = task.id
+        review.pending_action = "lgtm_comment"
+        review.action_nonce = "A" * 48
+        review.pending_review_body = "Looks good"
+        review.publishing_actor = "youchengsong"
+        review.publishing_retry_count = 0
+        review.publishing_task_started_at = started_at
+        review.publishing_started_at = started_at + timedelta(seconds=30)
+        await db.commit()
+
+    response = await client.get("/api/pr-monitor/results")
+
+    assert response.status_code == 200, response.text
+    item = response.json()[0]
+    assert item["aggregate_verdict"] is None
+    assert item["verdict_state"] == "unavailable"
+    assert item["display_status"] == "Infrastructure error"
+
+
+def test_result_feed_nonce_validation_is_mysql_collation_independent():
+    import backend.api.pr_monitor as pr_monitor_api
+    from sqlalchemy import String, column, select as sql_select
+    from sqlalchemy.dialects import mysql
+
+    expression = pr_monitor_api._lowercase_hex_sql_remainder(
+        column("action_nonce", String())
+    )
+    compiled = str(sql_select(expression).compile(
+        dialect=mysql.dialect(),
+        compile_kwargs={"literal_binds": True},
+    )).lower()
+
+    assert "lower(" not in compiled
+    assert compiled.count("replace(") == 16
+    assert "'a'" in compiled
+    assert "'f'" in compiled
+
+
+@pytest.mark.asyncio
+async def test_historical_delivery_run_does_not_hide_later_monitor_result(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    from backend.models.delivery import DeliveryRun
+
+    async with session_factory() as db:
+        project = Project(name="historical-delivery-result", status="ready")
+        db.add(project)
+        await db.commit()
+        project_id = project.id
+    repo = await _create_repo(
+        client,
+        "owner/result-after-delivery",
+        project_id=project_id,
+    )
+    async with session_factory() as db:
+        db.add(DeliveryRun(
+            admission_scope="test:admin",
+            idempotency_key="historical-delivery-result",
+            request_hash="1" * 64,
+            project_id=project_id,
+            monitored_repo_id=repo["id"],
+            title="Historical delivery",
+            requirements="Already delivered",
+            requirements_hash="2" * 64,
+            policy_snapshot={"auto_merge": False},
+            policy_hash="3" * 64,
+            base_branch="main",
+            delivery_branch="delivery/historical-result",
+            pr_number=118,
+            phase="done",
+            activity="terminal",
+            outcome="success",
+            completed_at=datetime.utcnow() - timedelta(days=1),
+        ))
+        await db.commit()
+    review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=118,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        code_verdict="changes_required",
+        publication_state="not_applicable",
+        completed_at=datetime.utcnow(),
+    )
+
+    response = await client.get("/api/pr-monitor/results")
+
+    assert response.status_code == 200, response.text
+    assert len(response.json()) == 1
+    item = response.json()[0]
+    assert item["result_key"] == f"run:{run_id}"
+    assert item["review_id"] == review_id
+    assert item["can_rerun"] is True
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "_gh_pr_view",
+        AsyncMock(return_value=_open_pr_snapshot()),
+    )
+    rerun = await client.post(
+        f"/api/pr-monitor/reviews/{review_id}/rerun",
+        json={
+            "expected_head_sha": HEAD_SHA_1,
+            "idempotency_key": "rerun-after-historical-delivery",
+        },
+    )
+
+    assert rerun.status_code == 200, rerun.text
+    assert rerun.json()["rerun_of_review_id"] == review_id
+    assert rerun.json()["attempt"] == 2
+    async with session_factory() as db:
+        historical = await db.scalar(select(DeliveryRun))
+        monitor = await db.get(PRMonitorRun, run_id)
+        assert historical.outcome == "success"
+        assert monitor.current_review_id == rerun.json()["id"]
+
+
+@pytest.mark.asyncio
+async def test_github_identity_endpoint_forwards_cache_and_admin_refresh(
+    client,
+    monkeypatch,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(client, "owner/github-identity")
+    checked_at = datetime.utcnow()
+    identity = AsyncMock(return_value={
+        "actor": "youchengsong",
+        "error": None,
+        "checked_at": checked_at,
+    })
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_cached_github_publisher_identity",
+        identity,
+    )
+
+    cached = await client.get(
+        "/api/pr-monitor/github-identity",
+        params={"repo_id": repo["id"]},
+    )
+    refreshed = await client.get(
+        "/api/pr-monitor/github-identity",
+        params={"repo_id": repo["id"], "refresh": "true"},
+    )
+
+    assert cached.status_code == 200, cached.text
+    assert refreshed.status_code == 200, refreshed.text
+    assert cached.json()["available"] is True
+    assert cached.json()["actor"] == "youchengsong"
+    assert [item.kwargs for item in identity.await_args_list] == [
+        {"force": False},
+        {"force": True},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_member_cannot_force_github_identity_refresh(
+    secured_client,
+    monkeypatch,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="pr-result-identity-member@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        project = Project(name="pr-result-identity-project", status="ready")
+        db.add(project)
+        await db.flush()
+        repo = MonitoredRepo(
+            repo_full_name="owner/github-identity-member",
+            project_id=project.id,
+            webhook_secret="identity-member-secret",
+            enabled=True,
+        )
+        db.add(repo)
+        db.add(TeamProjectShare(
+            project_id=project.id,
+            target_type="user",
+            target_id=member_id,
+            shared_by=member_id,
+        ))
+        await db.commit()
+        repo_id = repo.id
+    identity = AsyncMock(return_value={
+        "actor": "youchengsong",
+        "error": None,
+        "checked_at": datetime.utcnow(),
+    })
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_cached_github_publisher_identity",
+        identity,
+    )
+
+    response = await client.get(
+        "/api/pr-monitor/github-identity",
+        params={"repo_id": repo_id, "refresh": "true"},
+        headers={"Authorization": f"Bearer {member_token}"},
+    )
+
+    assert response.status_code == 403, response.text
+    identity.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rerun_idempotency_winner_rejects_cross_project_corruption(
+    secured_client,
+):
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="pr-rerun-cross-project-member@example.com",
+        role="member",
+    )
+    async with session_factory() as db:
+        visible_project = Project(name="pr-rerun-visible-project", status="ready")
+        private_project = Project(name="pr-rerun-private-project", status="ready")
+        db.add_all((visible_project, private_project))
+        await db.flush()
+        visible_repo = MonitoredRepo(
+            repo_full_name="owner/pr-rerun-visible",
+            project_id=visible_project.id,
+            webhook_secret="v" * 64,
+            enabled=True,
+        )
+        private_repo = MonitoredRepo(
+            repo_full_name="owner/pr-rerun-private",
+            project_id=private_project.id,
+            webhook_secret="p" * 64,
+            enabled=True,
+        )
+        db.add_all((visible_repo, private_repo))
+        db.add(TeamProjectShare(
+            project_id=visible_project.id,
+            target_type="user",
+            target_id=member_id,
+            shared_by=999,
+        ))
+        await db.flush()
+        source = PRReview(
+            repo_id=visible_repo.id,
+            pr_number=223,
+            base_ref="main",
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            pr_title="Visible source",
+            pr_author="alice",
+            pr_url="https://github.com/owner/pr-rerun-visible/pull/223",
+            status="commented",
+            attempt=1,
+            code_verdict="changes_required",
+            publication_state="not_applicable",
+        )
+        db.add(source)
+        await db.flush()
+        run = PRMonitorRun(
+            repo_id=visible_repo.id,
+            pr_number=223,
+            status="reviewing",
+            current_base_sha=BASE_SHA_1,
+            current_head_sha=HEAD_SHA_1,
+        )
+        db.add(run)
+        await db.flush()
+        source.monitor_run_id = run.id
+        corrupt_winner = PRReview(
+            monitor_run_id=run.id,
+            repo_id=private_repo.id,
+            pr_number=223,
+            base_ref="main",
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            pr_title="PRIVATE_RERUN_WINNER_SENTINEL",
+            pr_author="mallory",
+            pr_url="https://github.com/owner/pr-rerun-private/pull/223",
+            status="pending",
+            attempt=2,
+            rerun_of_review_id=source.id,
+            rerun_idempotency_key="cross-project-corrupt-winner",
+        )
+        db.add(corrupt_winner)
+        await db.flush()
+        run.current_review_id = corrupt_winner.id
+        await db.commit()
+        source_id = source.id
+
+    response = await client.post(
+        f"/api/pr-monitor/reviews/{source_id}/rerun",
+        headers={"Authorization": f"Bearer {member_token}"},
+        json={
+            "expected_head_sha": HEAD_SHA_1,
+            "idempotency_key": "cross-project-corrupt-winner",
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"] == (
+        "Idempotent rerun result does not match the selected review"
+    )
+    assert "PRIVATE_RERUN_WINNER_SENTINEL" not in response.text
+    assert "owner/pr-rerun-private" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_exact_head_rerun_is_idempotent_and_preserves_source_evidence(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    repo = await _create_repo(client, "owner/exact-head-rerun")
+    source_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=116,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        code_verdict="changes_required",
+        publication_state="published",
+        completed_at=datetime.utcnow(),
+    )
+    published_at = datetime.utcnow() - timedelta(minutes=1)
+    async with session_factory() as db:
+        source = await db.get(PRReview, source_id)
+        source.published_actor = "youchengsong"
+        source.published_at = published_at
+        source.github_review_id = 998877
+        source.github_review_url = (
+            "https://github.com/owner/exact-head-rerun/pull/116#pullrequestreview-998877"
+        )
+        source.github_review_state = "COMMENTED"
+        await db.commit()
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "_gh_pr_view",
+        AsyncMock(return_value=_open_pr_snapshot()),
+    )
+    payload = {
+        "expected_head_sha": HEAD_SHA_1,
+        "idempotency_key": "rerun-exact-head-116",
+    }
+
+    first = await client.post(
+        f"/api/pr-monitor/reviews/{source_id}/rerun",
+        json=payload,
+    )
+    second = await client.post(
+        f"/api/pr-monitor/reviews/{source_id}/rerun",
+        json=payload,
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["id"] == second.json()["id"]
+    assert first.json()["id"] != source_id
+    assert first.json()["attempt"] == 2
+    assert first.json()["rerun_of_review_id"] == source_id
+    assert first.json()["head_sha"] == HEAD_SHA_1
+    assert set(first.json()) == {
+        "id",
+        "attempt",
+        "rerun_of_review_id",
+        "monitor_run_id",
+        "status",
+        "head_sha",
+    }
+    assert "task_id" not in first.text
+    async with session_factory() as db:
+        source = await db.get(PRReview, source_id)
+        run = await db.get(PRMonitorRun, run_id)
+        attempts = list((await db.execute(
+            select(PRReview)
+            .where(
+                PRReview.repo_id == repo["id"],
+                PRReview.pr_number == 116,
+            )
+            .order_by(PRReview.attempt)
+        )).scalars())
+        assert [item.attempt for item in attempts] == [1, 2]
+        assert source.code_verdict == "changes_required"
+        assert source.publication_state == "published"
+        assert source.published_actor == "youchengsong"
+        assert source.published_at == published_at
+        assert source.github_review_id == 998877
+        assert run.current_review_id == first.json()["id"]
+        assert run.current_head_sha == HEAD_SHA_1
+
+
+@pytest.mark.asyncio
+async def test_rerun_idempotency_receipt_survives_lifecycle_progress(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A committed key keeps returning its receipt after the Run advances."""
+
+    repo = await _create_repo(client, "owner/rerun-replay-after-progress")
+    source_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=118,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        code_verdict="changes_required",
+        publication_state="published",
+        completed_at=datetime.utcnow(),
+    )
+    verify_snapshot = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        pr_review_service,
+        "verify_pr_review_snapshot_current",
+        verify_snapshot,
+    )
+    payload = {
+        "expected_head_sha": HEAD_SHA_1,
+        "idempotency_key": "rerun-replay-after-progress-118",
+    }
+
+    first = await client.post(
+        f"/api/pr-monitor/reviews/{source_id}/rerun",
+        json=payload,
+    )
+    assert first.status_code == 200, first.text
+
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        run.status = "closed"
+        run.current_head_sha = HEAD_SHA_2
+        run.current_review_id = None
+        run.completed_at = datetime.utcnow()
+        await db.commit()
+
+    replay = await client.post(
+        f"/api/pr-monitor/reviews/{source_id}/rerun",
+        json=payload,
+    )
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == first.json()
+    verify_snapshot.assert_awaited_once()
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(func.count(PRReview.id)).where(
+                PRReview.repo_id == repo["id"],
+                PRReview.pr_number == 118,
+            )
+        ) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mutation", "expected_detail"),
+    (
+        ({"expected_head_sha": HEAD_SHA_2}, "Expected head does not match"),
+        ({"run_status": "merged"}, "terminal PR lifecycle"),
+        ({"delivery_id": f"delivery:42:{HEAD_SHA_1}"}, "Delivery-owned"),
+    ),
+    ids=("head-drift", "terminal", "delivery-owned"),
+)
+async def test_exact_head_rerun_rejects_changed_or_owned_subject(
+    client,
+    session_factory,
+    mutation,
+    expected_detail,
+):
+    repo = await _create_repo(
+        client,
+        f"owner/rerun-reject-{expected_detail.split()[0].lower()}",
+    )
+    source_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=117,
+        head_sha=HEAD_SHA_1,
+        review_status="error",
+        run_status="observing",
+        publication_state="failed",
+        completed_at=datetime.utcnow(),
+        delivery_id=mutation.get("delivery_id"),
+    )
+    if "run_status" in mutation:
+        async with session_factory() as db:
+            run = await db.get(PRMonitorRun, run_id)
+            run.status = mutation["run_status"]
+            run.completed_at = datetime.utcnow()
+            await db.commit()
+
+    response = await client.post(
+        f"/api/pr-monitor/reviews/{source_id}/rerun",
+        json={
+            "expected_head_sha": mutation.get(
+                "expected_head_sha", HEAD_SHA_1
+            ),
+            "idempotency_key": "rerun-rejected-subject",
+        },
+    )
+
+    assert response.status_code == 409, response.text
+    assert expected_detail in response.json()["detail"]
+    async with session_factory() as db:
+        assert await db.scalar(
+            select(func.count(PRReview.id)).where(
+                PRReview.repo_id == repo["id"],
+                PRReview.pr_number == 117,
+            )
+        ) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("merged", (False, True), ids=("closed", "merged"))
+async def test_closed_webhook_projects_terminal_lifecycle(
+    client,
+    session_factory,
+    monkeypatch,
+    merged,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(
+        client,
+        f"owner/terminal-{'merged' if merged else 'closed'}",
+    )
+    review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=119,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        code_verdict="changes_required",
+        publication_state="not_applicable",
+        failure_stage="lifecycle",
+        completed_at=datetime.utcnow(),
+    )
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_cached_github_publisher_identity",
+        AsyncMock(return_value={"actor": None}),
+    )
+    monkeypatch.setattr(
+        pr_review_service,
+        "_gh_pr_view",
+        AsyncMock(return_value={
+            "state": "MERGED" if merged else "CLOSED",
+            "mergedAt": "2026-08-16T00:00:00Z" if merged else None,
+            "baseRefName": "main",
+            "baseRefOid": BASE_SHA_1,
+            "headRefOid": HEAD_SHA_1,
+            "isDraft": False,
+            "mergeCommit": {"oid": "f" * 40} if merged else None,
+        }),
+    )
+    payload = _pr_payload(
+        repo["repo_full_name"],
+        action="closed",
+        number=119,
+        head_sha=HEAD_SHA_1,
+    )
+    payload["pull_request"]["merged"] = merged
+
+    response = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        payload,
+        delivery_id=f"terminal-{'merged' if merged else 'closed'}-119",
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "accepted"
+    expected_lifecycle = "merged" if merged else "closed"
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        review = await db.get(PRReview, review_id)
+        assert run.status == expected_lifecycle
+        assert run.completed_at is not None
+        assert run.terminal_intent_status == expected_lifecycle
+        assert run.terminal_intent_base_ref == "main"
+        assert run.terminal_intent_head_sha == HEAD_SHA_1
+        assert review.code_verdict == "changes_required"
+        assert review.publication_state == "not_applicable"
+        assert review.failure_stage == "lifecycle"
+
+    feed = await client.get("/api/pr-monitor/results")
+    assert feed.status_code == 200, feed.text
+    assert feed.json()[0]["aggregate_verdict"] == "changes_required"
+    assert feed.json()[0]["publication_state"] == "not_applicable"
+    assert feed.json()[0]["lifecycle_state"] == expected_lifecycle
+
+
+@pytest.mark.asyncio
+async def test_terminal_remote_fences_never_hold_request_db_transaction(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """Both the admission and post-intent GitHub reads return the DB lease."""
+
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(client, "owner/terminal-no-db-lease")
+    _review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=122,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        code_verdict="changes_required",
+        publication_state="not_applicable",
+        completed_at=datetime.utcnow(),
+    )
+    body = b"signed terminal lifecycle evidence"
+    transaction_states = []
+
+    async with session_factory() as db:
+        async def terminal_snapshot(_number, _repo_name):
+            transaction_states.append(bool(db.in_transaction()))
+            return {
+                "state": "CLOSED",
+                "mergedAt": None,
+                "baseRefName": "main",
+                "baseRefOid": BASE_SHA_1,
+                "headRefOid": HEAD_SHA_1,
+                "isDraft": False,
+                "mergeCommit": None,
+            }
+
+        monkeypatch.setattr(pr_review_service, "_gh_pr_view", terminal_snapshot)
+        result = await pr_monitor_api._terminalize_pull_request_run(
+            db,
+            repo_id=repo["id"],
+            pr_number=122,
+            base_ref="main",
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            merged=False,
+            body=body,
+            signature_header=_sign(repo["webhook_secret"], body),
+            delivery_id="terminal-no-db-lease-122",
+        )
+
+    assert result == {
+        "status": "accepted",
+        "run_id": run_id,
+        "lifecycle": "closed",
+    }
+    assert transaction_states == [False, False]
+
+
+@pytest.mark.asyncio
+async def test_terminal_post_intent_cas_yields_to_signed_reopen_generation(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A cross-process reopen after the intent commit cannot be overwritten."""
+
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(client, "owner/terminal-reopen-cas")
+    _review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=123,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        code_verdict="changes_required",
+        publication_state="not_applicable",
+        completed_at=datetime.utcnow(),
+    )
+    body = b"signed close racing a signed reopen"
+    remote_reads = 0
+
+    async with session_factory() as db:
+        async def terminal_snapshot(_number, _repo_name):
+            nonlocal remote_reads
+            remote_reads += 1
+            assert not db.in_transaction()
+            if remote_reads == 2:
+                async with session_factory() as reopening_db:
+                    reopening = await reopening_db.get(PRMonitorRun, run_id)
+                    assert reopening.terminal_intent_status == "closed"
+                    reopening.status = "reviewing"
+                    reopening.completed_at = None
+                    reopening.terminal_intent_status = None
+                    reopening.terminal_intent_base_ref = None
+                    reopening.terminal_intent_head_sha = None
+                    reopening.terminal_intent_delivery_id = None
+                    reopening.terminal_intent_observed_at = None
+                    reopening.terminal_intent_checked_at = None
+                    reopening.state_version += 1
+                    await reopening_db.commit()
+            return {
+                "state": "CLOSED",
+                "mergedAt": None,
+                "baseRefName": "main",
+                "baseRefOid": BASE_SHA_1,
+                "headRefOid": HEAD_SHA_1,
+                "isDraft": False,
+                "mergeCommit": None,
+            }
+
+        monkeypatch.setattr(pr_review_service, "_gh_pr_view", terminal_snapshot)
+        result = await pr_monitor_api._terminalize_pull_request_run(
+            db,
+            repo_id=repo["id"],
+            pr_number=123,
+            base_ref="main",
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            merged=False,
+            body=body,
+            signature_header=_sign(repo["webhook_secret"], body),
+            delivery_id="terminal-reopen-cas-123",
+        )
+
+    assert result == {"status": "ignored", "reason": "terminal intent changed"}
+    assert remote_reads == 2
+    async with session_factory() as db:
+        reopened = await db.get(PRMonitorRun, run_id)
+        assert reopened.status == "reviewing"
+        assert reopened.completed_at is None
+        assert reopened.terminal_intent_status is None
+        assert reopened.terminal_intent_head_sha is None
+
+
+@pytest.mark.asyncio
+async def test_trusted_recovery_cannot_consume_replaced_terminal_intent(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A recovery read for intent A cannot update or terminalize intent B."""
+
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(client, "owner/terminal-old-intent-cas")
+    _review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=124,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        code_verdict="changes_required",
+        publication_state="not_applicable",
+        completed_at=datetime.utcnow(),
+    )
+    async with session_factory() as seed_db:
+        run = await seed_db.get(PRMonitorRun, run_id)
+        run.terminal_intent_status = "closed"
+        run.terminal_intent_base_ref = "main"
+        run.terminal_intent_head_sha = HEAD_SHA_1
+        run.terminal_intent_delivery_id = "old-intent"
+        run.terminal_intent_observed_at = datetime.utcnow()
+        await seed_db.commit()
+
+    async with session_factory() as db:
+        async def replace_intent_during_remote_read(_number, _repo_name):
+            assert not db.in_transaction()
+            async with session_factory() as replacing_db:
+                replacement = await replacing_db.get(PRMonitorRun, run_id)
+                replacement.terminal_intent_status = "merged"
+                replacement.terminal_intent_head_sha = HEAD_SHA_2
+                replacement.terminal_intent_delivery_id = "new-intent"
+                replacement.terminal_intent_observed_at = datetime.utcnow()
+                replacement.terminal_intent_checked_at = None
+                replacement.state_version += 1
+                await replacing_db.commit()
+            return {
+                "state": "CLOSED",
+                "mergedAt": None,
+                "baseRefName": "main",
+                "baseRefOid": BASE_SHA_1,
+                "headRefOid": HEAD_SHA_1,
+                "isDraft": False,
+                "mergeCommit": None,
+            }
+
+        monkeypatch.setattr(
+            pr_review_service,
+            "_gh_pr_view",
+            replace_intent_during_remote_read,
+        )
+        result = await pr_monitor_api._terminalize_pull_request_run(
+            db,
+            repo_id=repo["id"],
+            pr_number=124,
+            base_ref="main",
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            merged=None,
+            trusted_recovery=True,
+        )
+
+    assert result == {
+        "status": "ignored",
+        "reason": "PR lifecycle generation changed during terminal verification",
+    }
+    async with session_factory() as db:
+        replacement = await db.get(PRMonitorRun, run_id)
+        assert replacement.status == "waiting_for_fix"
+        assert replacement.terminal_intent_status == "merged"
+        assert replacement.terminal_intent_head_sha == HEAD_SHA_2
+        assert replacement.terminal_intent_delivery_id == "new-intent"
+        assert replacement.terminal_intent_checked_at is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reopen_action",
+    ("reopened", "ready_for_review"),
+    ids=("reopened", "ready-for-review"),
+)
+async def test_reopened_webhook_creates_new_attempt_and_clears_terminal_intent(
+    client,
+    session_factory,
+    monkeypatch,
+    reopen_action,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(
+        client,
+        f"owner/{reopen_action.replace('_', '-')}",
+    )
+    source_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=120,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        code_verdict="changes_required",
+        publication_state="not_applicable",
+        failure_stage="lifecycle",
+        completed_at=datetime.utcnow(),
+    )
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_cached_github_publisher_identity",
+        AsyncMock(return_value={"actor": None}),
+    )
+    monkeypatch.setattr(
+        pr_review_service,
+        "_gh_pr_view",
+        AsyncMock(return_value={
+            "state": "CLOSED",
+            "mergedAt": None,
+            "baseRefName": "main",
+            "baseRefOid": BASE_SHA_1,
+            "headRefOid": HEAD_SHA_1,
+            "isDraft": False,
+            "mergeCommit": None,
+        }),
+    )
+    closed_payload = _pr_payload(
+        repo["repo_full_name"],
+        action="closed",
+        number=120,
+        head_sha=HEAD_SHA_1,
+    )
+    closed_payload["pull_request"]["merged"] = False
+    closed = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        closed_payload,
+        delivery_id=f"closed-before-{reopen_action}",
+    )
+    assert closed.status_code == 200, closed.text
+    assert closed.json()["status"] == "accepted"
+
+    reopen_payload = _pr_payload(
+        repo["repo_full_name"],
+        action=reopen_action,
+        number=120,
+        head_sha=HEAD_SHA_1,
+    )
+    reopened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        reopen_payload,
+        delivery_id=f"{reopen_action}-120",
+    )
+
+    assert reopened.status_code == 200, reopened.text
+    assert reopened.json()["status"] == "accepted"
+    assert reopened.json()["review_id"] != source_id
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        replacement = await db.get(PRReview, reopened.json()["review_id"])
+        assert run.status == "reviewing"
+        assert run.completed_at is None
+        assert run.current_review_id == replacement.id
+        assert run.terminal_intent_status is None
+        assert run.terminal_intent_base_ref is None
+        assert run.terminal_intent_head_sha is None
+        assert run.terminal_intent_delivery_id is None
+        assert run.terminal_intent_observed_at is None
+        assert replacement.attempt == 2
+        assert replacement.rerun_of_review_id == source_id
+        assert replacement.rerun_idempotency_key.startswith("wh:")
+        source = await db.get(PRReview, source_id)
+        assert source.code_verdict == "changes_required"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("delivery_action", "terminal_run", "exact_monitor_edge"),
+    (
+        pytest.param("reopened", True, True, id="reopened"),
+        pytest.param("ready_for_review", True, True, id="ready-for-review"),
+        pytest.param("synchronize", False, True, id="synchronize"),
+        pytest.param(
+            "synchronize",
+            False,
+            False,
+            id="synchronize-before-exact-bind",
+        ),
+    ),
+)
+async def test_delivery_owned_run_rejects_legacy_webhook_replacement(
+    client,
+    session_factory,
+    monkeypatch,
+    delivery_action,
+    terminal_run,
+    exact_monitor_edge,
+):
+    """Signed legacy webhooks cannot replace a Delivery-owned Run."""
+
+    import backend.api.pr_monitor as pr_monitor_api
+    from backend.models.delivery import DeliveryRun
+
+    now = datetime.utcnow()
+    async with session_factory() as db:
+        project = Project(
+            name=f"delivery-webhook-fence-{delivery_action}",
+            status="ready",
+        )
+        db.add(project)
+        await db.commit()
+        project_id = project.id
+    repo = await _create_repo(
+        client,
+        f"owner/delivery-webhook-fence-{delivery_action.replace('_', '-')}",
+        project_id=project_id,
+    )
+    source_review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=126,
+        head_sha=HEAD_SHA_1,
+        review_status="commented" if terminal_run else "reviewing",
+        run_status="closed" if terminal_run else "reviewing",
+        code_verdict="changes_required" if terminal_run else None,
+        publication_state="not_applicable" if terminal_run else "not_started",
+        failure_stage="lifecycle" if terminal_run else None,
+        completed_at=now if terminal_run else None,
+    )
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        source_review = await db.get(PRReview, source_review_id)
+        delivery = DeliveryRun(
+            admission_scope="test:admin",
+            idempotency_key=f"delivery-webhook-fence-{delivery_action}",
+            request_hash="d" * 64,
+            project_id=project_id,
+            monitored_repo_id=repo["id"],
+            pr_monitor_run_id=run_id if exact_monitor_edge else None,
+            title="Exact Delivery-owned PR",
+            requirements="Preserve Delivery ownership",
+            requirements_hash="e" * 64,
+            policy_snapshot={"auto_merge": False},
+            policy_hash="f" * 64,
+            base_branch="main",
+            delivery_branch=f"delivery/webhook-fence-{delivery_action}",
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            pr_number=126,
+            pr_url=f"https://github.com/{repo['repo_full_name']}/pull/126",
+            phase="done" if terminal_run else "monitoring",
+            activity="terminal" if terminal_run else "waiting",
+            outcome="success" if terminal_run else None,
+            completed_at=now if terminal_run else None,
+        )
+        db.add(delivery)
+        await db.flush()
+        source_review.delivery_id = f"delivery:{delivery.id}:{HEAD_SHA_1}"
+        if terminal_run:
+            run.terminal_intent_status = "closed"
+            run.terminal_intent_base_ref = "main"
+            run.terminal_intent_head_sha = HEAD_SHA_1
+            run.terminal_intent_delivery_id = "delivery-terminal-126"
+            run.terminal_intent_observed_at = now
+            run.terminal_intent_checked_at = now
+        await db.commit()
+        delivery_id = delivery.id
+        before_run = (
+            run.status,
+            run.state_version,
+            run.current_review_id,
+            run.current_base_sha,
+            run.current_head_sha,
+            run.completed_at,
+            run.terminal_intent_status,
+            run.terminal_intent_base_ref,
+            run.terminal_intent_head_sha,
+            run.terminal_intent_delivery_id,
+            run.terminal_intent_observed_at,
+            run.terminal_intent_checked_at,
+        )
+        before_review = (
+            source_review.status,
+            source_review.delivery_id,
+            source_review.monitor_run_id,
+            source_review.completed_at,
+        )
+        before_task_count = await db.scalar(
+            select(func.count()).select_from(Task)
+        )
+
+    create_review = AsyncMock(
+        side_effect=AssertionError("Delivery-owned webhook staged a Reviewer Task")
+    )
+    github_call = AsyncMock(
+        side_effect=AssertionError("Delivery-owned webhook reached GitHub")
+    )
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_cached_github_publisher_identity",
+        AsyncMock(return_value={"actor": None}),
+    )
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_create_pr_review_task_or_422",
+        create_review,
+    )
+    monkeypatch.setattr(pr_review_service, "_run_gh", github_call)
+
+    payload = _pr_payload(
+        repo["repo_full_name"],
+        action=delivery_action,
+        number=126,
+        head_sha=HEAD_SHA_2 if delivery_action == "synchronize" else HEAD_SHA_1,
+    )
+    response = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        payload,
+        delivery_id=f"legacy-{delivery_action}-126",
+    )
+
+    assert response.status_code == 409, response.text
+    assert "Delivery-owned PR state" in response.json()["detail"]
+    create_review.assert_not_awaited()
+    github_call.assert_not_awaited()
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        source_review = await db.get(PRReview, source_review_id)
+        delivery = await db.get(DeliveryRun, delivery_id)
+        after_run = (
+            run.status,
+            run.state_version,
+            run.current_review_id,
+            run.current_base_sha,
+            run.current_head_sha,
+            run.completed_at,
+            run.terminal_intent_status,
+            run.terminal_intent_base_ref,
+            run.terminal_intent_head_sha,
+            run.terminal_intent_delivery_id,
+            run.terminal_intent_observed_at,
+            run.terminal_intent_checked_at,
+        )
+        after_review = (
+            source_review.status,
+            source_review.delivery_id,
+            source_review.monitor_run_id,
+            source_review.completed_at,
+        )
+        assert after_run == before_run
+        assert after_review == before_review
+        assert delivery.pr_monitor_run_id == (
+            run_id if exact_monitor_edge else None
+        )
+        assert await db.scalar(
+            select(func.count(PRReview.id)).where(
+                PRReview.repo_id == repo["id"],
+                PRReview.pr_number == 126,
+            )
+        ) == 1
+        assert await db.scalar(
+            select(func.count()).select_from(Task)
+        ) == before_task_count
+        assert await db.scalar(
+            select(func.count(PRReviewerRun.id)).where(
+                PRReviewerRun.pr_review_id == source_review_id,
+            )
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_reopen_cannot_clear_newer_terminal_intent(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(client, "owner/stale-reopen-terminal-fence")
+    source_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=125,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="closed",
+        code_verdict="changes_required",
+        publication_state="not_applicable",
+        failure_stage="lifecycle",
+        completed_at=datetime.utcnow(),
+    )
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        run.terminal_intent_status = "closed"
+        run.terminal_intent_base_ref = "main"
+        run.terminal_intent_head_sha = HEAD_SHA_1
+        run.terminal_intent_delivery_id = "older-close"
+        run.terminal_intent_observed_at = datetime.utcnow()
+        await db.commit()
+
+    async def verify_then_commit_newer_close(_repo, _review_data, *, base_ref=None):
+        del base_ref
+        async with session_factory() as db:
+            run = await db.get(PRMonitorRun, run_id)
+            run.terminal_intent_delivery_id = "newer-close"
+            run.terminal_intent_observed_at = datetime.utcnow()
+            await db.commit()
+
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_cached_github_publisher_identity",
+        AsyncMock(return_value={"actor": None}),
+    )
+    monkeypatch.setattr(
+        pr_review_service,
+        "verify_pr_review_snapshot_current",
+        verify_then_commit_newer_close,
+    )
+    reopen_payload = _pr_payload(
+        repo["repo_full_name"],
+        action="reopened",
+        number=125,
+        head_sha=HEAD_SHA_1,
+    )
+
+    reopened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        reopen_payload,
+        delivery_id="stale-reopen-125",
+    )
+
+    assert reopened.status_code == 409, reopened.text
+    assert "newer PR lifecycle generation" in reopened.json()["detail"]
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        assert run.status == "closed"
+        assert run.terminal_intent_status == "closed"
+        assert run.terminal_intent_delivery_id == "newer-close"
+        assert run.current_review_id == source_id
+        assert await db.scalar(
+            select(func.count(PRReview.id)).where(
+                PRReview.repo_id == repo["id"],
+                PRReview.pr_number == 125,
+            )
+        ) == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_and_reopen_webhooks_fail_closed_on_active_merge_effect(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    repo = await _create_repo(client, "owner/terminal-active-effect")
+    review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=121,
+        head_sha=HEAD_SHA_1,
+        review_status="commented",
+        run_status="waiting_for_fix",
+        code_verdict="changes_required",
+        publication_state="not_applicable",
+        completed_at=datetime.utcnow(),
+    )
+    async with session_factory() as db:
+        db.add(PRMergeQueueAction(
+            monitor_run_id=run_id,
+            review_id=review_id,
+            trigger_base_sha=BASE_SHA_1,
+            trigger_head_sha=HEAD_SHA_1,
+            status="queued",
+            action_nonce="q" * 48,
+            github_queue_entry_id="MQ-active-effect",
+        ))
+        await db.commit()
+    monkeypatch.setattr(
+        pr_monitor_api,
+        "_cached_github_publisher_identity",
+        AsyncMock(return_value={"actor": None}),
+    )
+    monkeypatch.setattr(
+        pr_review_service,
+        "_gh_pr_view",
+        AsyncMock(return_value={
+            "state": "CLOSED",
+            "mergedAt": None,
+            "baseRefName": "main",
+            "baseRefOid": BASE_SHA_1,
+            "headRefOid": HEAD_SHA_1,
+            "isDraft": False,
+            "mergeCommit": None,
+        }),
+    )
+    closed_payload = _pr_payload(
+        repo["repo_full_name"],
+        action="closed",
+        number=121,
+        head_sha=HEAD_SHA_1,
+    )
+    closed_payload["pull_request"]["merged"] = False
+
+    closed = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        closed_payload,
+        delivery_id="closed-active-effect-121",
+    )
+
+    assert closed.status_code == 503, closed.text
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        assert run.status == "waiting_for_fix"
+        assert run.completed_at is None
+        assert run.terminal_intent_status == "closed"
+        assert run.terminal_intent_head_sha == HEAD_SHA_1
+
+    reopened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(
+            repo["repo_full_name"],
+            action="reopened",
+            number=121,
+            head_sha=HEAD_SHA_1,
+        ),
+        delivery_id="reopened-active-effect-121",
+    )
+
+    assert reopened.status_code == 503, reopened.text
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        assert run.status == "waiting_for_fix"
+        assert run.current_review_id == review_id
+        assert run.terminal_intent_status == "closed"
+        assert await db.scalar(
+            select(func.count(PRReview.id)).where(
+                PRReview.repo_id == repo["id"],
+                PRReview.pr_number == 121,
+            )
+        ) == 1
+
+
 @pytest.mark.asyncio
 async def test_resume_remote_repair_defers_authoritative_migration_to_reconciler(
     client, session_factory
@@ -1122,6 +2907,178 @@ async def test_panel_webhook_creates_roles_and_detail_api(client, session_factor
     )
 
 
+@pytest.mark.parametrize(
+    "roles",
+    [
+        ("principal_engineer", "senior_engineer"),
+        ("principal_engineer", "senior_engineer", "senior_engineer"),
+        ("principal_engineer", "senior_engineer", "observer"),
+    ],
+)
+def test_panel_aggregate_verdict_fails_closed_for_incomplete_or_invalid_roles(
+    roles,
+):
+    import backend.api.pr_monitor as pr_monitor_api
+
+    review = SimpleNamespace(code_verdict=None)
+    runs = [
+        SimpleNamespace(role=role, status="passed", verdict="pass")
+        for role in roles
+    ]
+
+    assert pr_monitor_api._aggregate_review_verdict(review, runs) is None
+
+
+@pytest.mark.asyncio
+async def test_panel_result_apis_do_not_fabricate_verdict_from_partial_role_rows(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(
+        client,
+        "owner/panel-partial-role-set",
+        review_mode="panel",
+        wait_for_ci=False,
+    )
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload("owner/panel-partial-role-set"),
+    )
+    assert opened.status_code == 200, opened.text
+    review_id = opened.json()["review_id"]
+
+    async with session_factory() as db:
+        review = await db.get(PRReview, review_id)
+        runs = list((await db.execute(
+            select(PRReviewerRun)
+            .where(PRReviewerRun.pr_review_id == review_id)
+            .order_by(PRReviewerRun.id)
+        )).scalars())
+        assert review is not None
+        assert len(runs) == 3
+        for run in runs[:2]:
+            run.status = "passed"
+            run.verdict = "pass"
+        await db.delete(runs[2])
+        review.status = "approved"
+        review.action_taken = "lgtm_comment"
+        await db.commit()
+
+    detail = await client.get(f"/api/pr-monitor/reviews/{review_id}")
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["reviewer_count"] == 2
+    assert detail.json()["aggregate_verdict"] is None
+    assert detail.json()["verdict_state"] == "unavailable"
+
+    feed = await client.get("/api/pr-monitor/results")
+    assert feed.status_code == 200, feed.text
+    item = next(row for row in feed.json() if row["review_id"] == review_id)
+    assert item["aggregate_verdict"] is None
+    assert item["verdict_state"] == "unavailable"
+    assert item["display_status"] != "Passed"
+
+
+@pytest.mark.asyncio
+async def test_result_feed_and_review_views_reject_cross_project_run_binding(
+    secured_client,
+):
+    client, session_factory = secured_client
+    member_id, member_token = await _create_user(
+        session_factory,
+        email="pr-result-cross-binding-member@example.com",
+        role="member",
+    )
+    _, admin_token = await _create_user(
+        session_factory,
+        email="pr-result-cross-binding-admin@example.com",
+        role="admin",
+    )
+    async with session_factory() as db:
+        visible_project = Project(name="pr-result-visible-project", status="ready")
+        private_project = Project(name="pr-result-private-project", status="ready")
+        db.add_all((visible_project, private_project))
+        await db.flush()
+        visible_repo = MonitoredRepo(
+            repo_full_name="owner/pr-result-visible",
+            project_id=visible_project.id,
+            webhook_secret="v" * 64,
+            enabled=True,
+        )
+        private_repo = MonitoredRepo(
+            repo_full_name="owner/pr-result-private",
+            project_id=private_project.id,
+            webhook_secret="p" * 64,
+            enabled=True,
+        )
+        db.add_all((visible_repo, private_repo))
+        db.add(TeamProjectShare(
+            project_id=visible_project.id,
+            target_type="user",
+            target_id=member_id,
+            shared_by=999,
+        ))
+        await db.flush()
+        private_review = PRReview(
+            repo_id=private_repo.id,
+            pr_number=222,
+            base_ref="main",
+            base_sha=BASE_SHA_1,
+            head_sha=HEAD_SHA_1,
+            pr_title="PRIVATE_CROSS_PROJECT_REVIEW_SENTINEL",
+            pr_author="alice",
+            pr_url="https://github.com/owner/pr-result-private/pull/222",
+            status="approved",
+            code_verdict="pass",
+            publication_state="reconciling",
+            completed_at=datetime.utcnow(),
+        )
+        db.add(private_review)
+        await db.flush()
+        corrupt_visible_run = PRMonitorRun(
+            repo_id=visible_repo.id,
+            pr_number=222,
+            status="waiting_for_fix",
+            current_base_sha=BASE_SHA_1,
+            current_head_sha=HEAD_SHA_1,
+            current_review_id=private_review.id,
+        )
+        db.add(corrupt_visible_run)
+        await db.flush()
+        # Reproduce a partially bound/cross-repository legacy row. There is no
+        # FK on current_review_id, so every read projection must validate the
+        # complete subject before borrowing this Run's ACL or lifecycle.
+        private_review.monitor_run_id = corrupt_visible_run.id
+        await db.commit()
+        private_repo_id = private_repo.id
+        private_review_id = private_review.id
+
+    member_feed = await client.get(
+        "/api/pr-monitor/results",
+        headers={"Authorization": f"Bearer {member_token}"},
+    )
+    assert member_feed.status_code == 200, member_feed.text
+    assert member_feed.json() == []
+    assert "PRIVATE_CROSS_PROJECT_REVIEW_SENTINEL" not in member_feed.text
+
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    listed = await client.get(
+        f"/api/pr-monitor/repos/{private_repo_id}/reviews",
+        headers=admin_headers,
+    )
+    detail = await client.get(
+        f"/api/pr-monitor/reviews/{private_review_id}",
+        headers=admin_headers,
+    )
+    assert listed.status_code == 200, listed.text
+    assert detail.status_code == 200, detail.text
+    listed_review = next(row for row in listed.json() if row["id"] == private_review_id)
+    assert listed_review["lifecycle_state"] == "unknown"
+    assert listed_review["can_rerun"] is False
+    assert detail.json()["lifecycle_state"] == "unknown"
+    assert detail.json()["can_rerun"] is False
+
+
 @pytest.mark.asyncio
 async def test_review_projection_separates_human_results_from_infrastructure_errors(
     client,
@@ -1270,6 +3227,88 @@ async def test_review_projection_separates_human_results_from_infrastructure_err
     )
     assert failed_row["display_summary"].endswith("…")
     assert "ERROR_DETAIL_SENTINEL" not in failed_row["display_summary"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        pytest.param(
+            {
+                "error_category": "unsupported_input_size",
+                "error_measured": None,
+                "error_limit": 10,
+                "error_unit": "characters",
+            },
+            id="partial-quartet",
+        ),
+        pytest.param(
+            {
+                "error_category": "unsupported_input_size",
+                "error_measured": 11,
+                "error_limit": 10,
+                "error_unit": "tokens",
+            },
+            id="bad-unit",
+        ),
+        pytest.param(
+            {
+                "error_category": "unsupported_input_size",
+                "error_measured": 2**53,
+                "error_limit": 10,
+                "error_unit": "characters",
+            },
+            id="unsafe-json-integer",
+        ),
+    ],
+)
+async def test_review_reads_fail_closed_on_malformed_input_evidence(
+    client,
+    session_factory,
+    evidence,
+):
+    repo = await _create_repo(
+        client,
+        "owner/malformed-public-input-evidence-"
+        + evidence["error_unit"].replace(" ", "-")
+        + str(evidence["error_measured"]),
+    )
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(repo["repo_full_name"]),
+    )
+    review_id = opened.json()["review_id"]
+    async with session_factory() as db:
+        # Simulate a legacy/corrupt row even after the new database CHECK is
+        # present; read projections must still fail closed instead of 500ing.
+        await db.execute(text("PRAGMA ignore_check_constraints = ON"))
+        review = await db.get(PRReview, review_id)
+        assert review is not None
+        review.status = "error"
+        review.action_taken = "error"
+        review.failure_stage = "reviewer"
+        review.publication_state = "not_applicable"
+        review.review_summary = "untrusted malformed size evidence"
+        for field, value in evidence.items():
+            setattr(review, field, value)
+        await db.commit()
+
+    listed = await client.get(f"/api/pr-monitor/repos/{repo['id']}/reviews")
+    detail = await client.get(f"/api/pr-monitor/reviews/{review_id}")
+    feed = await client.get("/api/pr-monitor/results")
+    assert listed.status_code == detail.status_code == feed.status_code == 200
+    payloads = [
+        next(item for item in listed.json() if item["id"] == review_id),
+        detail.json(),
+        next(item for item in feed.json() if item["review_id"] == review_id),
+    ]
+    for payload in payloads:
+        assert payload["error_category"] is None
+        assert payload["error_measured"] is None
+        assert payload["error_limit"] is None
+        assert payload["error_unit"] is None
+        assert payload["display_status"] != "Review input too large"
 
 
 @pytest.mark.asyncio
@@ -1973,7 +4012,7 @@ async def test_regenerate_secret_is_one_time_and_webhook_uses_rotated_value(clie
 
 
 @pytest.mark.asyncio
-async def test_bind_developer_reads_remote_subject_inside_task_barrier(
+async def test_bind_developer_reads_remote_subject_before_task_barrier(
     client,
     session_factory,
 ):
@@ -2034,14 +4073,14 @@ async def test_bind_developer_reads_remote_subject_inside_task_barrier(
         task_id = task.id
         run_id = run.id
 
-    async def read_while_fenced(_pr_number, _repo_name):
-        assert get_task_operation_lock(task_id).locked()
+    async def read_before_fence(_pr_number, _repo_name):
+        assert not get_task_operation_lock(task_id).locked()
         return _open_pr_snapshot()
 
     with patch.object(
         pr_review_service,
         "_gh_pr_view",
-        side_effect=read_while_fenced,
+        side_effect=read_before_fence,
     ):
         response = await client.post(
             f"/api/pr-monitor/runs/{run_id}/bind-developer",
@@ -3409,7 +5448,7 @@ async def test_webhook_synchronize_persists_recovery_intent_before_cleanup(
         ).scalars().all()
         assert len(reviews) == 1
         assert old.status == "superseding"
-        assert old.superseding_snapshot["version"] == 2
+        assert old.superseding_snapshot["version"] == 4
         assert (
             old.superseding_snapshot["pr_data"]["head_sha"]
             == HEAD_SHA_2
@@ -4287,7 +6326,7 @@ async def test_webhook_canonicalizes_uppercase_commit_shas(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["opened", "synchronize"])
-@pytest.mark.parametrize("failure_boundary", ["prepare", "create"])
+@pytest.mark.parametrize("failure_boundary", ["prepare", "preflight"])
 async def test_webhook_maps_oversized_review_input_to_422(
     client,
     session_factory,
@@ -4303,21 +6342,161 @@ async def test_webhook_maps_oversized_review_input_to_422(
         "unsupported_input_size: reviewer prompt exceeds the safe model input "
         "limit; no reviewer Task was created."
     )
+    measured = 120_001
+    limit = 120_000
+    delivery_id = f"oversized-{action}-{failure_boundary}"
+    original_prepare = pr_review_service.prepare_pr_review_context
+    original_preflight = pr_review_service.preflight_pr_review_prompts
 
     async def reject_oversized_input(*args, **kwargs):
+        with patch.object(
+            pr_review_service,
+            "preflight_pr_review_prompts",
+            original_preflight,
+        ):
+            context = await original_prepare(*args, **kwargs)
+        error = pr_review_service.PRReviewInputTooLarge(
+            detail,
+            measured=measured,
+            limit=limit,
+            unit="characters",
+        )
+        error.prepared_context = context
+        raise error
+
+    def reject_locked_preflight(*args, **kwargs):
         del args, kwargs
-        raise pr_review_service.PRReviewInputTooLarge(detail)
+        raise pr_review_service.PRReviewInputTooLarge(
+            detail,
+            measured=measured,
+            limit=limit,
+            unit="characters",
+        )
+
+    if failure_boundary == "prepare":
+        monkeypatch.setattr(
+            pr_review_service,
+            "prepare_pr_review_context",
+            reject_oversized_input,
+        )
+        monkeypatch.setattr(
+            pr_review_service,
+            "preflight_pr_review_prompts",
+            reject_locked_preflight,
+        )
+    else:
+        monkeypatch.setattr(
+            pr_review_service,
+            "preflight_pr_review_prompts",
+            reject_locked_preflight,
+        )
+
+    payload = _pr_payload(
+        repo["repo_full_name"],
+        action=action,
+        head_sha=HEAD_SHA_2,
+    )
+    response = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        payload,
+        delivery_id=delivery_id,
+    )
+
+    assert response.status_code == 422, response.text
+    receipt = response.json()
+    assert receipt == {
+        "detail": _canonical_input_rejection_detail(
+            measured,
+            limit,
+            "characters",
+        ),
+        "error_category": "unsupported_input_size",
+        "measured": measured,
+        "limit": limit,
+        "unit": "characters",
+        "review_id": receipt["review_id"],
+    }
+    redelivery = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        payload,
+        delivery_id=delivery_id,
+    )
+    assert redelivery.status_code == 422, redelivery.text
+    assert redelivery.json() == receipt
+
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview).where(PRReview.repo_id == repo["id"])
+        )).scalars())
+        assert len(reviews) == 1
+        review = reviews[0]
+        assert review.id == receipt["review_id"]
+        assert review.status == "error"
+        assert review.code_verdict is None
+        assert review.publication_state == "not_applicable"
+        assert review.failure_stage == "reviewer"
+        assert review.error_category == "unsupported_input_size"
+        assert review.error_measured == measured
+        assert review.error_limit == limit
+        assert review.error_unit == "characters"
+        assert review.task_id is None
+        run = await db.get(PRMonitorRun, review.monitor_run_id)
+        assert run is not None
+        assert run.current_review_id == review.id
+        assert run.current_base_sha == review.base_sha == BASE_SHA_1
+        assert run.current_head_sha == review.head_sha == HEAD_SHA_2
+        assert run.status == "paused"
+        assert list((await db.execute(select(Task))).scalars()) == []
+
+    feed = await client.get("/api/pr-monitor/results")
+    assert feed.status_code == 200, feed.text
+    item = next(row for row in feed.json() if row["review_id"] == receipt["review_id"])
+    assert item["verdict_state"] == "unavailable"
+    assert item["aggregate_verdict"] is None
+    assert item["publication_state"] == "not_applicable"
+    assert item["failure_stage"] == "reviewer"
+    assert item["error_category"] == "unsupported_input_size"
+    assert item["error_measured"] == measured
+    assert item["error_limit"] == limit
+    assert item["error_unit"] == "characters"
+    assert item["display_status"] == "Review input too large"
+    assert detail not in item["display_summary"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["opened", "synchronize"])
+async def test_webhook_preliminary_size_rejection_yields_to_locked_policy(
+    client,
+    session_factory,
+    monkeypatch,
+    action,
+):
+    """A stale capture-time provider limit cannot reject current policy."""
+
+    repo = await _create_repo(
+        client,
+        f"owner/preliminary-size-race-{action}",
+    )
+    original_prepare = pr_review_service.prepare_pr_review_context
+
+    async def reject_only_preliminary(*args, **kwargs):
+        context = await original_prepare(*args, **kwargs)
+        error = pr_review_service.PRReviewInputTooLarge(
+            "stale preliminary rejection",
+            measured=120_001,
+            limit=120_000,
+            unit="characters",
+        )
+        error.prepared_context = context
+        raise error
 
     monkeypatch.setattr(
         pr_review_service,
-        (
-            "prepare_pr_review_context"
-            if failure_boundary == "prepare"
-            else "create_pr_review_task"
-        ),
-        reject_oversized_input,
+        "prepare_pr_review_context",
+        reject_only_preliminary,
     )
-
     response = await _post_webhook(
         client,
         repo["webhook_secret"],
@@ -4326,14 +6505,142 @@ async def test_webhook_maps_oversized_review_input_to_422(
             action=action,
             head_sha=HEAD_SHA_2,
         ),
+        delivery_id=f"preliminary-size-race-{action}",
     )
 
-    assert response.status_code == 422, response.text
-    assert response.json() == {"detail": detail}
+    assert response.status_code == 200, response.text
+    review_id = response.json()["review_id"]
     async with session_factory() as db:
-        assert list((await db.execute(
-            select(PRReview).where(PRReview.repo_id == repo["id"])
-        )).scalars()) == []
+        review = await db.get(PRReview, review_id)
+        assert review is not None
+        assert review.status == "reviewing"
+        assert review.error_category is None
+        assert review.task_id is not None
+
+
+@pytest.mark.asyncio
+async def test_webhook_synchronize_prepare_oversize_supersedes_active_review(
+    client,
+    session_factory,
+    monkeypatch,
+):
+    """A prepared-input rejection still safely replaces the old generation."""
+
+    repo = await _create_repo(client, "owner/prepare-oversize-active")
+    opened = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(repo["repo_full_name"], action="opened"),
+    )
+    assert opened.status_code == 200, opened.text
+    old_review_id = opened.json()["review_id"]
+    async with session_factory() as db:
+        old_review = await db.get(PRReview, old_review_id)
+        assert old_review is not None
+        old_task_id = old_review.task_id
+        assert old_task_id is not None
+
+    detail = (
+        "unsupported_input_size: prepared review input exceeds the safe model "
+        "limit; no reviewer Task was created."
+    )
+    measured = 130_001
+    limit = 130_000
+    original_prepare = pr_review_service.prepare_pr_review_context
+    original_preflight = pr_review_service.preflight_pr_review_prompts
+
+    async def reject_prepared_input(*args, **kwargs):
+        with patch.object(
+            pr_review_service,
+            "preflight_pr_review_prompts",
+            original_preflight,
+        ):
+            context = await original_prepare(*args, **kwargs)
+        error = pr_review_service.PRReviewInputTooLarge(
+            detail,
+            measured=measured,
+            limit=limit,
+            unit="UTF-8 bytes",
+        )
+        error.prepared_context = context
+        raise error
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "prepare_pr_review_context",
+        reject_prepared_input,
+    )
+
+    def reject_locked_policy(*_args, **_kwargs):
+        raise pr_review_service.PRReviewInputTooLarge(
+            detail,
+            measured=measured,
+            limit=limit,
+            unit="UTF-8 bytes",
+        )
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "preflight_pr_review_prompts",
+        reject_locked_policy,
+    )
+
+    synchronized = await _post_webhook(
+        client,
+        repo["webhook_secret"],
+        _pr_payload(
+            repo["repo_full_name"],
+            action="synchronize",
+            head_sha=HEAD_SHA_2,
+        ),
+        delivery_id="prepare-oversize-active",
+    )
+
+    assert synchronized.status_code == 422, synchronized.text
+    receipt = synchronized.json()
+    assert receipt["detail"] == _canonical_input_rejection_detail(
+        measured,
+        limit,
+        "UTF-8 bytes",
+    )
+    assert receipt["error_category"] == "unsupported_input_size"
+    assert receipt["measured"] == measured
+    assert receipt["limit"] == limit
+    assert receipt["unit"] == "UTF-8 bytes"
+
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview)
+            .where(PRReview.repo_id == repo["id"])
+            .order_by(PRReview.id)
+        )).scalars())
+        assert len(reviews) == 2
+        old_review, rejected = reviews
+        assert old_review.id == old_review_id
+        assert old_review.status == "superseded"
+        assert old_review.superseding_snapshot is None
+        old_task = await db.get(Task, old_task_id)
+        assert old_task is not None
+        assert old_task.status == "completed"
+        assert old_task.metadata_["pr_review_superseded"] is True
+
+        assert rejected.id == receipt["review_id"]
+        assert rejected.status == "error"
+        assert rejected.head_sha == HEAD_SHA_2
+        assert rejected.task_id is None
+        assert rejected.publication_state == "not_applicable"
+        assert rejected.failure_stage == "reviewer"
+        assert rejected.error_category == "unsupported_input_size"
+        assert rejected.error_measured == measured
+        assert rejected.error_limit == limit
+        assert rejected.error_unit == "UTF-8 bytes"
+        run = await db.get(PRMonitorRun, rejected.monitor_run_id)
+        assert run is not None
+        assert run.current_review_id == rejected.id
+        assert run.current_base_sha == rejected.base_sha == BASE_SHA_1
+        assert run.current_head_sha == rejected.head_sha == HEAD_SHA_2
+        assert run.status == "paused"
+        assert run.pause_reason == "review_input_too_large"
 
 
 @pytest.mark.asyncio
@@ -4370,6 +6677,8 @@ async def test_webhook_synchronize_rechecks_locked_policy_prompt_budget_before_s
         "unsupported_input_size: locked codex review policy cannot accept this "
         "prompt; no reviewer Task was created."
     )
+    measured = 120_001
+    limit = 120_000
     observed_providers = []
 
     def reject_locked_codex_policy(
@@ -4382,7 +6691,12 @@ async def test_webhook_synchronize_rechecks_locked_policy_prompt_budget_before_s
         del pr_data, prepared_context, base_ref
         observed_providers.append(repo_row.provider)
         if repo_row.provider == "codex":
-            raise pr_review_service.PRReviewInputTooLarge(detail)
+            raise pr_review_service.PRReviewInputTooLarge(
+                detail,
+                measured=measured,
+                limit=limit,
+                unit="characters",
+            )
         return ("prompt", None)
 
     monkeypatch.setattr(
@@ -4407,20 +6721,42 @@ async def test_webhook_synchronize_rechecks_locked_policy_prompt_budget_before_s
     )
 
     assert synchronized.status_code == 422, synchronized.text
-    assert synchronized.json() == {"detail": detail}
-    assert observed_providers == ["codex"]
+    receipt = synchronized.json()
+    assert receipt["detail"] == _canonical_input_rejection_detail(
+        measured,
+        limit,
+        "characters",
+    )
+    assert receipt["error_category"] == "unsupported_input_size"
+    assert receipt["measured"] == measured
+    assert receipt["limit"] == limit
+    assert receipt["unit"] == "characters"
+    assert observed_providers == ["codex", "codex"]
     async with session_factory() as db:
         reviews = list((await db.execute(
             select(PRReview)
             .where(PRReview.repo_id == repo["id"])
             .order_by(PRReview.id)
         )).scalars())
-        assert [review.id for review in reviews] == [old_review_id]
-        assert reviews[0].status == "reviewing"
+        assert len(reviews) == 2
+        assert reviews[0].id == old_review_id
+        assert reviews[0].status == "superseded"
         assert reviews[0].superseding_snapshot is None
+        rejected = reviews[1]
+        assert rejected.id == receipt["review_id"]
+        assert rejected.status == "error"
+        assert rejected.task_id is None
+        assert rejected.head_sha == HEAD_SHA_2
+        assert rejected.publication_state == "not_applicable"
+        assert rejected.failure_stage == "reviewer"
+        run = await db.get(PRMonitorRun, rejected.monitor_run_id)
+        assert run.current_review_id == rejected.id
+        assert run.current_head_sha == HEAD_SHA_2
+        assert run.status == "paused"
         old_task = await db.get(Task, old_task_id)
         assert old_task is not None
-        assert old_task.status == "pending"
+        assert old_task.status == "completed"
+        assert old_task.metadata_["pr_review_superseded"] is True
 
 
 @pytest.mark.asyncio
@@ -4445,6 +6781,8 @@ async def test_webhook_opened_rechecks_locked_policy_prompt_budget_before_create
         "unsupported_input_size: locked codex review policy cannot accept this "
         "prompt; no reviewer Task was created."
     )
+    measured = 120_001
+    limit = 120_000
     observed_providers = []
 
     def reject_locked_codex_policy(
@@ -4457,7 +6795,12 @@ async def test_webhook_opened_rechecks_locked_policy_prompt_budget_before_create
         del pr_data, prepared_context, base_ref
         observed_providers.append(repo_row.provider)
         if repo_row.provider == "codex":
-            raise pr_review_service.PRReviewInputTooLarge(detail)
+            raise pr_review_service.PRReviewInputTooLarge(
+                detail,
+                measured=measured,
+                limit=limit,
+                unit="characters",
+            )
         return ("prompt", None)
 
     monkeypatch.setattr(
@@ -4478,7 +6821,16 @@ async def test_webhook_opened_rechecks_locked_policy_prompt_budget_before_create
     )
 
     assert opened.status_code == 422, opened.text
-    assert opened.json() == {"detail": detail}
+    receipt = opened.json()
+    assert receipt["detail"] == _canonical_input_rejection_detail(
+        measured,
+        limit,
+        "characters",
+    )
+    assert receipt["error_category"] == "unsupported_input_size"
+    assert receipt["measured"] == measured
+    assert receipt["limit"] == limit
+    assert receipt["unit"] == "characters"
     assert observed_providers == ["codex"]
     async with session_factory() as db:
         reviews = list((await db.execute(
@@ -4487,7 +6839,12 @@ async def test_webhook_opened_rechecks_locked_policy_prompt_budget_before_create
         tasks = list((await db.execute(
             select(Task).where(Task.title.like("PR Review:%"))
         )).scalars())
-        assert reviews == []
+        assert len(reviews) == 1
+        assert reviews[0].id == receipt["review_id"]
+        assert reviews[0].status == "error"
+        assert reviews[0].task_id is None
+        assert reviews[0].publication_state == "not_applicable"
+        assert reviews[0].failure_stage == "reviewer"
         assert tasks == []
 
 
@@ -5695,7 +8052,11 @@ async def test_webhook_synchronize_worker_lost_response_retries_terminal_cleanup
 async def test_webhook_self_pr_ignored(client, session_factory, monkeypatch):
     """本机 gh 登录账号的 PR 自动屏蔽（self-approval 无意义）。"""
     import backend.api.pr_monitor as prm
-    monkeypatch.setattr(prm, "_GH_LOGIN_CACHE", "machine-user")
+    monkeypatch.setattr(
+        prm,
+        "_cached_github_publisher_identity",
+        AsyncMock(return_value={"actor": "machine-user"}),
+    )
 
     repo = await _create_repo(client, "owner/self-test")
     payload = _pr_payload("owner/self-test", number=9, author="machine-user")
@@ -5709,13 +8070,15 @@ async def test_webhook_self_pr_ignored(client, session_factory, monkeypatch):
 async def test_webhook_self_pr_allowed_when_whitelisted(client, session_factory, monkeypatch):
     """白名单显式包含本机账号时不屏蔽（测试后门）。"""
     import backend.api.pr_monitor as prm
-    monkeypatch.setattr(prm, "_GH_LOGIN_CACHE", "machine-user")
-    from unittest.mock import AsyncMock, MagicMock, patch as _patch
-
+    monkeypatch.setattr(
+        prm,
+        "_cached_github_publisher_identity",
+        AsyncMock(return_value={"actor": "machine-user"}),
+    )
     repo = await _create_repo(client, "owner/self-wl", allowed_authors=["machine-user"])
     payload = _pr_payload("owner/self-wl", number=10, author="machine-user")
-    with _patch("backend.services.pr_review_service.create_pr_review_task",
-                AsyncMock(return_value=MagicMock(id=1))):
+    with patch("backend.services.pr_review_service.create_pr_review_task",
+               AsyncMock(return_value=MagicMock(id=1))):
         resp = await _post_webhook(client, repo["webhook_secret"], payload)
     assert resp.status_code == 200
     assert resp.json()["status"] != "ignored"

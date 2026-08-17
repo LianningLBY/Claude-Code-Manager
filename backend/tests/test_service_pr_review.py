@@ -65,6 +65,46 @@ PUBLISHING_STARTED_AT = datetime(2026, 7, 31, 0, 0, 0)
 ACTOR = "ccm-bot"
 
 
+def _published_action_mock(
+    status: str,
+    action: str,
+    *,
+    review_id: int,
+) -> AsyncMock:
+    """Return a publisher mock with the immutable GitHub receipt it owes."""
+
+    async def publish(**kwargs):
+        kwargs["evidence_sink"].update({
+            "github_review_id": review_id,
+            "github_review_url": (
+                "https://github.com/owner/repo/pull/7"
+                f"#pullrequestreview-{review_id}"
+            ),
+            "github_review_state": "COMMENTED",
+            "published_actor": ACTOR,
+            "published_at": kwargs["publishing_started_at"],
+        })
+        return status, action
+
+    return AsyncMock(side_effect=publish)
+
+
+@pytest.fixture(autouse=True)
+def _default_fresh_github_identity(monkeypatch):
+    """Keep legacy direct-publisher tests explicit about the fresh fence.
+
+    Individual identity-rotation/failure tests replace this default with their
+    own ordered AsyncMock.  Without a default, old publisher unit tests would
+    accidentally route their mocked Review POST response through ``GET user``.
+    """
+
+    monkeypatch.setattr(
+        pr_review_service,
+        "_gh_authenticated_login",
+        AsyncMock(return_value=ACTOR),
+    )
+
+
 def _make_repo(**overrides) -> MonitoredRepo:
     values = {
         "repo_full_name": "owner/repo",
@@ -554,6 +594,7 @@ async def _arm_publishing(
     body="Looks good.",
 ) -> None:
     review.status = "publishing"
+    review.review_summary = body
     review.pending_action = action
     review.pending_review_body = body
     review.publishing_actor = ACTOR
@@ -568,6 +609,21 @@ async def _arm_publishing(
     )
     await db.commit()
     await db.refresh(review)
+
+
+async def _bind_current_reviewing_run(db, review: PRReview) -> PRMonitorRun:
+    run = PRMonitorRun(
+        repo_id=review.repo_id,
+        pr_number=review.pr_number,
+        current_base_sha=review.base_sha,
+        current_head_sha=review.head_sha,
+        current_review_id=review.id,
+        status="reviewing",
+    )
+    db.add(run)
+    await db.flush()
+    review.monitor_run_id = run.id
+    return run
 
 
 async def _bind_delivery_review(
@@ -695,6 +751,33 @@ def test_review_prompt_budget_is_utf8_bounded_and_provider_specific():
             provider="claude",
             label="single reviewer",
         )
+
+
+def test_input_rejection_evidence_enforces_json_safe_integer_boundary():
+    maximum = pr_review_service.PRReviewInputTooLarge.max_safe_integer
+    accepted = pr_review_service.PRReviewInputTooLarge(
+        "bounded",
+        measured=maximum,
+        limit=maximum - 1,
+        unit="characters",
+    )
+    assert accepted.measured == maximum
+
+    for measured, limit in (
+        (maximum + 1, 1),
+        (maximum + 1, maximum),
+        (maximum + 2, maximum + 1),
+    ):
+        with pytest.raises(
+            ValueError,
+            match="invalid PR review input-size evidence",
+        ):
+            pr_review_service.PRReviewInputTooLarge(
+                "out of range",
+                measured=measured,
+                limit=limit,
+                unit="characters",
+            )
 
 
 def test_single_prompt_keeps_the_complete_patch_within_budget():
@@ -3138,7 +3221,7 @@ async def test_publish_merged_comment_is_exact_and_reconciles_lost_ack():
 
     assert find_comment.await_count == 2
     find_merge.assert_awaited_once()
-    ensure_current.assert_awaited_once()
+    assert ensure_current.await_count == 2
     api.assert_awaited_once()
     assert api.await_args.args == ("repos/owner/repo/issues/7/comments",)
     assert api.await_args.kwargs["method"] == "POST"
@@ -3200,8 +3283,16 @@ async def test_post_merge_actor_rotation_stays_recoverable():
             "_find_merge_evidence",
             find_merge,
         ),
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            AsyncMock(return_value="rotated-bot"),
+        ),
     ):
-        with pytest.raises(GhError, match="merged comment identity changed") as exc:
+        with pytest.raises(
+            GhError,
+            match="publishing identity changed.*merged comment",
+        ) as exc:
             await pr_review_service._publish_merged_comment(
                 repo_name="owner/repo",
                 pr_number=PR_DATA["number"],
@@ -3218,7 +3309,7 @@ async def test_post_merge_actor_rotation_stays_recoverable():
 
     assert not pr_review_service._terminal_publication_error(exc.value)
     find_merge.assert_awaited_once()
-    ensure_current.assert_not_awaited()
+    ensure_current.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -3285,7 +3376,11 @@ async def test_post_merge_actor_rotation_keeps_durable_outbox_pending(
     assert refreshed.pending_action == "approved_merged"
     assert refreshed.publishing_actor == ACTOR
     assert refreshed.publishing_lease_token is None
-    assert "merged comment identity changed" in refreshed.review_summary
+    assert refreshed.review_summary == "Looks good."
+    assert refreshed.publication_state == "reconciling"
+    assert refreshed.failure_stage == "github_identity"
+    assert "publishing identity changed" in refreshed.publication_error
+    assert "merged comment evidence" in refreshed.publication_error
 
 
 @pytest.mark.asyncio
@@ -3385,6 +3480,16 @@ async def test_publish_rotated_actor_without_evidence_refuses_new_write():
         patch.object(pr_review_service, "_gh_api_json", api),
         patch.object(
             pr_review_service,
+            "_gh_pr_view",
+            AsyncMock(return_value=_snapshot()),
+        ),
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            AsyncMock(return_value="replacement-bot"),
+        ),
+        patch.object(
+            pr_review_service,
             "_find_review_evidence",
             AsyncMock(return_value=None),
         ),
@@ -3469,9 +3574,10 @@ async def test_check_review_reads_exact_terminal_body_and_publishes(
         timestamp=task.started_at + timedelta(seconds=1),
     ))
     await db_session.commit()
+    expected_task_id = task.id
     expected_task_started_at = task.started_at
 
-    async def publish_after_durable_claim(**_kwargs):
+    async def publish_after_durable_claim(**kwargs):
         await db_session.refresh(review)
         assert review.status == "publishing"
         assert review.pending_action == "lgtm_comment"
@@ -3480,6 +3586,13 @@ async def test_check_review_reads_exact_terminal_body_and_publishes(
         assert review.publishing_retry_count == 3
         assert review.publishing_task_started_at == expected_task_started_at
         assert review.publishing_started_at is not None
+        kwargs["evidence_sink"].update({
+            "github_review_id": 731,
+            "github_review_url": "https://github.com/owner/repo/pull/7#pullrequestreview-731",
+            "github_review_state": "COMMENTED",
+            "published_actor": ACTOR,
+            "published_at": review.publishing_started_at,
+        })
         return "approved", "lgtm_comment"
 
     publish = AsyncMock(side_effect=publish_after_durable_claim)
@@ -3499,13 +3612,18 @@ async def test_check_review_reads_exact_terminal_body_and_publishes(
             db_session,
             review.id,
             "owner/repo",
-            terminal_task_id=task.id,
+            terminal_task_id=expected_task_id,
             terminal_task_retry_count=3,
         )
 
     await db_session.refresh(review)
     assert review.status == "approved"
     assert review.action_taken == "lgtm_comment"
+    assert review.code_verdict == "pass"
+    assert review.code_verdict_task_id == expected_task_id
+    assert review.code_verdict_retry_count == 3
+    assert review.code_verdict_task_started_at == expected_task_started_at
+    assert review.code_verdict_recorded_at is not None
     assert review.completed_at is not None
     assert review.review_summary == "No blocking findings."
     assert "PR_REVIEW_BODY_BEGIN" not in review.review_summary
@@ -3523,7 +3641,8 @@ async def test_check_review_reads_exact_terminal_body_and_publishes(
     assert publish.await_args.kwargs["review_body"] == "No blocking findings."
     assert publish.await_args.kwargs["actor"] == ACTOR
     assert callable(publish.await_args.kwargs["ensure_current"])
-    assert no_broadcast.broadcast.await_count == 2
+    # Immutable code verdict, armed publication, and published receipt.
+    assert no_broadcast.broadcast.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -3544,7 +3663,20 @@ async def test_check_review_changes_requested_persists_clean_agent_body(
         body=body,
         retry_count=5,
     )
-    publish = AsyncMock(return_value=("commented", "review_comments"))
+    expected_task_id = task.id
+    expected_task_started_at = task.started_at
+
+    async def publish_with_evidence(**kwargs):
+        kwargs["evidence_sink"].update({
+            "github_review_id": 732,
+            "github_review_url": "https://github.com/owner/repo/pull/7#pullrequestreview-732",
+            "github_review_state": "COMMENTED",
+            "published_actor": ACTOR,
+            "published_at": kwargs["publishing_started_at"],
+        })
+        return "commented", "review_comments"
+
+    publish = AsyncMock(side_effect=publish_with_evidence)
     publish_findings = AsyncMock()
     with (
         patch.object(
@@ -3567,13 +3699,18 @@ async def test_check_review_changes_requested_persists_clean_agent_body(
             db_session,
             review.id,
             repo.repo_full_name,
-            terminal_task_id=task.id,
+            terminal_task_id=expected_task_id,
             terminal_task_retry_count=5,
         )
 
     await db_session.refresh(review)
     assert review.status == "commented"
     assert review.action_taken == "review_comments"
+    assert review.code_verdict == "changes_required"
+    assert review.code_verdict_task_id == expected_task_id
+    assert review.code_verdict_retry_count == 5
+    assert review.code_verdict_task_started_at == expected_task_started_at
+    assert review.code_verdict_recorded_at is not None
     assert review.review_summary == body
     assert "PR_REVIEW_BODY_BEGIN" not in review.review_summary
     assert "PR_REVIEW_BODY_END" not in review.review_summary
@@ -3589,7 +3726,7 @@ async def test_check_review_changes_requested_persists_clean_agent_body(
     publish.assert_awaited_once()
     assert publish.await_args.kwargs["review_body"] == body
     publish_findings.assert_awaited_once()
-    assert no_broadcast.broadcast.await_count == 2
+    assert no_broadcast.broadcast.await_count == 3
 
 
 @pytest.mark.asyncio
@@ -3640,9 +3777,9 @@ async def test_background_terminal_arms_review_without_publishing_effect(
     assert review.pending_action == "lgtm_comment"
     assert task.pty_background_generation == generation
     resume.assert_not_awaited()
-    # Only the durable publishing transition is announced. The actual GitHub
-    # completion event belongs to marker-free recovery.
-    assert no_broadcast.broadcast.await_count == 1
+    # The immutable code verdict and durable publishing transition are
+    # announced. The actual GitHub completion belongs to marker-free recovery.
+    assert no_broadcast.broadcast.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -3655,6 +3792,7 @@ async def test_check_review_retries_transient_identity_read(
     review_id = review.id
     task_id = task.id
     retry_count = task.retry_count
+    task_started_at = task.started_at
     repo_name = repo.repo_full_name
     await _add_terminal_log(
         db_session,
@@ -3663,11 +3801,21 @@ async def test_check_review_retries_transient_identity_read(
         body="No blocking findings.",
     )
     identity = AsyncMock(
-        side_effect=[GhError("GitHub API timeout"), ACTOR, ACTOR]
+        side_effect=[GhError("GitHub API timeout"), ACTOR]
     )
-    publish = AsyncMock(return_value=("approved", "lgtm_comment"))
+    async def publish_with_evidence(**kwargs):
+        kwargs["evidence_sink"].update({
+            "github_review_id": 733,
+            "github_review_url": "https://github.com/owner/repo/pull/7#pullrequestreview-733",
+            "github_review_state": "COMMENTED",
+            "published_actor": ACTOR,
+            "published_at": kwargs["publishing_started_at"],
+        })
+        return "approved", "lgtm_comment"
+
+    publish = AsyncMock(side_effect=publish_with_evidence)
     with (
-        patch.object(pr_review_service, "_gh_authenticated_login", identity),
+        patch.object(pr_review_service, "_github_publisher_login", identity),
         patch.object(pr_review_service, "_publish_review_action", publish),
     ):
         await check_and_update_review(
@@ -3679,6 +3827,16 @@ async def test_check_review_retries_transient_identity_read(
         )
         await db_session.refresh(review)
         assert review.status == "reviewing"
+        assert review.code_verdict == "pass"
+        assert review.review_summary == "No blocking findings."
+        assert review.code_verdict_task_id == task_id
+        assert review.code_verdict_retry_count == retry_count
+        assert review.code_verdict_task_started_at == task_started_at
+        assert review.code_verdict_recorded_at is not None
+        frozen_at = review.code_verdict_recorded_at
+        assert review.publication_state == "reconciling"
+        assert review.failure_stage == "github_identity"
+        assert review.publication_error == "GitHub API timeout"
         publish.assert_not_awaited()
 
         await check_and_update_review(
@@ -3691,8 +3849,202 @@ async def test_check_review_retries_transient_identity_read(
 
     await db_session.refresh(review)
     assert review.status == "approved"
-    assert identity.await_count == 3
+    assert review.code_verdict == "pass"
+    assert review.code_verdict_recorded_at == frozen_at
+    assert identity.await_count == 2
     publish.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_code_verdict_freezes_in_committed_generation_before_identity(
+    db_session,
+    repo,
+    no_broadcast,
+):
+    review, task = await _make_review(db_session, repo, retry_count=8)
+    body = "The exact head has no blocking findings."
+    await _add_terminal_log(
+        db_session,
+        task,
+        result="lgtm_comment",
+        body=body,
+        retry_count=8,
+    )
+    review_id = review.id
+    task_id = task.id
+    task_started_at = task.started_at
+    repo_name = repo.repo_full_name
+
+    async def identity_after_verdict_commit():
+        # The GitHub boundary is reached only after a separate commit made the
+        # immutable code result and complete generation provenance visible.
+        await db_session.refresh(review)
+        assert review.status == "reviewing"
+        assert review.code_verdict == "pass"
+        assert review.review_summary == body
+        assert review.code_verdict_task_id == task_id
+        assert review.code_verdict_retry_count == 8
+        assert review.code_verdict_task_started_at == task_started_at
+        assert review.code_verdict_recorded_at is not None
+        return ACTOR
+
+    identity = AsyncMock(side_effect=identity_after_verdict_commit)
+
+    async def publish_with_evidence(**kwargs):
+        kwargs["evidence_sink"].update({
+            "github_review_id": 734,
+            "github_review_url": "https://github.com/owner/repo/pull/7#pullrequestreview-734",
+            "github_review_state": "COMMENTED",
+            "published_actor": ACTOR,
+            "published_at": kwargs["publishing_started_at"],
+        })
+        return "approved", "lgtm_comment"
+
+    publish = AsyncMock(side_effect=publish_with_evidence)
+    with (
+        patch.object(pr_review_service, "_github_publisher_login", identity),
+        patch.object(pr_review_service, "_publish_review_action", publish),
+    ):
+        await check_and_update_review(
+            db_session,
+            review_id,
+            repo_name,
+            terminal_task_id=task_id,
+            terminal_task_retry_count=8,
+        )
+
+    identity.assert_awaited()
+    publish.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_code_verdict_cas_rejects_conflicting_result_or_body(
+    db_session,
+    repo,
+):
+    review, task = await _make_review(db_session, repo, retry_count=9)
+    review_id = review.id
+    task_id = task.id
+    task_started_at = task.started_at
+    assert await pr_review_service._commit_exact_code_verdict(
+        db_session,
+        review_id=review_id,
+        task_id=task_id,
+        retry_count=9,
+        task_started_at=task_started_at,
+        code_verdict="pass",
+        review_summary="Stable result.",
+        background_handoff_pending=None,
+        expected_background_generation=None,
+    )
+    await db_session.refresh(review)
+    recorded_at = review.code_verdict_recorded_at
+
+    assert await pr_review_service._commit_exact_code_verdict(
+        db_session,
+        review_id=review_id,
+        task_id=task_id,
+        retry_count=9,
+        task_started_at=task_started_at,
+        code_verdict="pass",
+        review_summary="Stable result.",
+        background_handoff_pending=None,
+        expected_background_generation=None,
+    )
+    assert not await pr_review_service._commit_exact_code_verdict(
+        db_session,
+        review_id=review_id,
+        task_id=task_id,
+        retry_count=9,
+        task_started_at=task_started_at,
+        code_verdict="changes_required",
+        review_summary="Stable result.",
+        background_handoff_pending=None,
+        expected_background_generation=None,
+    )
+    assert not await pr_review_service._commit_exact_code_verdict(
+        db_session,
+        review_id=review_id,
+        task_id=task_id,
+        retry_count=9,
+        task_started_at=task_started_at,
+        code_verdict="pass",
+        review_summary="Changed result.",
+        background_handoff_pending=None,
+        expected_background_generation=None,
+    )
+    await db_session.refresh(review)
+    assert review.code_verdict == "pass"
+    assert review.review_summary == "Stable result."
+    assert review.code_verdict_recorded_at == recorded_at
+
+
+@pytest.mark.asyncio
+async def test_terminal_intent_before_task_completion_keeps_verdict_without_github(
+    db_session,
+    repo,
+    no_broadcast,
+):
+    review, task = await _make_review(db_session, repo, retry_count=10)
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=review.pr_number,
+        current_base_sha=review.base_sha,
+        current_head_sha=review.head_sha,
+        current_review_id=review.id,
+        status="reviewing",
+        terminal_intent_status="closed",
+        terminal_intent_base_ref=review.base_ref,
+        terminal_intent_head_sha=review.head_sha,
+        terminal_intent_delivery_id="closed-before-result",
+        terminal_intent_observed_at=datetime.utcnow(),
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review.monitor_run_id = run.id
+    body = "Review completed while the signed close was settling."
+    await _add_terminal_log(
+        db_session,
+        task,
+        result="lgtm_comment",
+        body=body,
+        retry_count=10,
+    )
+    review_id = review.id
+    task_id = task.id
+    task_started_at = task.started_at
+    repo_name = repo.repo_full_name
+    identity = AsyncMock(return_value=ACTOR)
+    capability = AsyncMock()
+    publish = AsyncMock()
+    with (
+        patch.object(pr_review_service, "_gh_authenticated_login", identity),
+        patch.object(pr_review_service, "_freeze_safe_merge_method", capability),
+        patch.object(pr_review_service, "_publish_review_action", publish),
+    ):
+        await check_and_update_review(
+            db_session,
+            review_id,
+            repo_name,
+            terminal_task_id=task_id,
+            terminal_task_retry_count=10,
+        )
+
+    await db_session.refresh(review)
+    assert review.status == "approved"
+    assert review.code_verdict == "pass"
+    assert review.review_summary == body
+    assert review.code_verdict_task_id == task_id
+    assert review.code_verdict_retry_count == 10
+    assert review.code_verdict_task_started_at == task_started_at
+    assert review.code_verdict_recorded_at is not None
+    assert review.publication_state == "not_applicable"
+    assert review.failure_stage == "lifecycle"
+    assert review.pending_action is None
+    identity.assert_not_awaited()
+    capability.assert_not_awaited()
+    publish.assert_not_awaited()
+    assert no_broadcast.broadcast.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -3719,6 +4071,13 @@ async def test_check_auto_merge_rebase_only_arms_fast_forward_publication(
         assert review.status == "publishing"
         assert review.merge_method == "fast-forward"
         assert kwargs["merge_method"] == "fast-forward"
+        kwargs["evidence_sink"].update({
+            "github_review_id": 735,
+            "github_review_url": "https://github.com/owner/repo/pull/7#pullrequestreview-735",
+            "github_review_state": "COMMENTED",
+            "published_actor": ACTOR,
+            "published_at": kwargs["publishing_started_at"],
+        })
         return "merged", "approved_merged"
 
     publish = AsyncMock(side_effect=publish_after_direct_ref_claim)
@@ -3748,7 +4107,7 @@ async def test_check_auto_merge_rebase_only_arms_fast_forward_publication(
     assert review.action_taken == "approved_merged"
     assert review.merge_method == "fast-forward"
     repo_capability.assert_awaited_once_with("repos/owner/repo")
-    assert actor.await_count == 2
+    actor.assert_awaited_once()
     publish.assert_awaited_once()
 
 
@@ -3773,7 +4132,18 @@ async def test_check_auto_merge_retries_transient_capability_read(
         GhError("GitHub API HTTP 503"),
         "fast-forward",
     ])
-    publish = AsyncMock(return_value=("merged", "approved_merged"))
+
+    async def publish_with_evidence(**kwargs):
+        kwargs["evidence_sink"].update({
+            "github_review_id": 736,
+            "github_review_url": "https://github.com/owner/repo/pull/7#pullrequestreview-736",
+            "github_review_state": "COMMENTED",
+            "published_actor": ACTOR,
+            "published_at": kwargs["publishing_started_at"],
+        })
+        return "merged", "approved_merged"
+
+    publish = AsyncMock(side_effect=publish_with_evidence)
     with (
         patch.object(pr_review_service, "_freeze_safe_merge_method", freeze),
         patch.object(
@@ -3831,7 +4201,11 @@ async def test_check_auto_merge_blocker_publishes_on_rebase_only_repository(
     freeze = AsyncMock(side_effect=AssertionError(
         "blocking reviews must not inspect auto-merge capability"
     ))
-    publish = AsyncMock(return_value=("commented", "review_comments"))
+    publish = _published_action_mock(
+        "commented",
+        "review_comments",
+        review_id=737,
+    )
     with (
         patch.object(
             pr_review_service,
@@ -3890,7 +4264,11 @@ async def test_check_review_ignores_newer_output_from_old_retry(
         ),
     ])
     await db_session.commit()
-    publish = AsyncMock(return_value=("approved", "lgtm_comment"))
+    publish = _published_action_mock(
+        "approved",
+        "lgtm_comment",
+        review_id=738,
+    )
     with (
         patch.object(
             pr_review_service,
@@ -4152,7 +4530,10 @@ async def test_delivery_durable_publication_never_resumes_approved_merged(
     await db_session.refresh(review)
     assert review.status == "error"
     assert review.action_taken == "error"
-    assert "Durable PR publication state is invalid" in review.review_summary
+    assert review.review_summary == "Looks good."
+    assert review.publication_state == "failed"
+    assert review.failure_stage == "publication"
+    assert "Durable PR publication state is invalid" in review.publication_error
     identity.assert_not_awaited()
     publish.assert_not_awaited()
 
@@ -4244,7 +4625,11 @@ async def test_delivery_durable_publication_resumes_frozen_auto_merge(
     review.publishing_lease_expires_at = datetime.utcnow() + timedelta(minutes=5)
     await db_session.commit()
 
-    publish = AsyncMock(return_value=("merged", "approved_merged"))
+    publish = _published_action_mock(
+        "merged",
+        "approved_merged",
+        review_id=739,
+    )
     identity = AsyncMock(return_value=ACTOR)
     with (
         patch.object(
@@ -4271,7 +4656,7 @@ async def test_delivery_durable_publication_resumes_frozen_auto_merge(
     assert review.completed_at is not None
     assert review.pending_action is None
     assert review.publishing_lease_token is None
-    identity.assert_awaited_once()
+    identity.assert_not_awaited()
     publish.assert_awaited_once()
     assert publish.await_args.kwargs["result"] == "approved_merged"
     assert publish.await_args.kwargs["auto_merge"] is True
@@ -4345,7 +4730,10 @@ async def test_check_review_unconfirmed_publish_error_stays_publishing(
     assert review.action_taken is None
     assert review.pending_action == "lgtm_comment"
     assert review.action_nonce == ACTION_NONCE
-    assert "nonce reconciliation" in review.review_summary
+    assert review.review_summary == "Looks good."
+    assert review.publication_state == "reconciling"
+    assert review.failure_stage == "recovery"
+    assert "nonce reconciliation" in review.publication_error
 
 
 @pytest.mark.asyncio
@@ -4380,11 +4768,14 @@ async def test_check_review_terminal_snapshot_error_finishes_error(
     await db_session.refresh(review)
     assert review.status == "error"
     assert review.action_taken == "error"
-    assert "snapshot changed" in review.review_summary
+    assert review.review_summary == "Looks good."
+    assert review.publication_state == "not_applicable"
+    assert review.failure_stage == "lifecycle"
+    assert "snapshot changed" in review.publication_error
 
 
 @pytest.mark.asyncio
-async def test_check_review_actor_rotation_without_evidence_finishes_error(
+async def test_check_review_actor_rotation_without_evidence_stays_recoverable(
     db_session,
     repo,
     no_broadcast,
@@ -4417,9 +4808,13 @@ async def test_check_review_actor_rotation_without_evidence_finishes_error(
         )
 
     await db_session.refresh(review)
-    assert review.status == "error"
-    assert review.action_taken == "error"
-    assert "identity changed" in review.review_summary
+    assert review.status == "publishing"
+    assert review.action_taken is None
+    assert review.pending_action == "lgtm_comment"
+    assert review.review_summary == "Looks good."
+    assert review.publication_state == "reconciling"
+    assert review.failure_stage == "github_identity"
+    assert "identity changed" in review.publication_error
 
 
 @pytest.mark.asyncio
@@ -4434,9 +4829,16 @@ async def test_check_review_cannot_commit_after_background_handoff_arms(
     task_retry_count = task.retry_count
     pending = False
 
-    async def publish_then_arm(**_kwargs):
+    async def publish_then_arm(**kwargs):
         nonlocal pending
         pending = True
+        kwargs["evidence_sink"].update({
+            "github_review_id": 742,
+            "github_review_url": "https://github.com/owner/repo/pull/7#pullrequestreview-742",
+            "github_review_state": "COMMENTED",
+            "published_actor": ACTOR,
+            "published_at": kwargs["publishing_started_at"],
+        })
         await db_session.execute(
             update(Task)
             .where(Task.id == task_id)
@@ -4469,7 +4871,7 @@ async def test_check_review_cannot_commit_after_background_handoff_arms(
     assert review.status == "publishing"
     assert review.pending_action == "lgtm_comment"
     assert review.completed_at is None
-    assert no_broadcast.broadcast.await_count == 1
+    assert no_broadcast.broadcast.await_count == 2
 
 
 @pytest.mark.asyncio
@@ -4488,7 +4890,17 @@ async def test_recover_publishing_pr_reviews_reuses_nonce_without_write(
 
     api = AsyncMock()
     gh_view = AsyncMock(return_value=_snapshot())
-    find_review = AsyncMock(return_value="APPROVED")
+    async def find_existing_review(**kwargs):
+        kwargs["evidence_sink"].update({
+            "github_review_id": 743,
+            "github_review_url": "https://github.com/owner/repo/pull/7#pullrequestreview-743",
+            "github_review_state": "APPROVED",
+            "published_actor": ACTOR,
+            "published_at": PUBLISHING_STARTED_AT,
+        })
+        return "APPROVED"
+
+    find_review = AsyncMock(side_effect=find_existing_review)
     with (
         patch.object(
             pr_review_service,
@@ -4549,7 +4961,11 @@ async def test_recovery_uses_frozen_review_base_ref_after_repo_config_drift(
         repo.default_branch = "release/next"
         await db.commit()
 
-    publish = AsyncMock(return_value=("approved", "lgtm_comment"))
+    publish = _published_action_mock(
+        "approved",
+        "lgtm_comment",
+        review_id=740,
+    )
     with (
         patch.object(
             pr_review_service,
@@ -4564,6 +4980,103 @@ async def test_recovery_uses_frozen_review_base_ref_after_repo_config_drift(
 
     publish.assert_awaited_once()
     assert publish.await_args.kwargs["base_ref"] == "main"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing_evidence", "finalized"),
+    [
+        ({"github_review_id": 745}, True),
+        ({
+            "github_review_id": 745,
+            "github_review_url": (
+                "https://github.com/owner/repo/pull/7#pullrequestreview-745"
+            ),
+            "github_review_state": "COMMENTED",
+            "published_actor": ACTOR,
+            "published_at": PUBLISHING_STARTED_AT,
+        }, True),
+        ({"github_review_id": 999}, False),
+        ({
+            "github_review_url": (
+                "https://github.com/owner/repo/pull/7#pullrequestreview-999"
+            ),
+        }, False),
+        ({"github_review_state": "APPROVED"}, False),
+        ({"published_actor": "other-bot"}, False),
+        ({"published_at": datetime(2026, 7, 30, 23, 59, 0)}, False),
+    ],
+    ids=(
+        "same-partial",
+        "same-complete",
+        "conflicting-id",
+        "conflicting-url",
+        "conflicting-state",
+        "conflicting-actor",
+        "conflicting-time",
+    ),
+)
+async def test_terminal_publication_cas_preserves_immutable_evidence(
+    session_factory,
+    no_broadcast,
+    existing_evidence,
+    finalized,
+):
+    """Same evidence may fill NULLs; a conflicting partial tuple never changes."""
+
+    async with session_factory() as db:
+        repo = _make_repo()
+        db.add(repo)
+        await db.commit()
+        await db.refresh(repo)
+        review, task = await _make_review(db, repo)
+        await _arm_publishing(db, review, task)
+        for field, value in existing_evidence.items():
+            setattr(review, field, value)
+        await db.commit()
+        review_id = review.id
+
+    async with session_factory() as db:
+        lease_token = await pr_review_service._acquire_publication_lease(
+            db,
+            review_id,
+        )
+    assert lease_token is not None
+
+    publish = _published_action_mock(
+        "approved",
+        "lgtm_comment",
+        review_id=745,
+    )
+    async with session_factory() as db:
+        with patch.object(
+            pr_review_service,
+            "_publish_review_action",
+            publish,
+        ):
+            await pr_review_service._resume_publishing_review_under_lease(
+                db,
+                review_id,
+                repo.repo_full_name,
+                lease_token=lease_token,
+            )
+
+    async with session_factory() as db:
+        stored = await db.get(PRReview, review_id)
+        if finalized:
+            assert stored.status == "approved"
+            assert stored.publication_state == "published"
+            assert stored.github_review_id == 745
+            assert stored.github_review_url == (
+                "https://github.com/owner/repo/pull/7#pullrequestreview-745"
+            )
+            assert stored.github_review_state == "COMMENTED"
+            assert stored.published_actor == ACTOR
+            assert stored.published_at == PUBLISHING_STARTED_AT
+        else:
+            assert stored.status == "publishing"
+            for field in pr_review_service._PUBLICATION_EVIDENCE_FIELDS:
+                assert getattr(stored, field) == existing_evidence.get(field)
 
 
 @pytest.mark.asyncio
@@ -4633,7 +5146,17 @@ async def test_recover_migration_window_merge_outbox_after_lost_merge_ack(
         merged_by=ACTOR,
         merge_commit_sha=merge_sha,
     ))
-    find_review = AsyncMock(return_value="APPROVED")
+    async def find_existing_review(**kwargs):
+        kwargs["evidence_sink"].update({
+            "github_review_id": 744,
+            "github_review_url": "https://github.com/owner/repo/pull/7#pullrequestreview-744",
+            "github_review_state": "APPROVED",
+            "published_actor": ACTOR,
+            "published_at": PUBLISHING_STARTED_AT,
+        })
+        return "APPROVED"
+
+    find_review = AsyncMock(side_effect=find_existing_review)
     find_comment = AsyncMock(return_value=None)
     find_merge = AsyncMock(wraps=pr_review_service._find_merge_evidence)
     with (
@@ -4679,7 +5202,15 @@ async def test_recover_migration_window_merge_outbox_after_lost_merge_ack(
         assert stored.publishing_actor == ACTOR
         assert stored.publishing_started_at == PUBLISHING_STARTED_AT
 
-    assert find_review.await_args.kwargs == {
+    find_review_kwargs = dict(find_review.await_args.kwargs)
+    assert find_review_kwargs.pop("evidence_sink") == {
+        "github_review_id": 744,
+        "github_review_url": "https://github.com/owner/repo/pull/7#pullrequestreview-744",
+        "github_review_state": "APPROVED",
+        "published_actor": ACTOR,
+        "published_at": PUBLISHING_STARTED_AT,
+    }
+    assert find_review_kwargs == {
         "repo_name": "owner/repo",
         "pr_number": PR_DATA["number"],
         "head_sha": PR_DATA["head_sha"],
@@ -4740,7 +5271,10 @@ async def test_recover_publishing_pr_reviews_counts_only_terminal_rows(
     async with session_factory() as db:
         stored = await db.get(PRReview, review_id)
         assert stored.status == "publishing"
-        assert "nonce reconciliation" in stored.review_summary
+        assert stored.review_summary == "Looks good."
+        assert stored.publication_state == "reconciling"
+        assert stored.failure_stage == "recovery"
+        assert "nonce reconciliation" in stored.publication_error
 
 
 @pytest.mark.asyncio
@@ -4860,6 +5394,277 @@ async def test_publication_guard_rejects_delivery_ownership_change(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("action", "auto_merge", "merge_method"),
+    [
+        ("lgtm_comment", False, None),
+        ("review_comments", False, None),
+        ("approved_merged", True, "merge"),
+    ],
+)
+async def test_publication_guard_accepts_current_reviewing_run_effect_paths(
+    session_factory,
+    action,
+    auto_merge,
+    merge_method,
+):
+    """COMMENT, Finding, and merge effects share the exact reviewing fence."""
+
+    async with session_factory() as db:
+        repo = _make_repo(auto_merge=auto_merge)
+        db.add(repo)
+        await db.commit()
+        await db.refresh(repo)
+        review, task = await _make_review(db, repo, auto_merge=auto_merge)
+        await _bind_current_reviewing_run(db, review)
+        await _arm_publishing(db, review, task, action=action)
+        review_id = review.id
+        task_id = task.id
+        retry_count = task.retry_count
+        started_at = task.started_at
+        expected_delivery_id = review.delivery_id
+
+    async with session_factory() as db:
+        lease_token = await pr_review_service._acquire_publication_lease(
+            db,
+            review_id,
+        )
+    assert lease_token is not None
+
+    async with session_factory() as db:
+        assert await pr_review_service._publication_is_current(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            retry_count=retry_count,
+            task_started_at=started_at,
+            nonce=ACTION_NONCE,
+            lease_token=lease_token,
+            expected_delivery_id=expected_delivery_id,
+            base_ref="main",
+            merge_method=merge_method,
+        )
+
+
+@pytest.mark.asyncio
+async def test_publication_guard_preserves_legacy_review_without_run(
+    session_factory,
+):
+    """Pre-Run durable outboxes retain their existing safe recovery path."""
+
+    async with session_factory() as db:
+        repo = _make_repo()
+        db.add(repo)
+        await db.commit()
+        await db.refresh(repo)
+        review, task = await _make_review(db, repo)
+        await _arm_publishing(db, review, task)
+        review_id = review.id
+        task_id = task.id
+        retry_count = task.retry_count
+        started_at = task.started_at
+        expected_delivery_id = review.delivery_id
+
+    async with session_factory() as db:
+        lease_token = await pr_review_service._acquire_publication_lease(
+            db,
+            review_id,
+        )
+    assert lease_token is not None
+
+    async with session_factory() as db:
+        assert await pr_review_service._publication_is_current(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            retry_count=retry_count,
+            task_started_at=started_at,
+            nonce=ACTION_NONCE,
+            lease_token=lease_token,
+            expected_delivery_id=expected_delivery_id,
+            base_ref="main",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_status", ["closed", "merged"])
+async def test_publication_guard_rejects_committed_terminal_intent(
+    session_factory,
+    terminal_status,
+):
+    """A signed terminal intent revokes an already-armed merge publisher."""
+
+    async with session_factory() as db:
+        repo = _make_repo(auto_merge=True)
+        db.add(repo)
+        await db.commit()
+        await db.refresh(repo)
+        review, task = await _make_review(db, repo, auto_merge=True)
+        run = await _bind_current_reviewing_run(db, review)
+        await _arm_publishing(
+            db,
+            review,
+            task,
+            action="approved_merged",
+        )
+        review_id = review.id
+        task_id = task.id
+        retry_count = task.retry_count
+        started_at = task.started_at
+        run_id = run.id
+        expected_delivery_id = review.delivery_id
+
+    async with session_factory() as db:
+        lease_token = await pr_review_service._acquire_publication_lease(
+            db,
+            review_id,
+        )
+    assert lease_token is not None
+
+    async with session_factory() as db:
+        assert await pr_review_service._publication_is_current(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            retry_count=retry_count,
+            task_started_at=started_at,
+            nonce=ACTION_NONCE,
+            lease_token=lease_token,
+            expected_delivery_id=expected_delivery_id,
+            base_ref="main",
+            merge_method="merge",
+        )
+
+    # This is the webhook commit boundary.  Publication remains armed while
+    # terminal recovery drains it, but no later GitHub mutation is authorized.
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        run.terminal_intent_status = terminal_status
+        run.terminal_intent_base_ref = "main"
+        run.terminal_intent_head_sha = PR_DATA["head_sha"]
+        run.terminal_intent_delivery_id = f"terminal-{terminal_status}"
+        run.terminal_intent_observed_at = datetime.utcnow()
+        await db.commit()
+
+    async with session_factory() as db:
+        assert not await pr_review_service._publication_is_current(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            retry_count=retry_count,
+            task_started_at=started_at,
+            nonce=ACTION_NONCE,
+            lease_token=lease_token,
+            expected_delivery_id=expected_delivery_id,
+            base_ref="main",
+            merge_method="merge",
+        )
+
+
+@pytest.mark.asyncio
+async def test_publication_guard_rejects_partial_terminal_intent(
+    session_factory,
+):
+    """An interrupted webhook intent write fails closed even without status."""
+
+    async with session_factory() as db:
+        repo = _make_repo()
+        db.add(repo)
+        await db.commit()
+        await db.refresh(repo)
+        review, task = await _make_review(db, repo)
+        run = await _bind_current_reviewing_run(db, review)
+        await _arm_publishing(db, review, task)
+        review_id = review.id
+        task_id = task.id
+        retry_count = task.retry_count
+        started_at = task.started_at
+        run_id = run.id
+        expected_delivery_id = review.delivery_id
+
+    async with session_factory() as db:
+        lease_token = await pr_review_service._acquire_publication_lease(
+            db,
+            review_id,
+        )
+    assert lease_token is not None
+
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        run.terminal_intent_head_sha = PR_DATA["head_sha"]
+        await db.commit()
+
+    async with session_factory() as db:
+        assert not await pr_review_service._publication_is_current(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            retry_count=retry_count,
+            task_started_at=started_at,
+            nonce=ACTION_NONCE,
+            lease_token=lease_token,
+            expected_delivery_id=expected_delivery_id,
+            base_ref="main",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("current_review_id", None),
+        ("current_base_sha", "8" * 40),
+        ("current_head_sha", "9" * 40),
+        ("status", "paused"),
+    ],
+)
+async def test_publication_guard_rejects_monitor_binding_mismatch(
+    session_factory,
+    field,
+    value,
+):
+    async with session_factory() as db:
+        repo = _make_repo()
+        db.add(repo)
+        await db.commit()
+        await db.refresh(repo)
+        review, task = await _make_review(db, repo)
+        run = await _bind_current_reviewing_run(db, review)
+        await _arm_publishing(db, review, task)
+        review_id = review.id
+        task_id = task.id
+        retry_count = task.retry_count
+        started_at = task.started_at
+        run_id = run.id
+        expected_delivery_id = review.delivery_id
+
+    async with session_factory() as db:
+        lease_token = await pr_review_service._acquire_publication_lease(
+            db,
+            review_id,
+        )
+    assert lease_token is not None
+
+    async with session_factory() as db:
+        run = await db.get(PRMonitorRun, run_id)
+        setattr(run, field, value)
+        await db.commit()
+
+    async with session_factory() as db:
+        assert not await pr_review_service._publication_is_current(
+            db,
+            review_id=review_id,
+            task_id=task_id,
+            retry_count=retry_count,
+            task_started_at=started_at,
+            nonce=ACTION_NONCE,
+            lease_token=lease_token,
+            expected_delivery_id=expected_delivery_id,
+            base_ref="main",
+        )
+
+
+@pytest.mark.asyncio
 async def test_publication_guard_rejects_active_manager_termination_receipt(
     session_factory,
 ):
@@ -4956,7 +5761,11 @@ async def test_recover_incomplete_review_claims_exact_completed_generation(
         await _add_terminal_log(db, task)
         review_id = review.id
 
-    publish = AsyncMock(return_value=("approved", "lgtm_comment"))
+    publish = _published_action_mock(
+        "approved",
+        "lgtm_comment",
+        review_id=741,
+    )
     with (
         patch.object(
             pr_review_service,
@@ -5609,6 +6418,247 @@ async def test_recover_superseding_intent_creates_replacement_after_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_recover_superseding_input_rejection_after_cleanup_is_idempotent(
+    session_factory,
+    no_broadcast,
+):
+    """Snapshot v4 rechecks current policy and creates no Reviewer Task."""
+
+    from backend.services.task_termination import TaskTerminationResult
+
+    replacement = {
+        **PR_DATA,
+        "base_ref": "main",
+        "head_sha": "9" * 40,
+        "delivery_id": "delivery-input-rejection-recovery",
+    }
+    detail = (
+        "unsupported_input_size: recovered review input exceeds the safe model "
+        "limit; no reviewer Task was created."
+    )
+    measured = 140_001
+    limit = 140_000
+    context = _prepared_context()
+    context["head_sha"] = replacement["head_sha"]
+    async with session_factory() as db:
+        repo = _make_repo()
+        db.add(repo)
+        await db.commit()
+        await db.refresh(repo)
+        review, task = await _make_review(
+            db,
+            repo,
+            task_status="pending",
+        )
+        repo_id = repo.id
+        task_id = task.id
+        review_id = review.id
+        review.status = "superseding"
+        review.superseding_snapshot = {
+            "version": 4,
+            "pr_data": replacement,
+            "prepared_context": context,
+            "input_rejection": {
+                "category": "unsupported_input_size",
+                "measured": measured,
+                "limit": limit,
+                "unit": "UTF-8 bytes",
+            },
+        }
+        review.superseding_token = "3" * 48
+        review.superseding_started_at = (
+            datetime.utcnow() - timedelta(minutes=5)
+        )
+        await db.commit()
+
+    terminated_ids = []
+
+    async def terminate(task_id_arg, db, **_kwargs):
+        terminated_ids.append(task_id_arg)
+        current = await db.get(Task, task_id_arg)
+        previous = current.status
+        current.status = "completed"
+        current.completed_at = datetime.utcnow()
+        current.metadata_ = {
+            **(current.metadata_ or {}),
+            "pr_review_superseded": True,
+        }
+        await db.commit()
+        return TaskTerminationResult(
+            task_id=task_id_arg,
+            previous_status=previous,
+            terminal_status="completed",
+            transitioned=True,
+            stopped=False,
+            cleared_messages=0,
+            retry_count=current.retry_count,
+            turn_generation=current.turn_generation,
+            instance_id=current.instance_id,
+            started_at=current.started_at,
+            completed_at=current.completed_at,
+            pty_background_generation=None,
+        )
+
+    def reject_current_policy(*_args, **_kwargs):
+        raise pr_review_service.PRReviewInputTooLarge(
+            detail,
+            measured=measured,
+            limit=limit,
+            unit="UTF-8 bytes",
+        )
+
+    with (
+        patch(
+            "backend.services.task_termination."
+            "terminate_authoritative_task_generation",
+            side_effect=terminate,
+        ),
+        patch.object(
+            pr_review_service,
+            "preflight_pr_review_prompts",
+            side_effect=reject_current_policy,
+        ),
+    ):
+        recovered = await pr_review_service.recover_superseding_pr_reviews(
+            session_factory,
+            grace_seconds=0,
+        )
+        repeated = await pr_review_service.recover_superseding_pr_reviews(
+            session_factory,
+            grace_seconds=0,
+        )
+
+    assert recovered == 1
+    assert repeated == 0
+    assert terminated_ids == [task_id]
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview)
+            .where(PRReview.repo_id == repo_id)
+            .order_by(PRReview.id)
+        )).scalars())
+        tasks = list((await db.execute(
+            select(Task).order_by(Task.id)
+        )).scalars())
+        assert len(reviews) == 2
+        old, rejected = reviews
+        assert old.id == review_id
+        assert old.status == "superseded"
+        assert old.superseding_snapshot is None
+        assert old.superseding_token is None
+        assert old.superseding_started_at is None
+        assert tasks == [await db.get(Task, task_id)]
+        assert tasks[0].status == "completed"
+        assert tasks[0].metadata_["pr_review_superseded"] is True
+
+        assert rejected.status == "error"
+        assert rejected.task_id is None
+        assert rejected.base_sha == replacement["base_sha"]
+        assert rejected.head_sha == replacement["head_sha"]
+        assert rejected.publication_state == "not_applicable"
+        assert rejected.failure_stage == "reviewer"
+        assert rejected.error_category == "unsupported_input_size"
+        assert rejected.error_measured == measured
+        assert rejected.error_limit == limit
+        assert rejected.error_unit == "UTF-8 bytes"
+        run = await db.get(PRMonitorRun, rejected.monitor_run_id)
+        assert run is not None
+        assert run.current_review_id == rejected.id
+        assert run.current_base_sha == rejected.base_sha
+        assert run.current_head_sha == rejected.head_sha
+        assert run.status == "paused"
+        assert run.pause_reason == "review_input_too_large"
+
+
+@pytest.mark.asyncio
+async def test_recover_invalid_superseding_input_rejection_fails_closed(
+    session_factory,
+    no_broadcast,
+):
+    """Malformed v3 evidence is quarantined and never creates new work."""
+
+    async with session_factory() as db:
+        repo = _make_repo()
+        db.add(repo)
+        await db.commit()
+        await db.refresh(repo)
+        review, task = await _make_review(
+            db,
+            repo,
+            task_status="pending",
+        )
+        repo_id = repo.id
+        task_id = task.id
+        review_id = review.id
+        review.status = "superseding"
+        review.superseding_snapshot = {
+            "version": 3,
+            "kind": "input_rejection",
+            "repo_name": repo.repo_full_name,
+            "pr_data": {
+                **PR_DATA,
+                "base_ref": "main",
+                "head_sha": "8" * 40,
+            },
+            "input_rejection": {
+                "category": "unsupported_input_size",
+                "message": "unsupported_input_size: malformed evidence",
+                "measured": 10,
+                "limit": 20,
+                "unit": "characters",
+            },
+        }
+        review.superseding_token = "4" * 48
+        review.superseding_started_at = (
+            datetime.utcnow() - timedelta(minutes=5)
+        )
+        await db.commit()
+
+    terminate = AsyncMock()
+    create_rejection = AsyncMock()
+    with (
+        patch(
+            "backend.services.task_termination."
+            "terminate_authoritative_task_generation",
+            terminate,
+        ),
+        patch.object(
+            pr_review_service,
+            "create_pr_review_input_rejection",
+            create_rejection,
+        ),
+    ):
+        recovered = await pr_review_service.recover_superseding_pr_reviews(
+            session_factory,
+            grace_seconds=0,
+        )
+
+    assert recovered == 1
+    terminate.assert_not_awaited()
+    create_rejection.assert_not_awaited()
+    async with session_factory() as db:
+        reviews = list((await db.execute(
+            select(PRReview).where(PRReview.repo_id == repo_id)
+        )).scalars())
+        tasks = list((await db.execute(select(Task))).scalars())
+        assert len(reviews) == 1
+        stored = reviews[0]
+        assert stored.id == review_id
+        assert stored.status == "error"
+        assert stored.action_taken == "error"
+        assert stored.review_summary == (
+            "Durable PR synchronize snapshot is invalid"
+        )
+        assert stored.completed_at is not None
+        assert stored.superseding_snapshot is None
+        assert stored.superseding_token is None
+        assert stored.superseding_started_at is None
+        assert stored.task_id == task_id
+        assert tasks == [await db.get(Task, task_id)]
+        assert tasks[0].status == "pending"
+
+
+@pytest.mark.asyncio
 async def test_recover_superseding_intent_different_base_ref_is_not_self_target(
     session_factory,
     no_broadcast,
@@ -5864,7 +6914,12 @@ async def test_finding_publication_survives_exact_guard_rollback(db_session):
         await db_session.rollback()
         return True
 
+    async def list_comments(*_args, **_kwargs):
+        assert not db_session.in_transaction()
+        return [[]]
+
     async def post_comment(_endpoint, *, payload=None, **_kwargs):
+        assert not db_session.in_transaction()
         return {
             "id": 101,
             "body": payload["body"],
@@ -5875,7 +6930,7 @@ async def test_finding_publication_survives_exact_guard_rollback(db_session):
         }
 
     with (
-        patch.object(pr_review_service, "_gh_api_value", AsyncMock(return_value=[[]])),
+        patch.object(pr_review_service, "_gh_api_value", side_effect=list_comments),
         patch.object(pr_review_service, "_gh_api_json", side_effect=post_comment),
     ):
         await pr_review_service._publish_blocking_finding_threads(

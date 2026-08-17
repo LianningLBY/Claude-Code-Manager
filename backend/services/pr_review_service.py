@@ -7,13 +7,16 @@ import os
 import re
 import secrets
 import signal
+import time
 from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from urllib.parse import quote
+from weakref import WeakKeyDictionary
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.models.log_entry import LogEntry
@@ -23,8 +26,17 @@ from backend.models.pr_monitor import (
     PRMonitorRun,
     PRReview,
     PRReviewerRun,
+    pr_monitor_run_has_terminal_intent,
+    pr_monitor_run_no_terminal_intent_predicate,
 )
 from backend.models.task import Task
+from backend.pr_review_evidence import (
+    PR_REVIEW_INPUT_ERROR_CATEGORY,
+    PR_REVIEW_INPUT_ERROR_MAX_SAFE_INTEGER,
+    PR_REVIEW_INPUT_ERROR_UNITS,
+    pr_review_input_error_detail,
+    valid_pr_review_input_error_evidence,
+)
 from backend.services.cancellation import settle_awaitable
 from backend.services.task_creation import (
     stage_task_record,
@@ -117,10 +129,27 @@ _NO_COMPLETE_REVIEW_OUTPUT = (
 _TERMINAL_HISTORY_BACKFILL_GRACE = timedelta(minutes=5)
 _ACTION_NONCE_RE = re.compile(r"[0-9a-f]{48}\Z")
 _PR_REVIEW_ACTION_LOCKS: dict[int, asyncio.Lock] = {}
+_GITHUB_IDENTITY_STATUS_CACHE: WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    tuple[float, datetime, str | None, str | None],
+] = WeakKeyDictionary()
+_GITHUB_IDENTITY_STATUS_LOCKS: WeakKeyDictionary[
+    asyncio.AbstractEventLoop,
+    asyncio.Lock,
+] = WeakKeyDictionary()
+_GITHUB_IDENTITY_STATUS_TTL_SECONDS = 30.0
+_GITHUB_IDENTITY_FORCE_MIN_SECONDS = 2.0
 _PUBLICATION_LEASE_TOKEN_RE = re.compile(r"[0-9a-f]{48}\Z")
 _PUBLICATION_LEASE_TTL = timedelta(minutes=3)
 _PUBLICATION_LEASE_RENEW_SECONDS = 30.0
 _PUBLICATION_MUTATION_GUARD = timedelta(seconds=45)
+_PUBLICATION_EVIDENCE_FIELDS = (
+    "published_actor",
+    "published_at",
+    "github_review_id",
+    "github_review_url",
+    "github_review_state",
+)
 # ``merge``/``squash`` remain readable only to reconcile evidence for a
 # publication outbox armed by an older binary; they must never replay the
 # base-mutable PR merge endpoint. New publications always use ``fast-forward``
@@ -139,6 +168,44 @@ _STANDARD_GITHUB_ROLES = {
 class PRReviewInputTooLarge(ValueError):
     """A complete immutable review cannot fit the supported input budget."""
 
+    category = PR_REVIEW_INPUT_ERROR_CATEGORY
+    _SUPPORTED_UNITS = PR_REVIEW_INPUT_ERROR_UNITS
+    max_safe_integer = PR_REVIEW_INPUT_ERROR_MAX_SAFE_INTEGER
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        measured: int,
+        limit: int,
+        unit: str,
+    ) -> None:
+        if not isinstance(message, str) or not message or not (
+            valid_pr_review_input_error_evidence(
+                category=self.category,
+                measured=measured,
+                limit=limit,
+                unit=unit,
+            )
+        ):
+            raise ValueError("invalid PR review input-size evidence")
+        super().__init__(message)
+        self.measured = measured
+        self.limit = limit
+        self.unit = unit
+
+    @property
+    def public_detail(self) -> str:
+        return pr_review_input_error_detail(
+            measured=self.measured,
+            limit=self.limit,
+            unit=self.unit,
+        )
+
+
+class PRReviewLifecycleConflict(ValueError):
+    """A terminal PR lifecycle was not explicitly reopened for a new Review."""
+
 
 def validate_review_prompt_budget(
     prompt: str,
@@ -146,7 +213,11 @@ def validate_review_prompt_budget(
     provider: str,
     label: str,
 ) -> None:
-    """Reject oversized prompts before any Review or Task becomes visible."""
+    """Reject oversized prompts before creating an executable Reviewer Task.
+
+    The caller may persist the bounded rejection evidence as a read-only
+    result so administrators can see why review execution was not admitted.
+    """
 
     normalized_provider = (provider or "claude").strip().lower()
     if normalized_provider not in {"claude", "codex"}:
@@ -167,7 +238,10 @@ def validate_review_prompt_budget(
             f"{label} prompt for {normalized_provider} is {measured} {unit}; "
             f"the safe limit is {limit} {unit}. "
             "Reduce the PR patch or use a smaller explicit Guide Pack; no "
-            "reviewer Task was created."
+            "reviewer Task was created.",
+            measured=measured,
+            limit=limit,
+            unit=unit,
         )
 
 # Publication substates live in the existing durable outbox column.  They are
@@ -1157,12 +1231,20 @@ async def prepare_pr_review_context(
     # Validate it while the operation is still read-only so synchronize can
     # reject deterministic provider limits before persisting a supersede
     # intent or terminating an older reviewer generation.
-    preflight_pr_review_prompts(
-        repo,
-        pr_data,
-        prepared_context=context,
-        base_ref=frozen_base_ref,
-    )
+    try:
+        preflight_pr_review_prompts(
+            repo,
+            pr_data,
+            prepared_context=context,
+            base_ref=frozen_base_ref,
+        )
+    except PRReviewInputTooLarge as exc:
+        # The immutable GitHub material remains valid even when the policy
+        # observed before the repository write lock rejects it.  Preserve that
+        # context so the caller can re-evaluate admission against the latest
+        # locked provider/mode instead of treating a stale policy as final.
+        exc.prepared_context = context
+        raise
     return context
 
 
@@ -2084,6 +2166,43 @@ def _validate_review_evidence(
     return state.upper()
 
 
+def _capture_review_publication_evidence(
+    response: dict,
+    *,
+    repo_name: str,
+    pr_number: int,
+    state: str,
+    sink: dict | None,
+) -> None:
+    """Copy only already-validated, immutable GitHub Review evidence."""
+
+    if sink is None:
+        return
+    review_id = response["id"]
+    submitted_at = _parse_github_datetime(response.get("submitted_at"))
+    user = response.get("user")
+    actor = user.get("login") if isinstance(user, dict) else None
+    # Never trust a response URL as authorization evidence.  The response id,
+    # actor, state, head and nonce were validated above; construct the one
+    # canonical public URL from that frozen subject.
+    html_url = (
+        f"https://github.com/{repo_name}/pull/{pr_number}"
+        f"#pullrequestreview-{review_id}"
+    )
+    sink.clear()
+    sink.update({
+        "github_review_id": review_id,
+        "github_review_url": html_url,
+        "github_review_state": state,
+        "published_actor": actor,
+        "published_at": (
+            submitted_at.replace(tzinfo=None)
+            if submitted_at is not None
+            else None
+        ),
+    })
+
+
 async def _gh_authenticated_login() -> str:
     response = await _gh_api_json("user")
     login = response.get("login")
@@ -2094,6 +2213,121 @@ async def _gh_authenticated_login() -> str:
     ):
         raise GhError("GitHub authenticated user response is malformed")
     return login
+
+
+async def _require_fresh_github_publisher_actor(
+    expected_actor: str,
+    *,
+    effect: str,
+) -> str:
+    """Fence one not-yet-started GitHub mutation with a real identity read.
+
+    Status/UI identity checks intentionally use a short TTL and an
+    administrator refresh throttle.  An effect boundary cannot use either:
+    credentials may have rotated while the publisher was reading CI,
+    protection, threads, or PR state.  Resolve ``gh api user`` immediately
+    before the write and compare case-insensitively with the durable actor
+    frozen when the outbox was armed.
+
+    Reconciliation callers invoke this only after nonce evidence is absent.
+    Existing evidence therefore remains readable even when the old actor is
+    no longer the currently authenticated identity.
+    """
+
+    current_actor = await _gh_authenticated_login()
+    if current_actor.casefold() != expected_actor.casefold():
+        raise GhError(
+            "GitHub publishing identity changed before durable "
+            f"{effect} evidence was found"
+        )
+    return current_actor
+
+
+def _github_identity_public_error(exc: BaseException) -> str:
+    """Map raw gh/auth/transport failures to stable non-secret UI text."""
+
+    value = str(exc).lower()
+    if any(marker in value for marker in ("401", "auth", "login", "credential")):
+        return "GitHub CLI is not authenticated"
+    if "timeout" in value or "timed out" in value:
+        return "GitHub identity check timed out"
+    return "GitHub identity is unavailable"
+
+
+async def _github_publisher_identity_status(*, force: bool = False) -> dict:
+    """Resolve CCM's publisher actor through one per-loop TTL/single-flight source."""
+
+    loop = asyncio.get_running_loop()
+    requested_at = time.monotonic()
+    now = requested_at
+    cached = _GITHUB_IDENTITY_STATUS_CACHE.get(loop)
+    if (
+        force
+        and cached is not None
+        and now - cached[0] < _GITHUB_IDENTITY_FORCE_MIN_SECONDS
+    ):
+        return {
+            "checked_at": cached[1],
+            "actor": cached[2],
+            "error": cached[3],
+        }
+    if (
+        not force
+        and cached is not None
+        and now - cached[0] < _GITHUB_IDENTITY_STATUS_TTL_SECONDS
+    ):
+        return {
+            "checked_at": cached[1],
+            "actor": cached[2],
+            "error": cached[3],
+        }
+    lock = _GITHUB_IDENTITY_STATUS_LOCKS.setdefault(loop, asyncio.Lock())
+    async with lock:
+        now = time.monotonic()
+        cached = _GITHUB_IDENTITY_STATUS_CACHE.get(loop)
+        if cached is not None and (
+            (not force and now - cached[0] < _GITHUB_IDENTITY_STATUS_TTL_SECONDS)
+            # Concurrent forced refreshes share the first result produced
+            # after this caller started waiting on the single-flight lock.
+            or (force and cached[0] >= requested_at)
+        ):
+            return {
+                "checked_at": cached[1],
+                "actor": cached[2],
+                "error": cached[3],
+            }
+        try:
+            actor = await _gh_authenticated_login()
+        except Exception as exc:
+            actor = None
+            error = _github_identity_public_error(exc)
+        else:
+            error = None
+        checked_at = datetime.utcnow()
+        _GITHUB_IDENTITY_STATUS_CACHE[loop] = (
+            time.monotonic(),
+            checked_at,
+            actor,
+            error,
+        )
+        return {"checked_at": checked_at, "actor": actor, "error": error}
+
+
+async def _github_publisher_login() -> str:
+    """Return the same actor used by status/self-PR/publication decisions."""
+
+    status = await _github_publisher_identity_status()
+    actor = status["actor"]
+    if actor is None:
+        raise GhError(status["error"] or "GitHub identity is unavailable")
+    return actor
+
+
+def _reset_github_publisher_identity_cache() -> None:
+    """Clear all event-loop identity state for tests or credential rotation."""
+
+    _GITHUB_IDENTITY_STATUS_CACHE.clear()
+    _GITHUB_IDENTITY_STATUS_LOCKS.clear()
 
 
 def _expected_review_states(result: str) -> set[str]:
@@ -2117,6 +2351,7 @@ async def _find_review_evidence(
     nonce: str,
     actor: str,
     publishing_started_at: datetime,
+    evidence_sink: dict | None = None,
 ) -> str | None:
     value = await _gh_api_value(
         f"repos/{repo_name}/pulls/{pr_number}/reviews?per_page=100",
@@ -2138,11 +2373,11 @@ async def _find_review_evidence(
     if not matches:
         return None
     states: set[str] = set()
+    valid_matches: list[tuple[int, str, dict]] = []
     valid_count = 0
     for match in matches:
         try:
-            states.add(
-                _validate_review_evidence(
+            state = _validate_review_evidence(
                     match,
                     expected_states=_expected_review_states(result),
                     expected_head=head_sha,
@@ -2150,7 +2385,8 @@ async def _find_review_evidence(
                     actor=actor,
                     publishing_started_at=publishing_started_at,
                 )
-            )
+            states.add(state)
+            valid_matches.append((match["id"], state, match))
             valid_count += 1
         except GhError:
             # The nonce becomes public with the first Review attempt. Other
@@ -2173,6 +2409,15 @@ async def _find_review_evidence(
             valid_count,
             nonce,
         )
+    selected_id, selected_state, selected = min(valid_matches, key=lambda item: item[0])
+    del selected_id
+    _capture_review_publication_evidence(
+        selected,
+        repo_name=repo_name,
+        pr_number=pr_number,
+        state=selected_state,
+        sink=evidence_sink,
+    )
     return "APPROVED" if "APPROVED" in states else sorted(states)[0]
 
 
@@ -2452,11 +2697,15 @@ async def _publish_merged_comment(
         )
     if existing_comment is not None:
         return
-    if current_actor.lower() != actor.lower():
-        raise GhError(
-            "GitHub merged comment identity changed before durable "
-            "evidence was found"
-        )
+    # Preserve the stale-generation precedence used by recovery, then repeat
+    # the same guard after the network-backed actor check so terminal intent
+    # committed during that check still wins before the POST.
+    if not await ensure_current():
+        raise GhError("PR review publication generation is no longer current")
+    await _require_fresh_github_publisher_actor(
+        actor,
+        effect="merged comment",
+    )
     if not await ensure_current():
         raise GhError("PR review publication generation is no longer current")
     try:
@@ -2630,6 +2879,10 @@ async def _publish_one_finding_thread(
         return "published_inline", existing[0], existing[1], None
     use_fallback = finding.line is None
     if not use_fallback:
+        await _require_fresh_github_publisher_actor(
+            actor,
+            effect="Finding comment",
+        )
         if not await ensure_current():
             raise GhError("Finding publication generation is no longer current")
         try:
@@ -2662,6 +2915,10 @@ async def _publish_one_finding_thread(
         repo_name=repo_name, pr_number=pr_number, finding=finding, actor=actor, inline=False
     )
     if existing_fallback is None:
+        await _require_fresh_github_publisher_actor(
+            actor,
+            effect="Finding comment",
+        )
         if not await ensure_current():
             raise GhError("Finding fallback publication generation is no longer current")
         response = await _gh_api_json(
@@ -2700,6 +2957,11 @@ async def _publish_blocking_finding_threads(
         (finding.thread_status, _FindingPublication.from_model(finding))
         for finding in findings
     ]
+    # GitHub comment lookup/publication can take seconds.  The immutable
+    # scalar projection above is sufficient for remote work, so release the
+    # read transaction before the first network await and reacquire only for
+    # the exact-generation CAS below.
+    await db.rollback()
     for thread_status, finding in frozen_findings:
         if thread_status in {"published_inline", "published_fallback", "resolved"}:
             continue
@@ -2755,6 +3017,7 @@ async def _publish_review_action(
     required_checks: list[dict] | None = None,
     ensure_zero_threads: Callable[[], Awaitable[bool]] | None = None,
     strict_branch_protection: bool = True,
+    evidence_sink: dict | None = None,
 ) -> tuple[str, str]:
     """Reconcile or perform one durable, head-pinned GitHub publication."""
 
@@ -2782,13 +3045,9 @@ async def _publish_review_action(
         nonce=nonce,
         actor=actor,
         publishing_started_at=publishing_started_at,
+        evidence_sink=evidence_sink,
     )
     if review_state is None:
-        if current_actor.lower() != actor.lower():
-            raise GhError(
-                "GitHub publishing identity changed before durable review "
-                "evidence was found"
-            )
         initial = _validated_pr_snapshot(
             await _gh_pr_view(pr_number, repo_name)
         )
@@ -2798,9 +3057,6 @@ async def _publish_review_action(
             base_sha=base_sha,
             head_sha=head_sha,
         )
-        if not await ensure_current():
-            raise GhError("PR review publication generation is no longer current")
-
         if result == "approved_merged":
             assert merge_method is not None
             # Reject a statically unsafe publication before even its
@@ -2837,6 +3093,14 @@ async def _publish_review_action(
             raise GhError("unknown PR review recommendation")
 
         try:
+            await _require_fresh_github_publisher_actor(
+                actor,
+                effect="review",
+            )
+            if not await ensure_current():
+                raise GhError(
+                    "PR review publication generation is no longer current"
+                )
             response = await _gh_api_json(
                 review_endpoint,
                 method="POST",
@@ -2854,6 +3118,13 @@ async def _publish_review_action(
                 actor=actor,
                 publishing_started_at=publishing_started_at,
             )
+            _capture_review_publication_evidence(
+                response,
+                repo_name=repo_name,
+                pr_number=pr_number,
+                state=review_state,
+                sink=evidence_sink,
+            )
         except GhError as exc:
             # A killed/timed-out client can still have reached GitHub. Always
             # reconcile the random nonce before deciding whether another write
@@ -2866,6 +3137,7 @@ async def _publish_review_action(
                 nonce=nonce,
                 actor=actor,
                 publishing_started_at=publishing_started_at,
+                evidence_sink=evidence_sink,
             )
             if review_state is not None:
                 pass
@@ -2885,10 +3157,6 @@ async def _publish_review_action(
                     base_sha=base_sha,
                     head_sha=head_sha,
                 )
-                if not await ensure_current():
-                    raise GhError(
-                        "PR review publication generation is no longer current"
-                    )
                 fallback_text = (
                     review_body
                     if result == "review_comments"
@@ -2904,6 +3172,14 @@ async def _publish_review_action(
                     fallback_text,
                     nonce,
                 )
+                await _require_fresh_github_publisher_actor(
+                    actor,
+                    effect="review",
+                )
+                if not await ensure_current():
+                    raise GhError(
+                        "PR review publication generation is no longer current"
+                    )
                 response = await _gh_api_json(
                     review_endpoint,
                     method="POST",
@@ -2922,6 +3198,13 @@ async def _publish_review_action(
                         actor=actor,
                         publishing_started_at=publishing_started_at,
                     )
+                    _capture_review_publication_evidence(
+                        response,
+                        repo_name=repo_name,
+                        pr_number=pr_number,
+                        state=review_state,
+                        sink=evidence_sink,
+                    )
                 except GhError:
                     review_state = await _find_review_evidence(
                         repo_name=repo_name,
@@ -2931,6 +3214,7 @@ async def _publish_review_action(
                         nonce=nonce,
                         actor=actor,
                         publishing_started_at=publishing_started_at,
+                        evidence_sink=evidence_sink,
                     )
                     if review_state is None:
                         raise
@@ -2979,11 +3263,6 @@ async def _publish_review_action(
             "automatic replay is disabled"
         )
     if not merge_confirmed:
-        if current_actor.lower() != actor.lower():
-            raise GhError(
-                "GitHub publishing identity changed before durable merge "
-                "evidence was found"
-            )
         guarded = _validated_pr_snapshot(
             await _gh_pr_view(pr_number, repo_name)
         )
@@ -3047,6 +3326,10 @@ async def _publish_review_action(
             base_ref=base_ref,
             captured_base=base_sha,
             head_sha=head_sha,
+        )
+        await _require_fresh_github_publisher_actor(
+            actor,
+            effect="merge",
         )
         if not await ensure_current():
             raise GhError(
@@ -3635,28 +3918,113 @@ async def _get_or_create_pr_monitor_project(db: AsyncSession) -> int:
         return marked[0].id
 
 
+async def create_pr_review_input_rejection(
+    db: AsyncSession,
+    repo: MonitoredRepo,
+    pr_data: dict,
+    *,
+    error: PRReviewInputTooLarge,
+    allow_terminal_reactivation: bool = False,
+) -> PRReview:
+    """Persist one exact-subject deterministic admission failure.
+
+    This row is a read-only result, not an executable Reviewer Task.  It is
+    attached to the same durable PR lifecycle as successful admissions so the
+    ordinary Tasks result feed can explain why no code verdict exists.  The
+    structured size evidence is constructor-validated and bounded; raw model
+    input and exception objects never enter the public feed.
+    """
+
+    pr_number, _repo_name, base_sha, head_sha = _validate_review_identifiers(
+        repo,
+        pr_data,
+    )
+    base_ref = _frozen_pr_base_ref(repo, pr_data)
+    if not isinstance(error, PRReviewInputTooLarge):
+        raise TypeError("PR review rejection requires input-size evidence")
+
+    review = PRReview(
+        attempt=pr_data.get("_review_attempt", 1),
+        rerun_of_review_id=pr_data.get("_rerun_of_review_id"),
+        rerun_idempotency_key=pr_data.get("_rerun_idempotency_key"),
+        repo_id=repo.id,
+        pr_number=pr_number,
+        base_ref=base_ref,
+        base_sha=base_sha,
+        head_sha=head_sha,
+        delivery_id=pr_data.get("delivery_id"),
+        pr_title=pr_data["title"],
+        pr_author=pr_data["author"],
+        pr_url=pr_data["url"],
+        status="error",
+        action_taken="error",
+        code_verdict=None,
+        review_summary=error.public_detail,
+        publication_state="not_applicable",
+        failure_stage="reviewer",
+        error_category=error.category,
+        error_measured=error.measured,
+        error_limit=error.limit,
+        error_unit=error.unit,
+        completed_at=datetime.utcnow(),
+    )
+    db.add(review)
+    await db.flush()
+
+    from backend.services.pr_monitor_loop import attach_review_to_run
+
+    await attach_review_to_run(
+        db,
+        repo=repo,
+        review=review,
+        pr_data=pr_data,
+        allow_terminal_reactivation=allow_terminal_reactivation,
+        pause_on_review_error=True,
+    )
+    await db.refresh(review)
+    await _broadcast_review_update(review.id, "error", "error")
+    return review
+
+
 async def create_pr_review_task(
     db: AsyncSession,
     repo: MonitoredRepo,
     pr_data: dict,
     *,
     prepared_context: dict | None = None,
+    prepared_ci_evidence: dict | None = None,
+    allow_remote_ci: bool = True,
+    allow_terminal_reactivation: bool = False,
 ) -> PRReview:
     if (repo.review_mode or "single") == "panel":
         from backend.services.pr_review_panel import (
             create_pr_review_panel,
             create_waiting_ci_review,
-            fetch_exact_head_ci,
+            capture_exact_head_ci_evidence,
+            validated_exact_head_ci_evidence,
         )
 
         if repo.wait_for_ci:
             _number, repo_name, _base_sha, head_sha = (
                 _validate_review_identifiers(repo, pr_data)
             )
-            ci_status, ci_summary, ci_details = await fetch_exact_head_ci(
-                repo_name,
-                head_sha,
-                repo.required_checks,
+            evidence = prepared_ci_evidence
+            if evidence is None:
+                if not allow_remote_ci:
+                    raise ValueError(
+                        "exact-head CI evidence must be captured before the "
+                        "database write lock"
+                    )
+                evidence = await capture_exact_head_ci_evidence(
+                    repo_name,
+                    head_sha,
+                    repo.required_checks,
+                )
+            ci_status, ci_summary, ci_details = validated_exact_head_ci_evidence(
+                evidence,
+                repo_name=repo_name,
+                head_sha=head_sha,
+                required_checks=repo.required_checks,
             )
             if ci_status != "passed":
                 review = await create_waiting_ci_review(
@@ -3668,7 +4036,13 @@ async def create_pr_review_task(
                     ci_details=ci_details,
                 )
                 from backend.services.pr_monitor_loop import attach_review_to_run
-                await attach_review_to_run(db, repo=repo, review=review, pr_data=pr_data)
+                await attach_review_to_run(
+                    db,
+                    repo=repo,
+                    review=review,
+                    pr_data=pr_data,
+                    allow_terminal_reactivation=allow_terminal_reactivation,
+                )
                 return review
 
         review = await create_pr_review_panel(
@@ -3678,7 +4052,13 @@ async def create_pr_review_task(
             prepared_context=prepared_context,
         )
         from backend.services.pr_monitor_loop import attach_review_to_run
-        await attach_review_to_run(db, repo=repo, review=review, pr_data=pr_data)
+        await attach_review_to_run(
+            db,
+            repo=repo,
+            review=review,
+            pr_data=pr_data,
+            allow_terminal_reactivation=allow_terminal_reactivation,
+        )
         # Review Tasks become dispatchable only after the same commit has made
         # their exact PRMonitorRun subject durable.
         from backend.services.pr_review_panel import _wake_dispatcher
@@ -3709,6 +4089,9 @@ async def create_pr_review_task(
     action_nonce = secrets.token_hex(24)
 
     review = PRReview(
+        attempt=pr_data.get("_review_attempt", 1),
+        rerun_of_review_id=pr_data.get("_rerun_of_review_id"),
+        rerun_idempotency_key=pr_data.get("_rerun_idempotency_key"),
         repo_id=repo.id,
         pr_number=pr_data["number"],
         base_ref=base_ref,
@@ -3763,6 +4146,16 @@ async def create_pr_review_task(
 
     review.task_id = task.id
     review.status = "reviewing"
+
+    from backend.services.pr_monitor_loop import attach_review_to_run
+
+    await attach_review_to_run(
+        db,
+        repo=repo,
+        review=review,
+        pr_data=pr_data,
+        allow_terminal_reactivation=allow_terminal_reactivation,
+    )
 
     await db.commit()
     await db.refresh(review)
@@ -3889,6 +4282,7 @@ async def _check_and_update_review_locked(
                 "status": "error",
                 "action_taken": "error",
                 "review_summary": summary,
+                "failure_stage": "reviewer",
                 "completed_at": datetime.utcnow(),
             },
         )
@@ -3964,43 +4358,117 @@ async def _check_and_update_review_locked(
         )
         return
 
-    # Resolve and freeze the merge strategy and writer identity before
-    # claiming the outbox. These are read-only GitHub calls; no external write
-    # occurs until the durable ``publishing`` row commits.
+    code_verdict = (
+        "changes_required"
+        if terminal_result == "review_comments"
+        else "pass"
+    )
+    if not await _commit_exact_code_verdict(
+        db,
+        review_id=pr_review_id,
+        task_id=terminal_task_id,
+        retry_count=terminal_task_retry_count,
+        task_started_at=task_started_at,
+        code_verdict=code_verdict,
+        review_summary=terminal_body,
+        background_handoff_pending=background_handoff_pending,
+        expected_background_generation=expected_background_generation,
+    ):
+        return
+
+    terminal_gate = await _settle_terminal_intent_before_github(
+        db,
+        review_id=pr_review_id,
+        task_id=terminal_task_id,
+        retry_count=terminal_task_retry_count,
+        task_started_at=task_started_at,
+        terminal_result=terminal_result,
+        terminal_body=terminal_body,
+        background_handoff_pending=background_handoff_pending,
+        expected_background_generation=expected_background_generation,
+    )
+    if terminal_gate != "clear":
+        return
+
+    # The code result is now durable in its own transaction. Resolve the
+    # merge strategy and writer identity before claiming the outbox. These are
+    # read-only GitHub calls; failures update only publication diagnostics and
+    # can be retried without erasing or relabelling the verdict.
     merge_method = None
     if terminal_result == "approved_merged":
         try:
             merge_method = await _freeze_safe_merge_method(repo_full_name)
         except GhRepositoryCapabilityError as exc:
-            await finish_reviewing_error(
+            summary = (
                 "Unable to freeze a safe GitHub merge method"
                 + (f": {exc}" if str(exc) else "")
             )
+            await _commit_exact_review_update(
+                db,
+                review_id=pr_review_id,
+                expected_status="reviewing",
+                task_id=terminal_task_id,
+                retry_count=terminal_task_retry_count,
+                task_started_at=task_started_at,
+                background_handoff_pending=background_handoff_pending,
+                expected_background_generation=expected_background_generation,
+                values={
+                    "publication_state": "failed",
+                    "publication_error": summary[:2000],
+                    "failure_stage": "merge",
+                },
+            )
             return
-        except GhError:
-            # No external effect has been armed yet. Keep the completed exact
-            # generation in ``reviewing`` so periodic recovery can retry a
-            # transient GitHub capability read.
-            await db.rollback()
+        except GhError as exc:
+            await _commit_exact_review_update(
+                db,
+                review_id=pr_review_id,
+                expected_status="reviewing",
+                task_id=terminal_task_id,
+                retry_count=terminal_task_retry_count,
+                task_started_at=task_started_at,
+                background_handoff_pending=background_handoff_pending,
+                expected_background_generation=expected_background_generation,
+                values={
+                    "publication_state": "reconciling",
+                    "publication_error": str(exc)[:2000],
+                    "failure_stage": "merge",
+                },
+            )
             return
     try:
-        actor = await _gh_authenticated_login()
-    except GhError:
+        actor = await _github_publisher_login()
+    except GhError as exc:
         # Authentication endpoint timeouts/5xx do not invalidate the reviewed
         # subject. The durable reviewing generation is the retry boundary.
-        await db.rollback()
+        await _commit_exact_review_update(
+            db,
+            review_id=pr_review_id,
+            expected_status="reviewing",
+            task_id=terminal_task_id,
+            retry_count=terminal_task_retry_count,
+            task_started_at=task_started_at,
+            background_handoff_pending=background_handoff_pending,
+            expected_background_generation=expected_background_generation,
+            values={
+                "publication_state": "reconciling",
+                "publication_error": str(exc)[:2000],
+                "failure_stage": "github_identity",
+            },
+        )
         return
     publishing_started_at = datetime.utcnow()
-    claimed = await _commit_exact_review_update(
+    claimed = await _commit_exact_review_publication_arm(
         db,
         review_id=pr_review_id,
-        expected_status="reviewing",
         task_id=terminal_task_id,
         retry_count=terminal_task_retry_count,
         task_started_at=task_started_at,
+        terminal_result=terminal_result,
+        terminal_body=terminal_body,
         background_handoff_pending=background_handoff_pending,
         expected_background_generation=expected_background_generation,
-        values={
+        arm_values={
             "status": "publishing",
             "pending_action": terminal_result,
             "pending_review_body": terminal_body,
@@ -4009,9 +4477,9 @@ async def _check_and_update_review_locked(
             "publishing_task_started_at": task_started_at,
             "publishing_started_at": publishing_started_at,
             "merge_method": merge_method,
-            "review_summary": (
-                "Agent recommendation verified; GitHub publication pending"
-            ),
+            "publication_state": "publishing",
+            "publication_error": None,
+            "failure_stage": None,
         },
     )
     if not claimed:
@@ -4148,6 +4616,420 @@ async def _locked_task_generation_exists(
     return result.rowcount == 1
 
 
+async def _commit_exact_review_publication_arm(
+    db: AsyncSession,
+    *,
+    review_id: int,
+    task_id: int,
+    retry_count: int,
+    task_started_at: datetime,
+    terminal_result: str,
+    terminal_body: str,
+    arm_values: dict,
+    background_handoff_pending: Callable[[], bool] | None,
+    expected_background_generation: str | None,
+) -> bool:
+    """Linearize single-review publication after Task -> Run -> Review.
+
+    A terminal intent that wins the Run boundary preserves the completed code
+    verdict but makes GitHub publication inapplicable.  Otherwise the exact
+    outbox is armed while holding the same Run row that terminal webhooks use.
+    """
+
+    if background_handoff_pending is not None and background_handoff_pending():
+        await db.rollback()
+        return False
+    subject = (await db.execute(
+        select(
+            PRReview.monitor_run_id,
+            PRReview.base_ref,
+            PRReview.base_sha,
+            PRReview.head_sha,
+        ).where(
+            PRReview.id == review_id,
+            PRReview.status == "reviewing",
+            PRReview.task_id == task_id,
+        )
+    )).one_or_none()
+    if subject is None:
+        await db.rollback()
+        return False
+    monitor_run_id = subject.monitor_run_id
+    base_ref = subject.base_ref
+    base_sha = subject.base_sha
+    head_sha = subject.head_sha
+    expected_code_verdict = (
+        "changes_required"
+        if terminal_result == "review_comments"
+        else "pass"
+    )
+    await db.rollback()
+    if not await _locked_task_generation_exists(
+        db,
+        task_id=task_id,
+        retry_count=retry_count,
+        started_at=task_started_at,
+        expected_background_generation=expected_background_generation,
+    ):
+        await db.rollback()
+        return False
+    if monitor_run_id is None:
+        # Delivery and legacy Review rows may intentionally have no Monitor
+        # lifecycle parent. Preserve their original exact Task->Review arm:
+        # there is no Run terminal-intent boundary to consult, but the locked
+        # Task generation and immutable Review subject still fence publication.
+        changed = await db.execute(
+            update(PRReview)
+            .where(
+                PRReview.id == review_id,
+                PRReview.monitor_run_id.is_(None),
+                PRReview.status == "reviewing",
+                PRReview.task_id == task_id,
+                PRReview.base_sha == base_sha,
+                PRReview.head_sha == head_sha,
+                PRReview.code_verdict == expected_code_verdict,
+                PRReview.review_summary == terminal_body,
+                PRReview.code_verdict_task_id == task_id,
+                PRReview.code_verdict_retry_count == retry_count,
+                PRReview.code_verdict_task_started_at == task_started_at,
+                PRReview.code_verdict_recorded_at.is_not(None),
+            )
+            .values(**arm_values)
+        )
+        if (
+            changed.rowcount != 1
+            or (
+                background_handoff_pending is not None
+                and background_handoff_pending()
+            )
+        ):
+            await db.rollback()
+            return False
+        await db.commit()
+        await _broadcast_review_update(
+            review_id,
+            arm_values.get("status"),
+            arm_values.get("action_taken"),
+        )
+        return True
+    run = (await db.execute(
+        select(PRMonitorRun)
+        .where(PRMonitorRun.id == monitor_run_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if (
+        run is None
+        or run.current_review_id != review_id
+        or run.current_base_sha != base_sha
+        or run.current_head_sha != head_sha
+        or run.completed_at is not None
+        or run.status in {"merged", "closed"}
+    ):
+        await db.rollback()
+        return False
+    terminal_intent_won = pr_monitor_run_has_terminal_intent(run)
+    if terminal_intent_won and (
+        run.terminal_intent_status not in {"merged", "closed"}
+        or run.terminal_intent_base_ref != base_ref
+        or run.terminal_intent_head_sha != head_sha
+    ):
+        await db.rollback()
+        return False
+    values = (
+        {
+            "status": (
+                "commented"
+                if terminal_result == "review_comments"
+                else "approved"
+            ),
+            "action_taken": None,
+            "pending_action": None,
+            "pending_review_body": None,
+            "review_summary": terminal_body,
+            "publication_state": "not_applicable",
+            "publication_error": None,
+            "failure_stage": "lifecycle",
+            "completed_at": datetime.utcnow(),
+        }
+        if terminal_intent_won
+        else arm_values
+    )
+    changed = await db.execute(
+        update(PRReview)
+        .where(
+            PRReview.id == review_id,
+            PRReview.monitor_run_id == run.id,
+            PRReview.status == "reviewing",
+            PRReview.task_id == task_id,
+            PRReview.base_sha == base_sha,
+            PRReview.head_sha == head_sha,
+            PRReview.code_verdict == expected_code_verdict,
+            PRReview.review_summary == terminal_body,
+            PRReview.code_verdict_task_id == task_id,
+            PRReview.code_verdict_retry_count == retry_count,
+            PRReview.code_verdict_task_started_at == task_started_at,
+            PRReview.code_verdict_recorded_at.is_not(None),
+        )
+        .values(**values)
+    )
+    if (
+        changed.rowcount != 1
+        or (
+            background_handoff_pending is not None
+            and background_handoff_pending()
+        )
+    ):
+        await db.rollback()
+        return False
+    await db.commit()
+    await _broadcast_review_update(
+        review_id,
+        values.get("status"),
+        values.get("action_taken"),
+    )
+    return not terminal_intent_won
+
+
+async def _commit_exact_code_verdict(
+    db: AsyncSession,
+    *,
+    review_id: int,
+    task_id: int,
+    retry_count: int,
+    task_started_at: datetime,
+    code_verdict: str,
+    review_summary: str,
+    background_handoff_pending: Callable[[], bool] | None,
+    expected_background_generation: str | None,
+) -> bool:
+    """Freeze one exact Task generation's code result before GitHub reads.
+
+    The verdict and marker-stripped human body are one immutable fact.  A
+    retry may prove the same pair again, but a different verdict *or* body is
+    data corruption and fails closed.  Publication and lifecycle code never
+    calls this helper and therefore cannot clear or rewrite the code result.
+    """
+
+    if code_verdict not in {"pass", "changes_required"}:
+        await db.rollback()
+        return False
+    if (
+        not isinstance(review_summary, str)
+        or not review_summary
+        or background_handoff_pending is not None
+        and background_handoff_pending()
+    ):
+        await db.rollback()
+        return False
+    if not await _locked_task_generation_exists(
+        db,
+        task_id=task_id,
+        retry_count=retry_count,
+        started_at=task_started_at,
+        expected_background_generation=expected_background_generation,
+    ):
+        await db.rollback()
+        return False
+    recorded_at = datetime.utcnow()
+    changed = await db.execute(
+        update(PRReview)
+        .where(
+            PRReview.id == review_id,
+            PRReview.status == "reviewing",
+            PRReview.task_id == task_id,
+            PRReview.code_verdict.is_(None),
+            PRReview.code_verdict_task_id.is_(None),
+            PRReview.code_verdict_retry_count.is_(None),
+            PRReview.code_verdict_task_started_at.is_(None),
+            PRReview.code_verdict_recorded_at.is_(None),
+        )
+        .values(
+            code_verdict=code_verdict,
+            code_verdict_task_id=task_id,
+            code_verdict_retry_count=retry_count,
+            code_verdict_task_started_at=task_started_at,
+            code_verdict_recorded_at=recorded_at,
+            review_summary=review_summary,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if changed.rowcount == 0:
+        # Idempotent recovery never rewrites the original evidence timestamp.
+        # It succeeds only when every immutable source field proves the exact
+        # same completed Task generation and human result.
+        existing = (await db.execute(
+            select(
+                PRReview.code_verdict,
+                PRReview.review_summary,
+                PRReview.code_verdict_task_id,
+                PRReview.code_verdict_retry_count,
+                PRReview.code_verdict_task_started_at,
+                PRReview.code_verdict_recorded_at,
+            ).where(
+                PRReview.id == review_id,
+                PRReview.status == "reviewing",
+                PRReview.task_id == task_id,
+            )
+        )).one_or_none()
+        idempotent = bool(
+            existing is not None
+            and existing.code_verdict == code_verdict
+            and existing.review_summary == review_summary
+            and existing.code_verdict_task_id == task_id
+            and existing.code_verdict_retry_count == retry_count
+            and existing.code_verdict_task_started_at == task_started_at
+            and isinstance(existing.code_verdict_recorded_at, datetime)
+        )
+        await db.rollback()
+        return idempotent
+    if (
+        changed.rowcount != 1
+        or (
+            background_handoff_pending is not None
+            and background_handoff_pending()
+        )
+    ):
+        await db.rollback()
+        return False
+    await db.commit()
+    await _broadcast_review_update(review_id, "reviewing", None)
+    return True
+
+
+async def _settle_terminal_intent_before_github(
+    db: AsyncSession,
+    *,
+    review_id: int,
+    task_id: int,
+    retry_count: int,
+    task_started_at: datetime,
+    terminal_result: str,
+    terminal_body: str,
+    background_handoff_pending: Callable[[], bool] | None,
+    expected_background_generation: str | None,
+) -> str:
+    """Settle a pre-existing Run terminal intent without any GitHub call.
+
+    Returns ``clear`` when no terminal intent won, ``settled`` after committing
+    the immutable verdict as publication-not-applicable, and ``blocked`` for a
+    stale/partial/mismatched lifecycle shape.  The later publication-arm CAS
+    repeats this boundary to cover an intent that races after this check.
+    """
+
+    subject = (await db.execute(
+        select(
+            PRReview.monitor_run_id,
+            PRReview.base_ref,
+            PRReview.base_sha,
+            PRReview.head_sha,
+        ).where(
+            PRReview.id == review_id,
+            PRReview.status == "reviewing",
+            PRReview.task_id == task_id,
+        )
+    )).one_or_none()
+    if subject is None:
+        await db.rollback()
+        return "blocked"
+    if subject.monitor_run_id is None:
+        await db.rollback()
+        return "clear"
+    monitor_run_id = subject.monitor_run_id
+    base_ref = subject.base_ref
+    base_sha = subject.base_sha
+    head_sha = subject.head_sha
+    expected_code_verdict = (
+        "changes_required"
+        if terminal_result == "review_comments"
+        else "pass"
+    )
+    await db.rollback()
+    if not await _locked_task_generation_exists(
+        db,
+        task_id=task_id,
+        retry_count=retry_count,
+        started_at=task_started_at,
+        expected_background_generation=expected_background_generation,
+    ):
+        await db.rollback()
+        return "blocked"
+    run = (await db.execute(
+        select(PRMonitorRun)
+        .where(PRMonitorRun.id == monitor_run_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )).scalar_one_or_none()
+    if (
+        run is None
+        or run.current_review_id != review_id
+        or run.current_base_sha != base_sha
+        or run.current_head_sha != head_sha
+    ):
+        await db.rollback()
+        return "blocked"
+    if not pr_monitor_run_has_terminal_intent(run):
+        await db.rollback()
+        return "clear"
+    if (
+        run.terminal_intent_status not in {"merged", "closed"}
+        or run.terminal_intent_base_ref != base_ref
+        or run.terminal_intent_head_sha != head_sha
+    ):
+        # Partial or mismatched signed intent revokes new effects but cannot
+        # fabricate a lifecycle result. Recovery must repair/settle it first.
+        await db.rollback()
+        return "blocked"
+    changed = await db.execute(
+        update(PRReview)
+        .where(
+            PRReview.id == review_id,
+            PRReview.monitor_run_id == run.id,
+            PRReview.status == "reviewing",
+            PRReview.task_id == task_id,
+            PRReview.base_sha == base_sha,
+            PRReview.head_sha == head_sha,
+            PRReview.code_verdict == expected_code_verdict,
+            PRReview.review_summary == terminal_body,
+            PRReview.code_verdict_task_id == task_id,
+            PRReview.code_verdict_retry_count == retry_count,
+            PRReview.code_verdict_task_started_at == task_started_at,
+            PRReview.code_verdict_recorded_at.is_not(None),
+        )
+        .values(
+            status=(
+                "commented"
+                if terminal_result == "review_comments"
+                else "approved"
+            ),
+            action_taken=None,
+            pending_action=None,
+            pending_review_body=None,
+            publication_state="not_applicable",
+            publication_error=None,
+            failure_stage="lifecycle",
+            completed_at=datetime.utcnow(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if (
+        changed.rowcount != 1
+        or (
+            background_handoff_pending is not None
+            and background_handoff_pending()
+        )
+    ):
+        await db.rollback()
+        return "blocked"
+    await db.commit()
+    await _broadcast_review_update(
+        review_id,
+        "commented" if terminal_result == "review_comments" else "approved",
+        None,
+    )
+    return "settled"
+
+
 async def _commit_exact_review_update(
     db: AsyncSession,
     *,
@@ -4165,7 +5047,13 @@ async def _commit_exact_review_update(
     expected_merge_method: str | None = None,
     expected_background_generation: str | None = None,
 ) -> bool:
-    """CAS a review while holding proof of the exact completed Task turn."""
+    """CAS a review while holding proof of the exact completed Task turn.
+
+    GitHub publication evidence is write-once even when only part of its tuple
+    survived an interrupted reconciliation.  A terminal transition may fill a
+    NULL with the same observed receipt, but it may neither replace a different
+    value nor clear an already-persisted value.
+    """
 
     if (
         background_handoff_pending is not None
@@ -4208,6 +5096,16 @@ async def _commit_exact_review_update(
     if expected_merge_method is not None:
         review_predicates.append(
             PRReview.merge_method == expected_merge_method
+        )
+    for field in _PUBLICATION_EVIDENCE_FIELDS:
+        if field not in values:
+            continue
+        column = getattr(PRReview, field)
+        incoming = values[field]
+        review_predicates.append(
+            column.is_(None)
+            if incoming is None
+            else or_(column.is_(None), column == incoming)
         )
     changed = await db.execute(
         update(PRReview)
@@ -4583,10 +5481,12 @@ async def _fail_identity_pending_publication(
         .values(
             status="error",
             action_taken="error",
-            review_summary=summary[:2000],
             completed_at=datetime.utcnow(),
             pending_action=None,
             pending_review_body=None,
+            publication_state="failed",
+            publication_error=summary[:2000],
+            failure_stage="github_identity",
         )
         .execution_options(synchronize_session=False)
     )
@@ -4764,7 +5664,9 @@ async def _arm_identity_pending_publication(
             values={
                 "status": "error",
                 "action_taken": "error",
-                "review_summary": str(exc)[:2000],
+                "publication_state": "failed",
+                "publication_error": str(exc)[:2000],
+                "failure_stage": "merge",
                 "completed_at": datetime.utcnow(),
             },
         )
@@ -4783,7 +5685,7 @@ async def _arm_identity_pending_publication(
         # retry instead of terminally pausing the Monitor Run.
         return False
     try:
-        actor = await _gh_authenticated_login()
+        actor = await _github_publisher_login()
     except GhError:
         return False
     return await _commit_exact_review_update(
@@ -4803,10 +5705,9 @@ async def _arm_identity_pending_publication(
             "publishing_task_started_at": task_started_at,
             "publishing_started_at": datetime.utcnow(),
             "merge_method": merge_method,
-            "review_summary": (
-                "Accepted rebuttal cleared all Finding threads; "
-                "automatic merge publication armed"
-            ),
+            "publication_state": "publishing",
+            "publication_error": None,
+            "failure_stage": None,
         },
     )
 
@@ -4854,6 +5755,29 @@ async def _publication_is_current(
         review = review_result.scalar_one_or_none()
         if review is None:
             return False
+        if review.monitor_run_id is not None:
+            # A signed close/merge webhook commits terminal intent before it
+            # drains an already-armed publisher.  The Review lease and Task
+            # generation alone therefore cannot authorize another GitHub
+            # effect.  Re-prove the exact active Run/Review subject and the
+            # absence of even a partial terminal-intent shape at every final
+            # mutation boundary.  Legacy Reviews with no Run keep their
+            # existing recovery behavior.
+            run_id = await db.scalar(
+                select(PRMonitorRun.id).where(
+                    PRMonitorRun.id == review.monitor_run_id,
+                    PRMonitorRun.repo_id == review.repo_id,
+                    PRMonitorRun.pr_number == review.pr_number,
+                    PRMonitorRun.status == "reviewing",
+                    PRMonitorRun.current_review_id == review.id,
+                    PRMonitorRun.current_base_sha == review.base_sha,
+                    PRMonitorRun.current_head_sha == review.head_sha,
+                    PRMonitorRun.completed_at.is_(None),
+                    pr_monitor_run_no_terminal_intent_predicate(),
+                )
+            )
+            if run_id != review.monitor_run_id:
+                return False
         if (
             isinstance(expected_delivery_id, str)
             and expected_delivery_id.startswith("delivery:")
@@ -4901,7 +5825,6 @@ def _terminal_publication_error(exc: GhError) -> bool:
         "GitHub merge commit evidence is malformed or mismatched",
         "GitHub merged comment evidence is malformed or mismatched",
         "GitHub exact merge evidence is missing before merged comment",
-        "GitHub publishing identity changed before durable",
         "Frozen GitHub merge evidence policy is invalid",
         "Frozen GitHub merge method is invalid",
         "Frozen GitHub merge method is no longer allowed",
@@ -4910,6 +5833,39 @@ def _terminal_publication_error(exc: GhError) -> bool:
         "GitHub commit ancestry response is malformed",
         "GitHub PR base ancestry is unsafe",
         "unknown PR review recommendation",
+    ))
+
+
+def _publication_evidence_complete(
+    evidence: dict | None,
+    *,
+    actor: object,
+) -> bool:
+    return bool(
+        isinstance(evidence, dict)
+        and type(evidence.get("github_review_id")) is int
+        and evidence["github_review_id"] > 0
+        and isinstance(evidence.get("github_review_url"), str)
+        and evidence["github_review_url"]
+        and evidence.get("github_review_state") in {
+            "COMMENTED", "APPROVED", "CHANGES_REQUESTED"
+        }
+        and isinstance(evidence.get("published_actor"), str)
+        and isinstance(actor, str)
+        and evidence["published_actor"].lower() == actor.lower()
+        and isinstance(evidence.get("published_at"), datetime)
+    )
+
+
+def _is_github_identity_failure_message(value: str) -> bool:
+    lowered = value.lower()
+    return any(marker in lowered for marker in (
+        "github publishing identity",
+        "github authenticated user",
+        "github cli is not authenticated",
+        "credentials",
+        "authentication",
+        "http 401",
     ))
 
 
@@ -4922,6 +5878,9 @@ async def _finish_publishing_error(
     task_started_at: datetime | None,
     summary: str,
     lease_token: str,
+    publication_evidence: dict | None = None,
+    publishing_actor: str | None = None,
+    publication_action: str | None = None,
 ) -> None:
     if (
         task_id is None
@@ -4930,6 +5889,30 @@ async def _finish_publishing_error(
     ):
         await db.rollback()
         return
+    lifecycle_error = any(
+        marker in summary.lower()
+        for marker in (
+            "pr became draft",
+            "pr snapshot changed",
+            "pr changed without matching merge evidence",
+        )
+    )
+    identity_error = _is_github_identity_failure_message(summary)
+    evidence_complete = _publication_evidence_complete(
+        publication_evidence,
+        actor=publishing_actor,
+    )
+    evidence_values = (
+        {
+            "published_actor": publication_evidence["published_actor"],
+            "published_at": publication_evidence["published_at"],
+            "github_review_id": publication_evidence["github_review_id"],
+            "github_review_url": publication_evidence["github_review_url"],
+            "github_review_state": publication_evidence["github_review_state"],
+        }
+        if evidence_complete and publication_evidence is not None
+        else {}
+    )
     await _commit_exact_review_update(
         db,
         review_id=review_id,
@@ -4940,10 +5923,30 @@ async def _finish_publishing_error(
         values={
             "status": "error",
             "action_taken": "error",
-            "review_summary": summary,
+            "publication_state": (
+                "published"
+                if evidence_complete
+                else ("not_applicable" if lifecycle_error else "failed")
+            ),
+            "publication_error": summary[:2000],
+            "failure_stage": (
+                "lifecycle"
+                if lifecycle_error
+                else (
+                    "github_identity"
+                    if identity_error
+                    else (
+                        "merge"
+                        if evidence_complete
+                        and publication_action == "approved_merged"
+                        else "publication"
+                    )
+                )
+            ),
             "completed_at": datetime.utcnow(),
             "publishing_lease_token": None,
             "publishing_lease_expires_at": None,
+            **evidence_values,
         },
         expected_lease_token=lease_token,
     )
@@ -4955,18 +5958,47 @@ async def _record_publication_pending(
     review_id: int,
     summary: str,
     lease_token: str,
+    publication_evidence: dict | None = None,
+    publishing_actor: str | None = None,
 ) -> None:
+    evidence_complete = _publication_evidence_complete(
+        publication_evidence,
+        actor=publishing_actor,
+    )
+    evidence_values = (
+        {
+            "published_actor": publication_evidence["published_actor"],
+            "published_at": publication_evidence["published_at"],
+            "github_review_id": publication_evidence["github_review_id"],
+            "github_review_url": publication_evidence["github_review_url"],
+            "github_review_state": publication_evidence["github_review_state"],
+        }
+        if evidence_complete and publication_evidence is not None
+        else {}
+    )
+    evidence_fences = []
+    for column_name, value in evidence_values.items():
+        column = getattr(PRReview, column_name)
+        evidence_fences.append(or_(column.is_(None), column == value))
     changed = await db.execute(
         update(PRReview)
         .where(
             PRReview.id == review_id,
             PRReview.status == "publishing",
             PRReview.publishing_lease_token == lease_token,
+            *evidence_fences,
         )
         .values(
-            review_summary=summary[:2000],
+            publication_state="reconciling",
+            publication_error=summary[:2000],
+            failure_stage=(
+                "github_identity"
+                if _is_github_identity_failure_message(summary)
+                else "recovery"
+            ),
             publishing_lease_token=None,
             publishing_lease_expires_at=None,
+            **evidence_values,
         )
     )
     if changed.rowcount:
@@ -5197,6 +6229,7 @@ async def _resume_publishing_review_under_lease(
         and action
         in {"approved_merged", "lgtm_comment", "review_comments"}
         and isinstance(body, str)
+        and bool(body)
         and "\x00" not in body
         and len(body.encode("utf-8")) <= _MAX_REVIEW_BODY_BYTES
         and isinstance(actor, str)
@@ -5308,16 +6341,7 @@ async def _resume_publishing_review_under_lease(
             review_id,
         )
         return
-    try:
-        current_actor = await _gh_authenticated_login()
-    except GhError as exc:
-        await _record_publication_pending(
-            db,
-            review_id=review_id,
-            summary=f"GitHub publishing identity unavailable: {exc}",
-            lease_token=lease_token,
-        )
-        return
+    publication_evidence: dict = {}
     try:
         new_status, action_taken = await _publish_review_action(
             repo_name=repo_full_name,
@@ -5331,13 +6355,17 @@ async def _resume_publishing_review_under_lease(
             merge_method=merge_method,
             nonce=nonce,
             actor=actor,
-            current_actor=current_actor,
+            # Kept as a compatibility argument for direct callers.  Every
+            # not-yet-started mutation performs its own uncached actor fence
+            # at the final effect boundary; this value is never trusted.
+            current_actor=actor,
             publishing_started_at=publishing_started_at,
             ensure_current=ensure_current,
             wait_for_ci=frozen_wait_for_ci,
             required_checks=frozen_required_checks,
             ensure_zero_threads=(ensure_zero_threads if panel_task else None),
             strict_branch_protection=strict_branch_protection,
+            evidence_sink=publication_evidence,
         )
     except GhError as exc:
         logger.error(
@@ -5354,6 +6382,9 @@ async def _resume_publishing_review_under_lease(
                 task_started_at=task_started_at,
                 summary=f"PR publication could not continue: {exc}",
                 lease_token=lease_token,
+                publication_evidence=publication_evidence,
+                publishing_actor=actor,
+                publication_action=action,
             )
         else:
             await _record_publication_pending(
@@ -5364,7 +6395,25 @@ async def _resume_publishing_review_under_lease(
                     f"{exc}"
                 ),
                 lease_token=lease_token,
+                publication_evidence=publication_evidence,
+                publishing_actor=actor,
             )
+        return
+
+    evidence_complete = _publication_evidence_complete(
+        publication_evidence,
+        actor=actor,
+    )
+    if not evidence_complete:
+        await _record_publication_pending(
+            db,
+            review_id=review_id,
+            summary=(
+                "GitHub Review was acknowledged but immutable publication "
+                "evidence is incomplete; reconciliation is required"
+            ),
+            lease_token=lease_token,
+        )
         return
 
     if action == "review_comments":
@@ -5383,6 +6432,8 @@ async def _resume_publishing_review_under_lease(
                 review_id=review_id,
                 summary=f"Finding Thread publication pending reconciliation: {exc}",
                 lease_token=lease_token,
+                publication_evidence=publication_evidence,
+                publishing_actor=actor,
             )
             return
 
@@ -5398,18 +6449,14 @@ async def _resume_publishing_review_under_lease(
             "status": new_status,
             "action_taken": action_taken,
             "completed_at": datetime.utcnow(),
-            # For a single reviewer, ``body`` is the only human-facing result
-            # and has already had its strict transport markers removed. Panel
-            # details retain their structured role summaries and Findings, so
-            # do not duplicate the potentially 60 KiB aggregate Gate body.
-            "review_summary": (
-                body
-                if not panel_task
-                else (
-                    f"Agent recommendation: {action}; backend action: "
-                    f"{action_taken}; durable nonce evidence verified"
-                )
-            ),
+            "publication_state": "published",
+            "publication_error": None,
+            "failure_stage": None,
+            "published_actor": publication_evidence["published_actor"],
+            "published_at": publication_evidence["published_at"],
+            "github_review_id": publication_evidence["github_review_id"],
+            "github_review_url": publication_evidence["github_review_url"],
+            "github_review_state": publication_evidence["github_review_state"],
             "pending_action": None,
             "pending_review_body": None,
             "publishing_actor": actor if preserve_merge_evidence else None,
@@ -5568,8 +6615,73 @@ async def recover_publishing_pr_reviews(db_factory) -> int:
 def _validated_superseding_snapshot(
     value: object,
 ) -> tuple[dict, dict] | None:
-    if not isinstance(value, dict) or value.get("version") != 2:
+    if not isinstance(value, dict):
         return None
+    if value.get("version") == 3:
+        if value.get("kind") != "input_rejection":
+            return None
+        pr_data = value.get("pr_data")
+        evidence = value.get("input_rejection")
+        repo_name = value.get("repo_name")
+        if (
+            not isinstance(pr_data, dict)
+            or not isinstance(evidence, dict)
+            or not isinstance(repo_name, str)
+            or _GITHUB_REPO_RE.fullmatch(repo_name) is None
+            or evidence.get("category") != PRReviewInputTooLarge.category
+        ):
+            return None
+        pr_data = dict(pr_data)
+        base_ref = pr_data.get("base_ref")
+        pr_number = pr_data.get("number")
+        base_sha = pr_data.get("base_sha")
+        head_sha = pr_data.get("head_sha")
+        if (
+            not _valid_base_ref(base_ref)
+            or not isinstance(pr_number, int)
+            or isinstance(pr_number, bool)
+            or pr_number <= 0
+            or not isinstance(base_sha, str)
+            or _GITHUB_SHA_RE.fullmatch(base_sha.lower()) is None
+            or not isinstance(head_sha, str)
+            or _GITHUB_SHA_RE.fullmatch(head_sha.lower()) is None
+        ):
+            return None
+        try:
+            rejection = PRReviewInputTooLarge(
+                "validated durable PR review input-size evidence",
+                measured=evidence.get("measured"),
+                limit=evidence.get("limit"),
+                unit=evidence.get("unit"),
+            )
+        except (TypeError, ValueError):
+            return None
+        pr_data["base_sha"] = base_sha.lower()
+        pr_data["head_sha"] = head_sha.lower()
+        return pr_data, {
+            "_ccm_input_rejection": {
+                "repo_name": repo_name,
+                "message": rejection.public_detail,
+                "measured": rejection.measured,
+                "limit": rejection.limit,
+                "unit": rejection.unit,
+            }
+        }
+    version = value.get("version")
+    if version not in {2, 4}:
+        return None
+    if version == 4:
+        hint = value.get("input_rejection")
+        if hint is not None and (
+            not isinstance(hint, dict)
+            or not valid_pr_review_input_error_evidence(
+                category=hint.get("category"),
+                measured=hint.get("measured"),
+                limit=hint.get("limit"),
+                unit=hint.get("unit"),
+            )
+        ):
+            return None
     pr_data = value.get("pr_data")
     prepared_context = value.get("prepared_context")
     if not isinstance(pr_data, dict) or not isinstance(
@@ -5625,12 +6737,38 @@ def _validated_superseding_snapshot(
     return pr_data, prepared_context
 
 
+def _superseding_input_rejection(
+    prepared_context: dict,
+) -> tuple[str, PRReviewInputTooLarge] | None:
+    evidence = prepared_context.get("_ccm_input_rejection")
+    if not isinstance(evidence, dict):
+        return None
+    repo_name = evidence.get("repo_name")
+    if not isinstance(repo_name, str):
+        return None
+    try:
+        rejection = PRReviewInputTooLarge(
+            evidence.get("message"),
+            measured=evidence.get("measured"),
+            limit=evidence.get("limit"),
+            unit=evidence.get("unit"),
+        )
+    except (TypeError, ValueError):
+        return None
+    return repo_name, rejection
+
+
 async def recover_superseding_pr_reviews(
     db_factory,
     *,
     grace_seconds: float = 60.0,
 ) -> int:
     """Resume synchronize intents committed before old-Task termination."""
+
+    from backend.services.pr_review_panel import (
+        capture_exact_head_ci_evidence,
+        validated_exact_head_ci_evidence,
+    )
 
     async with db_factory() as db:
         result = await db.execute(
@@ -5699,8 +6837,12 @@ async def recover_superseding_pr_reviews(
                     .values(
                         status="error",
                         action_taken="error",
-                        review_summary=(
-                            "Durable PR synchronize snapshot is invalid"
+                        review_summary=case(
+                            (
+                                PRReview.code_verdict.is_(None),
+                                "Durable PR synchronize snapshot is invalid",
+                            ),
+                            else_=PRReview.review_summary,
                         ),
                         completed_at=datetime.utcnow(),
                         superseding_snapshot=None,
@@ -5727,7 +6869,12 @@ async def recover_superseding_pr_reviews(
         validated = _validated_superseding_snapshot(group[0][3])
         if validated is None:
             continue
-        pr_data, prepared_context = validated
+        pr_data, durable_prepared_context = validated
+        legacy_rejection_hint = _superseding_input_rejection(
+            durable_prepared_context
+        )
+        prepared_context = durable_prepared_context
+        prepared_ci_evidence = None
         try:
             async with AsyncExitStack():
                 # Task operation locks are the outer lifecycle boundary.
@@ -5741,8 +6888,36 @@ async def recover_superseding_pr_reviews(
                         repo_id,
                         populate_existing=True,
                     )
-                    if repo is None:
+                    if repo is None or (
+                        legacy_rejection_hint is not None
+                        and repo.repo_full_name != legacy_rejection_hint[0]
+                    ):
                         continue
+                    repo_ci_snapshot = {
+                        "repo_full_name": repo.repo_full_name,
+                        "review_mode": repo.review_mode,
+                        "wait_for_ci": bool(repo.wait_for_ci),
+                        "required_checks": list(repo.required_checks or []),
+                    }
+                    repo_context_snapshot = SimpleNamespace(
+                        id=repo.id,
+                        repo_full_name=repo.repo_full_name,
+                        default_branch=repo.default_branch,
+                        auto_merge=bool(repo.auto_merge),
+                        provider=repo.provider,
+                        review_mode=repo.review_mode,
+                    )
+                    preliminary_rejection = None
+                    if legacy_rejection_hint is None:
+                        try:
+                            preflight_pr_review_prompts(
+                                repo,
+                                pr_data,
+                                prepared_context=prepared_context,
+                                base_ref=pr_data.get("base_ref"),
+                            )
+                        except PRReviewInputTooLarge as exc:
+                            preliminary_rejection = exc
                     current_rows = await db.execute(
                         select(PRReview).where(
                             PRReview.id.in_(review_ids),
@@ -5758,7 +6933,7 @@ async def recover_superseding_pr_reviews(
                             and _validated_superseding_snapshot(
                                 review.superseding_snapshot
                             )
-                            == (pr_data, prepared_context)
+                            == (pr_data, durable_prepared_context)
                         )
                     ]
                     if {
@@ -5792,6 +6967,39 @@ async def recover_superseding_pr_reviews(
                         )
                     )).scalars().all()
                     task_ids.update(panel_task_ids)
+                if legacy_rejection_hint is not None:
+                    # Legacy v3 persisted only a size hint.  It is not
+                    # authoritative after provider/mode changes, so rebuild
+                    # the exact immutable context without a DB connection and
+                    # let the current policy preflight it below.
+                    try:
+                        prepared_context = await prepare_pr_review_context(
+                            repo_context_snapshot,
+                            pr_data,
+                            base_ref=pr_data.get("base_ref"),
+                        )
+                    except PRReviewInputTooLarge as exc:
+                        prepared_context = getattr(
+                            exc,
+                            "prepared_context",
+                            None,
+                        )
+                        if not isinstance(prepared_context, dict):
+                            raise
+                        preliminary_rejection = exc
+                if (
+                    preliminary_rejection is None
+                    and (repo_ci_snapshot["review_mode"] or "single") == "panel"
+                    and repo_ci_snapshot["wait_for_ci"]
+                ):
+                    # CI is the only remote input needed by replacement
+                    # creation.  Capture it after the read session has closed
+                    # and before any Task-operation or row lock is acquired.
+                    prepared_ci_evidence = await capture_exact_head_ci_evidence(
+                        repo_ci_snapshot["repo_full_name"],
+                        pr_data["head_sha"],
+                        repo_ci_snapshot["required_checks"],
+                    )
                 from backend.services.task_termination import (
                     TaskTerminationConflict,
                     TaskTerminationResult,
@@ -5874,6 +7082,36 @@ async def recover_superseding_pr_reviews(
                         if repo is None:
                             await db.rollback()
                             continue
+                        final_rejection = None
+                        try:
+                            preflight_pr_review_prompts(
+                                repo,
+                                pr_data,
+                                prepared_context=prepared_context,
+                                base_ref=pr_data.get("base_ref"),
+                            )
+                        except PRReviewInputTooLarge as exc:
+                            final_rejection = exc
+                        locked_ci_evidence = None
+                        if final_rejection is None and (
+                            (repo.review_mode or "single") == "panel"
+                            and repo.wait_for_ci
+                        ):
+                            try:
+                                validated_exact_head_ci_evidence(
+                                    prepared_ci_evidence,
+                                    repo_name=repo.repo_full_name,
+                                    head_sha=pr_data["head_sha"],
+                                    required_checks=repo.required_checks,
+                                )
+                            except ValueError:
+                                # Policy changed while old Tasks were being
+                                # stopped.  Keep the durable superseding intent
+                                # intact; the next recovery pass will capture
+                                # fresh CI before taking any locks.
+                                await db.rollback()
+                                continue
+                            locked_ci_evidence = prepared_ci_evidence
                         target = await db.execute(
                             select(PRReview.id).where(
                                 PRReview.repo_id == repo_id,
@@ -5937,7 +7175,13 @@ async def recover_superseding_pr_reviews(
                                     status="reviewing",
                                     completed_at=None,
                                     action_taken=None,
-                                    review_summary=None,
+                                    review_summary=case(
+                                        (
+                                            PRReview.code_verdict.is_(None),
+                                            None,
+                                        ),
+                                        else_=PRReview.review_summary,
+                                    ),
                                     superseding_snapshot=None,
                                     superseding_token=None,
                                     superseding_started_at=None,
@@ -5948,12 +7192,22 @@ async def recover_superseding_pr_reviews(
                             await db.rollback()
                             continue
                         if existing_target is None:
-                            await create_pr_review_task(
-                                db,
-                                repo,
-                                pr_data,
-                                prepared_context=prepared_context,
-                            )
+                            if final_rejection is not None:
+                                await create_pr_review_input_rejection(
+                                    db,
+                                    repo,
+                                    pr_data,
+                                    error=final_rejection,
+                                )
+                            else:
+                                await create_pr_review_task(
+                                    db,
+                                    repo,
+                                    pr_data,
+                                    prepared_context=prepared_context,
+                                    prepared_ci_evidence=locked_ci_evidence,
+                                    allow_remote_ci=False,
+                                )
                         else:
                             await db.commit()
                         recovered += changed_count
@@ -6146,7 +7400,13 @@ async def recover_incomplete_pr_reviews(
             .values(
                 status=status,
                 action_taken=("error" if status == "error" else None),
-                review_summary=summary[:2000],
+                review_summary=case(
+                    (
+                        PRReview.code_verdict.is_(None),
+                        summary[:2000],
+                    ),
+                    else_=PRReview.review_summary,
+                ),
                 completed_at=completed_at or datetime.utcnow(),
             )
             .execution_options(synchronize_session=False)
@@ -6356,6 +7616,11 @@ async def recover_incomplete_pr_reviews(
     )
 
     terminal_runs_reconciled = await reconcile_terminal_review_runs(db_factory)
+    from backend.api.pr_monitor import reconcile_remote_pr_lifecycles
+
+    remote_lifecycles_reconciled = await reconcile_remote_pr_lifecycles(
+        db_factory
+    )
     repair_queued = await reconcile_repair_wakes(db_factory, dispatcher)
     from backend.services.pr_review_adjudication import (
         recover_adjudications,
@@ -6391,7 +7656,7 @@ async def recover_incomplete_pr_reviews(
     return (
         recovered + action_recovered + panel_recovered
         + cancelled_reviewers_reconciled + ci_started
-        + terminal_runs_reconciled + repair_queued
+        + terminal_runs_reconciled + remote_lifecycles_reconciled + repair_queued
         + adjudications_recovered + rebuttals_resolved
         + fixed_findings_resolved + merge_progressed
         + finding_actions_recovered

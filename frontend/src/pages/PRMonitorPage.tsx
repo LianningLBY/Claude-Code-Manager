@@ -1,11 +1,16 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { api } from '../api/client';
-import type { MonitoredRepo, PRFinding, PRMonitorRun, PRReview, RequiredCheckPolicy } from '../api/client';
+import type { GitHubPublisherIdentity, MonitoredRepo, PRFinding, PRMonitorRun, PRReview, RequiredCheckPolicy } from '../api/client';
 import { Plus, ArrowLeft, X, Copy, RefreshCw, ToggleLeft, ToggleRight, Trash2, GitPullRequest, Check } from '../components/icons';
 import { FindingActions } from '../components/PRReview/FindingActions';
 import { MarkdownContent } from '../components/MarkdownContent';
 import { useDialogA11y } from '../hooks/useDialogA11y';
 import { useWebSocket } from '../hooks/useWebSocket';
+import {
+  canonicalGitHubFindingCommentUrl,
+  canonicalGitHubPRUrl,
+  canonicalGitHubReviewUrl,
+} from '../components/PRReview/githubUrls';
 
 const DEFAULT_WEBHOOK_URL = `${window.location.origin}/api/github/webhook`;
 const FINDING_SEVERITY_ORDER: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
@@ -173,7 +178,9 @@ const REVIEW_STATUS_LABELS: Record<string, string> = {
   publishing: 'Publishing result',
   superseding: 'Updating to a newer head',
   passed: 'Passed',
-  approved: 'Approved',
+  // "approved" is a legacy CCM code-verdict status. New GitHub publications
+  // are COMMENT events, so never label this as a GitHub approval.
+  approved: 'Code review passed',
   changes_required: 'Changes required',
   commented: 'Comments published',
   error: 'Review failed',
@@ -193,6 +200,23 @@ function statusText(status: string): string {
     || status.split('_').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
 }
 
+const REVIEW_ACTION_LABELS: Record<string, string> = {
+  lgtm_comment: 'Pass comment published',
+  review_comments: 'Change-request comment published',
+  approved_merged: 'Pass comment published · PR merged',
+  error: 'Action not completed',
+};
+
+function reviewActionText(action: string): string {
+  if (REVIEW_ACTION_LABELS[action]) return REVIEW_ACTION_LABELS[action];
+  return action
+    .split('_')
+    .map((part) => part.toLowerCase() === 'approved'
+      ? 'passed review'
+      : part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
 function reviewerRoleText(role: string): string {
   return REVIEWER_ROLE_LABELS[role] || statusText(role);
 }
@@ -201,9 +225,76 @@ function reviewStatusText(review: PRReview): string {
   return review.display_status?.trim() || statusText(review.status);
 }
 
-function reviewTaskIds(review: PRReview): number[] {
-  if (review.task_ids?.length) return [...new Set(review.task_ids)];
-  return review.task_id == null ? [] : [review.task_id];
+function reviewStatusClasses(review: PRReview): string {
+  if (review.error_category === 'unsupported_input_size') {
+    return 'bg-amber-500/15 text-amber-300';
+  }
+  if (review.aggregate_verdict === 'pass') return STATUS_COLORS.passed;
+  if (review.aggregate_verdict === 'changes_required') return STATUS_COLORS.changes_required;
+  return STATUS_COLORS[review.status] || 'bg-gray-600 text-gray-300';
+}
+
+function publicationStatusText(review: PRReview): string | null {
+  if (!review.publication_state) return null;
+  const labels = {
+    not_started: 'GitHub publication not started',
+    publishing: 'Publishing GitHub comment',
+    reconciling: 'Reconciling GitHub publication',
+    published: 'GitHub comment published',
+    failed: 'GitHub publication failed',
+    not_applicable: 'GitHub publication not applicable',
+  } as const;
+  return labels[review.publication_state];
+}
+
+function lifecycleStatusText(review: PRReview): string | null {
+  if (!review.lifecycle_state) return null;
+  const labels = {
+    unknown: 'Historical lifecycle unavailable',
+    reviewing: 'PR open',
+    superseding: 'Updating to a newer head',
+    superseded: 'Review superseded',
+    cancelled: 'Review cancelled',
+    merged: 'PR merged',
+    closed: 'PR closed',
+    failed: 'PR lifecycle failed',
+  } as const;
+  return labels[review.lifecycle_state];
+}
+
+function verdictStatusText(review: PRReview): string | null {
+  if (review.verdict_state === 'pending') return 'Code review pending';
+  if (review.verdict_state === 'unavailable') return 'Code verdict unavailable';
+  if (review.aggregate_verdict === 'pass') return 'Code verdict: Pass';
+  if (review.aggregate_verdict === 'changes_required') return 'Code verdict: Changes required';
+  return null;
+}
+
+function reviewHasNoCodeVerdict(review: PRReview): boolean {
+  if (review.aggregate_verdict) return false;
+  if (review.verdict_state) return review.verdict_state === 'unavailable';
+  return review.outcome_kind === 'infrastructure_error';
+}
+
+function parsePRMonitorDeepLink(): { repoId: number; reviewId: number | null } | null {
+  const query = window.location.hash.split('?', 2)[1];
+  if (!query) return null;
+  const params = new URLSearchParams(query);
+  const repoId = Number(params.get('repo'));
+  const reviewId = Number(params.get('review'));
+  if (!Number.isSafeInteger(repoId) || repoId <= 0) return null;
+  return {
+    repoId,
+    reviewId: Number.isSafeInteger(reviewId) && reviewId > 0 ? reviewId : null,
+  };
+}
+
+function setPRMonitorDeepLink(repoId?: number, reviewId?: number | null) {
+  const params = new URLSearchParams();
+  if (repoId) params.set('repo', String(repoId));
+  if (reviewId) params.set('review', String(reviewId));
+  const query = params.toString();
+  window.history.replaceState(null, '', `#/pr-monitor${query ? `?${query}` : ''}`);
 }
 
 function shortSha(sha: string | null): string {
@@ -528,7 +619,18 @@ function AddRepoModal({
   );
 }
 
-function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: () => void; onRefresh: () => void }) {
+function RepoDetail({
+  repo,
+  initialReviewId,
+  onBack,
+  onRefresh,
+}: {
+  repo: MonitoredRepo;
+  initialReviewId?: number | null;
+  onBack: () => void;
+  onRefresh: () => void;
+}) {
+  const isAdmin = currentUserIsAdmin();
   const initialReviewMode = repo.review_mode || 'single';
   const initialWaitForCi = initialReviewMode === 'panel' && Boolean(repo.wait_for_ci);
   const [detail, setDetail] = useState<MonitoredRepo>(repo);
@@ -563,12 +665,53 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
   const [saveError, setSaveError] = useState<string | null>(null);
   const [runActionError, setRunActionError] = useState<string | null>(null);
   const [runActionPending, setRunActionPending] = useState<string | null>(null);
+  const [rerunPending, setRerunPending] = useState(false);
+  const [rerunNotice, setRerunNotice] = useState<string | null>(null);
+  const rerunIdempotencyRef = useRef<{
+    reviewId: number;
+    headSha: string;
+    key: string;
+  } | null>(null);
+  const initialReviewOpenedRef = useRef<number | null>(null);
+  const openReviewRequestRef = useRef(0);
+  const runActionRequestRef = useRef(0);
+  const [githubIdentity, setGitHubIdentity] = useState<GitHubPublisherIdentity | null>(null);
+  const [githubIdentityLoading, setGitHubIdentityLoading] = useState(true);
+  const [githubIdentityHttpError, setGitHubIdentityHttpError] = useState<string | null>(null);
+  const githubIdentityRequestRef = useRef(0);
 
   useEffect(() => {
     api.getWebhookInfo()
       .then(info => setWebhookUrl(info.webhook_url || DEFAULT_WEBHOOK_URL))
       .catch(() => setWebhookUrl(DEFAULT_WEBHOOK_URL));
   }, []);
+
+  const loadGitHubIdentity = useCallback(async (forceRefresh = false) => {
+    const requestId = ++githubIdentityRequestRef.current;
+    const expectedRepoId = repo.id;
+    setGitHubIdentityLoading(true);
+    setGitHubIdentityHttpError(null);
+    try {
+      const identity = await api.getPRMonitorGitHubIdentity(expectedRepoId, forceRefresh);
+      if (requestId !== githubIdentityRequestRef.current || expectedRepoId !== repo.id) return;
+      setGitHubIdentity(identity);
+    } catch (error) {
+      if (requestId !== githubIdentityRequestRef.current || expectedRepoId !== repo.id) return;
+      setGitHubIdentity(null);
+      setGitHubIdentityHttpError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (requestId === githubIdentityRequestRef.current && expectedRepoId === repo.id) {
+        setGitHubIdentityLoading(false);
+      }
+    }
+  }, [repo.id]);
+
+  useEffect(() => {
+    void loadGitHubIdentity();
+    return () => {
+      githubIdentityRequestRef.current += 1;
+    };
+  }, [loadGitHubIdentity]);
 
   useEffect(() => {
     if (providerConfigLoaded && !providers.includes(provider)) {
@@ -592,7 +735,67 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
     } catch (error) { setSaveError(String(error)); }
   }, [repo.id, page]);
 
+  const openReview = useCallback(async (reviewId: number, updateDeepLink = true) => {
+    const requestId = ++openReviewRequestRef.current;
+    // Selecting a Review invalidates any slow Run mutation started from the
+    // previous selection. The backend operation may still complete, but its
+    // response must never be rendered as the newly selected Review's Run.
+    runActionRequestRef.current += 1;
+    setRunActionPending(null);
+    setRunActionError(null);
+    setRerunNotice(null);
+    setDeveloperTaskId('');
+    try {
+      const reviewDetail = await api.getReviewDetail(reviewId);
+      if (requestId !== openReviewRequestRef.current) return;
+      if (reviewDetail.repo_id !== repo.id) {
+        throw new Error('The requested Review does not belong to this monitored repository');
+      }
+      selectedReviewIdRef.current = reviewDetail.id;
+      setSelectedReview(reviewDetail);
+      setMonitorRun(null);
+      if (updateDeepLink) setPRMonitorDeepLink(repo.id, reviewDetail.id);
+      if (reviewDetail.monitor_run_id) {
+        try {
+          const expectedRunId = reviewDetail.monitor_run_id;
+          const nextRun = await api.getPRMonitorRun(expectedRunId);
+          if (
+            requestId === openReviewRequestRef.current
+            && selectedReviewIdRef.current === reviewDetail.id
+            && nextRun.id === expectedRunId
+          ) {
+            setMonitorRun(nextRun);
+          }
+        } catch (error) {
+          if (
+            requestId === openReviewRequestRef.current
+            && selectedReviewIdRef.current === reviewDetail.id
+          ) {
+            setRunActionError(String(error));
+          }
+        }
+      }
+      return requestId === openReviewRequestRef.current
+        && selectedReviewIdRef.current === reviewDetail.id
+        ? reviewDetail
+        : null;
+    } catch (error) {
+      if (requestId !== openReviewRequestRef.current) return null;
+      selectedReviewIdRef.current = null;
+      setSelectedReview(null);
+      setMonitorRun(null);
+      setRunActionError(String(error));
+      return null;
+    }
+  }, [repo.id]);
+
   useEffect(() => { loadDetail(); loadReviews(); }, [loadDetail, loadReviews]);
+
+  useEffect(() => {
+    if (!initialReviewId || initialReviewOpenedRef.current === initialReviewId) return;
+    initialReviewOpenedRef.current = initialReviewId;
+    void openReview(initialReviewId, false);
+  }, [initialReviewId, openReview]);
 
   const refreshSelectedReview = useCallback(async () => {
     const reviewId = selectedReviewIdRef.current;
@@ -692,19 +895,82 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
     action: string,
     operation: () => Promise<PRMonitorRun>,
   ) => {
+    const sourceReviewId = selectedReviewIdRef.current;
+    const sourceRunId = monitorRun?.id ?? null;
+    const sourceOpenRequest = openReviewRequestRef.current;
+    if (sourceReviewId == null || sourceRunId == null) return;
+    const actionRequestId = ++runActionRequestRef.current;
+    const stillCurrent = () => (
+      actionRequestId === runActionRequestRef.current
+      && sourceOpenRequest === openReviewRequestRef.current
+      && sourceReviewId === selectedReviewIdRef.current
+    );
     setRunActionPending(action);
     setRunActionError(null);
     try {
-      setMonitorRun(await operation());
+      const updatedRun = await operation();
+      if (stillCurrent() && updatedRun.id === sourceRunId) {
+        setMonitorRun(updatedRun);
+      }
     } catch (error) {
-      setRunActionError(String(error));
+      if (stillCurrent()) setRunActionError(String(error));
     } finally {
-      setRunActionPending(null);
+      if (stillCurrent()) setRunActionPending(null);
     }
   };
 
+  const rerunSelectedReview = async () => {
+    if (!selectedReview?.can_rerun || !selectedReview.head_sha || rerunPending) return;
+    const sourceReviewId = selectedReview.id;
+    const sourceHeadSha = selectedReview.head_sha;
+    setRerunPending(true);
+    setRunActionError(null);
+    setRerunNotice(null);
+    const priorAttempt = rerunIdempotencyRef.current;
+    const attempt = priorAttempt
+      && priorAttempt.reviewId === selectedReview.id
+      && priorAttempt.headSha === selectedReview.head_sha
+      ? priorAttempt
+      : {
+          reviewId: selectedReview.id,
+          headSha: selectedReview.head_sha,
+          key: typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `pr-rerun-${selectedReview.id}-${Date.now()}`,
+        };
+    rerunIdempotencyRef.current = attempt;
+    let rerunId: number;
+    try {
+      const receipt = await api.rerunPRReview(sourceReviewId, sourceHeadSha, attempt.key);
+      rerunIdempotencyRef.current = null;
+      rerunId = receipt.id;
+    } catch (error) {
+      if (
+        selectedReviewIdRef.current === sourceReviewId
+        && selectedReview?.head_sha === sourceHeadSha
+      ) {
+        setRunActionError(`Could not start the exact-head review: ${String(error)}`);
+      }
+      setRerunPending(false);
+      return;
+    }
+    if (
+      selectedReviewIdRef.current !== sourceReviewId
+      || selectedReview?.head_sha !== sourceHeadSha
+    ) {
+      setRerunPending(false);
+      void loadReviews();
+      return;
+    }
+    const rerun = await openReview(rerunId);
+    if (rerun && selectedReviewIdRef.current === rerun.id) {
+      setRerunNotice('Exact-head review started.');
+    }
+    setRerunPending(false);
+    void loadReviews();
+  };
+
   const reviewerRuns = selectedReview?.reviewer_runs ?? [];
-  const selectedReviewTaskIds = selectedReview ? reviewTaskIds(selectedReview) : [];
   const selectedReviewSummary = selectedReview?.display_summary?.trim()
     || selectedReview?.review_summary?.trim()
     || (selectedReview && isActiveReview(selectedReview)
@@ -713,6 +979,16 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
   const reviewerStatusSummary = countSummary(selectedReview?.reviewer_status_counts);
   const reviewerVerdictSummary = countSummary(selectedReview?.reviewer_verdict_counts);
   const reviewerCount = selectedReview?.reviewer_count ?? reviewerRuns.length;
+  const noCodeVerdict = Boolean(selectedReview && reviewHasNoCodeVerdict(selectedReview));
+  const inputAdmissionRejected = selectedReview?.error_category === 'unsupported_input_size';
+  const selectedGitHubReviewUrl = selectedReview
+    ? canonicalGitHubReviewUrl(
+      selectedReview.github_review_url,
+      detail.repo_full_name,
+      selectedReview.pr_number,
+      selectedReview.github_review_id,
+    )
+    : null;
   const terminalRun = monitorRun ? TERMINAL_RUN_STATUSES.has(monitorRun.status) : false;
   const readyRun = monitorRun ? READY_RUN_STATUSES.has(monitorRun.status) : false;
   const busyRun = monitorRun ? BUSY_RUN_STATUSES.has(monitorRun.status) : false;
@@ -925,6 +1201,48 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
         </div>
       </div>
 
+      <section aria-label="GitHub publishing identity" className="bg-gray-800 rounded-lg p-5 space-y-3">
+        <div className="flex items-center justify-between gap-3">
+          <h4 className="text-foreground font-semibold">GitHub Publishing Identity</h4>
+          {isAdmin && (
+            <button
+              type="button"
+              onClick={() => void loadGitHubIdentity(true)}
+              disabled={githubIdentityLoading}
+              className="inline-flex items-center gap-1 rounded px-2 py-1 text-xs text-gray-300 hover:bg-gray-700 disabled:cursor-wait disabled:opacity-50"
+            >
+              <RefreshCw size={13} className={githubIdentityLoading ? 'animate-spin' : ''} />
+              {githubIdentityLoading ? 'Checking…' : 'Refresh identity'}
+            </button>
+          )}
+        </div>
+        <p className="text-xs leading-5 text-gray-400">
+          This is the backend <code>gh</code> identity CCM uses to publish PR comments.
+          It is independent of Codex authentication and any GitHub login in this browser or connector.
+        </p>
+        {githubIdentityLoading && !githubIdentity && !githubIdentityHttpError && (
+          <p role="status" className="text-xs text-blue-300">Checking the CCM backend identity…</p>
+        )}
+        {githubIdentityHttpError && (
+          <p role="alert" className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+            Identity request failed: {githubIdentityHttpError}
+          </p>
+        )}
+        {githubIdentity?.available && githubIdentity.actor && (
+          <div className="rounded border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-200">
+            <p className="font-medium">CCM will publish as {githubIdentity.actor}</p>
+            <p className="mt-1 opacity-75">Checked {new Date(githubIdentity.checked_at).toLocaleString()}</p>
+          </div>
+        )}
+        {githubIdentity && (!githubIdentity.available || !githubIdentity.actor) && (
+          <div className="rounded border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+            <p className="font-medium">CCM publishing identity unavailable</p>
+            <p className="mt-1 opacity-80">{githubIdentity.error || 'The backend could not confirm its GitHub identity.'}</p>
+            <p className="mt-1 opacity-75">Checked {new Date(githubIdentity.checked_at).toLocaleString()}</p>
+          </div>
+        )}
+      </section>
+
       <div className="bg-gray-800 rounded-lg p-5 space-y-3">
         <div className="flex items-center justify-between gap-3">
           <h4 className="text-foreground font-semibold">Review History</h4>
@@ -943,18 +1261,18 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                 <thead>
                   <tr className="text-gray-400 text-left border-b border-gray-700">
                     <th className="pb-2 pr-4">PR</th>
+                    <th className="pb-2 pr-4">Attempt</th>
                     <th className="pb-2 pr-4">Head</th>
                     <th className="pb-2 pr-4">Title</th>
                     <th className="pb-2 pr-4">Author</th>
                     <th className="pb-2 pr-4">Status</th>
                     <th className="pb-2 pr-4">Action</th>
-                    <th className="pb-2 pr-4">Tasks</th>
                     <th className="pb-2">Time</th>
                   </tr>
                 </thead>
                 <tbody>
                   {reviews.map((r) => {
-                    const taskIds = reviewTaskIds(r);
+                    const prUrl = canonicalGitHubPRUrl(r.pr_url, detail.repo_full_name, r.pr_number);
                     const snapshotState = r.is_current_snapshot
                       ?? (selectedReview?.id === r.id ? selectedReview.is_current_snapshot : undefined);
                     const headLabel = snapshotState === true
@@ -965,32 +1283,32 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                           ? 'Latest review'
                           : 'Previous review';
                     return (
-                    <tr key={r.id} className={`border-b border-gray-700/50 text-gray-300 cursor-pointer hover:bg-gray-700/30 ${
+                    <tr key={r.id} className={`border-b border-gray-700/50 text-gray-300 cursor-pointer hover:bg-gray-700/30 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-400 ${
                       selectedReview?.id === r.id ? 'bg-indigo-500/10' : ''
                     }`}
-                      onClick={async () => {
-                        setRunActionError(null);
-                        setDeveloperTaskId('');
-                        try {
-                          const reviewDetail = await api.getReviewDetail(r.id);
-                          setSelectedReview(reviewDetail);
-                          setMonitorRun(null);
-                          if (reviewDetail.monitor_run_id) {
-                            try {
-                              setMonitorRun(await api.getPRMonitorRun(reviewDetail.monitor_run_id));
-                            } catch (error) {
-                              setRunActionError(String(error));
-                            }
-                          }
-                        } catch (error) {
-                          setSelectedReview(null);
-                          setMonitorRun(null);
-                          setRunActionError(String(error));
-                        }
+                      tabIndex={0}
+                      aria-label={`Open Review ${r.id}, attempt ${r.attempt}`}
+                      onClick={() => void openReview(r.id)}
+                      onKeyDown={(event) => {
+                        if (event.key !== 'Enter' && event.key !== ' ') return;
+                        event.preventDefault();
+                        void openReview(r.id);
                       }}>
                       <td className="py-2 pr-4">
-                        <a href={r.pr_url} target="_blank" rel="noopener noreferrer"
-                          className="text-indigo-400 hover:text-indigo-300">#{r.pr_number}</a>
+                        {prUrl ? (
+                          <a href={prUrl} target="_blank" rel="noopener noreferrer"
+                            onClick={(event) => event.stopPropagation()}
+                            onKeyDown={(event) => event.stopPropagation()}
+                            className="text-indigo-400 hover:text-indigo-300">#{r.pr_number}</a>
+                        ) : <span>#{r.pr_number}</span>}
+                      </td>
+                      <td className="py-2 pr-4 text-xs">
+                        <span>Attempt {r.attempt}</span>
+                        {r.rerun_of_review_id != null && (
+                          <span className="mt-1 block text-[10px] text-gray-500">
+                            Re-run of Review #{r.rerun_of_review_id}
+                          </span>
+                        )}
                       </td>
                       <td className="py-2 pr-4">
                         <code className="text-xs text-gray-300" title={r.head_sha || undefined}>{shortSha(r.head_sha)}</code>
@@ -1005,16 +1323,11 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                       <td className="py-2 pr-4 max-w-xs truncate">{r.pr_title}</td>
                       <td className="py-2 pr-4">{r.pr_author}</td>
                       <td className="py-2 pr-4">
-                        <span className={`px-2 py-0.5 rounded text-xs ${STATUS_COLORS[r.status] || 'bg-gray-600 text-gray-300'}`}>
+                        <span className={`px-2 py-0.5 rounded text-xs ${reviewStatusClasses(r)}`}>
                           {reviewStatusText(r)}
                         </span>
                       </td>
-                      <td className="py-2 pr-4 text-xs">{r.action_taken ? statusText(r.action_taken) : '-'}</td>
-                      <td className="py-2 pr-4">
-                        {taskIds.length ? taskIds.map((taskId) => (
-                          <span key={taskId} className="mr-1 text-indigo-400">#{taskId}</span>
-                        )) : '-'}
-                      </td>
+                      <td className="py-2 pr-4 text-xs">{r.action_taken ? reviewActionText(r.action_taken) : '-'}</td>
                       <td className="py-2 text-xs text-gray-500">{new Date(r.created_at).toLocaleString()}</td>
                     </tr>
                     );
@@ -1028,13 +1341,16 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                 <div className="flex justify-between">
                   <h5 className="font-medium text-foreground">Review Detail · PR #{selectedReview.pr_number}</h5>
                   <button className="text-xs text-gray-400" onClick={() => {
+                    openReviewRequestRef.current += 1;
+                    selectedReviewIdRef.current = null;
                     setSelectedReview(null);
                     setMonitorRun(null);
                     setRunActionError(null);
+                    setPRMonitorDeepLink(repo.id, null);
                   }}>Close</button>
                 </div>
                 <div className="flex flex-wrap items-center gap-2 text-xs">
-                  <span className={`rounded px-2 py-0.5 ${STATUS_COLORS[selectedReview.status] || 'bg-gray-600 text-gray-300'}`}>
+                  <span className={`rounded px-2 py-0.5 ${reviewStatusClasses(selectedReview)}`}>
                     {reviewStatusText(selectedReview)}
                   </span>
                   {selectedReview.aggregate_verdict && (
@@ -1052,32 +1368,114 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                     head {shortSha(selectedReview.head_sha)}
                   </code>
                 </div>
-                <div role={selectedReview.outcome_kind === 'infrastructure_error' ? 'alert' : undefined}
+                {(verdictStatusText(selectedReview) || publicationStatusText(selectedReview) || lifecycleStatusText(selectedReview)) && (
+                  <div aria-label="Review outcome" className="grid gap-2 text-xs md:grid-cols-3">
+                    {verdictStatusText(selectedReview) && (
+                      <div className={`rounded border px-3 py-2 ${
+                        selectedReview.verdict_state === 'unavailable'
+                          ? inputAdmissionRejected
+                            ? 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                            : 'border-red-500/30 bg-red-500/10 text-red-300'
+                          : selectedReview.aggregate_verdict === 'pass'
+                            ? 'border-green-500/30 bg-green-500/10 text-green-300'
+                            : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+                      }`}>
+                        <span className="font-medium">{verdictStatusText(selectedReview)}</span>
+                      </div>
+                    )}
+                    {publicationStatusText(selectedReview) && (
+                      <div className={`rounded border px-3 py-2 ${
+                        selectedReview.publication_state === 'failed'
+                          ? 'border-red-500/30 bg-red-500/10 text-red-300'
+                          : selectedReview.publication_state === 'published'
+                            ? 'border-indigo-500/30 bg-indigo-500/10 text-indigo-200'
+                            : 'border-gray-600 bg-gray-700/40 text-gray-300'
+                      }`}>
+                        <span className="font-medium">{publicationStatusText(selectedReview)}</span>
+                        {selectedReview.publication_state === 'published' && (
+                          <p className="mt-1 text-[11px] opacity-80">
+                            {selectedReview.published_actor
+                              ? `Published by CCM as ${selectedReview.published_actor}`
+                              : 'Published by CCM'}
+                            {selectedReview.published_at
+                              ? ` · ${new Date(selectedReview.published_at).toLocaleString()}`
+                              : ''}
+                            {selectedReview.github_state ? ` · GitHub ${selectedReview.github_state}` : ''}
+                          </p>
+                        )}
+                      </div>
+                    )}
+                    {lifecycleStatusText(selectedReview) && (
+                      <div className="rounded border border-gray-600 bg-gray-700/40 px-3 py-2 text-gray-300">
+                        <span className="font-medium">{lifecycleStatusText(selectedReview)}</span>
+                      </div>
+                    )}
+                  </div>
+                )}
+                <div role={noCodeVerdict ? 'alert' : undefined}
                   className={`rounded border p-3 ${
-                    selectedReview.outcome_kind === 'infrastructure_error'
-                      ? 'border-red-500/30 bg-red-500/10'
+                    noCodeVerdict
+                      ? inputAdmissionRejected
+                        ? 'border-amber-500/30 bg-amber-500/10'
+                        : 'border-red-500/30 bg-red-500/10'
                       : 'border-gray-700 bg-gray-900/40'
                   }`}>
                   <h6 className="mb-2 text-sm font-medium text-foreground">
-                    {selectedReview.outcome_kind === 'infrastructure_error' ? 'Review system failure' : 'Review summary'}
+                    {inputAdmissionRejected
+                      ? 'Review not started: input too large'
+                      : noCodeVerdict
+                        ? 'Review system failure'
+                        : 'Review summary'}
                   </h6>
                   <MarkdownContent content={selectedReviewSummary} className="text-xs text-gray-300" />
-                  {selectedReview.outcome_kind === 'infrastructure_error' && (
+                  {inputAdmissionRejected
+                    && selectedReview.error_measured != null
+                    && selectedReview.error_limit != null
+                    && selectedReview.error_unit && (
+                    <p className="mt-2 text-xs text-amber-300">
+                      Exact review input: {selectedReview.error_measured.toLocaleString()} {selectedReview.error_unit}; safe limit:{' '}
+                      {selectedReview.error_limit.toLocaleString()} {selectedReview.error_unit}. No Reviewer Task was created.
+                    </p>
+                  )}
+                  {noCodeVerdict && !inputAdmissionRejected && (
                     <p className="mt-2 text-xs text-red-300">No code verdict was produced by this failed review run.</p>
                   )}
                 </div>
-                {(reviewerCount > 0 || selectedReviewTaskIds.length > 0) && (
+                {reviewerCount > 0 && (
                   <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-gray-400">
                     {reviewerCount > 0 && <span>{reviewerCount} reviewer{reviewerCount === 1 ? '' : 's'}</span>}
                     {reviewerStatusSummary && <span>Progress: {reviewerStatusSummary}</span>}
                     {reviewerVerdictSummary && <span>Results: {reviewerVerdictSummary}</span>}
-                    {selectedReviewTaskIds.length > 0 && (
-                      <span>Review Task{selectedReviewTaskIds.length === 1 ? '' : 's'}: {' '}
-                        {selectedReviewTaskIds.map((taskId) => <span key={taskId} className="text-indigo-300">#{taskId}{' '}</span>)}
-                      </span>
-                    )}
                   </div>
                 )}
+                {selectedReview.failure_stage && (
+                  <p className={`text-xs ${inputAdmissionRejected ? 'text-amber-300' : 'text-red-300'}`}>
+                    Failure stage: {inputAdmissionRejected
+                      ? 'review input admission'
+                      : statusText(selectedReview.failure_stage)}
+                  </p>
+                )}
+                {selectedGitHubReviewUrl && (
+                  <a
+                    href={selectedGitHubReviewUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex text-xs text-indigo-300 hover:text-indigo-200"
+                  >
+                    Open published GitHub comment
+                  </a>
+                )}
+                {selectedReview.can_rerun && selectedReview.head_sha && (
+                  <button
+                    type="button"
+                    disabled={rerunPending}
+                    onClick={() => void rerunSelectedReview()}
+                    className="rounded border border-indigo-500/40 px-2.5 py-1.5 text-xs text-indigo-200 hover:bg-indigo-500/10 disabled:opacity-50"
+                  >
+                    {rerunPending ? 'Starting exact-head review…' : 'Re-run exact head'}
+                  </button>
+                )}
+                {rerunNotice && <p role="status" className="text-xs text-emerald-300">{rerunNotice}</p>}
                 {selectedReview.ci_summary && <p className="text-xs text-gray-400">CI: {selectedReview.ci_summary}</p>}
                 {monitorRun && (
                   <div className="space-y-2 text-xs">
@@ -1152,7 +1550,6 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                     <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
                       <span className="font-medium text-gray-200">
                         {reviewerRoleText(run.role)}
-                        {run.task_id != null && <span className="ml-2 text-xs font-normal text-indigo-300">Task #{run.task_id}</span>}
                       </span>
                       <span className={STATUS_COLORS[run.status] || 'text-gray-400'}>{statusText(run.status)}</span>
                     </div>
@@ -1165,7 +1562,14 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                     {run.error_message && <p className="text-xs text-red-400 mt-1">{run.error_message}</p>}
                     {[...run.findings].sort((a, b) => (
                       (FINDING_SEVERITY_ORDER[a.severity] ?? 9) - (FINDING_SEVERITY_ORDER[b.severity] ?? 9)
-                    )).map(finding => (
+                    )).map(finding => {
+                      const findingThreadUrl = canonicalGitHubFindingCommentUrl(
+                        finding.github_comment_url,
+                        detail.repo_full_name,
+                        selectedReview.pr_number,
+                        finding.github_comment_id,
+                      );
+                      return (
                       <div key={finding.id} className="mt-3 border-l-2 border-orange-500 pl-3 text-xs space-y-1">
                         <p className="text-orange-300">[{finding.severity}] {finding.path}{finding.line ? `:${finding.line}` : ''} — {finding.title}</p>
                         <p className="text-gray-300">Evidence: {finding.evidence}</p>
@@ -1173,8 +1577,8 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                         <p className="text-gray-400">Required fix: {finding.required_fix}</p>
                         <p className="text-gray-400">Test: {finding.test}</p>
                         <p className="text-gray-500">
-                          Thread: {finding.github_comment_url ? (
-                            <a className="text-indigo-400 hover:text-indigo-300" href={finding.github_comment_url}
+                          Thread: {findingThreadUrl ? (
+                            <a className="text-indigo-400 hover:text-indigo-300" href={findingThreadUrl}
                               target="_blank" rel="noopener noreferrer">{finding.thread_status}</a>
                           ) : finding.thread_status}
                         </p>
@@ -1182,16 +1586,15 @@ function RepoDetail({ repo, onBack, onRefresh }: { repo: MonitoredRepo; onBack: 
                         <FindingActions
                           finding={finding}
                           currentSnapshot={selectedReview.is_current_snapshot !== false}
-                          onChanged={async () => {
-                            setSelectedReview(await api.getReviewDetail(selectedReview.id));
-                          }}
+                          onChanged={refreshSelectedReview}
                         />
-                        <FindingRebuttalForm finding={finding} onSubmitted={async () => {
-                          const refreshed = await api.getReviewDetail(selectedReview.id);
-                          setSelectedReview(refreshed);
-                        }} />
+                        <FindingRebuttalForm
+                          finding={finding}
+                          onSubmitted={refreshSelectedReview}
+                        />
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 ))}
               </>
@@ -1215,7 +1618,24 @@ export function PRMonitorPage() {
   const [error, setError] = useState<string | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [selectedRepo, setSelectedRepo] = useState<MonitoredRepo | null>(null);
+  const [initialDeepLink, setInitialDeepLink] = useState(parsePRMonitorDeepLink);
+  const deepLinkAppliedRef = useRef(false);
   const isAdmin = currentUserIsAdmin();
+
+  useEffect(() => {
+    const handleHashChange = () => {
+      const route = window.location.hash.replace(/^#\/?/, '').split('?', 1)[0];
+      if (route !== 'pr-monitor') return;
+      const deepLink = parsePRMonitorDeepLink();
+      deepLinkAppliedRef.current = false;
+      setInitialDeepLink(deepLink);
+      // A pushState/hashchange navigation must never leave the prior repository
+      // rendered while the new (or invalid) deep link is being resolved.
+      setSelectedRepo(null);
+    };
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -1234,12 +1654,21 @@ export function PRMonitorPage() {
         if (!active) return;
         setRepos(data);
         setError(null);
+        if (initialDeepLink && !deepLinkAppliedRef.current) {
+          deepLinkAppliedRef.current = true;
+          const linkedRepo = data.find((repo) => repo.id === initialDeepLink.repoId);
+          if (linkedRepo) setSelectedRepo(linkedRepo);
+          else {
+            setSelectedRepo(null);
+            setError(`Monitored repository #${initialDeepLink.repoId} was not found`);
+          }
+        }
       })
       .catch((caught) => {
         if (active) setError(String(caught));
       });
     return () => { active = false; };
-  }, []);
+  }, [initialDeepLink]);
 
   const handleToggle = async (repo: MonitoredRepo) => {
     try {
@@ -1259,7 +1688,18 @@ export function PRMonitorPage() {
   if (selectedRepo) {
     return (
       <div className="p-4 md:p-6 max-w-6xl mx-auto">
-        <RepoDetail repo={selectedRepo} onBack={() => { setSelectedRepo(null); refresh(); }} onRefresh={refresh} />
+        <RepoDetail
+          key={selectedRepo.id}
+          repo={selectedRepo}
+          initialReviewId={initialDeepLink?.repoId === selectedRepo.id ? initialDeepLink.reviewId : null}
+          onBack={() => {
+            setInitialDeepLink(null);
+            setPRMonitorDeepLink();
+            setSelectedRepo(null);
+            refresh();
+          }}
+          onRefresh={refresh}
+        />
       </div>
     );
   }
@@ -1303,7 +1743,21 @@ export function PRMonitorPage() {
             <tbody>
               {repos.map(repo => (
                 <tr key={repo.id} className="border-b border-gray-700/50 hover:bg-gray-700/30 cursor-pointer text-gray-300"
-                  onClick={() => setSelectedRepo(repo)}>
+                  tabIndex={0}
+                  aria-label={`Open monitored repository ${repo.repo_full_name}`}
+                  onClick={() => {
+                    setInitialDeepLink(null);
+                    setPRMonitorDeepLink(repo.id, null);
+                    setSelectedRepo(repo);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.target !== event.currentTarget) return;
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    event.preventDefault();
+                    setInitialDeepLink(null);
+                    setPRMonitorDeepLink(repo.id, null);
+                    setSelectedRepo(repo);
+                  }}>
                   <td className="px-4 py-3 font-medium text-foreground">{repo.repo_full_name}</td>
                   <td className="px-4 py-3">
                     <span className={`inline-block w-2 h-2 rounded-full mr-2 ${repo.status === 'active' ? 'bg-green-400' : 'bg-red-400'}`} />
@@ -1319,13 +1773,15 @@ export function PRMonitorPage() {
                     </span>
                   </td>
                   <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
-                    <button onClick={() => handleToggle(repo)} className="text-gray-400 hover:text-foreground">
+                    <button aria-label={`${repo.enabled ? 'Disable' : 'Enable'} monitoring for ${repo.repo_full_name}`}
+                      onClick={() => handleToggle(repo)} className="text-gray-400 hover:text-foreground">
                       {repo.enabled ? <ToggleRight size={22} className="text-green-400" /> : <ToggleLeft size={22} />}
                     </button>
                   </td>
                   <td className="px-4 py-3 text-xs text-gray-500">{new Date(repo.created_at).toLocaleDateString()}</td>
                   <td className="px-4 py-3" onClick={(e) => e.stopPropagation()}>
-                    <button onClick={() => handleDelete(repo)} className="text-gray-400 hover:text-red-400">
+                    <button aria-label={`Delete monitoring for ${repo.repo_full_name}`}
+                      onClick={() => handleDelete(repo)} className="text-gray-400 hover:text-red-400">
                       <Trash2 size={16} />
                     </button>
                   </td>

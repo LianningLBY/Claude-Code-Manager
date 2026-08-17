@@ -70,10 +70,12 @@ async def legacy_pr_effect_is_forbidden(
 
     A legacy PR action is forbidden when any durable ownership edge proves
     Delivery control: the reserved Review marker, a DeliveryRun-to-monitor or
-    DeliveryRun-to-developer relation, or the exact repository/PR lifecycle.
+    DeliveryRun-to-developer relation, or an active repository/PR lifecycle.
     The redundant edges are intentional.  Publisher adoption and controller
     binding are separate transactions, so checking only one nullable foreign
     key would expose a window where a legacy repair/merge action could start.
+    A terminal historical lifecycle does not own every later ordinary Monitor
+    Run for that repo/PR unless an exact durable edge still links the two.
 
     Callers that are about to mutate state should invoke this while holding
     their normal repository/review writer fence.  A malformed ``delivery:``
@@ -124,32 +126,48 @@ async def legacy_pr_effect_is_forbidden(
         if delivery_task is not None:
             return True
 
-    run_conditions = []
+    exact_run_conditions = []
+    subject_run_conditions = []
     if monitor_run is not None:
-        run_conditions.extend(
-            (
-                DeliveryRun.pr_monitor_run_id == monitor_run.id,
-                and_(
-                    DeliveryRun.monitored_repo_id == monitor_run.repo_id,
-                    DeliveryRun.pr_number == monitor_run.pr_number,
-                ),
+        exact_run_conditions.append(
+            DeliveryRun.pr_monitor_run_id == monitor_run.id
+        )
+        subject_run_conditions.append(
+            and_(
+                DeliveryRun.monitored_repo_id == monitor_run.repo_id,
+                DeliveryRun.pr_number == monitor_run.pr_number,
             )
         )
     for item in reviews:
         if item.monitor_run_id is not None:
-            run_conditions.append(
+            exact_run_conditions.append(
                 DeliveryRun.pr_monitor_run_id == item.monitor_run_id
             )
-        run_conditions.append(
+        subject_run_conditions.append(
             and_(
                 DeliveryRun.monitored_repo_id == item.repo_id,
                 DeliveryRun.pr_number == item.pr_number,
             )
         )
     for task_id in task_ids:
-        run_conditions.append(DeliveryRun.developer_task_id == task_id)
-    if not run_conditions:
+        exact_run_conditions.append(DeliveryRun.developer_task_id == task_id)
+    if not exact_run_conditions and not subject_run_conditions:
         return False
+
+    run_conditions = list(exact_run_conditions)
+    if subject_run_conditions:
+        # Repository/PR is only a crash-gap ownership hint.  Once that
+        # Delivery lifecycle is terminal, a later ordinary Monitor Run may
+        # legitimately reuse the same PR number; only an exact immutable edge
+        # above may keep blocking it.  Treat malformed half-terminal rows as
+        # active so ambiguous ownership still fails closed.
+        run_conditions.append(and_(
+            or_(
+                DeliveryRun.activity != "terminal",
+                DeliveryRun.outcome.is_(None),
+            ),
+            or_(*subject_run_conditions),
+        ))
     return (
         await db.execute(
             select(DeliveryRun.id).where(or_(*run_conditions)).limit(1)

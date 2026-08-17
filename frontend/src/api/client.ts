@@ -1626,6 +1626,8 @@ export interface RequiredCheckPolicy {
 
 export interface PRReview {
   id: number;
+  attempt: number;
+  rerun_of_review_id: number | null;
   monitor_run_id: number | null;
   repo_id: number;
   pr_number: number;
@@ -1645,9 +1647,26 @@ export interface PRReview {
   reviewer_status_counts?: Record<string, number>;
   reviewer_verdict_counts?: Record<string, number>;
   aggregate_verdict?: 'pass' | 'changes_required' | null;
+  verdict_state?: PRVerdictState;
+  publication_state?: PRPublicationState;
+  publication_error?: string | null;
+  lifecycle_state?: PRLifecycleState;
+  failure_stage?: PRFailureStage | null;
+  error_category?: 'unsupported_input_size' | null;
+  error_measured?: number | null;
+  error_limit?: number | null;
+  error_unit?: 'characters' | 'UTF-8 bytes' | null;
   display_status?: string | null;
   display_summary?: string | null;
   outcome_kind?: PRReviewOutcomeKind;
+  /** GitHub publication is always a COMMENT for the current PR Monitor path. */
+  github_event?: 'COMMENT' | null;
+  published_actor?: string | null;
+  published_at?: string | null;
+  github_review_id?: number | null;
+  github_review_url?: string | null;
+  github_state?: string | null;
+  can_rerun?: boolean;
   action_taken: string | null;
   merge_method: 'merge' | 'squash' | 'fast-forward' | null;
   ci_status: string | null;
@@ -1780,6 +1799,69 @@ export interface PRReviewerRun {
 }
 
 export type PRReviewOutcomeKind = 'in_progress' | 'review_result' | 'infrastructure_error' | 'lifecycle';
+
+export type PRVerdictState = 'pending' | 'complete' | 'unavailable';
+export type PRPublicationState = 'not_started' | 'publishing' | 'reconciling' | 'published' | 'failed' | 'not_applicable';
+export type PRLifecycleState = 'unknown' | 'reviewing' | 'superseding' | 'superseded' | 'cancelled' | 'merged' | 'closed' | 'failed';
+export type PRFailureStage = 'reviewer' | 'ci' | 'github_identity' | 'publication' | 'merge' | 'recovery' | 'lifecycle';
+
+/** Minimal receipt returned after an exact-head rerun is accepted. */
+export interface PRReviewRerunReceipt {
+  id: number;
+  attempt: number;
+  rerun_of_review_id: number;
+  monitor_run_id: number | null;
+  status: string;
+  head_sha: string;
+}
+
+/**
+ * Safe, read-only projection used by the ordinary Tasks page. It intentionally
+ * contains no internal Reviewer Task IDs, prompts, sessions, logs, nonces, or
+ * pending GitHub bodies.
+ */
+export interface PRReviewResult {
+  /** Stable UI identity for both Run-backed and historical orphan results. */
+  result_key: string;
+  run_id: number | null;
+  repo_id: number;
+  repo_full_name: string;
+  pr_number: number;
+  pr_title: string;
+  pr_url: string;
+  review_id: number | null;
+  base_ref: string | null;
+  base_sha: string | null;
+  head_sha: string | null;
+  verdict_state: PRVerdictState;
+  aggregate_verdict: 'pass' | 'changes_required' | null;
+  publication_state: PRPublicationState;
+  lifecycle_state: PRLifecycleState;
+  failure_stage: PRFailureStage | null;
+  error_category: 'unsupported_input_size' | null;
+  error_measured: number | null;
+  error_limit: number | null;
+  error_unit: 'characters' | 'UTF-8 bytes' | null;
+  display_status: string;
+  display_summary: string | null;
+  published_actor: string | null;
+  published_at: string | null;
+  github_review_id: number | null;
+  github_review_url: string | null;
+  github_state: string | null;
+  github_event: 'COMMENT' | null;
+  created_at: string;
+  updated_at: string;
+  completed_at: string | null;
+  can_rerun: boolean;
+}
+
+export interface GitHubPublisherIdentity {
+  available: boolean;
+  actor: string | null;
+  error: string | null;
+  checked_at: string;
+}
 
 export interface PoolUsageWindow {
   utilization: number | null;
@@ -3166,6 +3248,20 @@ export const api = {
     request<PRReview[]>(`/api/pr-monitor/repos/${repoId}/reviews?page=${page}&size=${size}`),
   getReviewDetail: (reviewId: number) =>
     request<PRReview>(`/api/pr-monitor/reviews/${reviewId}`),
+  getPRReviewResults: (page = 1, size = 50) =>
+    request<PRReviewResult[]>(`/api/pr-monitor/results?page=${page}&size=${size}`),
+  getPRMonitorGitHubIdentity: (repoId: number, refresh = false) =>
+    request<GitHubPublisherIdentity>(
+      `/api/pr-monitor/github-identity?repo_id=${repoId}${refresh ? '&refresh=true' : ''}`,
+    ),
+  rerunPRReview: (reviewId: number, expectedHeadSha: string, idempotencyKey: string) =>
+    request<PRReviewRerunReceipt>(`/api/pr-monitor/reviews/${reviewId}/rerun`, {
+      method: 'POST',
+      body: JSON.stringify({
+        expected_head_sha: expectedHeadSha,
+        idempotency_key: idempotencyKey,
+      }),
+    }),
   ignoreReviewFinding: (findingId: number, idempotencyKey: string) =>
     request<PRFindingAction>(`/api/pr-monitor/findings/${findingId}/ignore`, {
       method: 'POST', body: JSON.stringify({ idempotency_key: idempotencyKey }),

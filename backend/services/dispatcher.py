@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 from fastapi import HTTPException
-from sqlalchemy import select, update, func, or_
+from sqlalchemy import case, select, update, func, or_
 
 from sqlalchemy import select as sa_select
 
@@ -12429,7 +12429,13 @@ class GlobalDispatcher:
                         .values(
                             status="error",
                             action_taken="error",
-                            review_summary=f"Task failed: {error[:500]}",
+                            review_summary=case(
+                                (
+                                    PRReview.code_verdict.is_(None),
+                                    f"Task failed: {error[:500]}",
+                                ),
+                                else_=PRReview.review_summary,
+                            ),
                             completed_at=datetime.utcnow(),
                         )
                     )

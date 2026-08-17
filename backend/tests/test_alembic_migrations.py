@@ -8,6 +8,8 @@ Ensures:
 import importlib.util
 import io
 import json
+import shutil
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,11 +23,13 @@ from alembic.script import ScriptDirectory
 import pytest
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     CheckConstraint,
     ForeignKeyConstraint,
     Integer,
     JSON,
     String,
+    Text,
     UniqueConstraint,
     create_engine,
     inspect,
@@ -111,6 +115,7 @@ WORKER_RENAME_TAG_OUTBOX_REVISION = "c4a8e2f6b190"
 PR_MONITOR_TASK_TOMBSTONE_REVISION = "e2a4c6f8b1d3"
 DELIVERY_PR_MONITOR_MERGE_REVISION = "f4c7a9d2e610"
 INSTANCE_PROCESS_IDENTITY_REVISION = "a56a13b7f287"
+PR_REVIEW_RESULT_EVIDENCE_REVISION = "b1d7e4a9c302"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
@@ -121,7 +126,7 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = INSTANCE_PROCESS_IDENTITY_REVISION
+CURRENT_HEAD_REVISION = PR_REVIEW_RESULT_EVIDENCE_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -3290,6 +3295,15 @@ def _load_pr_review_base_ref_migration(
 ):
     return _load_revision_migration(
         "2b8d4f6a1c90_freeze_pr_review_base_ref.py",
+        module_suffix,
+    )
+
+
+def _load_pr_review_result_evidence_migration(
+    module_suffix: str = "test",
+):
+    return _load_revision_migration(
+        "b1d7e4a9c302_add_pr_review_result_evidence.py",
         module_suffix,
     )
 
@@ -8012,7 +8026,15 @@ class TestFreshMigration:
             "base_ref",
             "base_sha",
             "head_sha",
+            "attempt",
         ) in unique_column_sets
+        assert (
+            "repo_id",
+            "pr_number",
+            "base_ref",
+            "base_sha",
+            "head_sha",
+        ) not in unique_column_sets
         assert (
             "repo_id",
             "pr_number",
@@ -9028,7 +9050,15 @@ class TestAlreadyMigratedDb:
                 "base_ref",
                 "base_sha",
                 "head_sha",
+                "attempt",
             ) in unique_column_sets
+            assert (
+                "repo_id",
+                "pr_number",
+                "base_ref",
+                "base_sha",
+                "head_sha",
+            ) not in unique_column_sets
             assert (
                 "repo_id",
                 "pr_number",
@@ -9124,7 +9154,15 @@ class TestAlreadyMigratedDb:
             "base_ref",
             "base_sha",
             "head_sha",
+            "attempt",
         ) in unique_column_sets
+        assert (
+            "repo_id",
+            "pr_number",
+            "base_ref",
+            "base_sha",
+            "head_sha",
+        ) not in unique_column_sets
         assert (
             "repo_id",
             "pr_number",
@@ -10511,7 +10549,13 @@ class TestPublishedMigrationHistory:
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
-        assert set(script.get_heads()) == {DELIVERY_PR_MONITOR_MERGE_REVISION}
+        assert set(script.get_heads()) == {PR_REVIEW_RESULT_EVIDENCE_REVISION}
+        assert (
+            script.get_revision(
+                PR_REVIEW_RESULT_EVIDENCE_REVISION
+            ).down_revision
+            == INSTANCE_PROCESS_IDENTITY_REVISION
+        )
         assert set(
             script.get_revision(
                 DELIVERY_PR_MONITOR_MERGE_REVISION
@@ -10585,12 +10629,6 @@ class TestPublishedMigrationHistory:
                 INSTANCE_PROCESS_IDENTITY_REVISION
             ).down_revision
             == DELIVERY_PR_MONITOR_MERGE_REVISION
-        )
-        assert (
-            script.get_revision(
-                DELIVERY_PR_MONITOR_MERGE_REVISION
-            ).down_revision
-            == PR_MONITOR_TASK_TOMBSTONE_REVISION
         )
         assert (
             script.get_revision(DELIVERY_FRONTEND_REVIEW_REVISION).down_revision
@@ -12863,6 +12901,2313 @@ def test_remove_team_share_ssh_fences_upgrade_downgrade_upgrade(tmp_path):
                 "SELECT version_num FROM alembic_version"
             )).scalar_one() == REMOVE_TEAM_SHARE_SSH_FENCES_REVISION
     finally:
+        engine.dispose()
+
+
+_PR_RESULT_REVIEW_COLUMNS = (
+    "attempt",
+    "rerun_of_review_id",
+    "rerun_idempotency_key",
+    "code_verdict",
+    "code_verdict_task_id",
+    "code_verdict_retry_count",
+    "code_verdict_task_started_at",
+    "code_verdict_recorded_at",
+    "publication_state",
+    "publication_error",
+    "failure_stage",
+    "error_category",
+    "error_measured",
+    "error_limit",
+    "error_unit",
+    "published_actor",
+    "published_at",
+    "github_review_id",
+    "github_review_url",
+    "github_review_state",
+)
+_PR_RESULT_RUN_COLUMNS = (
+    "terminal_intent_status",
+    "terminal_intent_base_ref",
+    "terminal_intent_head_sha",
+    "terminal_intent_delivery_id",
+    "terminal_intent_observed_at",
+    "terminal_intent_checked_at",
+    "legacy_terminal_recovery_pending",
+)
+_PR_RESULT_DOWNGRADE_CRASH_TARGETS = (
+    ("create_unique_constraint", "uq_pr_reviews_repo_pr_base_ref_base_head"),
+    ("drop_constraint", "uq_pr_reviews_repo_pr_base_ref_base_head_attempt"),
+    ("drop_constraint", "fk_pr_reviews_rerun_of_review_id_pr_reviews"),
+    ("drop_index", "ix_pr_reviews_rerun_of_review_id"),
+    ("drop_constraint", "uq_pr_reviews_rerun_idempotency"),
+    ("drop_constraint", "ck_pr_reviews_input_error_evidence"),
+    ("drop_constraint", "ck_pr_reviews_rerun_shape"),
+    ("drop_constraint", "ck_pr_reviews_attempt"),
+    *[("drop_column", name) for name in reversed(_PR_RESULT_REVIEW_COLUMNS)],
+    *[("drop_column", name) for name in reversed(_PR_RESULT_RUN_COLUMNS)],
+)
+
+
+@pytest.fixture(scope="module")
+def _pr_result_head_sqlite_db(tmp_path_factory):
+    """Build one immutable head database copied by every crash-point test."""
+
+    directory = tmp_path_factory.mktemp("pr-result-head")
+    db_path = str(directory / "head.db")
+    cfg = _alembic_cfg(db_path)
+    _run_alembic(cfg, command.upgrade, PR_REVIEW_RESULT_EVIDENCE_REVISION)
+    engine = create_engine(f"sqlite:///{db_path}")
+    try:
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == PR_REVIEW_RESULT_EVIDENCE_REVISION
+    finally:
+        engine.dispose()
+    return db_path
+
+
+def _seed_pr_result_subject(conn, *, suffix: int = 1) -> tuple[int, int, int]:
+    task_id = 8700 + suffix
+    repo_id = 8800 + suffix
+    review_id = 8900 + suffix
+    run_id = 9000 + suffix
+    base_sha = f"{suffix % 10}" * 40
+    head_sha = f"{(suffix + 1) % 10}" * 40
+    conn.execute(text("""
+        INSERT INTO tasks (
+            id, title, description, status, priority, target_branch,
+            merge_status, retry_count, max_retries, mode, created_at
+        ) VALUES (
+            :task_id, 'PR result source', 'review', 'completed', 0, 'main',
+            'pending', 0, 2, 'auto', '2026-08-16 00:00:00'
+        )
+    """), {"task_id": task_id})
+    conn.execute(text("""
+        INSERT INTO monitored_repos (
+            id, repo_full_name, webhook_secret, required_checks,
+            created_at, updated_at
+        ) VALUES (
+            :repo_id, :repo_name, 'secret', '[]',
+            '2026-08-16 00:00:00', '2026-08-16 00:00:00'
+        )
+    """), {
+        "repo_id": repo_id,
+        "repo_name": f"owner/pr-result-{suffix}",
+    })
+    conn.execute(text("""
+        INSERT INTO pr_reviews (
+            id, repo_id, pr_number, base_ref, base_sha, head_sha,
+            pr_title, pr_author, pr_url, status, created_at
+        ) VALUES (
+            :review_id, :repo_id, :pr_number, 'main', :base_sha, :head_sha,
+            'PR result evidence', 'alice', :pr_url, 'approved',
+            '2026-08-16 00:00:01'
+        )
+    """), {
+        "review_id": review_id,
+        "repo_id": repo_id,
+        "pr_number": suffix,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "pr_url": f"https://github.com/owner/pr-result-{suffix}/pull/{suffix}",
+    })
+    conn.execute(text("""
+        INSERT INTO pr_monitor_runs (
+            id, repo_id, pr_number, status, current_base_sha,
+            current_head_sha, current_review_id, created_at, updated_at
+        ) VALUES (
+            :run_id, :repo_id, :pr_number, 'reviewing', :base_sha,
+            :head_sha, :review_id,
+            '2026-08-16 00:00:02', '2026-08-16 00:00:02'
+        )
+    """), {
+        "run_id": run_id,
+        "repo_id": repo_id,
+        "pr_number": suffix,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "review_id": review_id,
+    })
+    conn.execute(text(
+        "UPDATE pr_reviews SET monitor_run_id = :run_id WHERE id = :review_id"
+    ), {"run_id": run_id, "review_id": review_id})
+    return repo_id, review_id, run_id
+
+
+class _PRResultSimulatedCrash(RuntimeError):
+    pass
+
+
+class TestPRReviewResultEvidenceMigration:
+    def test_input_error_check_matches_orm_and_preserves_literal_case(self):
+        module = _load_pr_review_result_evidence_migration(
+            "input_error_model_check"
+        )
+        constraints = {
+            constraint.name: constraint
+            for constraint in backend.models.pr_monitor.PRReview.__table__.constraints
+            if isinstance(constraint, CheckConstraint)
+        }
+        model_check = constraints[module._INPUT_ERROR_CHECK]
+
+        assert module._check_shape(model_check.sqltext) == module._check_shape(
+            module._INPUT_ERROR_CHECK_SQL
+        )
+        assert module._check_shape(
+            constraints[module._ATTEMPT_CHECK].sqltext
+        ) == module._check_shape(module._ATTEMPT_CHECK_SQL)
+        assert module._check_shape(
+            constraints[module._RERUN_SHAPE_CHECK].sqltext
+        ) == module._check_shape(module._RERUN_SHAPE_CHECK_SQL)
+        assert module._check_shape(
+            module._INPUT_ERROR_CHECK_SQL.replace(
+                "'UTF-8 bytes'",
+                "'utf-8 bytes'",
+            )
+        ) != module._check_shape(module._INPUT_ERROR_CHECK_SQL)
+        normalized = module._normalized_check_sql(module._INPUT_ERROR_CHECK_SQL)
+        assert "replace(error_category, 'unsupported_input_size', '')" in normalized
+        assert "replace(error_unit, 'characters', '')" in normalized
+        assert "replace(error_unit, 'UTF-8 bytes', '')" in normalized
+        assert module._normalized_check_sql(
+            module._INPUT_ERROR_CHECK_SQL.replace(
+                "'unsupported_input_size'",
+                "_utf8mb4'unsupported_input_size'",
+            )
+        ) == normalized
+
+    @pytest.mark.parametrize(
+        "drifted_sql",
+        (
+            "error_category IS NULL",
+            None,
+            "__canonical_with_wrong_category__",
+            "__canonical_with_wrong_limit__",
+            "__canonical_with_wrong_unit__",
+        ),
+    )
+    def test_input_error_check_reflection_is_fail_closed(
+        self,
+        drifted_sql,
+    ):
+        module = _load_pr_review_result_evidence_migration(
+            "input_error_check_drift"
+        )
+        replacements = {
+            "__canonical_with_wrong_category__": (
+                module._INPUT_ERROR_CHECK_SQL.replace(
+                    "unsupported_input_size",
+                    "Unsupported_input_size",
+                )
+            ),
+            "__canonical_with_wrong_limit__": (
+                module._INPUT_ERROR_CHECK_SQL.replace(
+                    "9007199254740991",
+                    "9007199254740992",
+                )
+            ),
+            "__canonical_with_wrong_unit__": (
+                module._INPUT_ERROR_CHECK_SQL.replace(
+                    "'UTF-8 bytes'",
+                    "'UTF-8 Bytes'",
+                )
+            ),
+        }
+        drifted_sql = replacements.get(drifted_sql, drifted_sql)
+        bind = SimpleNamespace(dialect=SimpleNamespace(name="sqlite"))
+        inspector = MagicMock()
+        inspector.get_check_constraints.return_value = [{
+            "name": module._INPUT_ERROR_CHECK,
+            "sqltext": drifted_sql,
+        }]
+
+        with (
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            pytest.raises(RuntimeError, match="incompatible input evidence"),
+        ):
+            module._input_error_check_present()
+
+    def test_mysql_input_error_check_must_be_enforced(self):
+        module = _load_pr_review_result_evidence_migration(
+            "input_error_check_mysql_enforcement"
+        )
+        bind = MagicMock()
+        bind.dialect = SimpleNamespace(name="mysql", is_mariadb=False)
+        bind.execute.return_value = [
+            (module._INPUT_ERROR_CHECK, "NO"),
+        ]
+        inspector = MagicMock()
+        inspector.get_check_constraints.return_value = [{
+            "name": module._INPUT_ERROR_CHECK,
+            "sqltext": module._INPUT_ERROR_CHECK_SQL,
+        }]
+
+        with (
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            pytest.raises(RuntimeError, match="is not enforced"),
+        ):
+            module._input_error_check_present()
+
+    @pytest.mark.parametrize(
+        ("dialect_name", "is_mariadb", "version", "accepted"),
+        (
+            ("mysql", False, (8, 0, 15), False),
+            ("mysql", False, (8, 0, 16), True),
+            ("mariadb", True, (10, 6, 0), False),
+            ("mariadb", True, (10, 6, 1), True),
+        ),
+    )
+    def test_mysql_family_check_enforcement_version_gate(
+        self,
+        dialect_name,
+        is_mariadb,
+        version,
+        accepted,
+    ):
+        module = _load_pr_review_result_evidence_migration(
+            f"input_error_version_{dialect_name}_{version[-1]}"
+        )
+        bind = MagicMock()
+        bind.dialect = SimpleNamespace(
+            name=dialect_name,
+            is_mariadb=is_mariadb,
+            server_version_info=version,
+        )
+        bind.execute.return_value = [
+            ("pr_reviews", "InnoDB"),
+            ("pr_monitor_runs", "InnoDB"),
+        ]
+        with (
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+        ):
+            if accepted:
+                module._require_supported_mysql_family()
+            else:
+                with pytest.raises(RuntimeError, match="requires"):
+                    module._require_supported_mysql_family()
+
+    @pytest.mark.parametrize(
+        "engines",
+        (
+            (("pr_reviews", "MyISAM"), ("pr_monitor_runs", "InnoDB")),
+            (("pr_reviews", "InnoDB"),),
+            (("pr_reviews", None), ("pr_monitor_runs", "InnoDB")),
+        ),
+    )
+    def test_mysql_family_requires_both_target_tables_to_be_innodb(
+        self,
+        engines,
+    ):
+        module = _load_pr_review_result_evidence_migration("mysql_engines")
+        bind = MagicMock()
+        bind.dialect = SimpleNamespace(
+            name="mysql",
+            is_mariadb=False,
+            server_version_info=(8, 0, 36),
+        )
+        bind.execute.return_value = engines
+        with (
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+            pytest.raises(RuntimeError, match="InnoDB"),
+        ):
+            module._require_supported_mysql_family()
+
+    def test_constraint_creation_rechecks_the_rerun_foreign_key(self):
+        module = _load_pr_review_result_evidence_migration(
+            "rerun_fk_post_create_reflection"
+        )
+        batch_alter = MagicMock()
+        batch = batch_alter.return_value.__enter__.return_value
+
+        with (
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+            patch.object(module, "_check_present", return_value=True),
+            patch.object(
+                module,
+                "_unique_constraints",
+                return_value={
+                    module._OLD_SUBJECT: module._OLD_SUBJECT_COLUMNS,
+                },
+            ),
+            patch.object(module, "_ensure_unique"),
+            patch.object(
+                module,
+                "_owned_rerun_foreign_keys",
+                side_effect=([], []),
+            ),
+            patch.object(module.op, "batch_alter_table", batch_alter),
+            pytest.raises(
+                RuntimeError,
+                match="did not install the canonical rerun foreign key",
+            ),
+        ):
+            module._ensure_constraints()
+
+        batch.create_foreign_key.assert_called_once_with(
+            module._RERUN_FK,
+            module._TABLE,
+            ["rerun_of_review_id"],
+            ["id"],
+            ondelete="SET NULL",
+        )
+
+    def test_postgresql_check_uses_server_canonical_definition(self):
+        module = _load_pr_review_result_evidence_migration(
+            "input_error_postgresql_check"
+        )
+        bind = MagicMock()
+        bind.dialect = SimpleNamespace(name="postgresql")
+        canonical = (
+            "CHECK (((error_category)::text = "
+            "'unsupported_input_size'::text))"
+        )
+        with (
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(
+                module,
+                "_postgresql_check_definitions",
+                side_effect=(
+                    {module._INPUT_ERROR_CHECK: canonical},
+                    {module._INPUT_ERROR_CHECK: canonical},
+                ),
+            ),
+        ):
+            assert module._input_error_check_present() is True
+        assert bind.execute.call_count == 2
+
+    def test_legacy_nonce_backfill_is_mysql_collation_independent(self):
+        module = _load_pr_review_result_evidence_migration(
+            "mysql_nonce_collation"
+        )
+        expression = module._lowercase_hex_sql_remainder(
+            module.sa.column("action_nonce", module.sa.String())
+        )
+        compiled = str(module.sa.select(expression).compile(
+            dialect=mysql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )).lower()
+
+        assert "lower(" not in compiled
+        assert compiled.count("replace(") == 16
+        assert "'a'" in compiled
+        assert "'f'" in compiled
+
+    def test_sqlite_fresh_upgrade_downgrade_reupgrade(self, tmp_path):
+        db_path = str(tmp_path / "pr-result-roundtrip.db")
+        cfg = _alembic_cfg(db_path)
+        module = _load_pr_review_result_evidence_migration(
+            "sqlite_roundtrip_check"
+        )
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_RESULT_EVIDENCE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        assert set(_PR_RESULT_REVIEW_COLUMNS) <= {
+            item["name"] for item in inspector.get_columns("pr_reviews")
+        }
+        assert set(_PR_RESULT_RUN_COLUMNS) <= {
+            item["name"] for item in inspector.get_columns("pr_monitor_runs")
+        }
+        assert {
+            item["name"]: tuple(item["column_names"])
+            for item in inspector.get_unique_constraints("pr_reviews")
+        }["uq_pr_reviews_repo_pr_base_ref_base_head_attempt"] == (
+            "repo_id", "pr_number", "base_ref", "base_sha", "head_sha",
+            "attempt",
+        )
+        checks = {
+            item["name"]: item["sqltext"]
+            for item in inspector.get_check_constraints("pr_reviews")
+        }
+        for name, sql in module._CHECK_SPECS.items():
+            assert module._check_shape(checks[name]) == module._check_shape(sql)
+        engine.dispose()
+
+        _run_alembic(cfg, command.downgrade, INSTANCE_PROCESS_IDENTITY_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        assert set(_PR_RESULT_REVIEW_COLUMNS).isdisjoint(
+            item["name"] for item in inspector.get_columns("pr_reviews")
+        )
+        assert set(_PR_RESULT_RUN_COLUMNS).isdisjoint(
+            item["name"] for item in inspector.get_columns("pr_monitor_runs")
+        )
+        assert set(module._CHECK_SPECS).isdisjoint({
+            item["name"]
+            for item in inspector.get_check_constraints("pr_reviews")
+        })
+        assert {
+            item["name"]: tuple(item["column_names"])
+            for item in inspector.get_unique_constraints("pr_reviews")
+        }["uq_pr_reviews_repo_pr_base_ref_base_head"] == (
+            "repo_id", "pr_number", "base_ref", "base_sha", "head_sha",
+        )
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_RESULT_EVIDENCE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == PR_REVIEW_RESULT_EVIDENCE_REVISION
+        engine.dispose()
+
+    def test_postgresql_downgrade_takes_access_exclusive_writer_locks(self):
+        module = _load_pr_review_result_evidence_migration(
+            "postgresql_downgrade_writer_fence"
+        )
+        execute = MagicMock()
+        with (
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+            patch.object(module, "_dialect", return_value="postgresql"),
+            patch.object(module.op, "execute", execute),
+        ):
+            assert module._acquire_downgrade_writer_fence() == "postgresql"
+
+        execute.assert_called_once()
+        lock_sql = " ".join(str(execute.call_args.args[0]).lower().split())
+        assert lock_sql == (
+            "lock table pr_reviews, pr_monitor_runs "
+            "in access exclusive mode"
+        )
+
+    def test_sqlite_downgrade_preserves_legacy_duplicate_null_subjects(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "pr-result-null-subject-downgrade.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, INSTANCE_PROCESS_IDENTITY_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    id, repo_full_name, webhook_secret, required_checks,
+                    created_at, updated_at
+                ) VALUES (
+                    9600, 'owner/legacy-null-subject', 'secret', '[]',
+                    '2026-08-16 00:00:00', '2026-08-16 00:00:00'
+                )
+            """))
+            for review_id in (9601, 9602):
+                conn.execute(text("""
+                    INSERT INTO pr_reviews (
+                        id, repo_id, pr_number, base_ref, base_sha, head_sha,
+                        pr_title, pr_author, pr_url, status, created_at
+                    ) VALUES (
+                        :review_id, 9600, 4, 'main', NULL, NULL,
+                        'legacy null subject', 'alice',
+                        'https://github.com/owner/legacy-null-subject/pull/4',
+                        'pending', '2026-08-16 00:00:01'
+                    )
+                """), {"review_id": review_id})
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_RESULT_EVIDENCE_REVISION)
+        _run_alembic(cfg, command.downgrade, INSTANCE_PROCESS_IDENTITY_REVISION)
+
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT id FROM pr_reviews WHERE repo_id = 9600 ORDER BY id"
+            )).scalars().all() == [9601, 9602]
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == INSTANCE_PROCESS_IDENTITY_REVISION
+        engine.dispose()
+
+    @pytest.mark.parametrize("rowcount", (0, -1, 2))
+    def test_sqlite_downgrade_writer_fence_requires_exact_revision_row(
+        self,
+        rowcount,
+    ):
+        module = _load_pr_review_result_evidence_migration(
+            f"sqlite_downgrade_writer_fence_{rowcount}"
+        )
+        bind = MagicMock()
+        bind.execute.return_value.rowcount = rowcount
+        with (
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+            patch.object(module, "_dialect", return_value="sqlite"),
+            patch.object(module.op, "get_bind", return_value=bind),
+            pytest.raises(RuntimeError, match="SQLite revision writer fence"),
+        ):
+            module._acquire_downgrade_writer_fence()
+
+        statement, params = bind.execute.call_args.args
+        assert " ".join(str(statement).lower().split()) == (
+            "update alembic_version set version_num = version_num "
+            "where version_num = :expected_revision"
+        )
+        assert params == {"expected_revision": module.revision}
+
+    def test_sqlite_downgrade_writer_fence_accepts_exact_revision_row(self):
+        module = _load_pr_review_result_evidence_migration(
+            "sqlite_downgrade_writer_fence_success"
+        )
+        bind = MagicMock()
+        bind.execute.return_value.rowcount = 1
+        with (
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+            patch.object(module, "_dialect", return_value="sqlite"),
+            patch.object(module.op, "get_bind", return_value=bind),
+        ):
+            assert module._acquire_downgrade_writer_fence() == "sqlite"
+
+    @pytest.mark.parametrize("dialect_name", ("mysql", "mariadb"))
+    def test_mysql_family_downgrade_refuses_before_destructive_ddl(
+        self,
+        dialect_name,
+    ):
+        module = _load_pr_review_result_evidence_migration(
+            f"{dialect_name}_downgrade_writer_fence"
+        )
+        batch_alter = MagicMock()
+        with (
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_dialect", return_value=dialect_name),
+            patch.object(module.op, "batch_alter_table", batch_alter),
+            pytest.raises(RuntimeError, match="releases writer locks"),
+        ):
+            module.downgrade()
+        batch_alter.assert_not_called()
+
+    def test_downgrade_discards_only_reconstructible_legacy_projections(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "legacy-projection-downgrade.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, INSTANCE_PROCESS_IDENTITY_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        legacy_rows = (
+            (
+                9401,
+                401,
+                "approved",
+                "lgtm_comment",
+                None,
+                "legacy approval summary",
+            ),
+            (
+                9402,
+                402,
+                "commented",
+                "review_comments",
+                None,
+                "legacy changes summary",
+            ),
+            (
+                9403,
+                403,
+                "error",
+                "error",
+                "approved_merged",
+                "PR was merged before publication",
+            ),
+        )
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    id, repo_full_name, webhook_secret, required_checks,
+                    created_at, updated_at
+                ) VALUES (
+                    9400, 'owner/legacy-projection', 'secret', '[]',
+                    '2026-08-16 00:00:00', '2026-08-16 00:00:00'
+                )
+            """))
+            for (
+                review_id,
+                pr_number,
+                status,
+                action_taken,
+                pending_action,
+                summary,
+            ) in legacy_rows:
+                conn.execute(text("""
+                    INSERT INTO pr_reviews (
+                        id, repo_id, pr_number, base_ref, base_sha, head_sha,
+                        pr_title, pr_author, pr_url, status, action_taken,
+                        pending_action, review_summary, created_at
+                    ) VALUES (
+                        :review_id, 9400, :pr_number, 'main', :base_sha,
+                        :head_sha, 'legacy projection', 'alice', :pr_url,
+                        :status, :action_taken, :pending_action, :summary,
+                        '2026-08-16 00:00:01'
+                    )
+                """), {
+                    "review_id": review_id,
+                    "pr_number": pr_number,
+                    "base_sha": f"{pr_number % 10}" * 40,
+                    "head_sha": f"{(pr_number + 1) % 10}" * 40,
+                    "pr_url": (
+                        "https://github.com/owner/legacy-projection/pull/"
+                        f"{pr_number}"
+                    ),
+                    "status": status,
+                    "action_taken": action_taken,
+                    "pending_action": pending_action,
+                    "summary": summary,
+                })
+            conn.execute(text("""
+                INSERT INTO pr_monitor_runs (
+                    id, repo_id, pr_number, status, current_base_sha,
+                    current_head_sha, current_review_id, created_at, updated_at
+                ) VALUES (
+                    9503, 9400, 403, 'reviewing', :base_sha, :head_sha, 9403,
+                    '2026-08-16 00:00:02', '2026-08-16 00:00:02'
+                )
+            """), {
+                "base_sha": "3" * 40,
+                "head_sha": "4" * 40,
+            })
+            conn.execute(text(
+                "UPDATE pr_reviews SET monitor_run_id = 9503 WHERE id = 9403"
+            ))
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_RESULT_EVIDENCE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            projected = {
+                row.id: (
+                    row.code_verdict,
+                    row.publication_state,
+                    row.failure_stage,
+                )
+                for row in conn.execute(text(
+                    "SELECT id, code_verdict, publication_state, failure_stage "
+                    "FROM pr_reviews WHERE id BETWEEN 9401 AND 9403 "
+                    "ORDER BY id"
+                ))
+            }
+            marker = conn.execute(text(
+                "SELECT legacy_terminal_recovery_pending "
+                "FROM pr_monitor_runs WHERE id = 9503"
+            )).scalar_one()
+        assert projected == {
+            9401: ("pass", "reconciling", "recovery"),
+            9402: ("changes_required", "reconciling", "recovery"),
+            9403: (None, "not_applicable", "lifecycle"),
+        }
+        assert marker == 1
+        engine.dispose()
+
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            INSTANCE_PROCESS_IDENTITY_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        assert set(_PR_RESULT_REVIEW_COLUMNS).isdisjoint(
+            item["name"] for item in inspector.get_columns("pr_reviews")
+        )
+        assert set(_PR_RESULT_RUN_COLUMNS).isdisjoint(
+            item["name"] for item in inspector.get_columns("pr_monitor_runs")
+        )
+        with engine.connect() as conn:
+            restored = conn.execute(text(
+                "SELECT id, status, action_taken, pending_action, review_summary "
+                "FROM pr_reviews WHERE id BETWEEN 9401 AND 9403 ORDER BY id"
+            )).all()
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == INSTANCE_PROCESS_IDENTITY_REVISION
+        assert restored == [
+            (row[0], row[2], row[3], row[4], row[5]) for row in legacy_rows
+        ]
+        engine.dispose()
+
+    def test_sqlite_input_error_check_enforces_canonical_quartet(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "pr-result-input-error-check.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_RESULT_EVIDENCE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            _, review_id, _ = _seed_pr_result_subject(conn, suffix=41)
+
+        update = text(
+            "UPDATE pr_reviews SET error_category = :category, "
+            "error_measured = :measured, error_limit = :limit, "
+            "error_unit = :unit WHERE id = :review_id"
+        )
+        canonical = {
+            "category": "unsupported_input_size",
+            "measured": 2,
+            "limit": 1,
+            "unit": "characters",
+            "review_id": review_id,
+        }
+        with engine.begin() as conn:
+            conn.execute(update, canonical)
+            conn.execute(update, {
+                **canonical,
+                "measured": 9_007_199_254_740_991,
+                "limit": 9_007_199_254_740_990,
+                "unit": "UTF-8 bytes",
+            })
+            conn.execute(update, {
+                "category": None,
+                "measured": None,
+                "limit": None,
+                "unit": None,
+                "review_id": review_id,
+            })
+
+        invalid = (
+            {**canonical, "category": None},
+            {**canonical, "category": "Unsupported_input_size"},
+            {**canonical, "category": "unsupported_input_size "},
+            {**canonical, "measured": None},
+            {**canonical, "limit": None},
+            {**canonical, "unit": None},
+            {**canonical, "limit": 0},
+            {**canonical, "limit": -1},
+            {**canonical, "measured": 1},
+            {
+                **canonical,
+                "measured": 9_007_199_254_740_992,
+                "limit": 9_007_199_254_740_991,
+            },
+            {**canonical, "unit": "utf-8 bytes"},
+            {**canonical, "unit": "characters "},
+            {
+                **canonical,
+                "measured": None,
+                "limit": None,
+                "unit": None,
+            },
+        )
+        for values in invalid:
+            with engine.connect() as conn:
+                transaction = conn.begin()
+                with pytest.raises(IntegrityError):
+                    conn.execute(update, values)
+                transaction.rollback()
+        engine.dispose()
+
+    def test_sqlite_rerun_attempt_and_shape_checks_are_enforced(self, tmp_path):
+        db_path = str(tmp_path / "pr-result-rerun-checks.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_RESULT_EVIDENCE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            _, parent_id, _ = _seed_pr_result_subject(conn, suffix=42)
+            _, child_id, _ = _seed_pr_result_subject(conn, suffix=43)
+
+        invalid_updates = (
+            ("attempt = 0", {}),
+            (
+                "attempt = 2, rerun_of_review_id = :parent_id, "
+                "rerun_idempotency_key = NULL",
+                {"parent_id": parent_id},
+            ),
+            (
+                "attempt = 2, rerun_of_review_id = :child_id, "
+                "rerun_idempotency_key = 'self-rerun'",
+                {"child_id": child_id},
+            ),
+            (
+                "attempt = 1, rerun_of_review_id = :parent_id, "
+                "rerun_idempotency_key = 'first-attempt-parent'",
+                {"parent_id": parent_id},
+            ),
+            (
+                "attempt = 2, rerun_of_review_id = NULL, "
+                "rerun_idempotency_key = NULL",
+                {},
+            ),
+        )
+        for assignment, params in invalid_updates:
+            with engine.connect() as conn:
+                transaction = conn.begin()
+                with pytest.raises(IntegrityError):
+                    conn.execute(
+                        text(
+                            f"UPDATE pr_reviews SET {assignment} "
+                            "WHERE id = :child_id"
+                        ),
+                        {"child_id": child_id, **params},
+                    )
+                transaction.rollback()
+
+        with engine.connect() as conn:
+            conn.exec_driver_sql("PRAGMA foreign_keys = ON")
+            conn.commit()
+            transaction = conn.begin()
+            # A first review admitted by ready_for_review may carry a durable
+            # idempotency key without having a parent review.
+            conn.execute(
+                text(
+                    "UPDATE pr_reviews SET attempt = 1, "
+                    "rerun_of_review_id = NULL, "
+                    "rerun_idempotency_key = 'first-attempt-key' "
+                    "WHERE id = :child_id"
+                ),
+                {"child_id": child_id},
+            )
+            conn.execute(
+                text(
+                    "UPDATE pr_reviews SET attempt = 2, "
+                    "rerun_of_review_id = :parent_id, "
+                    "rerun_idempotency_key = 'valid-rerun' WHERE id = :child_id"
+                ),
+                {"parent_id": parent_id, "child_id": child_id},
+            )
+            conn.execute(
+                text("DELETE FROM pr_reviews WHERE id = :parent_id"),
+                {"parent_id": parent_id},
+            )
+            rerun = conn.execute(text(
+                "SELECT attempt, rerun_of_review_id, rerun_idempotency_key "
+                "FROM pr_reviews WHERE id = :child_id"
+            ), {"child_id": child_id}).one()
+            assert rerun == (2, None, "valid-rerun")
+            transaction.commit()
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        ("table_name", "column_name"),
+        [
+            *[("pr_reviews", name) for name in _PR_RESULT_REVIEW_COLUMNS],
+            *[("pr_monitor_runs", name) for name in _PR_RESULT_RUN_COLUMNS],
+        ],
+    )
+    def test_upgrade_replays_every_committed_column_add(
+        self,
+        table_name,
+        column_name,
+    ):
+        module = _load_pr_review_result_evidence_migration(
+            f"add_{table_name}_{column_name}"
+        )
+        state = {module._TABLE: {}, module._RUN_TABLE: {}}
+        calls: dict[tuple[str, str], int] = {}
+        crashed = False
+
+        @contextmanager
+        def batch_alter_table(selected_table, **_kwargs):
+            class Batch:
+                def add_column(self, column):
+                    nonlocal crashed
+                    key = (selected_table, column.name)
+                    calls[key] = calls.get(key, 0) + 1
+                    state[selected_table][column.name] = {"name": column.name}
+                    if key == (table_name, column_name) and not crashed:
+                        crashed = True
+                        raise _PRResultSimulatedCrash(column_name)
+
+            yield Batch()
+
+        def reflected(selected_table=module._TABLE):
+            return dict(state[selected_table])
+
+        with (
+            patch.object(module, "_dialect", return_value="sqlite"),
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+            patch.object(module, "_reflected_columns", side_effect=reflected),
+            patch.object(module, "_assert_column_shape"),
+            patch.object(
+                module.op,
+                "batch_alter_table",
+                side_effect=batch_alter_table,
+            ),
+        ):
+            with pytest.raises(_PRResultSimulatedCrash, match=column_name):
+                module._ensure_columns()
+            module._ensure_columns()
+
+        assert crashed
+        assert set(state[module._TABLE]) == set(module._column_specs())
+        assert set(state[module._RUN_TABLE]) == set(module._run_column_specs())
+        assert set(calls) == {
+            *[(module._TABLE, name) for name in module._column_specs()],
+            *[(module._RUN_TABLE, name) for name in module._run_column_specs()],
+        }
+        assert all(count == 1 for count in calls.values())
+
+    @pytest.mark.parametrize(
+        "target",
+        (
+            ("create_check_constraint", "ck_pr_reviews_attempt"),
+            ("create_check_constraint", "ck_pr_reviews_rerun_shape"),
+            ("create_check_constraint", "ck_pr_reviews_input_error_evidence"),
+            ("create_unique_constraint", "uq_pr_reviews_repo_pr_base_ref_base_head_attempt"),
+            ("create_unique_constraint", "uq_pr_reviews_rerun_idempotency"),
+            ("create_foreign_key", "fk_pr_reviews_rerun_of_review_id_pr_reviews"),
+            ("create_index", "ix_pr_reviews_rerun_of_review_id"),
+            ("drop_constraint", "uq_pr_reviews_repo_pr_base_ref_base_head"),
+        ),
+        ids=lambda item: f"{item[0]}-{item[1]}",
+    )
+    def test_upgrade_replays_every_committed_constraint_step(self, target):
+        module = _load_pr_review_result_evidence_migration(
+            f"constraint_{target[0]}_{target[1]}"
+        )
+        uniques = {module._OLD_SUBJECT: module._OLD_SUBJECT_COLUMNS}
+        checks: dict[str, str] = {}
+        foreign_keys: list[dict] = []
+        indexes: dict[str, tuple[tuple[str, ...], bool, bool]] = {}
+        calls: dict[tuple[str, str], int] = {}
+        crashed = False
+
+        def mutate(method, name, operation):
+            nonlocal crashed
+            key = (method, name)
+            calls[key] = calls.get(key, 0) + 1
+            operation()
+            if key == target and not crashed:
+                crashed = True
+                raise _PRResultSimulatedCrash(name)
+
+        @contextmanager
+        def batch_alter_table(_table, **_kwargs):
+            class Batch:
+                def create_check_constraint(self, name, expression):
+                    mutate(
+                        "create_check_constraint",
+                        name,
+                        lambda: checks.__setitem__(name, expression),
+                    )
+
+                def create_unique_constraint(self, name, columns):
+                    mutate(
+                        "create_unique_constraint",
+                        name,
+                        lambda: uniques.__setitem__(name, tuple(columns)),
+                    )
+
+                def drop_constraint(self, name, *, type_):
+                    assert type_ == "unique"
+                    mutate(
+                        "drop_constraint",
+                        name,
+                        lambda: uniques.pop(name, None),
+                    )
+
+                def create_foreign_key(
+                    self, name, referred_table, constrained, referred, **options
+                ):
+                    def create():
+                        foreign_keys[:] = [{
+                            "name": name,
+                            "constrained_columns": list(constrained),
+                            "referred_schema": None,
+                            "referred_table": referred_table,
+                            "referred_columns": list(referred),
+                            "options": options,
+                            "dialect_options": {},
+                        }]
+
+                    mutate("create_foreign_key", name, create)
+
+                def create_index(self, name, columns, *, unique):
+                    mutate(
+                        "create_index",
+                        name,
+                        lambda: indexes.__setitem__(
+                            name, (tuple(columns), unique, False)
+                        ),
+                    )
+
+            yield Batch()
+
+        inspector = MagicMock()
+        inspector.get_foreign_keys.side_effect = lambda _table: list(
+            foreign_keys
+        )
+        with (
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+            patch.object(
+                module,
+                "_unique_constraints",
+                side_effect=lambda: dict(uniques),
+            ),
+            patch.object(
+                module,
+                "_check_present",
+                side_effect=lambda name, _sql: name in checks,
+            ),
+            patch.object(module, "_indexes", side_effect=lambda: dict(indexes)),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module.op, "get_bind", return_value=object()),
+            patch.object(
+                module.op,
+                "batch_alter_table",
+                side_effect=batch_alter_table,
+            ),
+        ):
+            with pytest.raises(_PRResultSimulatedCrash, match=target[1]):
+                module._ensure_constraints()
+            module._ensure_constraints()
+
+        assert crashed
+        assert uniques == {
+            module._NEW_SUBJECT: module._NEW_SUBJECT_COLUMNS,
+            module._RERUN_UNIQUE: module._RERUN_UNIQUE_COLUMNS,
+        }
+        assert set(checks) == set(module._CHECK_SPECS)
+        for name, sql in module._CHECK_SPECS.items():
+            assert module._check_shape(checks[name]) == module._check_shape(sql)
+        assert len(foreign_keys) == 1
+        assert module._rerun_foreign_key_matches(foreign_keys[0])
+        assert indexes == {
+            module._RERUN_INDEX: (("rerun_of_review_id",), False, False)
+        }
+        assert calls[target] == 1
+
+    @pytest.mark.parametrize(
+        "target",
+        _PR_RESULT_DOWNGRADE_CRASH_TARGETS,
+        ids=lambda item: f"{item[0]}-{item[1]}",
+    )
+    def test_sqlite_downgrade_replays_every_committed_ddl_step(
+        self,
+        tmp_path,
+        _pr_result_head_sqlite_db,
+        target,
+    ):
+        db_path = str(tmp_path / f"downgrade-{target[0]}-{target[1]}.db")
+        shutil.copyfile(_pr_result_head_sqlite_db, db_path)
+        module = _load_pr_review_result_evidence_migration(
+            f"downgrade_{target[0]}_{target[1]}"
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        crashed = False
+
+        with engine.begin() as conn:
+            operations = Operations(MigrationContext.configure(conn))
+            original_batch = operations.batch_alter_table
+
+            @contextmanager
+            def crash_batch(*args, **kwargs):
+                triggered = False
+                with original_batch(*args, **kwargs) as batch:
+                    class BatchProxy:
+                        def __getattr__(self, name):
+                            attribute = getattr(batch, name)
+                            if name not in {
+                                "create_unique_constraint",
+                                "drop_constraint",
+                                "drop_index",
+                                "drop_column",
+                            }:
+                                return attribute
+
+                            def invoke(*method_args, **method_kwargs):
+                                nonlocal triggered
+                                result = attribute(*method_args, **method_kwargs)
+                                object_name = method_args[0]
+                                if (name, object_name) == target:
+                                    triggered = True
+                                return result
+
+                            return invoke
+
+                    yield BatchProxy()
+                if triggered:
+                    raise _PRResultSimulatedCrash(target[1])
+
+            try:
+                with (
+                    patch.object(operations, "batch_alter_table", crash_batch),
+                    patch.object(module, "op", operations),
+                    patch.object(
+                        module,
+                        "context",
+                        SimpleNamespace(is_offline_mode=lambda: False),
+                    ),
+                ):
+                    module.downgrade()
+            except _PRResultSimulatedCrash:
+                crashed = True
+        engine.dispose()
+        assert crashed, f"downgrade never reached {target!r}"
+
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(
+            cfg,
+            command.downgrade,
+            INSTANCE_PROCESS_IDENTITY_REVISION,
+        )
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        assert set(_PR_RESULT_REVIEW_COLUMNS).isdisjoint(
+            item["name"] for item in inspector.get_columns("pr_reviews")
+        )
+        assert set(_PR_RESULT_RUN_COLUMNS).isdisjoint(
+            item["name"] for item in inspector.get_columns("pr_monitor_runs")
+        )
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == INSTANCE_PROCESS_IDENTITY_REVISION
+        engine.dispose()
+
+    @pytest.mark.parametrize(
+        (
+            "case_name",
+            "spec_group",
+            "column_name",
+            "dialect_name",
+            "actual_type",
+            "nullable",
+            "default",
+            "matches",
+        ),
+        (
+            (
+                "mysql-boolean-quoted-zero",
+                "run",
+                "legacy_terminal_recovery_pending",
+                "mysql",
+                mysql.TINYINT(display_width=1),
+                False,
+                "'0'",
+                True,
+            ),
+            (
+                "mariadb-boolean-quoted-zero",
+                "run",
+                "legacy_terminal_recovery_pending",
+                "mariadb",
+                mysql.TINYINT(display_width=1),
+                False,
+                "'0'",
+                True,
+            ),
+            (
+                "mysql-boolean-quoted-false-is-text",
+                "run",
+                "legacy_terminal_recovery_pending",
+                "mysql",
+                mysql.TINYINT(display_width=1),
+                False,
+                "'false'",
+                False,
+            ),
+            (
+                "sqlite-boolean-quoted-false-is-text",
+                "run",
+                "legacy_terminal_recovery_pending",
+                "sqlite",
+                Boolean(),
+                False,
+                "'false'",
+                False,
+            ),
+            (
+                "postgresql-boolean-cast",
+                "run",
+                "legacy_terminal_recovery_pending",
+                "postgresql",
+                postgresql.BOOLEAN(),
+                False,
+                "'false'::boolean",
+                True,
+            ),
+            (
+                "integer-is-not-bigint",
+                "review",
+                "attempt",
+                "sqlite",
+                BigInteger(),
+                False,
+                "1",
+                False,
+            ),
+            (
+                "integer-default-drift",
+                "review",
+                "attempt",
+                "sqlite",
+                Integer(),
+                False,
+                "2",
+                False,
+            ),
+            (
+                "code-verdict-varchar-length-drift",
+                "review",
+                "code_verdict",
+                "postgresql",
+                postgresql.VARCHAR(length=29),
+                True,
+                None,
+                False,
+            ),
+            (
+                "code-verdict-task-id-is-not-bigint",
+                "review",
+                "code_verdict_task_id",
+                "sqlite",
+                BigInteger(),
+                True,
+                None,
+                False,
+            ),
+            (
+                "code-verdict-retry-is-not-bigint",
+                "review",
+                "code_verdict_retry_count",
+                "sqlite",
+                BigInteger(),
+                True,
+                None,
+                False,
+            ),
+            (
+                "code-verdict-task-time-timezone-drift",
+                "review",
+                "code_verdict_task_started_at",
+                "postgresql",
+                postgresql.TIMESTAMP(timezone=True),
+                True,
+                None,
+                False,
+            ),
+            (
+                "code-verdict-recorded-time-timezone-drift",
+                "review",
+                "code_verdict_recorded_at",
+                "postgresql",
+                postgresql.TIMESTAMP(timezone=True),
+                True,
+                None,
+                False,
+            ),
+            (
+                "varchar-length-drift",
+                "review",
+                "publication_state",
+                "postgresql",
+                postgresql.VARCHAR(length=29),
+                False,
+                "'not_started'::character varying",
+                False,
+            ),
+            (
+                "text-is-not-varchar",
+                "review",
+                "publication_error",
+                "sqlite",
+                String(length=2000),
+                True,
+                None,
+                False,
+            ),
+            (
+                "timestamp-timezone-drift",
+                "review",
+                "published_at",
+                "postgresql",
+                postgresql.TIMESTAMP(timezone=True),
+                True,
+                None,
+                False,
+            ),
+            (
+                "mysql-unsigned-bigint-drift",
+                "review",
+                "github_review_id",
+                "mysql",
+                mysql.BIGINT(unsigned=True),
+                True,
+                None,
+                False,
+            ),
+        ),
+        ids=lambda *values: values[0] if len(values) == 1 else None,
+    )
+    def test_column_shape_is_dialect_aware_and_strict(
+        self,
+        case_name,
+        spec_group,
+        column_name,
+        dialect_name,
+        actual_type,
+        nullable,
+        default,
+        matches,
+    ):
+        del case_name
+        module = _load_pr_review_result_evidence_migration(
+            f"column_shape_{column_name}_{dialect_name}"
+        )
+        specs = (
+            module._column_specs()
+            if spec_group == "review"
+            else module._run_column_specs()
+        )
+        reflected = {
+            "name": column_name,
+            "type": actual_type,
+            "nullable": nullable,
+            "default": default,
+        }
+        with patch.object(module, "_dialect", return_value=dialect_name):
+            if matches:
+                module._assert_column_shape(reflected, specs[column_name])
+            else:
+                with pytest.raises(RuntimeError, match="incompatible column"):
+                    module._assert_column_shape(reflected, specs[column_name])
+
+    @pytest.mark.parametrize(
+        "drift",
+        ("name", "schema", "onupdate", "deferrable", "ondelete"),
+    )
+    def test_rerun_foreign_key_rejects_every_semantic_drift(self, drift):
+        module = _load_pr_review_result_evidence_migration(f"fk_{drift}")
+        foreign_key = {
+            "name": module._RERUN_FK,
+            "constrained_columns": ["rerun_of_review_id"],
+            "referred_schema": None,
+            "referred_table": module._TABLE,
+            "referred_columns": ["id"],
+            "options": {"ondelete": "SET NULL"},
+            "dialect_options": {},
+        }
+        assert module._rerun_foreign_key_matches(foreign_key)
+        if drift == "name":
+            foreign_key["name"] = "fk_unowned"
+        elif drift == "schema":
+            foreign_key["referred_schema"] = "public"
+        elif drift == "onupdate":
+            foreign_key["options"]["onupdate"] = "CASCADE"
+        elif drift == "deferrable":
+            foreign_key["options"]["deferrable"] = True
+        else:
+            foreign_key["options"]["ondelete"] = "CASCADE"
+        assert not module._rerun_foreign_key_matches(foreign_key)
+
+    @pytest.mark.parametrize(
+        "extra",
+        (
+            {"dialect_options": {"sqlite_where": text("0")}},
+            {"include_columns": ["attempt"]},
+            {"column_sorting": {"rerun_of_review_id": ("desc",)}},
+            {"expressions": ["lower(rerun_of_review_id)"]},
+        ),
+    )
+    def test_rerun_index_signature_rejects_partial_or_extended_indexes(
+        self,
+        extra,
+    ):
+        module = _load_pr_review_result_evidence_migration("index_extra")
+        index = {
+            "name": module._RERUN_INDEX,
+            "column_names": ["rerun_of_review_id"],
+            "unique": False,
+            **extra,
+        }
+        assert module._index_signature(index) == (
+            ("rerun_of_review_id",),
+            False,
+            True,
+        )
+        assert module._index_signature({
+            "name": module._RERUN_INDEX,
+            "column_names": ["rerun_of_review_id"],
+            "unique": False,
+            "dialect_options": {
+                "postgresql_include": [],
+                "postgresql_nulls_not_distinct": False,
+            },
+        }) == (("rerun_of_review_id",), False, False)
+
+    def test_upgrade_preflights_all_existing_columns_before_any_ddl(self):
+        module = _load_pr_review_result_evidence_migration(
+            "upgrade_column_preflight"
+        )
+        review_columns = {
+            name: {"name": name}
+            for name in module._column_specs()
+            if name != "attempt"
+        }
+        run_columns = {
+            name: {"name": name} for name in module._run_column_specs()
+        }
+
+        def reflected(table=module._TABLE):
+            return review_columns if table == module._TABLE else run_columns
+
+        def validate(_reflected, expected):
+            if expected.name == "legacy_terminal_recovery_pending":
+                raise RuntimeError("late existing upgrade column drift")
+
+        batch = MagicMock()
+        backfill = MagicMock()
+        with (
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+            patch.object(module, "_dialect", return_value="sqlite"),
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_reflected_columns", side_effect=reflected),
+            patch.object(module, "_assert_column_shape", side_effect=validate),
+            patch.object(module, "_check_present", return_value=True),
+            patch.object(module, "_backfill", backfill),
+            patch.object(module.op, "batch_alter_table", batch),
+            pytest.raises(
+                RuntimeError,
+                match="late existing upgrade column drift",
+            ),
+        ):
+            module.upgrade()
+        batch.assert_not_called()
+        backfill.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "drift",
+        ("rerun_unique", "foreign_key", "index"),
+    )
+    def test_upgrade_constraint_drift_fails_before_backfill_or_ddl(self, drift):
+        module = _load_pr_review_result_evidence_migration(
+            f"upgrade_preflight_{drift}"
+        )
+        review_columns = {
+            name: {"name": name} for name in module._column_specs()
+        }
+        run_columns = {
+            name: {"name": name} for name in module._run_column_specs()
+        }
+        uniques = {module._OLD_SUBJECT: module._OLD_SUBJECT_COLUMNS}
+        foreign_key = {
+            "name": module._RERUN_FK,
+            "constrained_columns": ["rerun_of_review_id"],
+            "referred_schema": None,
+            "referred_table": module._TABLE,
+            "referred_columns": ["id"],
+            "options": {"ondelete": "SET NULL"},
+            "dialect_options": {},
+        }
+        indexes = {
+            module._RERUN_INDEX: (("rerun_of_review_id",), False, False)
+        }
+        if drift == "rerun_unique":
+            uniques[module._RERUN_UNIQUE] = ("rerun_of_review_id",)
+        elif drift == "foreign_key":
+            foreign_key["options"]["onupdate"] = "CASCADE"
+        else:
+            indexes[module._RERUN_INDEX] = (
+                ("rerun_of_review_id",), False, True,
+            )
+
+        def reflected(table=module._TABLE):
+            return review_columns if table == module._TABLE else run_columns
+
+        inspector = MagicMock()
+        inspector.get_foreign_keys.return_value = [foreign_key]
+        bind = MagicMock()
+        batch = MagicMock()
+        backfill = MagicMock()
+        with (
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+            patch.object(module, "_dialect", return_value="sqlite"),
+            patch.object(module, "_reflected_columns", side_effect=reflected),
+            patch.object(module, "_assert_column_shape"),
+            patch.object(module, "_check_present", return_value=True),
+            patch.object(
+                module,
+                "_unique_constraints",
+                side_effect=lambda: dict(uniques),
+            ),
+            patch.object(
+                module,
+                "_indexes",
+                side_effect=lambda: dict(indexes),
+            ),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(module.op, "batch_alter_table", batch),
+            patch.object(module, "_backfill", backfill),
+            pytest.raises(RuntimeError),
+        ):
+            module.upgrade()
+        batch.assert_not_called()
+        backfill.assert_not_called()
+
+    def test_downgrade_preflights_all_columns_before_any_ddl(self):
+        module = _load_pr_review_result_evidence_migration(
+            "downgrade_column_preflight"
+        )
+        review_columns = {
+            name: {"name": name} for name in module._column_specs()
+        }
+        run_columns = {
+            name: {"name": name} for name in module._run_column_specs()
+        }
+
+        def reflected(table=module._TABLE):
+            return review_columns if table == module._TABLE else run_columns
+
+        def validate(_reflected, expected):
+            if expected.name == "legacy_terminal_recovery_pending":
+                raise RuntimeError("late owned column drift")
+
+        batch = MagicMock()
+        execute = MagicMock()
+        foreign_key = {
+            "name": module._RERUN_FK,
+            "constrained_columns": ["rerun_of_review_id"],
+            "referred_schema": None,
+            "referred_table": module._TABLE,
+            "referred_columns": ["id"],
+            "options": {"ondelete": "SET NULL"},
+            "dialect_options": {},
+        }
+        with (
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+            patch.object(module, "_reflected_columns", side_effect=reflected),
+            patch.object(module, "_assert_column_shape", side_effect=validate),
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_acquire_downgrade_writer_fence"),
+            patch.object(
+                module,
+                "_check_present",
+                return_value=True,
+            ),
+            patch.object(
+                module,
+                "_unique_constraints",
+                return_value={
+                    module._NEW_SUBJECT: module._NEW_SUBJECT_COLUMNS,
+                    module._RERUN_UNIQUE: module._RERUN_UNIQUE_COLUMNS,
+                },
+            ),
+            patch.object(
+                module,
+                "_owned_rerun_foreign_keys",
+                return_value=[foreign_key],
+            ),
+            patch.object(
+                module,
+                "_indexes",
+                return_value={
+                    module._RERUN_INDEX: (
+                        ("rerun_of_review_id",),
+                        False,
+                        False,
+                    )
+                },
+            ),
+            patch.object(module.op, "batch_alter_table", batch),
+            patch.object(module.op, "execute", execute),
+            pytest.raises(RuntimeError, match="late owned column drift"),
+        ):
+            module.downgrade()
+        batch.assert_not_called()
+        execute.assert_not_called()
+
+    @pytest.mark.parametrize("drift", ("unique", "foreign_key", "index"))
+    def test_downgrade_constraint_drift_fails_before_any_ddl(self, drift):
+        module = _load_pr_review_result_evidence_migration(
+            f"downgrade_preflight_{drift}"
+        )
+        review_columns = {
+            name: {"name": name} for name in module._column_specs()
+        }
+        run_columns = {
+            name: {"name": name} for name in module._run_column_specs()
+        }
+        uniques = {
+            module._NEW_SUBJECT: module._NEW_SUBJECT_COLUMNS,
+            module._RERUN_UNIQUE: module._RERUN_UNIQUE_COLUMNS,
+        }
+        foreign_key = {
+            "name": module._RERUN_FK,
+            "constrained_columns": ["rerun_of_review_id"],
+            "referred_schema": None,
+            "referred_table": module._TABLE,
+            "referred_columns": ["id"],
+            "options": {"ondelete": "SET NULL"},
+            "dialect_options": {},
+        }
+        indexes = {
+            module._RERUN_INDEX: (("rerun_of_review_id",), False, False)
+        }
+        if drift == "unique":
+            uniques[module._NEW_SUBJECT] = ("repo_id", "attempt")
+        elif drift == "foreign_key":
+            foreign_key["options"]["onupdate"] = "CASCADE"
+        else:
+            indexes[module._RERUN_INDEX] = (
+                ("rerun_of_review_id",), False, True,
+            )
+
+        def reflected(table=module._TABLE):
+            return review_columns if table == module._TABLE else run_columns
+
+        inspector = MagicMock()
+        inspector.get_foreign_keys.return_value = [foreign_key]
+        bind = MagicMock()
+        bind.execute.return_value.first.return_value = None
+        batch = MagicMock()
+        with (
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: False),
+            ),
+            patch.object(module, "_reflected_columns", side_effect=reflected),
+            patch.object(module, "_assert_column_shape"),
+            patch.object(module, "_require_supported_mysql_family"),
+            patch.object(module, "_acquire_downgrade_writer_fence"),
+            patch.object(
+                module,
+                "_check_present",
+                return_value=True,
+            ),
+            patch.object(
+                module,
+                "_unique_constraints",
+                side_effect=lambda: dict(uniques),
+            ),
+            patch.object(
+                module,
+                "_indexes",
+                side_effect=lambda: dict(indexes),
+            ),
+            patch.object(module.sa, "inspect", return_value=inspector),
+            patch.object(module.op, "get_bind", return_value=bind),
+            patch.object(module.op, "batch_alter_table", batch),
+            pytest.raises(RuntimeError),
+        ):
+            module.downgrade()
+        batch.assert_not_called()
+
+    def test_review_113_legacy_terminal_backfill_is_strict(self, tmp_path):
+        db_path = str(tmp_path / "review-113-backfill.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, INSTANCE_PROCESS_IDENTITY_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        repo_id = 9113
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    id, repo_full_name, webhook_secret, required_checks,
+                    created_at, updated_at
+                ) VALUES (
+                    :repo_id, 'owner/review-113', 'secret', '[]',
+                    '2026-08-15 00:00:00', '2026-08-15 00:00:00'
+                )
+            """), {"repo_id": repo_id})
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, created_at
+                ) VALUES (
+                    3113, 'review 113', 'review', 'completed', 0, 'main',
+                    'pending', 0, 2, 'auto', '2026-08-15 00:00:00'
+                )
+            """))
+            reviews = (
+                (113, 1, 1, "error", "error", "lgtm_comment", "PR was merged before publication"),
+                (114, 2, 2, "error", "lgtm_comment", "review_comments", "PR was closed before publication"),
+                (115, 3, 3, "error", "error", "lgtm_comment", "GitHub transport timed out"),
+                (116, 4, 4, "error", "error", "approved_merged", "PR snapshot changed before publication"),
+                (117, 4, 6, "approved", "lgtm_comment", None, "ordinary current review"),
+                (118, 5, 5, "error", "error", None, "PR became draft before publication"),
+            )
+            for (
+                review_id,
+                pr_number,
+                sha_seed,
+                status,
+                action,
+                pending,
+                summary,
+            ) in reviews:
+                conn.execute(text("""
+                    INSERT INTO pr_reviews (
+                        id, repo_id, pr_number, base_ref, base_sha, head_sha,
+                        pr_title, pr_author, pr_url, status, action_taken,
+                        pending_action, review_summary, created_at
+                    ) VALUES (
+                        :id, :repo_id, :pr_number, 'main', :base_sha, :head_sha,
+                        'legacy review', 'alice', :url, :status, :action,
+                        :pending, :summary, '2026-08-15 00:00:01'
+                    )
+                """), {
+                    "id": review_id,
+                    "repo_id": repo_id,
+                    "pr_number": pr_number,
+                    "base_sha": f"{sha_seed}" * 40,
+                    "head_sha": f"{(sha_seed + 1) % 10}" * 40,
+                    "url": f"https://github.com/owner/review-113/pull/{pr_number}",
+                    "status": status,
+                    "action": action,
+                    "pending": pending,
+                    "summary": summary,
+                })
+            conn.execute(text("""
+                UPDATE pr_reviews
+                SET task_id = 3113,
+                    action_nonce = :nonce,
+                    pending_review_body = 'legacy pass body',
+                    publishing_actor = 'ccm-bot',
+                    publishing_retry_count = 0,
+                    publishing_task_started_at = '2026-08-15 00:00:03',
+                    publishing_started_at = '2026-08-15 00:00:04'
+                WHERE id = 113
+            """), {"nonce": "a" * 48})
+            for run_id, pr_number, current_review_id, sha_seed in (
+                (213, 1, 113, 1),
+                (214, 2, 114, 2),
+                (215, 3, 115, 3),
+                (216, 4, 117, 6),
+                (218, 5, 118, 5),
+            ):
+                conn.execute(text("""
+                    INSERT INTO pr_monitor_runs (
+                        id, repo_id, pr_number, status, current_base_sha,
+                        current_head_sha, current_review_id,
+                        created_at, updated_at
+                    ) VALUES (
+                        :id, :repo_id, :pr_number, 'reviewing', :base_sha,
+                        :head_sha, :review_id,
+                        '2026-08-15 00:00:02', '2026-08-15 00:00:02'
+                    )
+                """), {
+                    "id": run_id,
+                    "repo_id": repo_id,
+                    "pr_number": pr_number,
+                    "base_sha": f"{sha_seed}" * 40,
+                    "head_sha": f"{(sha_seed + 1) % 10}" * 40,
+                    "review_id": current_review_id,
+                })
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_RESULT_EVIDENCE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            markers = dict(conn.execute(text(
+                "SELECT id, legacy_terminal_recovery_pending "
+                "FROM pr_monitor_runs ORDER BY id"
+            )).all())
+            states = {
+                row.id: (
+                    row.code_verdict,
+                    row.publication_state,
+                    row.failure_stage,
+                )
+                for row in conn.execute(text(
+                    "SELECT id, code_verdict, publication_state, "
+                    "failure_stage "
+                    "FROM pr_reviews ORDER BY id"
+                ))
+            }
+        assert markers == {213: 1, 214: 0, 215: 0, 216: 0, 218: 0}
+        assert states[113] == ("pass", "not_applicable", "lifecycle")
+        assert states[114] == (None, "not_applicable", "lifecycle")
+        assert states[115] == (None, "failed", "publication")
+        assert states[116] == (None, "not_applicable", "lifecycle")
+        assert states[117] == ("pass", "reconciling", "recovery")
+        assert states[118] == (None, "not_started", None)
+        engine.dispose()
+
+    def test_legacy_code_verdict_backfill_requires_provable_terminal_shape(
+        self,
+        tmp_path,
+    ):
+        db_path = str(tmp_path / "legacy-code-verdict-backfill.db")
+        cfg = _alembic_cfg(db_path)
+        _run_alembic(cfg, command.upgrade, INSTANCE_PROCESS_IDENTITY_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        full_nonce = "a" * 48
+        started_at = "2026-08-15 00:00:03"
+
+        def legacy_row(
+            review_id,
+            *,
+            status,
+            action_taken=None,
+            pending_action=None,
+            expected=None,
+            **overrides,
+        ):
+            values = {
+                "id": review_id,
+                "pr_number": review_id,
+                "base_sha": f"{review_id:040x}"[-40:],
+                "head_sha": f"{review_id + 1:040x}"[-40:],
+                "url": (
+                    "https://github.com/owner/verdict-backfill/pull/"
+                    f"{review_id}"
+                ),
+                "status": status,
+                "action_taken": action_taken,
+                "pending_action": pending_action,
+                "action_nonce": None,
+                "task_id": None,
+                "pending_body": None,
+                "publishing_actor": None,
+                "retry_count": None,
+                "publishing_task_started_at": None,
+                "publishing_started_at": None,
+                "expected": expected,
+            }
+            values.update(overrides)
+            return values
+
+        complete_outbox = {
+            "action_nonce": full_nonce,
+            "task_id": 3301,
+            "pending_body": "review body",
+            "publishing_actor": "ccm-bot",
+            "retry_count": 0,
+            "publishing_task_started_at": started_at,
+            "publishing_started_at": started_at,
+        }
+        rows = (
+            # Only coherent, already-terminal status/action pairs are proof.
+            legacy_row(
+                301,
+                status="approved",
+                action_taken="lgtm_comment",
+                expected="pass",
+            ),
+            legacy_row(
+                302,
+                status="merged",
+                action_taken="approved_merged",
+                expected="pass",
+            ),
+            legacy_row(
+                303,
+                status="commented",
+                action_taken="review_comments",
+                expected="changes_required",
+            ),
+            legacy_row(
+                304,
+                status="approved",
+                action_taken="review_comments",
+            ),
+            legacy_row(
+                305,
+                status="merged",
+                action_taken="lgtm_comment",
+            ),
+            legacy_row(
+                306,
+                status="commented",
+                action_taken="lgtm_comment",
+            ),
+            legacy_row(307, status="approved"),
+            # A complete armed Single outbox freezes the verdict before the
+            # external GitHub mutation, including publishing/error recovery.
+            legacy_row(
+                308,
+                status="publishing",
+                pending_action="lgtm_comment",
+                expected="pass",
+                **complete_outbox,
+            ),
+            legacy_row(
+                309,
+                status="error",
+                action_taken="error",
+                pending_action="approved_merged",
+                expected="pass",
+                **(complete_outbox | {"retry_count": 2}),
+            ),
+            legacy_row(
+                310,
+                status="error",
+                action_taken="error",
+                pending_action="review_comments",
+                expected="changes_required",
+                **(complete_outbox | {"retry_count": 1}),
+            ),
+            # Near misses must stay unknown; migration may not infer a verdict
+            # from a stray pending action or malformed outbox generation.
+            legacy_row(
+                311,
+                status="publishing",
+                pending_action="lgtm_comment",
+                **(complete_outbox | {"action_nonce": "A" * 48}),
+            ),
+            legacy_row(
+                312,
+                status="publishing",
+                pending_action="lgtm_comment",
+                **(complete_outbox | {"action_nonce": "a" * 47 + "g"}),
+            ),
+            legacy_row(
+                313,
+                status="error",
+                action_taken="error",
+                pending_action="review_comments",
+                **(complete_outbox | {"pending_body": None}),
+            ),
+            legacy_row(
+                314,
+                status="error",
+                action_taken="error",
+                pending_action="review_comments",
+                **(complete_outbox | {"publishing_actor": None}),
+            ),
+            legacy_row(
+                315,
+                status="error",
+                action_taken="error",
+                pending_action="review_comments",
+                **(
+                    complete_outbox
+                    | {"publishing_task_started_at": None}
+                ),
+            ),
+            legacy_row(
+                316,
+                status="error",
+                action_taken="error",
+                pending_action="review_comments",
+                **(complete_outbox | {"publishing_started_at": None}),
+            ),
+            legacy_row(
+                317,
+                status="error",
+                action_taken="error",
+                pending_action="review_comments",
+                **(complete_outbox | {"retry_count": -1}),
+            ),
+            legacy_row(
+                318,
+                status="error",
+                action_taken="error",
+                pending_action="review_comments",
+                **(complete_outbox | {"task_id": None}),
+            ),
+            legacy_row(
+                319,
+                status="pending",
+                pending_action="lgtm_comment",
+                **complete_outbox,
+            ),
+            # Panel evidence remains in PRReviewerRun and must not be guessed
+            # from the legacy aggregate status/action pair.
+            legacy_row(
+                320,
+                status="approved",
+                action_taken="lgtm_comment",
+            ),
+        )
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO monitored_repos (
+                    id, repo_full_name, webhook_secret, required_checks,
+                    created_at, updated_at
+                ) VALUES (
+                    3300, 'owner/verdict-backfill', 'secret', '[]',
+                    '2026-08-15 00:00:00', '2026-08-15 00:00:00'
+                )
+            """))
+            conn.execute(text("""
+                INSERT INTO tasks (
+                    id, title, description, status, priority, target_branch,
+                    merge_status, retry_count, max_retries, mode, created_at
+                ) VALUES (
+                    3301, 'legacy reviewer', 'review', 'completed', 0, 'main',
+                    'pending', 0, 2, 'auto', '2026-08-15 00:00:01'
+                )
+            """))
+            for row in rows:
+                conn.execute(text("""
+                    INSERT INTO pr_reviews (
+                        id, repo_id, pr_number, base_ref, base_sha, head_sha,
+                        pr_title, pr_author, pr_url, task_id, status,
+                        action_taken, action_nonce, pending_action,
+                        pending_review_body, publishing_actor,
+                        publishing_retry_count, publishing_task_started_at,
+                        publishing_started_at, created_at
+                    ) VALUES (
+                        :id, 3300, :pr_number, 'main', :base_sha, :head_sha,
+                        'legacy verdict', 'alice', :url, :task_id, :status,
+                        :action_taken, :action_nonce, :pending_action,
+                        :pending_body, :publishing_actor, :retry_count,
+                        :publishing_task_started_at,
+                        :publishing_started_at,
+                        '2026-08-15 00:00:02'
+                    )
+                """), row)
+            conn.execute(text("""
+                INSERT INTO pr_reviewer_runs (
+                    pr_review_id, role, provider, status, verdict,
+                    prompt_policy_hash, guide_pack_hash, created_at
+                ) VALUES (
+                    320, 'principal', 'codex', 'completed', 'pass',
+                    :policy_hash, :guide_hash, '2026-08-15 00:00:03'
+                )
+            """), {
+                "policy_hash": "b" * 64,
+                "guide_hash": "c" * 64,
+            })
+        engine.dispose()
+
+        _run_alembic(cfg, command.upgrade, PR_REVIEW_RESULT_EVIDENCE_REVISION)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.connect() as conn:
+            actual = {
+                item.id: (
+                    item.code_verdict,
+                    item.code_verdict_task_id,
+                    item.code_verdict_retry_count,
+                    item.code_verdict_task_started_at,
+                    item.code_verdict_recorded_at,
+                )
+                for item in conn.execute(text(
+                    "SELECT id, code_verdict, code_verdict_task_id, "
+                    "code_verdict_retry_count, "
+                    "code_verdict_task_started_at, "
+                    "code_verdict_recorded_at "
+                    "FROM pr_reviews ORDER BY id"
+                ))
+            }
+        assert actual == {
+            row["id"]: (row["expected"], None, None, None, None)
+            for row in rows
+        }
+        engine.dispose()
+
+    def test_postgresql_offline_upgrade_emits_complete_transactional_sql(self):
+        module = _load_pr_review_result_evidence_migration("postgresql_offline")
+        output = io.StringIO()
+        migration_context = MigrationContext.configure(
+            dialect_name="postgresql",
+            opts={"as_sql": True, "output_buffer": output},
+        )
+        with (
+            patch.object(module, "op", Operations(migration_context)),
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: True),
+            ),
+        ):
+            module.upgrade()
+        ddl = output.getvalue().lower()
+        assert "add column attempt integer default '1' not null" in ddl
+        assert "add column code_verdict varchar(30)" in ddl
+        assert "add column code_verdict_task_id integer" in ddl
+        assert "add column code_verdict_retry_count integer" in ddl
+        assert "add column code_verdict_task_started_at timestamp" in ddl
+        assert "add column code_verdict_recorded_at timestamp" in ddl
+        assert "add column legacy_terminal_recovery_pending boolean" in ddl
+        assert "ck_pr_reviews_input_error_evidence" in ddl
+        assert "error_category = 'unsupported_input_size'" in ddl
+        assert "error_measured <= 9007199254740991" in ddl
+        assert "error_unit in ('characters', 'utf-8 bytes')" in ddl
+        assert "update pr_reviews" in ddl
+        new_subject = ddl.index(
+            "add constraint uq_pr_reviews_repo_pr_base_ref_base_head_attempt"
+        )
+        old_subject = ddl.index(
+            "drop constraint uq_pr_reviews_repo_pr_base_ref_base_head"
+        )
+        assert new_subject < old_subject
+        assert "fk_pr_reviews_rerun_of_review_id_pr_reviews" in ddl
+        assert "ix_pr_reviews_rerun_of_review_id" in ddl
+
+    @pytest.mark.parametrize("dialect_name", ("sqlite", "mysql", "mariadb"))
+    def test_nontransactional_offline_upgrade_is_refused_before_ddl(
+        self,
+        dialect_name,
+    ):
+        module = _load_pr_review_result_evidence_migration(
+            f"offline_{dialect_name}"
+        )
+        batch = MagicMock()
+        with (
+            patch.object(module, "_dialect", return_value=dialect_name),
+            patch.object(
+                module,
+                "context",
+                SimpleNamespace(is_offline_mode=lambda: True),
+            ),
+            patch.object(module.op, "batch_alter_table", batch),
+            pytest.raises(RuntimeError, match="interrupted DDL"),
+        ):
+            module._ensure_columns()
+        batch.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("evidence_sql", "error_pattern"),
+        (
+            (
+                "UPDATE pr_reviews SET attempt = 2, "
+                "rerun_idempotency_key = 'manual-rerun' WHERE id = 8901",
+                "rerun or publication evidence",
+            ),
+            (
+                "UPDATE pr_reviews SET code_verdict = 'pass', "
+                "code_verdict_task_id = 8701, "
+                "code_verdict_retry_count = 0, "
+                "code_verdict_task_started_at = '2026-08-16 00:00:03', "
+                "code_verdict_recorded_at = '2026-08-16 00:00:04' "
+                "WHERE id = 8901",
+                "rerun or publication evidence",
+            ),
+            (
+                "UPDATE pr_reviews SET code_verdict = 'pass', "
+                "action_taken = 'review_comments' WHERE id = 8901",
+                "rerun or publication evidence",
+            ),
+            (
+                "UPDATE pr_reviews SET code_verdict_task_id = 8701 "
+                "WHERE id = 8901",
+                "rerun or publication evidence",
+            ),
+            (
+                "UPDATE pr_reviews SET code_verdict_retry_count = 0 "
+                "WHERE id = 8901",
+                "rerun or publication evidence",
+            ),
+            (
+                "UPDATE pr_reviews SET code_verdict_task_started_at = "
+                "'2026-08-16 00:00:03' WHERE id = 8901",
+                "rerun or publication evidence",
+            ),
+            (
+                "UPDATE pr_reviews SET code_verdict_recorded_at = "
+                "'2026-08-16 00:00:04' WHERE id = 8901",
+                "rerun or publication evidence",
+            ),
+            (
+                "UPDATE pr_reviews SET publication_state = 'published', "
+                "published_actor = 'ccm-bot', github_review_id = 77 "
+                "WHERE id = 8901",
+                "rerun or publication evidence",
+            ),
+            (
+                "UPDATE pr_reviews SET "
+                "error_category = 'unsupported_input_size', "
+                "error_measured = 120001, error_limit = 120000, "
+                "error_unit = 'characters' WHERE id = 8901",
+                "rerun or publication evidence",
+            ),
+            (
+                "UPDATE pr_monitor_runs SET terminal_intent_status = 'merged' "
+                "WHERE id = 9001",
+                "terminal lifecycle evidence",
+            ),
+            (
+                "UPDATE pr_monitor_runs SET terminal_intent_checked_at = "
+                "'2026-08-16 00:00:05' WHERE id = 9001",
+                "terminal lifecycle evidence",
+            ),
+            (
+                "UPDATE pr_monitor_runs SET "
+                "legacy_terminal_recovery_pending = 1 WHERE id = 9001",
+                "terminal lifecycle evidence",
+            ),
+        ),
+        ids=(
+            "rerun",
+            "native-verdict-provenance",
+            "unproven-verdict",
+            "code-verdict-task-id",
+            "code-verdict-retry",
+            "code-verdict-task-started",
+            "code-verdict-recorded",
+            "publication",
+            "input-rejection",
+            "terminal-intent",
+            "checked-recovery",
+            "legacy-marker",
+        ),
+    )
+    def test_downgrade_refuses_every_kind_of_durable_evidence(
+        self,
+        tmp_path,
+        _pr_result_head_sqlite_db,
+        evidence_sql,
+        error_pattern,
+    ):
+        db_path = str(tmp_path / f"evidence-{error_pattern.split()[0]}.db")
+        shutil.copyfile(_pr_result_head_sqlite_db, db_path)
+        engine = create_engine(f"sqlite:///{db_path}")
+        with engine.begin() as conn:
+            _seed_pr_result_subject(conn)
+            conn.execute(text(evidence_sql))
+        engine.dispose()
+
+        cfg = _alembic_cfg(db_path)
+        with pytest.raises(RuntimeError, match=error_pattern):
+            _run_alembic(
+                cfg,
+                command.downgrade,
+                INSTANCE_PROCESS_IDENTITY_REVISION,
+            )
+        engine = create_engine(f"sqlite:///{db_path}")
+        inspector = inspect(engine)
+        assert set(_PR_RESULT_REVIEW_COLUMNS) <= {
+            item["name"] for item in inspector.get_columns("pr_reviews")
+        }
+        assert set(_PR_RESULT_RUN_COLUMNS) <= {
+            item["name"] for item in inspector.get_columns("pr_monitor_runs")
+        }
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT version_num FROM alembic_version"
+            )).scalar_one() == PR_REVIEW_RESULT_EVIDENCE_REVISION
         engine.dispose()
 
 

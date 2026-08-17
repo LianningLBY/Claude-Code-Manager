@@ -910,7 +910,10 @@ async def test_direct_ref_capability_rebuttal_classifies_terminal_policy_error(
     else:
         assert result.status == "error"
         assert result.action_taken == "error"
-        assert summary_match in result.review_summary
+        assert result.review_summary is None
+        assert result.publication_state == "failed"
+        assert result.failure_stage == "merge"
+        assert summary_match in result.publication_error
         assert result_run.status == "paused"
         assert result_run.pause_reason.startswith(f"review_error:{review_id}:")
         assert result_run.state_version == original_version + 1
@@ -1007,9 +1010,14 @@ async def test_rebuttal_auto_merge_restart_pauses_invalid_terminal_generation(
     assert terminal.status == "error"
     assert terminal.action_taken == "error"
     assert terminal.pending_action is None
-    assert f"status={task_status}" in (terminal.review_summary or "")
+    assert terminal.review_summary is None
+    assert terminal.publication_state == "failed"
+    assert terminal.failure_stage == "github_identity"
+    assert f"status={task_status}" in (terminal.publication_error or "")
     assert paused.status == "paused"
-    assert f"status={task_status}" in (paused.pause_reason or "")
+    assert paused.pause_reason == (
+        f"review_error:{review_id}:PR reviewer failed without a summary"
+    )
     freeze.assert_not_awaited()
     login.assert_not_awaited()
 

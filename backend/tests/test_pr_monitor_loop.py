@@ -21,6 +21,7 @@ from backend.models.task import Task
 from backend.models.test_harness import TestHarnessRun as HarnessRun
 from backend.models.worker import Worker
 from backend.services.pr_monitor_loop import (
+    _RepairRemoteSubject,
     _repair_remote_subject_is_current as _real_repair_remote_subject_is_current,
     attach_review_to_run,
     reconcile_terminal_review_runs,
@@ -558,7 +559,15 @@ async def test_repair_remote_subject_rejects_same_shas_new_base_ref(monkeypatch)
     monkeypatch.setattr(
         "backend.services.pr_review_service._gh_pr_view", fake_pr_view
     )
-    assert await _real_repair_remote_subject_is_current(repo, review) is False
+    assert await _real_repair_remote_subject_is_current(
+        _RepairRemoteSubject(
+            repo_full_name=repo.repo_full_name,
+            pr_number=review.pr_number,
+            base_ref=review.base_ref,
+            base_sha=review.base_sha,
+            head_sha=review.head_sha,
+        )
+    ) is False
 
 
 @pytest.mark.asyncio
@@ -642,8 +651,385 @@ async def test_pending_repair_base_ref_drift_pauses_without_delivery(
 
 
 @pytest.mark.asyncio
+async def test_repair_remote_read_releases_db_and_rejects_changed_generation(
+    db_session,
+    db_factory,
+    _stub_repair_remote_subject,
+):
+    from backend.services.pr_monitor_loop import reconcile_repair_wakes
+
+    repo = MonitoredRepo(
+        repo_full_name="owner/repair-remote-cas",
+        webhook_secret="s" * 64,
+        review_mode="panel",
+        auto_repair=True,
+    )
+    developer = Task(
+        title="Developer",
+        description="change",
+        status="completed",
+        session_id="repair-remote-cas-session",
+        last_cwd="/workspace/repair-remote-cas",
+    )
+    db_session.add_all((repo, developer))
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=96,
+        current_base_sha=BASE,
+        current_head_sha=HEAD,
+        developer_task_id=developer.id,
+        status="repair_pending",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review = PRReview(
+        monitor_run_id=run.id,
+        repo_id=repo.id,
+        pr_number=96,
+        base_ref="main",
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="repair remote CAS",
+        pr_author="alice",
+        pr_url="https://github.com/owner/repair-remote-cas/pull/96",
+        status="commented",
+    )
+    db_session.add(review)
+    await db_session.flush()
+    run.current_review_id = review.id
+    wake = PRRepairWake(
+        monitor_run_id=run.id,
+        review_id=review.id,
+        developer_task_id=developer.id,
+        trigger_base_sha=BASE,
+        trigger_head_sha=HEAD,
+        reason_kind="review_blocked",
+        evidence_hash="9" * 64,
+        evidence={"findings": []},
+        status="pending",
+        delivery_token="8" * 48,
+    )
+    db_session.add(wake)
+    await db_session.commit()
+    run_id = run.id
+    wake_id = wake.id
+
+    active_reconcile_db = None
+
+    @asynccontextmanager
+    async def tracking_db_factory():
+        nonlocal active_reconcile_db
+        async with db_factory() as db:
+            active_reconcile_db = db
+            try:
+                yield db
+            finally:
+                active_reconcile_db = None
+
+    async def race_remote_read(_subject):
+        assert active_reconcile_db is not None
+        assert not active_reconcile_db.in_transaction()
+        async with db_factory() as concurrent_db:
+            changed_run = await concurrent_db.get(PRMonitorRun, run_id)
+            assert changed_run is not None
+            changed_run.status = "paused"
+            changed_run.pause_reason = "concurrent_generation_change"
+            changed_run.state_version += 1
+            await concurrent_db.commit()
+        return True
+
+    _stub_repair_remote_subject.side_effect = race_remote_read
+    dispatcher = AsyncMock()
+
+    assert await reconcile_repair_wakes(tracking_db_factory, dispatcher) == 0
+
+    unchanged_wake = await db_session.get(
+        PRRepairWake,
+        wake_id,
+        populate_existing=True,
+    )
+    changed_run = await db_session.get(
+        PRMonitorRun,
+        run_id,
+        populate_existing=True,
+    )
+    assert unchanged_wake.status == "pending"
+    assert changed_run.status == "paused"
+    assert changed_run.pause_reason == "concurrent_generation_change"
+    dispatcher.enqueue_message.assert_not_awaited()
+    _stub_repair_remote_subject.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ownership", ("review_marker", "task_owner"))
+async def test_pending_worker_repair_never_migrates_preexisting_delivery_owner(
+    db_session,
+    db_factory,
+    monkeypatch,
+    _stub_repair_remote_subject,
+    ownership,
+):
+    from types import SimpleNamespace
+    from backend.services.pr_monitor_loop import reconcile_repair_wakes
+
+    repo = MonitoredRepo(
+        repo_full_name=f"owner/preowned-repair-{ownership}",
+        webhook_secret="s" * 64,
+        review_mode="panel",
+        auto_repair=True,
+    )
+    task = Task(
+        title="Delivery-owned worker task",
+        description="must not migrate",
+        status="completed",
+        worker_id=17,
+        session_id=f"preowned-{ownership}-session",
+        last_cwd=f"/workspace/preowned-{ownership}",
+        mode="delivery_loop" if ownership == "task_owner" else "auto",
+        delivery_run_id=701 if ownership == "task_owner" else None,
+        delivery_role="developer" if ownership == "task_owner" else None,
+    )
+    db_session.add_all((repo, task))
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=97,
+        current_base_sha=BASE,
+        current_head_sha=HEAD,
+        developer_task_id=task.id,
+        status="repair_pending",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review = PRReview(
+        monitor_run_id=run.id,
+        repo_id=repo.id,
+        pr_number=97,
+        base_ref="main",
+        base_sha=BASE,
+        head_sha=HEAD,
+        delivery_id=(
+            f"delivery:701:{HEAD}"
+            if ownership == "review_marker"
+            else None
+        ),
+        pr_title="preowned repair",
+        pr_author="alice",
+        pr_url=(
+            f"https://github.com/{repo.repo_full_name}/pull/97"
+        ),
+        status="commented",
+    )
+    db_session.add(review)
+    await db_session.flush()
+    run.current_review_id = review.id
+    wake = PRRepairWake(
+        monitor_run_id=run.id,
+        review_id=review.id,
+        developer_task_id=task.id,
+        trigger_base_sha=BASE,
+        trigger_head_sha=HEAD,
+        reason_kind="review_blocked",
+        evidence_hash=("6" if ownership == "review_marker" else "7") * 64,
+        evidence={"findings": [{"title": "blocking"}]},
+        status="pending",
+        delivery_token="5" * 48,
+    )
+    db_session.add(wake)
+    await db_session.commit()
+    wake_id = wake.id
+    run_id = run.id
+
+    migrate = AsyncMock()
+    monkeypatch.setattr(
+        "backend.main.task_migrator",
+        SimpleNamespace(migrate=migrate),
+    )
+    dispatcher = AsyncMock()
+
+    assert await reconcile_repair_wakes(db_factory, dispatcher) == 0
+
+    shadow = await db_session.get(PRRepairWake, wake_id, populate_existing=True)
+    paused = await db_session.get(PRMonitorRun, run_id, populate_existing=True)
+    assert shadow.status == "shadow"
+    assert shadow.last_error == "delivery_owned"
+    assert paused.status == "paused"
+    assert paused.pause_reason == "delivery_owned"
+    migrate.assert_not_awaited()
+    dispatcher.enqueue_message.assert_not_awaited()
+    _stub_repair_remote_subject.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_remote_probe_delivery_adoption_shadows_before_worker_migration(
+    db_session,
+    db_factory,
+    monkeypatch,
+    _stub_repair_remote_subject,
+):
+    from types import SimpleNamespace
+    from backend.services.pr_monitor_loop import reconcile_repair_wakes
+
+    repo = MonitoredRepo(
+        repo_full_name="owner/adopted-during-repair-probe",
+        webhook_secret="s" * 64,
+        review_mode="panel",
+        auto_repair=True,
+    )
+    task = Task(
+        title="Worker task adopted during probe",
+        description="must remain remote",
+        status="completed",
+        worker_id=19,
+        session_id="adopted-during-probe-session",
+        last_cwd="/workspace/adopted-during-probe",
+    )
+    db_session.add_all((repo, task))
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=98,
+        current_base_sha=BASE,
+        current_head_sha=HEAD,
+        developer_task_id=task.id,
+        status="repair_pending",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review = PRReview(
+        monitor_run_id=run.id,
+        repo_id=repo.id,
+        pr_number=98,
+        base_ref="main",
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="adopt during probe",
+        pr_author="alice",
+        pr_url=(
+            "https://github.com/owner/adopted-during-repair-probe/pull/98"
+        ),
+        status="commented",
+    )
+    db_session.add(review)
+    await db_session.flush()
+    run.current_review_id = review.id
+    wake = PRRepairWake(
+        monitor_run_id=run.id,
+        review_id=review.id,
+        developer_task_id=task.id,
+        trigger_base_sha=BASE,
+        trigger_head_sha=HEAD,
+        reason_kind="review_blocked",
+        evidence_hash="4" * 64,
+        evidence={"findings": [{"title": "blocking"}]},
+        status="pending",
+        delivery_token="3" * 48,
+    )
+    db_session.add(wake)
+    await db_session.commit()
+    task_id = task.id
+    run_id = run.id
+    wake_id = wake.id
+
+    active_reconcile_db = None
+
+    @asynccontextmanager
+    async def tracking_db_factory():
+        nonlocal active_reconcile_db
+        async with db_factory() as db:
+            active_reconcile_db = db
+            try:
+                yield db
+            finally:
+                active_reconcile_db = None
+
+    async def adopt_during_remote(_subject):
+        assert active_reconcile_db is not None
+        assert not active_reconcile_db.in_transaction()
+        async with db_factory() as adoption_db:
+            adopted = await adoption_db.get(Task, task_id)
+            assert adopted is not None and adopted.worker_id == 19
+            adopted.mode = "delivery_loop"
+            adopted.delivery_run_id = 702
+            adopted.delivery_role = "developer"
+            await adoption_db.commit()
+        return True
+
+    _stub_repair_remote_subject.side_effect = adopt_during_remote
+    migrate = AsyncMock()
+    monkeypatch.setattr(
+        "backend.main.task_migrator",
+        SimpleNamespace(migrate=migrate),
+    )
+    dispatcher = AsyncMock()
+
+    assert await reconcile_repair_wakes(tracking_db_factory, dispatcher) == 0
+
+    shadow = await db_session.get(PRRepairWake, wake_id, populate_existing=True)
+    paused = await db_session.get(PRMonitorRun, run_id, populate_existing=True)
+    adopted = await db_session.get(Task, task_id, populate_existing=True)
+    assert shadow.status == "shadow"
+    assert shadow.last_error == "delivery_owned"
+    assert paused.status == "paused"
+    assert paused.pause_reason == "delivery_owned"
+    assert adopted.worker_id == 19
+    assert adopted.mode == "delivery_loop"
+    migrate.assert_not_awaited()
+    dispatcher.enqueue_message.assert_not_awaited()
+    _stub_repair_remote_subject.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_single_review_ci_failure_without_findings_does_not_create_wake(
+    db_session,
+):
+    repo = MonitoredRepo(
+        repo_full_name="owner/single-ci-only",
+        webhook_secret="s" * 64,
+        review_mode="single",
+        auto_repair=True,
+    )
+    db_session.add(repo)
+    await db_session.flush()
+    review = PRReview(
+        repo_id=repo.id,
+        pr_number=109,
+        base_ref="main",
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="single ci only",
+        pr_author="alice",
+        pr_url="https://github.com/owner/single-ci-only/pull/109",
+        status="commented",
+        ci_status="failed",
+        ci_summary="tests failed",
+        ci_details={"head_sha": HEAD, "observed": []},
+    )
+    db_session.add(review)
+    await db_session.commit()
+    run = await attach_review_to_run(db_session, repo=repo, review=review)
+
+    wake = await record_blocking_evidence(
+        db_session,
+        review_id=review.id,
+        reason_kind="ci_failed",
+    )
+
+    assert wake is None
+    assert list((await db_session.execute(
+        select(PRFinding).where(PRFinding.pr_review_id == review.id)
+    )).scalars()) == []
+    assert list((await db_session.execute(
+        select(PRRepairWake).where(PRRepairWake.monitor_run_id == run.id)
+    )).scalars()) == []
+    await db_session.refresh(run)
+    assert run.status == "waiting_for_fix"
+
+
+@pytest.mark.asyncio
 async def test_local_repair_wake_has_durable_acceptance_and_awaits_new_push(
-    db_session, db_factory
+    db_session, db_factory, _stub_repair_remote_subject
 ):
     from backend.services.pr_monitor_loop import (
         admit_repair_wake,
@@ -685,6 +1071,17 @@ async def test_local_repair_wake_has_durable_acceptance_and_awaits_new_push(
         status="commented",
         ci_status="failed",
         ci_summary="tests failed",
+        ci_details={
+            "subject_kind": "pr_head",
+            "head_sha": HEAD,
+            "observed": [{
+                "kind": "check_run",
+                "name": "tests",
+                "app_slug": "github-actions",
+                "state": "failed",
+                "conclusion": "failure",
+            }],
+        },
     )
     db_session.add(review)
     await db_session.commit()
@@ -695,6 +1092,17 @@ async def test_local_repair_wake_has_durable_acceptance_and_awaits_new_push(
         db_session, review_id=review.id, reason_kind="ci_failed"
     )
     assert wake is not None and wake.status == "pending"
+    wake_id = wake.id
+    task_id = task.id
+    assert list((await db_session.execute(
+        select(PRFinding).where(PRFinding.pr_review_id == review.id)
+    )).scalars()) == []
+    assert wake.evidence["findings"] == []
+    assert wake.evidence["ci"] == {
+        "status": "failed",
+        "summary": "tests failed",
+        "details": review.ci_details,
+    }
 
     dispatcher = AsyncMock()
     assert await reconcile_repair_wakes(db_factory, dispatcher) == 1
@@ -704,6 +1112,14 @@ async def test_local_repair_wake_has_durable_acceptance_and_awaits_new_push(
     assert queued["task_id"] == task.id
     assert queued["source"].startswith(f"pr-repair:{wake.id}:")
     assert "Do not create another PR" in queued["prompt"]
+
+    async def assert_admission_remote_is_lock_free(_subject):
+        assert not db_session.in_transaction()
+        return True
+
+    _stub_repair_remote_subject.side_effect = (
+        assert_admission_remote_is_lock_free
+    )
 
     assert await admit_repair_wake(
         db_session,
@@ -719,6 +1135,11 @@ async def test_local_repair_wake_has_durable_acceptance_and_awaits_new_push(
         delivery_token=wake.delivery_token,
         task=task,
     ) is False
+    # A rejected second admission closes its read/lock transaction, which
+    # intentionally expires caller-owned ORM snapshots.
+    wake = await db_session.get(PRRepairWake, wake_id, populate_existing=True)
+    task = await db_session.get(Task, task_id, populate_existing=True)
+    assert wake is not None and task is not None
     task.status = "executing"
     task.completed_at = None
     await db_session.commit()

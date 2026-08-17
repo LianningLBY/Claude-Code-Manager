@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { api } from '../api/client';
-import type { Task, Project, TagItem } from '../api/client';
+import type { Task, Project, TagItem, PRReviewResult } from '../api/client';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { TaskForm } from '../components/Tasks/TaskForm';
 import { TaskList } from '../components/Tasks/TaskList';
@@ -20,8 +20,11 @@ import { mergeVisibleTaskOrder, useTaskReorder } from '../hooks/useTaskReorder';
 import { useTaskSearch } from '../hooks/useTaskSearch';
 import { TeamShareModal } from '../components/TeamShareModal';
 import { getTaskStatusLabel } from '../components/Tasks/taskStatus';
+import { PRReviewResultCard } from '../components/PRReview/PRReviewResultCard';
+import { canonicalGitHubPRUrl } from '../components/PRReview/githubUrls';
 
 const PAGE_SIZE = 20;
+const PR_RESULTS_PAGE_SIZE = 20;
 
 function isDeliveryOwnedTask(task: Task): boolean {
   return task.mode === 'delivery_loop' || task.delivery_run_id != null;
@@ -44,6 +47,29 @@ interface TasksPageProps {
 
 export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [prReviewResults, setPRReviewResults] = useState<PRReviewResult[]>([]);
+  const [prResultsError, setPRResultsError] = useState<string | null>(null);
+  const [prResultsRefreshing, setPRResultsRefreshing] = useState(false);
+  const [prResultsPage, setPRResultsPage] = useState(1);
+  const [prResultsHasNext, setPRResultsHasNext] = useState(false);
+  const [rerunPendingKey, setRerunPendingKey] = useState<string | null>(null);
+  const [rerunErrors, setRerunErrors] = useState<Record<string, {
+    sourceReviewId: number;
+    sourceHeadSha: string;
+    message: string;
+  }>>({});
+  const [rerunStarted, setRerunStarted] = useState<Record<string, {
+    sourceReviewId: number;
+    sourceHeadSha: string;
+    reviewId: number;
+    message: string;
+  }>>({});
+  const rerunIdempotencyRef = useRef(new Map<string, {
+    sourceReviewId: number;
+    headSha: string;
+    key: string;
+  }>());
+  const [taskPrefill, setTaskPrefill] = useState<{ key: string; description: string } | null>(null);
   const [, setAllTasks] = useState<Task[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [page, setPage] = useState(1);
@@ -249,6 +275,204 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
     }
   }, [setSearchResults]);
   useWebSocket(['system', 'tasks'], handleGlobalWs);
+
+  const prResultsMountedRef = useRef(false);
+  const prResultsMountGenerationRef = useRef(0);
+  const prResultsPageRef = useRef(prResultsPage);
+  prResultsPageRef.current = prResultsPage;
+  const prResultIdentityRef = useRef(new Map<string, { reviewId: number | null; headSha: string | null }>());
+  const prResultsCoordinatorRef = useRef<{
+    running: boolean;
+    trailing: boolean;
+    nextSequence: number;
+    appliedSequence: number;
+    waiters: Array<(ok: boolean) => void>;
+  }>({
+    running: false,
+    trailing: false,
+    nextSequence: 0,
+    appliedSequence: 0,
+    waiters: [],
+  });
+
+  const refreshPRReviewResults = useCallback((): Promise<boolean> => new Promise((resolve) => {
+    const coordinator = prResultsCoordinatorRef.current;
+    coordinator.waiters.push(resolve);
+    if (coordinator.running) {
+      coordinator.trailing = true;
+      return;
+    }
+    coordinator.running = true;
+    void (async () => {
+      let lastRequestOk = false;
+      if (prResultsMountedRef.current) setPRResultsRefreshing(true);
+      do {
+        coordinator.trailing = false;
+        const sequence = ++coordinator.nextSequence;
+        const mountGeneration = prResultsMountGenerationRef.current;
+        const requestedPage = prResultsPageRef.current;
+        try {
+          const results = await api.getPRReviewResults(requestedPage, PR_RESULTS_PAGE_SIZE);
+          lastRequestOk = true;
+          if (
+            prResultsMountedRef.current
+            && mountGeneration === prResultsMountGenerationRef.current
+            && requestedPage === prResultsPageRef.current
+            && sequence > coordinator.appliedSequence
+          ) {
+            coordinator.appliedSequence = sequence;
+            const byResultKey = new Map<string, PRReviewResult>();
+            results.forEach((result) => {
+              if (!byResultKey.has(result.result_key)) {
+                byResultKey.set(result.result_key, result);
+              }
+            });
+            const nextResults = [...byResultKey.values()];
+            prResultIdentityRef.current = new Map(nextResults.map((result) => [result.result_key, {
+              reviewId: result.review_id,
+              headSha: result.head_sha,
+            }]));
+            setPRReviewResults(nextResults);
+            setPRResultsHasNext(results.length === PR_RESULTS_PAGE_SIZE);
+            setRerunErrors((current) => Object.fromEntries(Object.entries(current).filter(([key, error]) => {
+              const identity = prResultIdentityRef.current.get(key);
+              return identity?.reviewId === error.sourceReviewId && identity.headSha === error.sourceHeadSha;
+            })));
+            setRerunStarted((current) => Object.fromEntries(Object.entries(current).filter(([key, started]) => {
+              const identity = prResultIdentityRef.current.get(key);
+              return identity?.reviewId === started.sourceReviewId && identity.headSha === started.sourceHeadSha;
+            })));
+            setPRResultsError(null);
+          }
+        } catch (error) {
+          lastRequestOk = false;
+          if (
+            prResultsMountedRef.current
+            && mountGeneration === prResultsMountGenerationRef.current
+            && requestedPage === prResultsPageRef.current
+            && sequence > coordinator.appliedSequence
+          ) {
+            coordinator.appliedSequence = sequence;
+            setPRResultsError(error instanceof Error ? error.message : String(error));
+          }
+        }
+      } while (coordinator.trailing && prResultsMountedRef.current);
+      coordinator.running = false;
+      if (prResultsMountedRef.current) setPRResultsRefreshing(false);
+      const waiters = coordinator.waiters.splice(0);
+      waiters.forEach((waiter) => waiter(lastRequestOk));
+    })();
+  }), []);
+
+  useEffect(() => {
+    prResultsMountedRef.current = true;
+    prResultsMountGenerationRef.current += 1;
+    void refreshPRReviewResults();
+    const interval = window.setInterval(refreshPRReviewResults, 15000);
+    return () => {
+      window.clearInterval(interval);
+      prResultsMountedRef.current = false;
+      prResultsMountGenerationRef.current += 1;
+    };
+  }, [prResultsPage, refreshPRReviewResults]);
+
+  const openPRReviewDetail = useCallback((result: PRReviewResult, reviewId?: number) => {
+    const targetReviewId = reviewId ?? result.review_id;
+    if (targetReviewId == null) return;
+    window.location.hash = `#/pr-monitor?repo=${result.repo_id}&review=${targetReviewId}`;
+  }, []);
+
+  const createPRFollowUp = useCallback((result: PRReviewResult) => {
+    const prUrl = canonicalGitHubPRUrl(result.pr_url, result.repo_full_name, result.pr_number);
+    const verdict = result.aggregate_verdict === 'changes_required'
+      ? 'Changes required'
+      : result.aggregate_verdict === 'pass'
+        ? 'Pass'
+        : 'Unavailable';
+    setTaskPrefill({
+      key: `${result.result_key}:${Date.now()}`,
+      description: [
+        `Follow up PR ${result.repo_full_name}#${result.pr_number}: ${result.pr_title}`,
+        prUrl ? `PR: ${prUrl}` : null,
+        `Reviewed head: ${result.head_sha || 'unknown'}`,
+        `Code verdict: ${verdict}`,
+        result.display_summary ? `Review summary: ${result.display_summary}` : null,
+      ].filter(Boolean).join('\n'),
+    });
+  }, []);
+
+  const rerunPRReview = useCallback(async (result: PRReviewResult) => {
+    if (result.review_id == null || !result.head_sha || rerunPendingKey != null) return;
+    const resultKey = result.result_key;
+    setRerunPendingKey(resultKey);
+    setRerunErrors((current) => {
+      const next = { ...current };
+      delete next[resultKey];
+      return next;
+    });
+    const priorAttempt = rerunIdempotencyRef.current.get(resultKey);
+    const attempt = priorAttempt
+      && priorAttempt.sourceReviewId === result.review_id
+      && priorAttempt.headSha === result.head_sha
+      ? priorAttempt
+      : {
+          sourceReviewId: result.review_id,
+          headSha: result.head_sha,
+          key: typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `pr-rerun-${result.review_id}-${Date.now()}`,
+        };
+    rerunIdempotencyRef.current.set(resultKey, attempt);
+    try {
+      const startedReview = await api.rerunPRReview(result.review_id, result.head_sha, attempt.key);
+      rerunIdempotencyRef.current.delete(resultKey);
+      const currentIdentity = prResultIdentityRef.current.get(resultKey);
+      if (
+        currentIdentity?.reviewId !== result.review_id
+        || currentIdentity.headSha !== result.head_sha
+      ) {
+        setRerunPendingKey(null);
+        return;
+      }
+      setRerunStarted((current) => ({
+        ...current,
+        [resultKey]: {
+          sourceReviewId: result.review_id!,
+          sourceHeadSha: result.head_sha!,
+          reviewId: startedReview.id,
+          message: 'Exact-head review started.',
+        },
+      }));
+    } catch (error) {
+      const currentIdentity = prResultIdentityRef.current.get(resultKey);
+      if (
+        currentIdentity?.reviewId === result.review_id
+        && currentIdentity.headSha === result.head_sha
+      ) {
+        setRerunErrors((current) => ({
+          ...current,
+          [resultKey]: {
+            sourceReviewId: result.review_id!,
+            sourceHeadSha: result.head_sha!,
+            message: error instanceof Error ? error.message : String(error),
+          },
+        }));
+      }
+      setRerunPendingKey(null);
+      return;
+    }
+    const refreshed = await refreshPRReviewResults();
+    if (!refreshed) {
+      setRerunStarted((current) => ({
+        ...current,
+        [resultKey]: current[resultKey] ? {
+          ...current[resultKey],
+          message: 'Exact-head review started. The result refresh was delayed and will retry automatically.',
+        } : current[resultKey],
+      }));
+    }
+    setRerunPendingKey(null);
+  }, [refreshPRReviewResults, rerunPendingKey]);
 
   const [isWide, setIsWide] = useState(() => window.innerWidth >= 1280);
   useEffect(() => {
@@ -606,9 +830,92 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
       </div>
   );
 
+  const showPRReviewResults = prReviewResults.length > 0
+    || Boolean(prResultsError)
+    || prResultsRefreshing
+    || prResultsPage > 1;
+  const prReviewResultsContent = (
+    <>
+      {showPRReviewResults && (
+        <section aria-label="PR review results" className="space-y-3">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <h2 className="text-sm font-semibold text-gray-200">PR Review Results</h2>
+              <p className="text-xs text-gray-500">
+                Read-only results in a separate feed; internal Reviewer Tasks stay hidden and Task filters do not apply.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void refreshPRReviewResults()}
+              disabled={prResultsRefreshing}
+              className="rounded px-2 py-1 text-xs text-gray-400 hover:bg-gray-800 hover:text-gray-200 disabled:cursor-wait disabled:opacity-50"
+            >
+              {prResultsRefreshing ? 'Refreshing…' : 'Refresh'}
+            </button>
+          </div>
+          {prResultsError && (
+            <p role="alert" className="rounded border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
+              Unable to load PR review results: {prResultsError}
+            </p>
+          )}
+          <div className="grid gap-3">
+            {prReviewResults.map((result) => {
+              const startedReview = rerunStarted[result.result_key];
+              const matchingStartedReview = startedReview?.sourceReviewId === result.review_id
+                && startedReview.sourceHeadSha === result.head_sha
+                ? startedReview
+                : null;
+              const rerunError = rerunErrors[result.result_key];
+              const matchingRerunError = rerunError?.sourceReviewId === result.review_id
+                && rerunError.sourceHeadSha === result.head_sha
+                ? rerunError.message
+                : null;
+              return (
+                <PRReviewResultCard
+                  key={result.result_key}
+                  result={result}
+                  onOpenDetail={openPRReviewDetail}
+                  onCreateFollowUp={createPRFollowUp}
+                  onRerun={rerunPRReview}
+                  rerunPending={rerunPendingKey === result.result_key}
+                  rerunError={matchingRerunError}
+                  rerunSuccess={matchingStartedReview ? {
+                    reviewId: matchingStartedReview.reviewId,
+                    message: matchingStartedReview.message,
+                  } : null}
+                />
+              );
+            })}
+          </div>
+          <div className="flex items-center justify-center gap-3 pt-1">
+            <button
+              type="button"
+              onClick={() => setPRResultsPage((current) => Math.max(1, current - 1))}
+              disabled={prResultsPage <= 1 || prResultsRefreshing}
+              className="rounded px-2 py-1 text-xs text-gray-400 hover:bg-gray-800 hover:text-gray-200 disabled:opacity-30"
+            >
+              Previous results
+            </button>
+            <span className="text-xs text-gray-500">Results page {prResultsPage}</span>
+            <button
+              type="button"
+              onClick={() => setPRResultsPage((current) => current + 1)}
+              disabled={!prResultsHasNext || prResultsRefreshing}
+              className="rounded px-2 py-1 text-xs text-gray-400 hover:bg-gray-800 hover:text-gray-200 disabled:opacity-30"
+            >
+              Older results
+            </button>
+          </div>
+        </section>
+      )}
+    </>
+  );
+
   const taskListContent = (
     <>
-      <TaskForm onCreated={refresh} />
+      <TaskForm onCreated={refresh} prefill={taskPrefill} />
+      {prReviewResultsContent}
       {filterControls}
 
       <TaskList
@@ -874,8 +1181,15 @@ export function TasksPage({ chatTaskId, onChatTaskChange }: TasksPageProps) {
             </button>
           </div>
         )}
-        <div className="flex-1 min-w-0">
-          {chatPanel}
+        <div className="flex min-w-0 flex-1 flex-col">
+          {showPRReviewResults && (
+            <div className="max-h-[35vh] shrink-0 overflow-y-auto border-b border-gray-800 p-3">
+              {prReviewResultsContent}
+            </div>
+          )}
+          <div className="min-h-0 flex-1">
+            {chatPanel}
+          </div>
         </div>
         </div>
         {teamShareModal}

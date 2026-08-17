@@ -856,6 +856,166 @@ async def test_clean_panel_arms_frozen_direct_auto_merge(
 
 
 @pytest.mark.asyncio
+async def test_panel_freezes_final_role_before_github_identity_and_retries(
+    db_session,
+    db_factory,
+):
+    repo = MonitoredRepo(
+        repo_full_name="owner/repo",
+        webhook_secret="s" * 64,
+        provider="claude",
+        review_model="claude-sonnet-4-6",
+        review_mode="panel",
+        wait_for_ci=False,
+        auto_merge=False,
+        default_branch="main",
+        allowed_authors=[],
+    )
+    db_session.add(repo)
+    await db_session.commit()
+    review = await pr_review_panel.create_pr_review_panel(
+        db_session,
+        repo,
+        PR_DATA,
+        prepared_context=_context(),
+    )
+    review_id = review.id
+    runs = list((await db_session.execute(
+        select(PRReviewerRun)
+        .where(PRReviewerRun.pr_review_id == review_id)
+        .order_by(PRReviewerRun.id)
+    )).scalars())
+    specs = [
+        (item.id, item.role, item.task_id)
+        for item in runs
+    ]
+    identity_observations = 0
+
+    async def fail_identity_after_observing_commit():
+        nonlocal identity_observations
+        identity_observations += 1
+        async with db_factory() as observer:
+            stored_review = await observer.get(PRReview, review_id)
+            stored_runs = list((await observer.execute(
+                select(PRReviewerRun)
+                .where(PRReviewerRun.pr_review_id == review_id)
+                .order_by(PRReviewerRun.id)
+            )).scalars())
+            stored_findings = list((await observer.execute(
+                select(PRFinding).where(PRFinding.pr_review_id == review_id)
+            )).scalars())
+            assert stored_review is not None
+            assert stored_review.status == "reviewing"
+            assert stored_review.publication_state == "reconciling"
+            assert [item.verdict for item in stored_runs] == [
+                "pass",
+                "pass",
+                "changes_required",
+            ]
+            assert stored_runs[-1].status == "reviewing"
+            assert len(stored_findings) == 1
+            assert stored_findings[0].reviewer_run_id == stored_runs[-1].id
+        raise pr_review_service.GhError("gh auth unavailable")
+
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            AsyncMock(side_effect=fail_identity_after_observing_commit),
+        ),
+        patch.object(
+            pr_review_service,
+            "_resume_publishing_review",
+            AsyncMock(),
+        ) as publish,
+    ):
+        results = []
+        for index, (run_id, role, task_id) in enumerate(specs):
+            task = await db_session.get(Task, task_id, populate_existing=True)
+            now = datetime.utcnow()
+            task.status = "completed"
+            task.started_at = now
+            task.completed_at = now
+            db_session.add(LogEntry(
+                task_id=task.id,
+                task_retry_count=task.retry_count,
+                event_type="result",
+                role="assistant",
+                content=_output(role, blocker=index == 2),
+                timestamp=now,
+            ))
+            await db_session.commit()
+            results.append(await pr_review_panel.check_and_update_reviewer_run(
+                db_session,
+                reviewer_run_id=run_id,
+                task_id=task_id,
+                retry_count=task.retry_count,
+                db_factory=db_factory,
+            ))
+
+    assert results == [True, True, False]
+    assert identity_observations == 1
+    publish.assert_not_awaited()
+    transient = await db_session.get(
+        PRReview,
+        review_id,
+        populate_existing=True,
+    )
+    assert transient.status == "reviewing"
+    assert transient.publication_state == "reconciling"
+    assert transient.failure_stage == "github_identity"
+    assert "gh auth unavailable" in transient.publication_error
+
+    final_run_id, _role, final_task_id = specs[-1]
+    final_task = await db_session.get(
+        Task,
+        final_task_id,
+        populate_existing=True,
+    )
+    with (
+        patch.object(
+            pr_review_service,
+            "_gh_authenticated_login",
+            AsyncMock(return_value="ccm-reviewer"),
+        ),
+        patch.object(
+            pr_review_service,
+            "_resume_publishing_review",
+            AsyncMock(),
+        ) as publish,
+    ):
+        assert await pr_review_panel.check_and_update_reviewer_run(
+            db_session,
+            reviewer_run_id=final_run_id,
+            task_id=final_task_id,
+            retry_count=final_task.retry_count,
+            db_factory=db_factory,
+        ) is True
+
+    completed = await db_session.get(
+        PRReview,
+        review_id,
+        populate_existing=True,
+    )
+    completed_run = await db_session.get(
+        PRReviewerRun,
+        final_run_id,
+        populate_existing=True,
+    )
+    finding_count = len(list((await db_session.execute(
+        select(PRFinding).where(PRFinding.pr_review_id == review_id)
+    )).scalars()))
+    assert completed.status == "publishing"
+    assert completed.pending_action == "review_comments"
+    assert completed.publication_state == "publishing"
+    assert completed.failure_stage is None
+    assert completed.publication_error is None
+    assert completed_run.status == "changes_required"
+    assert finding_count == 1
+    publish.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("auto_merge", "thread_status"),
     [
@@ -1919,7 +2079,10 @@ async def test_waiting_ci_oversize_fails_closed_once_after_ci_passes(
         pr_data=PR_DATA,
     )
     admission_error = pr_review_service.PRReviewInputTooLarge(
-        "unsupported_input_size: qa_engineer reviewer exceeds the safe limit"
+        "unsupported_input_size: qa_engineer reviewer exceeds the safe limit",
+        measured=120_001,
+        limit=120_000,
+        unit="characters",
     )
 
     with (
@@ -1957,12 +2120,16 @@ async def test_waiting_ci_oversize_fails_closed_once_after_ci_passes(
     assert refreshed.status == "error"
     assert refreshed.action_taken == "error"
     assert refreshed.ci_status == "passed"
-    assert refreshed.review_summary == str(admission_error)
+    assert refreshed.failure_stage == "reviewer"
+    assert refreshed.publication_state == "not_applicable"
+    assert refreshed.error_category == "unsupported_input_size"
+    assert refreshed.error_measured == 120_001
+    assert refreshed.error_limit == 120_000
+    assert refreshed.error_unit == "characters"
+    assert refreshed.review_summary == admission_error.public_detail
     assert refreshed.completed_at is not None
     assert refreshed_monitor.status == "paused"
-    assert refreshed_monitor.pause_reason.startswith(
-        f"review_error:{review.id}:unsupported_input_size:"
-    )
+    assert refreshed_monitor.pause_reason == "review_input_too_large"
     assert runs == []
 
 

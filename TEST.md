@@ -376,6 +376,12 @@ websocket identity 校验及固定端口上的孤儿 Chrome 不会被复用；
 | `test_webhook_non_pull_request_event_ignored` / `test_webhook_draft_pr_ignored` / `test_webhook_wrong_base_branch_ignored` / `test_webhook_author_not_allowed_ignored` | 各类过滤条件忽略 |
 | `test_webhook_duplicate_opened_ignored_while_in_progress` | 进行中重复 opened 事件去重 |
 | `test_webhook_synchronize_supersedes_old_review` | synchronize 将旧 review 标记 superseded 并新建 |
+| PR result projection verdict/publication/lifecycle matrix | 已有 aggregate verdict 时，publication stale/failed/not-applicable 不得改成 infrastructure error 或 no-verdict；只有 Reviewer 结果不可用时才返回 `verdict_state=unavailable`，并精确标记 `failure_stage` |
+| PR result feed public-field allowlist | `GET /api/pr-monitor/results` 对新记录一 Run 一项、Panel 不展开；缺少可靠 Run 快照的历史 Single 以不可重跑的 `review:<id>` 项展示；不返回内部 Task ID、prompt、patch、session、nonce、pending body 或原始协议字段 |
+| immutable publication evidence | 成功写入或恢复对账后保留 actor/time/GitHub Review ID/URL/`github_event=COMMENT`；后续 lifecycle 变化不清空，浏览器 Connector/Codex 登录态不能冒充 CCM publisher |
+| exact-head rerun admission/idempotency | `POST /reviews/{id}/rerun` 必须匹配 current open/non-draft exact head；重复 idempotency key 不双建，head/PR lifecycle 漂移拒绝且旧 history/evidence 保留 |
+| terminal/reopen webhook matrix | `closed` 分别收口 closed/merged：terminal intent 阻止新 effect，未 dispatch 工作直接取消，已开始的外部 effect 等待安全对账；`reopened`/`ready_for_review` 对当前 subject 重新 admission；迟到 callback 不得把终态 Run 翻回 paused/reviewing |
+| Delivery-owned webhook isolation | exact Delivery edge 与 adoption pre-bind（active subject + reserved marker）下的 `synchronize`/`reopened`/`ready_for_review` 均 409；Run/current Review/terminal evidence、Task/ReviewerRun 计数不变，且不得调用 GitHub effect |
 
 #### `test_mcp_server.py` — MCP Server 工具
 
@@ -843,7 +849,7 @@ Codex Fast 人工 smoke 使用隔离账号且会消耗额度：同一支持模�
 | 测试 | 验证内容 |
 |------|---------|
 | `test_build_review_prompt_*` | Reviewer prompt 始终禁止 Agent 执行 `gh pr merge`；合并权限只在后端 |
-| `test_fetch_base_guidance_ignores_unmanifested_root_documents` / `test_single_prompt_keeps_the_complete_patch_within_budget` / Panel prompt budget / superseding recovery | Reviewer 仅消费 manifest 显式授权 Guide、紧凑文件清单和完整 patch；legacy 隐式文档/changed-file 全文不会在恢复时回流，超限在 Task 物化前 fail closed |
+| `test_fetch_base_guidance_ignores_unmanifested_root_documents` / `test_single_prompt_keeps_the_complete_patch_within_budget` / Panel prompt budget / superseding recovery | Reviewer 仅消费 manifest 显式授权 Guide、紧凑文件清单和完整 patch；legacy 隐式文档/changed-file base/head 全文不会在恢复时回流。Codex prompt 上限 786,432 字符并预留 262,144 runtime envelope；超限在 Task 物化前以 reviewer input unavailable fail closed，不误称 publication infrastructure error |
 | `test_review_evidence_marker_is_hidden_from_rendered_human_body` / `test_review_evidence_reader_requires_an_exact_final_marker` / `test_find_review_evidence_reads_legacy_visible_marker_for_recovery` | 新 publication 只写末尾 HTML comment，human-visible body 无 nonce/schema；仅精确末尾 current/legacy marker 可恢复，legacy marker 不再写出 |
 | `test_publish_auto_merge_*` / `test_publish_merged_comment_*` | OFF 只发布 ready-to-merge Review；ON 固定 head merge，并以 nonce/head/actor/time 对账最终 merged comment；merge/comment ACK 丢失均不重复写 |
 | `test_delivery_durable_publication_*` | Delivery publication 只能恢复 Run 冻结的 merge policy，错配 outbox fail closed |
@@ -1184,6 +1190,14 @@ cd frontend && npx vitest run src/components/PRReview/FindingActions.test.tsx
 | `test_alembic_migrations.py` | `b7c9e2f4a610` 是唯一 head 且继承 `7a1d4e9c2b60`；fresh schema 含 `pr_finding_actions` 的审计/回执列、active-slot unique、idempotency/check/FK 约束；upgrade→downgrade→upgrade 可逆且 ORM 无漂移 |
 | `FindingActions.test.tsx` | 只有当前 snapshot 可创建 Action；下载成功且 receipt/hash 仍匹配当前候选后才开放确认；轮询、重试对账与错误提示不把 candidate 误报为已 push |
 
+迁移 `b1d7e4a9c302` 的 upgrade 支持 SQLite、PostgreSQL，以及通过版本与
+InnoDB 门控的 MySQL/MariaDB。自动 downgrade 只允许能持有 writer fence 的
+SQLite/PostgreSQL；MySQL/MariaDB 会 fail closed，必须先停写并备份，再通过单独
+验证的人工回滚流程处理。降级恢复旧 subject UNIQUE 时只把所有 key 列均非 NULL 的
+真实冲突视为 rerun；旧 SQLite/PostgreSQL/MySQL 都合法保留的 NULL subject 重复不得误阻断。
+attempt/lineage CHECK 还须允许首次 ready-for-review 的 parentless idempotency key 与
+父 Review `ON DELETE SET NULL` 后的历史 attempt，同时拒绝 attempt 1 指向父 Review。
+
 手动验收：在当前 Panel 的 open Finding 上先记录 Human advice，再生成 AI fix；确认 Task 页面所有公共修改入口返回 409。候选就绪后刷新页面，直接确认应被后端拒绝；下载 diff 并人工核对 target repo、PR、source ref、expected base/head、文件列表和 SHA-256，再确认应只产生一个以旧 head 为唯一 parent 的普通 commit。确认前 retarget PR、删除源分支或另行 push 改变源分支时，CCM 必须报告 stale/lease rejection，且不得重建或覆盖 ref；模拟确认请求超时后重试时，系统必须先用持久 nonce 与 parent 证据对账，不能重复 push。
 
 ### 手动测试: Webhook（需要构造 HMAC 签名）
@@ -1201,6 +1215,38 @@ curl -X POST http://localhost:8000/api/github/webhook \
   -d "$PAYLOAD"
 ```
 
+除 `opened` 外，再以新 delivery id 发送 `ready_for_review`、`closed`（分别含
+`pull_request.merged=false/true`）和 `reopened`。每次都核对 Run 的 lifecycle、旧 Reviewer generation 是否
+终止、迟到 callback 是否被 fencing，以及 reopened 后的 subject 是否与 GitHub 当前 base/head 完全一致。
+对 Delivery-owned Run 重放 `synchronize`、`reopened` 与 `ready_for_review` 时必须得到 409，并核对
+Delivery/Monitor/Review 的 owner edge、终态证据和 current Review 均未变化。
+
+### 结果工作项、发布身份与重新审查
+
+```bash
+# Tasks 页面使用的只读聚合 feed
+curl 'http://localhost:8000/api/pr-monitor/results?page=1&size=20' \
+  -H 'Authorization: Bearer <token>'
+
+# exact-head 重新审查；重复发送同一 key 必须返回同一个 attempt
+curl -X POST http://localhost:8000/api/pr-monitor/reviews/<review_id>/rerun \
+  -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_head_sha":"<40-hex-head>","idempotency_key":"manual-check-1"}'
+```
+
+必须人工核对：
+
+1. Panel 在 Tasks 只出现一张 `PR Review Result` 卡，普通 Task 分页、搜索和操作仍正常；卡片没有 Chat、Retry
+   Task、中断、分享、prompt、session 或日志入口。
+2. 详情分别显示 code verdict、publication、PR lifecycle 和 failure stage。构造“Review 已完成后外部合并 PR”
+   的竞态，应显示原 verdict + merged + publication not applicable，不出现自相矛盾的 no-verdict/infra 文案。
+3. 用运行 CCM 后端的同一系统用户执行 `gh api user --jq .login`，应与成功 publication 的 actor evidence 一致；
+   浏览器 Connector 或 Reviewer Codex 未登录不影响该结果。GitHub 页面上的新 Review event 必须为 COMMENT，
+   内部 pass 在 CCM 中也不能显示为 GitHub Approved。
+4. 在 current open/non-draft head 重审会新增 history；重复 key 不重复创建。随后 push 新 head、close/merge 或转为
+   draft，再提交旧 `expected_head_sha` 必须被拒绝，旧结果不得被覆盖。
+
 ### 前端测试
 
 Markdown 数学公式回归：
@@ -1214,6 +1260,9 @@ Markdown 数学公式回归：
 3. 点击仓库 → 验证详情页、Webhook 配置、复制按钮
 4. 切换 enabled → 验证开关状态
 5. 删除仓库 → 验证列表更新
+6. 导航到 Tasks → 验证 `PR Review Result` 与普通 Task 使用不同只读卡片，点击可进入精确 PR Monitor detail/GitHub
+7. 验证 Changes required、published COMMENT、publication not applicable、closed/merged 和 reviewer unavailable
+   的标签互不覆盖；列表摘要有界，detail 保留全文与 Review History
 
 ## Task 状态同步（status_change 广播收口，2026-07-12）
 

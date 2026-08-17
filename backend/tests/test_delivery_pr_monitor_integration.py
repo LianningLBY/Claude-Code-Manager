@@ -8,9 +8,12 @@ from sqlalchemy import select
 from backend.models.delivery import DeliveryRun
 from backend.models.pr_monitor import (
     MonitoredRepo,
+    PRFinding,
     PRMergeQueueAction,
     PRMonitorRun,
+    PRRepairWake,
     PRReview,
+    PRReviewerRun,
 )
 from backend.models.project import Project
 from backend.models.task import Task
@@ -18,6 +21,7 @@ from backend.services import pr_review_panel
 from backend.services.delivery_pr_policy import frozen_delivery_pr_policy
 from backend.services.delivery_service import value_hash
 from backend.services.pr_monitor_loop import (
+    attach_review_to_run,
     record_blocking_evidence,
     record_gate_pass,
 )
@@ -152,6 +156,74 @@ async def test_delivery_panel_only_monitor_uses_frozen_no_ci_policy(db_session):
 
 
 @pytest.mark.asyncio
+async def test_terminal_delivery_run_cannot_be_reactivated_by_opaque_review(
+    db_session,
+):
+    from backend.services.pr_review_service import PRReviewLifecycleConflict
+
+    repo, monitor, source_review, delivery = await _delivery_review(
+        db_session,
+        suffix="terminal-reopen-fence",
+        auto_repair=False,
+        auto_merge=False,
+        wait_for_ci=False,
+    )
+    terminal_at = datetime.utcnow()
+    delivery.phase = "done"
+    delivery.activity = "terminal"
+    delivery.outcome = "success"
+    delivery.completed_at = terminal_at
+    monitor.status = "closed"
+    monitor.completed_at = terminal_at
+    monitor.terminal_intent_status = "closed"
+    monitor.terminal_intent_base_ref = "main"
+    monitor.terminal_intent_head_sha = HEAD_SHA
+    monitor.terminal_intent_delivery_id = "delivery-terminal"
+    monitor.terminal_intent_observed_at = terminal_at
+    await db_session.commit()
+    monitor_id = monitor.id
+    source_review_id = source_review.id
+
+    replacement = PRReview(
+        attempt=2,
+        rerun_of_review_id=source_review_id,
+        rerun_idempotency_key="wh:opaque-reopened-delivery",
+        repo_id=repo.id,
+        pr_number=monitor.pr_number,
+        base_ref="main",
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+        delivery_id="opaque-github-reopened-delivery",
+        pr_title="Reopened Delivery PR",
+        pr_author="allowed-user",
+        pr_url=source_review.pr_url,
+        status="pending",
+    )
+    db_session.add(replacement)
+    await db_session.flush()
+    replacement_id = replacement.id
+
+    with pytest.raises(PRReviewLifecycleConflict, match="Delivery ownership"):
+        await attach_review_to_run(
+            db_session,
+            repo=repo,
+            review=replacement,
+            allow_terminal_reactivation=True,
+        )
+    await db_session.rollback()
+
+    stored_monitor = await db_session.get(PRMonitorRun, monitor_id)
+    assert stored_monitor.status == "closed"
+    assert stored_monitor.completed_at == terminal_at
+    assert stored_monitor.current_review_id == source_review_id
+    assert stored_monitor.terminal_intent_status == "closed"
+    assert stored_monitor.terminal_intent_delivery_id == "delivery-terminal"
+    assert await db_session.scalar(
+        select(PRReview.id).where(PRReview.id == replacement_id)
+    ) is None
+
+
+@pytest.mark.asyncio
 async def test_delivery_task_never_receives_legacy_pr_repair_wake(db_session):
     repo = MonitoredRepo(
         repo_full_name="owner/delivery",
@@ -204,8 +276,14 @@ async def test_delivery_task_never_receives_legacy_pr_repair_wake(db_session):
         reason_kind="ci_failed",
     )
 
-    assert wake is not None
-    assert wake.status == "shadow"
+    # A CI label without structured exact-head details is not actionable
+    # Repair evidence. Delivery ownership still remains protected, but CCM
+    # does not create an empty shadow instruction merely for audit cosmetics.
+    assert wake is None
+    assert list((await db_session.execute(
+        select(PRRepairWake).where(PRRepairWake.monitor_run_id == run.id)
+    )).scalars()) == []
+    await db_session.refresh(run)
     assert run.status == "waiting_for_fix"
     assert run.repair_attempts == 0
 
@@ -220,6 +298,36 @@ async def test_delivery_marker_suppresses_repair_after_task_binding_is_cleared(
         auto_repair=True,
     )
     assert monitor.developer_task_id is None
+
+    reviewer = PRReviewerRun(
+        pr_review_id=review.id,
+        role="senior_engineer",
+        provider="codex",
+        status="changes_required",
+        prompt_policy_hash="c" * 64,
+        guide_pack_hash="d" * 64,
+    )
+    db_session.add(reviewer)
+    await db_session.flush()
+    db_session.add(PRFinding(
+        pr_review_id=review.id,
+        reviewer_run_id=reviewer.id,
+        fingerprint="e" * 64,
+        thread_nonce="1" * 48,
+        role=reviewer.role,
+        severity="high",
+        category="correctness",
+        path="app.py",
+        line=4,
+        title="Wrong branch",
+        evidence="The false branch returns success.",
+        impact="Invalid input is accepted.",
+        required_fix="Return an error.",
+        test="Exercise invalid input.",
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    ))
+    await db_session.commit()
 
     wake = await record_blocking_evidence(
         db_session,

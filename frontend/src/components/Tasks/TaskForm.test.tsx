@@ -692,6 +692,53 @@ describe('TaskForm persisted defaults', () => {
     });
   });
 });
+
+describe('TaskForm result follow-up prefill', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+  });
+
+  it('loads an explicit PR result draft into the ordinary Task form', async () => {
+    const { rerender } = render(<TaskForm onCreated={vi.fn()} />);
+    const prompt = screen.getByPlaceholderText(/Prompt \/ Description/);
+    expect(prompt).toHaveValue('');
+
+    rerender(
+      <TaskForm
+        onCreated={vi.fn()}
+        prefill={{ key: 'run-41', description: 'Follow up acme/widget#133\nPR: https://github.com/acme/widget/pull/133' }}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(prompt).toHaveValue('Follow up acme/widget#133\nPR: https://github.com/acme/widget/pull/133');
+    });
+    expect(prompt).toHaveFocus();
+  });
+
+  it('does not overwrite an unsaved draft unless the user confirms replacement', async () => {
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const user = userEvent.setup();
+    const { rerender } = render(<TaskForm onCreated={vi.fn()} />);
+    const prompt = screen.getByPlaceholderText(/Prompt \/ Description/);
+    await user.type(prompt, 'Keep my unsaved draft');
+
+    rerender(
+      <TaskForm
+        onCreated={vi.fn()}
+        prefill={{ key: 'run-42', description: 'Replace with PR follow-up' }}
+      />,
+    );
+
+    await waitFor(() => expect(confirm).toHaveBeenCalledWith(
+      'Replace your unsaved Task draft with this PR follow-up?',
+    ));
+    expect(prompt).toHaveValue('Keep my unsaved draft');
+    confirm.mockRestore();
+  });
+});
+
 describe('TaskForm frontend review entry location', () => {
   beforeEach(() => {
     vi.clearAllMocks();

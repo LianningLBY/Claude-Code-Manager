@@ -1,3 +1,6 @@
+from contextlib import asynccontextmanager
+from datetime import datetime
+
 import pytest
 from sqlalchemy import select
 
@@ -20,6 +23,27 @@ from backend.services.pr_monitor_loop import record_gate_pass
 BASE = "a" * 40
 HEAD = "b" * 40
 MERGE = "c" * 40
+
+
+def _transaction_asserting_factory(db_factory):
+    """Expose an assertion used from mocked remote awaits."""
+
+    live_sessions = set()
+
+    @asynccontextmanager
+    async def tracked_factory():
+        async with db_factory() as db:
+            live_sessions.add(db)
+            try:
+                yield db
+            finally:
+                live_sessions.remove(db)
+
+    def assert_no_transaction():
+        assert live_sessions
+        assert all(not db.in_transaction() for db in live_sessions)
+
+    return tracked_factory, assert_no_transaction
 
 
 async def _seed_queue_action(
@@ -124,10 +148,14 @@ async def test_fake_pr_enters_queue_checks_merge_group_and_confirms_merge(
     await record_gate_pass(db_session, review.id)
     action = (await db_session.execute(select(PRMergeQueueAction))).scalar_one()
     assert action.status == "pending"
+    tracked_factory, assert_no_transaction = _transaction_asserting_factory(
+        db_factory
+    )
 
     merged = False
 
     async def fake_pr_view(_number, _repo):
+        assert_no_transaction()
         return {
             "state": "MERGED" if merged else "OPEN",
             "mergedAt": "2026-08-04T00:00:00Z" if merged else None,
@@ -139,13 +167,16 @@ async def test_fake_pr_enters_queue_checks_merge_group_and_confirms_merge(
         }
 
     async def fake_enqueue(_repo, _number, base_ref, base_sha, head_sha):
+        assert_no_transaction()
         assert (base_ref, base_sha, head_sha) == ("main", BASE, HEAD)
         return QueueEntry("MQ1", "QUEUED", "main", BASE, HEAD)
 
     async def fake_entry(_repo, _number):
+        assert_no_transaction()
         return QueueEntry("MQ1", "AWAITING_CHECKS", "main", BASE, HEAD)
 
     async def fake_group(_repo, *, default_branch, pr_number):
+        assert_no_transaction()
         assert (default_branch, pr_number) == ("main", 12)
         return MERGE, "refs/heads/gh-readonly-queue/main/pr-12-deadbeef"
 
@@ -153,7 +184,7 @@ async def test_fake_pr_enters_queue_checks_merge_group_and_confirms_merge(
     monkeypatch.setattr("backend.services.pr_merge_queue._enqueue", fake_enqueue)
     monkeypatch.setattr("backend.services.pr_merge_queue._read_queue_entry", fake_entry)
     monkeypatch.setattr("backend.services.pr_merge_queue._read_merge_group_ref", fake_group)
-    assert await reconcile_merge_queue(db_factory) == 1
+    assert await reconcile_merge_queue(tracked_factory) == 1
     action = await db_session.get(PRMergeQueueAction, action.id, populate_existing=True)
     assert action.status == "queued"
     assert action.github_queue_entry_id == "MQ1"
@@ -164,16 +195,17 @@ async def test_fake_pr_enters_queue_checks_merge_group_and_confirms_merge(
     ) is True
 
     async def fake_ci(_repo, sha, _required):
+        assert_no_transaction()
         assert sha == MERGE
         return "passed", "Passed", {"head_sha": sha, "observed": []}
 
     monkeypatch.setattr("backend.services.pr_review_panel.fetch_exact_head_ci", fake_ci)
-    assert await reconcile_merge_queue(db_factory) == 1
+    assert await reconcile_merge_queue(tracked_factory) == 1
     refreshed_run = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
     assert refreshed_run.status == "merge_group_passed"
 
     merged = True
-    assert await reconcile_merge_queue(db_factory) == 1
+    assert await reconcile_merge_queue(tracked_factory) == 1
     action = await db_session.get(PRMergeQueueAction, action.id, populate_existing=True)
     refreshed_run = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
     assert action.status == "merged"
@@ -393,9 +425,13 @@ async def test_queue_entry_disappearance_rechecks_and_records_racing_merge(
         db_session, name="racing-merge", number=32,
     )
     reads = 0
+    tracked_factory, assert_no_transaction = _transaction_asserting_factory(
+        db_factory
+    )
 
     async def fake_pr_view(_number, _repo_name):
         nonlocal reads
+        assert_no_transaction()
         reads += 1
         merged = reads >= 2
         return {
@@ -407,12 +443,13 @@ async def test_queue_entry_disappearance_rechecks_and_records_racing_merge(
         }
 
     async def no_entry(_repo_name, _number):
+        assert_no_transaction()
         return None
 
     monkeypatch.setattr("backend.services.pr_review_service._gh_pr_view", fake_pr_view)
     monkeypatch.setattr("backend.services.pr_merge_queue._read_queue_entry", no_entry)
 
-    assert await reconcile_merge_queue(db_factory) == 1
+    assert await reconcile_merge_queue(tracked_factory) == 1
     refreshed = await db_session.get(PRMergeQueueAction, action.id, populate_existing=True)
     refreshed_run = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
     assert reads == 2
@@ -421,7 +458,7 @@ async def test_queue_entry_disappearance_rechecks_and_records_racing_merge(
 
 
 @pytest.mark.asyncio
-async def test_queue_entry_disappearance_pauses_when_pr_remains_open(
+async def test_queue_entry_disappearance_records_proven_absence_when_pr_open(
     db_session, db_factory, monkeypatch
 ):
     _repo, run, _review, action = await _seed_queue_action(
@@ -444,8 +481,10 @@ async def test_queue_entry_disappearance_pauses_when_pr_remains_open(
     assert await reconcile_merge_queue(db_factory) == 0
     refreshed = await db_session.get(PRMergeQueueAction, action.id, populate_existing=True)
     refreshed_run = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
-    assert refreshed.status == "paused"
-    assert refreshed.last_error == "merge_queue_entry_disappeared"
+    assert refreshed.status == "failed"
+    assert refreshed.last_error == "merge_queue_remote_absence_proven:open"
+    assert refreshed.github_queue_entry_id is None
+    assert refreshed.completed_at is not None
     assert refreshed_run.status == "paused"
 
 
@@ -476,7 +515,9 @@ async def test_queue_blocked_remote_states_pause_fail_closed(
     assert await reconcile_merge_queue(db_factory) == 0
     refreshed = await db_session.get(PRMergeQueueAction, action.id, populate_existing=True)
     refreshed_run = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
-    assert refreshed.status == "paused"
+    # The Run pauses for operator visibility, but the Action stays active
+    # because the exact remote entry still exists and may later merge.
+    assert refreshed.status == "queued"
     assert refreshed.last_error == f"merge_queue_entry_{remote_state.lower()}"
     assert refreshed_run.status == "paused"
 
@@ -705,7 +746,7 @@ async def test_failed_wrong_subject_cleanup_pauses_high_risk_action(
     refreshed_run = await db_session.get(
         PRMonitorRun, run.id, populate_existing=True
     )
-    assert refreshed.status == "paused"
+    assert refreshed.status == "enqueuing"
     assert refreshed.github_queue_entry_id == "MQ-risk"
     assert refreshed.last_error.startswith("merge_queue_remote_cleanup_failed:")
     assert refreshed_run.status == "paused"
@@ -721,8 +762,12 @@ async def test_enqueue_finalize_cannot_revive_changed_lifecycle(
         status="pending",
     )
     dequeued = []
+    tracked_factory, assert_no_transaction = _transaction_asserting_factory(
+        db_factory
+    )
 
     async def fake_pr_view(_number, _repo_name):
+        assert_no_transaction()
         return {
             "state": "OPEN", "mergedAt": None, "baseRefName": "main",
             "baseRefOid": BASE,
@@ -730,6 +775,7 @@ async def test_enqueue_finalize_cannot_revive_changed_lifecycle(
         }
 
     async def fake_enqueue(*_args, **_kwargs):
+        assert_no_transaction()
         async with db_factory() as concurrent:
             changed_repo = await concurrent.get(MonitoredRepo, repo.id)
             changed_action = await concurrent.get(PRMergeQueueAction, action.id)
@@ -750,6 +796,7 @@ async def test_enqueue_finalize_cannot_revive_changed_lifecycle(
         )
 
     async def fake_dequeue(_repo_name, _number, pull_request_id, entry_id):
+        assert_no_transaction()
         assert pull_request_id == "PR-owned"
         dequeued.append(entry_id)
 
@@ -762,7 +809,7 @@ async def test_enqueue_finalize_cannot_revive_changed_lifecycle(
     monkeypatch.setattr(
         "backend.services.pr_merge_queue._dequeue_queue_entry", fake_dequeue
     )
-    assert await reconcile_merge_queue(db_factory) == 0
+    assert await reconcile_merge_queue(tracked_factory) == 0
     refreshed = await db_session.get(
         PRMergeQueueAction, action.id, populate_existing=True
     )
@@ -774,3 +821,332 @@ async def test_enqueue_finalize_cannot_revive_changed_lifecycle(
     assert refreshed.status != "queued"
     assert refreshed_run.status == "paused"
     assert refreshed_run.status != "merge_queued"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_status", ["paused", "failed"])
+async def test_legacy_terminal_status_with_remote_entry_rejoins_reconciler(
+    db_session,
+    db_factory,
+    monkeypatch,
+    legacy_status,
+):
+    _repo, run, _review, action = await _seed_queue_action(
+        db_session,
+        name=f"legacy-{legacy_status}",
+        number=60 if legacy_status == "paused" else 61,
+        status=legacy_status,
+    )
+    action.attempt_count = 1
+    action.last_error = "merge_queue_entry_unmergeable:legacy"
+    await db_session.commit()
+
+    async def exact_open(_number, _repo_name):
+        return {
+            "state": "OPEN", "mergedAt": None, "baseRefName": "main",
+            "baseRefOid": BASE, "headRefOid": HEAD,
+            "isDraft": False, "mergeCommit": None,
+        }
+
+    async def exact_entry(_repo_name, _number):
+        return QueueEntry(action.github_queue_entry_id, "QUEUED", "main", BASE, HEAD)
+
+    async def no_group(_repo_name, *, default_branch, pr_number):
+        assert default_branch == "main"
+        return None
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_pr_view", exact_open
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry", exact_entry
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_merge_group_ref", no_group
+    )
+
+    assert await reconcile_merge_queue(db_factory) == 1
+    refreshed = await db_session.get(
+        PRMergeQueueAction, action.id, populate_existing=True
+    )
+    refreshed_run = await db_session.get(
+        PRMonitorRun, run.id, populate_existing=True
+    )
+    assert refreshed.status == "queued"
+    assert refreshed.last_error is None
+    assert refreshed_run.status == "merge_queued"
+
+
+@pytest.mark.asyncio
+async def test_legacy_risky_action_settles_only_after_fresh_absence_proof(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    _repo, run, _review, action = await _seed_queue_action(
+        db_session,
+        name="legacy-absence",
+        number=62,
+        status="failed",
+    )
+    action.attempt_count = 1
+    action.last_error = "merge_queue_remote_cleanup_failed:legacy"
+    await db_session.commit()
+    reads = 0
+
+    async def exact_open(_number, _repo_name):
+        return {
+            "state": "OPEN", "mergedAt": None, "baseRefName": "main",
+            "baseRefOid": BASE, "headRefOid": HEAD,
+            "isDraft": False, "mergeCommit": None,
+        }
+
+    async def no_entry(_repo_name, _number):
+        nonlocal reads
+        reads += 1
+        return None
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_pr_view", exact_open
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry", no_entry
+    )
+
+    assert await reconcile_merge_queue(db_factory) == 0
+    refreshed = await db_session.get(
+        PRMergeQueueAction, action.id, populate_existing=True
+    )
+    assert refreshed.status == "failed"
+    assert refreshed.last_error == "merge_queue_remote_absence_proven:open"
+    assert refreshed.github_queue_entry_id is None
+    assert reads == 1
+
+    # The durable receipt removes this terminal-looking row from subsequent
+    # recovery scans despite its historical attempt_count.
+    assert await reconcile_merge_queue(db_factory) == 0
+    assert reads == 1
+
+
+@pytest.mark.asyncio
+async def test_terminal_intent_recovers_legacy_paused_remote_risk(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    _repo, run, _review, action = await _seed_queue_action(
+        db_session,
+        name="legacy-terminal",
+        number=63,
+        status="paused",
+    )
+    action.attempt_count = 1
+    action.last_error = "merge_group_ci_failed:legacy"
+    run.terminal_intent_status = "closed"
+    run.terminal_intent_base_ref = "main"
+    run.terminal_intent_head_sha = HEAD
+    run.terminal_intent_delivery_id = "delivery-closed-63"
+    run.terminal_intent_observed_at = datetime.utcnow()
+    await db_session.commit()
+    tracked_factory, assert_no_transaction = _transaction_asserting_factory(
+        db_factory
+    )
+
+    async def exact_closed(_number, _repo_name):
+        assert_no_transaction()
+        return {
+            "state": "CLOSED", "mergedAt": None,
+            "baseRefName": "main", "baseRefOid": BASE,
+            "headRefOid": HEAD, "isDraft": False, "mergeCommit": None,
+        }
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_pr_view", exact_closed
+    )
+
+    assert await reconcile_merge_queue(tracked_factory) == 1
+    refreshed = await db_session.get(
+        PRMergeQueueAction, action.id, populate_existing=True
+    )
+    assert refreshed.status == "superseded"
+    assert refreshed.completed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_remote_bundle_cas_preserves_concurrent_terminal_intent(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    """A terminal fence written during remote reads wins without a version bump."""
+
+    _repo, run, _review, action = await _seed_queue_action(
+        db_session,
+        name="remote-bundle-terminal-cas",
+        number=66,
+        status="queued",
+    )
+    tracked_factory, assert_no_transaction = _transaction_asserting_factory(
+        db_factory
+    )
+    terminal_observed_at = datetime.utcnow()
+
+    async def exact_open(_number, _repo_name):
+        assert_no_transaction()
+        return {
+            "state": "OPEN", "mergedAt": None,
+            "baseRefName": "main", "baseRefOid": BASE,
+            "headRefOid": HEAD, "isDraft": False, "mergeCommit": None,
+        }
+
+    async def entry_then_terminal_intent(_repo_name, _number):
+        assert_no_transaction()
+        async with db_factory() as concurrent:
+            changed = await concurrent.get(PRMonitorRun, run.id)
+            original_version = changed.state_version
+            changed.terminal_intent_status = "closed"
+            changed.terminal_intent_base_ref = "main"
+            changed.terminal_intent_head_sha = HEAD
+            changed.terminal_intent_delivery_id = "terminal-during-remote-bundle"
+            changed.terminal_intent_observed_at = terminal_observed_at
+            # The terminal-intent protocol intentionally need not increment
+            # state_version. The complete row generation must still fence it.
+            assert changed.state_version == original_version
+            await concurrent.commit()
+        return QueueEntry("MQ-66", "QUEUED", "main", BASE, HEAD)
+
+    async def no_group(_repo_name, *, default_branch, pr_number):
+        assert_no_transaction()
+        assert (default_branch, pr_number) == ("main", 66)
+        return None
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_pr_view",
+        exact_open,
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry",
+        entry_then_terminal_intent,
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_merge_group_ref",
+        no_group,
+    )
+
+    assert await reconcile_merge_queue(tracked_factory) == 0
+    preserved_run = await db_session.get(
+        PRMonitorRun,
+        run.id,
+        populate_existing=True,
+    )
+    preserved_action = await db_session.get(
+        PRMergeQueueAction,
+        action.id,
+        populate_existing=True,
+    )
+    assert preserved_run.terminal_intent_status == "closed"
+    assert preserved_run.terminal_intent_head_sha == HEAD
+    assert preserved_run.terminal_intent_delivery_id == (
+        "terminal-during-remote-bundle"
+    )
+    assert preserved_action.status == "queued"
+    assert preserved_action.last_error is None
+
+
+@pytest.mark.asyncio
+async def test_new_head_with_removed_queue_entry_settles_old_action(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    _repo, run, _review, action = await _seed_queue_action(
+        db_session,
+        name="pushed-head-removed-entry",
+        number=64,
+        status="queued",
+    )
+    new_head = "d" * 40
+    tracked_factory, assert_no_transaction = _transaction_asserting_factory(
+        db_factory
+    )
+
+    async def pushed_open(_number, _repo_name):
+        assert_no_transaction()
+        return {
+            "state": "OPEN", "mergedAt": None, "baseRefName": "main",
+            "baseRefOid": BASE, "headRefOid": new_head,
+            "isDraft": False, "mergeCommit": None,
+        }
+
+    async def no_entry(_repo_name, _number):
+        assert_no_transaction()
+        return None
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_pr_view", pushed_open
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry", no_entry
+    )
+
+    assert await reconcile_merge_queue(tracked_factory) == 1
+    refreshed = await db_session.get(
+        PRMergeQueueAction, action.id, populate_existing=True
+    )
+    refreshed_run = await db_session.get(
+        PRMonitorRun, run.id, populate_existing=True
+    )
+    assert refreshed.status == "failed"
+    assert refreshed.last_error == (
+        "merge_queue_remote_absence_proven:subject_changed"
+    )
+    assert refreshed.github_queue_entry_id is None
+    assert refreshed_run.status == "paused"
+
+
+@pytest.mark.asyncio
+async def test_new_head_with_live_different_queue_entry_stays_active(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    _repo, run, _review, action = await _seed_queue_action(
+        db_session,
+        name="pushed-head-live-entry",
+        number=65,
+        status="queued",
+    )
+    original_entry_id = action.github_queue_entry_id
+    new_head = "e" * 40
+
+    async def pushed_open(_number, _repo_name):
+        return {
+            "state": "OPEN", "mergedAt": None, "baseRefName": "main",
+            "baseRefOid": BASE, "headRefOid": new_head,
+            "isDraft": False, "mergeCommit": None,
+        }
+
+    async def different_live_entry(_repo_name, _number):
+        return QueueEntry("MQ-manual-new-head", "QUEUED", "main", BASE, new_head)
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_pr_view", pushed_open
+    )
+    monkeypatch.setattr(
+        "backend.services.pr_merge_queue._read_queue_entry",
+        different_live_entry,
+    )
+
+    assert await reconcile_merge_queue(db_factory) == 0
+    refreshed = await db_session.get(
+        PRMergeQueueAction, action.id, populate_existing=True
+    )
+    refreshed_run = await db_session.get(
+        PRMonitorRun, run.id, populate_existing=True
+    )
+    assert refreshed.status == "queued"
+    assert refreshed.github_queue_entry_id == original_entry_id
+    assert refreshed.last_error == (
+        "merge_queue_pr_subject_changed_remote_entry_present"
+    )
+    assert refreshed_run.status == "paused"

@@ -8,6 +8,7 @@ import logging
 import re
 import secrets
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +20,9 @@ from backend.models.pr_monitor import (
     PRFinding,
     PRMonitorRun,
     PRReview,
+    pr_monitor_run_no_terminal_intent_predicate,
     PRReviewerRun,
+    pr_monitor_run_has_terminal_intent,
 )
 from backend.models.task import Task
 from backend.services.task_creation import system_task_execution_principal_values
@@ -541,6 +544,9 @@ async def create_pr_review_panel(
         raise ValueError("panel PR review preflight returned a single prompt")
     nonce = secrets.token_hex(24)
     review = PRReview(
+        attempt=pr_data.get("_review_attempt", 1),
+        rerun_of_review_id=pr_data.get("_rerun_of_review_id"),
+        rerun_idempotency_key=pr_data.get("_rerun_idempotency_key"),
         repo_id=repo.id,
         pr_number=pr_number,
         base_ref=base_ref,
@@ -585,6 +591,9 @@ async def create_waiting_ci_review(
     if not _valid_base_ref(base_ref):
         raise ValueError("invalid PR base ref")
     review = PRReview(
+        attempt=pr_data.get("_review_attempt", 1),
+        rerun_of_review_id=pr_data.get("_rerun_of_review_id"),
+        rerun_idempotency_key=pr_data.get("_rerun_idempotency_key"),
         repo_id=repo.id,
         pr_number=pr_number,
         base_ref=base_ref,
@@ -934,6 +943,83 @@ async def fetch_exact_head_ci(
     return "passed", f"{len(normalized)} required exact-head CI checks passed", details
 
 
+def _exact_head_ci_policy_hash(
+    repo_name: str,
+    head_sha: str,
+    required_checks: object,
+) -> str:
+    """Bind lock-free CI evidence to one exact repository policy/subject."""
+
+    if not isinstance(repo_name, str) or not isinstance(head_sha, str):
+        raise ValueError("CI evidence subject is malformed")
+    try:
+        encoded = json.dumps(
+            {
+                "repo_name": repo_name,
+                "head_sha": head_sha,
+                "required_checks": required_checks or [],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("required CI policy is not canonical JSON") from exc
+    return hashlib.sha256(encoded).hexdigest()
+
+
+async def capture_exact_head_ci_evidence(
+    repo_name: str,
+    head_sha: str,
+    required_checks: list[dict] | None,
+) -> dict:
+    """Fetch CI without a DB connection and freeze its exact policy binding."""
+
+    status, summary, details = await fetch_exact_head_ci(
+        repo_name,
+        head_sha,
+        required_checks,
+    )
+    return {
+        "version": 1,
+        "policy_hash": _exact_head_ci_policy_hash(
+            repo_name,
+            head_sha,
+            required_checks,
+        ),
+        "status": status,
+        "summary": summary,
+        "details": details,
+    }
+
+
+def validated_exact_head_ci_evidence(
+    evidence: object,
+    *,
+    repo_name: str,
+    head_sha: str,
+    required_checks: list[dict] | None,
+) -> tuple[str, str, dict]:
+    """Consume only CI evidence captured for the current locked policy."""
+
+    if not isinstance(evidence, dict) or evidence.get("version") != 1:
+        raise ValueError("exact-head CI evidence is missing")
+    status = evidence.get("status")
+    summary = evidence.get("summary")
+    details = evidence.get("details")
+    if (
+        evidence.get("policy_hash")
+        != _exact_head_ci_policy_hash(repo_name, head_sha, required_checks)
+        or status not in {"pending", "failed", "missing", "passed"}
+        or not isinstance(summary, str)
+        or len(summary.encode("utf-8")) > 20_000
+        or not isinstance(details, dict)
+        or details.get("head_sha") != head_sha
+    ):
+        raise ValueError("exact-head CI evidence does not match current policy")
+    return status, summary, details
+
+
 async def _fail_waiting_ci_input(
     db_factory,
     *,
@@ -941,6 +1027,8 @@ async def _fail_waiting_ci_input(
     error: Exception,
 ) -> bool:
     """Terminalize one deterministic post-CI reviewer admission failure."""
+
+    from backend.services.pr_review_service import PRReviewInputTooLarge
 
     async with db_factory() as db:
         # Preserve the global PRMonitorRun -> PRReview lock order.  A newer
@@ -982,7 +1070,16 @@ async def _fail_waiting_ci_input(
         review.status = "error"
         review.action_taken = "error"
         review.ci_status = "passed"
-        review.review_summary = str(error)[:2000]
+        review.failure_stage = "reviewer"
+        if isinstance(error, PRReviewInputTooLarge):
+            review.review_summary = error.public_detail
+            review.error_category = error.category
+            review.error_measured = error.measured
+            review.error_limit = error.limit
+            review.error_unit = error.unit
+            review.publication_state = "not_applicable"
+        else:
+            review.review_summary = str(error)[:2000]
         review.completed_at = datetime.utcnow()
         if monitor_run is not None:
             from backend.services.pr_monitor_loop import (
@@ -1000,6 +1097,7 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
     from backend.services.pr_review_service import (
         PRReviewInputTooLarge,
         prepare_pr_review_context,
+        preflight_pr_review_prompts,
         verify_pr_review_snapshot_current,
     )
 
@@ -1007,8 +1105,10 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
         ids = list((await db.execute(
             select(PRReview.id)
             .join(MonitoredRepo, MonitoredRepo.id == PRReview.repo_id)
+            .join(PRMonitorRun, PRMonitorRun.current_review_id == PRReview.id)
             .where(
                 PRReview.status == "waiting_ci",
+                pr_monitor_run_no_terminal_intent_predicate(),
                 MonitoredRepo.enabled.is_(True),
                 MonitoredRepo.review_mode == "panel",
                 MonitoredRepo.wait_for_ci.is_(True),
@@ -1031,8 +1131,20 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
                     or review.head_sha is None
                 ):
                     continue
+                monitor = (
+                    await db.get(
+                        PRMonitorRun,
+                        review.monitor_run_id,
+                        populate_existing=True,
+                    )
+                    if review.monitor_run_id is not None
+                    else None
+                )
+                if monitor is None:
+                    continue
                 pr_data = {
                     "number": review.pr_number,
+                    "base_ref": review.base_ref,
                     "base_sha": review.base_sha,
                     "head_sha": review.head_sha,
                     "delivery_id": review.delivery_id,
@@ -1040,39 +1152,153 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
                     "author": review.pr_author,
                     "url": review.pr_url,
                 }
-                ci_status, ci_summary, ci_details = await fetch_exact_head_ci(
-                    repo.repo_full_name,
-                    review.head_sha,
-                    repo.required_checks,
+                repo_id = repo.id
+                monitor_id = monitor.id
+                repo_snapshot = SimpleNamespace(
+                    id=repo.id,
+                    repo_full_name=repo.repo_full_name,
+                    default_branch=repo.default_branch,
+                    auto_merge=bool(repo.auto_merge),
+                    provider=repo.provider,
+                    review_mode=repo.review_mode,
+                    wait_for_ci=bool(repo.wait_for_ci),
+                    required_checks=list(repo.required_checks or []),
                 )
-                review.ci_status = ci_status
-                review.ci_summary = ci_summary
-                review.ci_details = ci_details
+                observed_review_generation = (
+                    review.status,
+                    review.monitor_run_id,
+                    review.base_ref,
+                    review.base_sha,
+                    review.head_sha,
+                    review.completed_at,
+                )
+                observed_run_generation = (
+                    monitor.id,
+                    monitor.state_version,
+                    monitor.status,
+                    monitor.current_review_id,
+                    monitor.current_base_sha,
+                    monitor.current_head_sha,
+                    monitor.completed_at,
+                    monitor.terminal_intent_status,
+                )
+                await db.rollback()
+
+                ci_evidence = await capture_exact_head_ci_evidence(
+                    repo_snapshot.repo_full_name,
+                    pr_data["head_sha"],
+                    repo_snapshot.required_checks,
+                )
+                ci_status, ci_summary, ci_details = (
+                    validated_exact_head_ci_evidence(
+                        ci_evidence,
+                        repo_name=repo_snapshot.repo_full_name,
+                        head_sha=pr_data["head_sha"],
+                        required_checks=repo_snapshot.required_checks,
+                    )
+                )
                 if ci_status != "passed":
+                    locked_repo = (
+                        await db.execute(
+                            select(MonitoredRepo)
+                            .where(MonitoredRepo.id == repo_id)
+                            .with_for_update()
+                            .execution_options(populate_existing=True)
+                        )
+                    ).scalar_one_or_none()
+                    if (
+                        locked_repo is None
+                        or not locked_repo.enabled
+                        or locked_repo.review_mode != "panel"
+                        or not locked_repo.wait_for_ci
+                    ):
+                        await db.rollback()
+                        continue
+                    try:
+                        ci_status, ci_summary, ci_details = (
+                            validated_exact_head_ci_evidence(
+                                ci_evidence,
+                                repo_name=locked_repo.repo_full_name,
+                                head_sha=pr_data["head_sha"],
+                                required_checks=locked_repo.required_checks,
+                            )
+                        )
+                    except ValueError:
+                        # An administrator changed the repository name or CI
+                        # policy while the lock-free fetch was in flight.  The
+                        # next bounded pass captures fresh evidence instead of
+                        # committing stale status to the current Run.
+                        await db.rollback()
+                        continue
+                    locked_run = (
+                        await db.execute(
+                            select(PRMonitorRun)
+                            .where(PRMonitorRun.id == monitor_id)
+                            .with_for_update()
+                            .execution_options(populate_existing=True)
+                        )
+                    ).scalar_one_or_none()
+                    locked_review = (
+                        await db.execute(
+                            select(PRReview)
+                            .where(PRReview.id == review_id)
+                            .with_for_update()
+                            .execution_options(populate_existing=True)
+                        )
+                    ).scalar_one_or_none()
+                    if (
+                        locked_review is None
+                        or locked_run is None
+                        or (
+                            locked_review.status,
+                            locked_review.monitor_run_id,
+                            locked_review.base_ref,
+                            locked_review.base_sha,
+                            locked_review.head_sha,
+                            locked_review.completed_at,
+                        )
+                        != observed_review_generation
+                        or (
+                            locked_run.id,
+                            locked_run.state_version,
+                            locked_run.status,
+                            locked_run.current_review_id,
+                            locked_run.current_base_sha,
+                            locked_run.current_head_sha,
+                            locked_run.completed_at,
+                            locked_run.terminal_intent_status,
+                        )
+                        != observed_run_generation
+                    ):
+                        await db.rollback()
+                        continue
+                    locked_review.ci_status = ci_status
+                    locked_review.ci_summary = ci_summary
+                    locked_review.ci_details = ci_details
                     await db.commit()
-                    if ci_status == "failed" and review.monitor_run_id is not None:
+                    if ci_status == "failed":
                         from backend.services.pr_monitor_loop import record_blocking_evidence
                         await record_blocking_evidence(
                             db,
-                            review_id=review.id,
+                            review_id=review_id,
                             reason_kind="ci_failed",
                         )
                     continue
                 await verify_pr_review_snapshot_current(
-                    repo,
+                    repo_snapshot,
                     pr_data,
-                    base_ref=review.base_ref,
+                    base_ref=pr_data["base_ref"],
                 )
-                context = await prepare_pr_review_context(
-                    repo,
-                    pr_data,
-                    base_ref=review.base_ref,
-                )
-                # Context preparation is network-bound. Drop the old read
-                # snapshot before locking so disable/synchronize commits made
-                # during that call cannot survive in the ORM identity map.
-                repo_id = repo.id
-                await db.rollback()
+                try:
+                    context = await prepare_pr_review_context(
+                        repo_snapshot,
+                        pr_data,
+                        base_ref=pr_data["base_ref"],
+                    )
+                except PRReviewInputTooLarge as exc:
+                    context = getattr(exc, "prepared_context", None)
+                    if not isinstance(context, dict):
+                        raise
                 locked_repo = (await db.execute(
                     select(MonitoredRepo)
                     .where(MonitoredRepo.id == repo_id)
@@ -1112,33 +1338,104 @@ async def reconcile_waiting_ci_reviews(db_factory) -> int:
                     or locked_repo.review_mode != "panel"
                     or not locked_repo.wait_for_ci
                     or locked is None
+                    or (
+                        locked.status,
+                        locked.monitor_run_id,
+                        locked.base_ref,
+                        locked.base_sha,
+                        locked.head_sha,
+                        locked.completed_at,
+                    )
+                    != observed_review_generation
                     or locked.base_ref != context.get("base_ref")
                     or locked.base_sha != pr_data["base_sha"]
                     or locked.head_sha != pr_data["head_sha"]
                     or locked_run is None
                     or locked.monitor_run_id != locked_run.id
                     or locked_run.status != "waiting_ci"
+                    or pr_monitor_run_has_terminal_intent(locked_run)
                     or locked_run.current_review_id != locked.id
                     or locked_run.current_base_sha != locked.base_sha
                     or locked_run.current_head_sha != locked.head_sha
+                    or (
+                        locked_run.id,
+                        locked_run.state_version,
+                        locked_run.status,
+                        locked_run.current_review_id,
+                        locked_run.current_base_sha,
+                        locked_run.current_head_sha,
+                        locked_run.completed_at,
+                        locked_run.terminal_intent_status,
+                    )
+                    != observed_run_generation
                 ):
                     await db.rollback()
                     continue
-                # Context preparation may be slow. Verify the immutable remote
-                # subject once more while holding the same repository/run
-                # barrier used by disable and synchronize before creating any
-                # reviewer Tasks.
-                await verify_pr_review_snapshot_current(
-                    locked_repo,
-                    pr_data,
-                    base_ref=locked.base_ref,
-                )
+                try:
+                    validated_exact_head_ci_evidence(
+                        ci_evidence,
+                        repo_name=locked_repo.repo_full_name,
+                        head_sha=locked.head_sha,
+                        required_checks=locked_repo.required_checks,
+                    )
+                except ValueError:
+                    await db.rollback()
+                    continue
+                try:
+                    preflight_pr_review_prompts(
+                        locked_repo,
+                        pr_data,
+                        prepared_context=context,
+                        base_ref=locked.base_ref,
+                    )
+                except PRReviewInputTooLarge as exc:
+                    # The provider/mode observed during immutable GitHub
+                    # capture is only preliminary.  Persist a deterministic
+                    # admission result only when the latest locked policy also
+                    # rejects the complete prompt.
+                    locked.status = "error"
+                    locked.action_taken = "error"
+                    locked.ci_status = "passed"
+                    locked.ci_summary = ci_summary
+                    locked.ci_details = ci_details
+                    locked.failure_stage = "reviewer"
+                    locked.review_summary = exc.public_detail
+                    locked.error_category = exc.category
+                    locked.error_measured = exc.measured
+                    locked.error_limit = exc.limit
+                    locked.error_unit = exc.unit
+                    locked.publication_state = "not_applicable"
+                    locked.completed_at = datetime.utcnow()
+                    from backend.services.pr_monitor_loop import (
+                        _apply_current_review_error,
+                    )
+
+                    _apply_current_review_error(locked_run, locked)
+                    await db.commit()
+                    from backend.services.pr_review_service import (
+                        _broadcast_review_update,
+                    )
+
+                    await _broadcast_review_update(
+                        review_id,
+                        "error",
+                        "error",
+                    )
+                    logger.warning(
+                        "PR review %s cannot start after CI: %s",
+                        review_id,
+                        exc.public_detail,
+                    )
+                    continue
                 existing = (await db.execute(
                     select(PRReviewerRun.id).where(PRReviewerRun.pr_review_id == review_id)
                 )).scalar_one_or_none()
                 if existing is not None:
                     await db.rollback()
                     continue
+                locked.ci_status = ci_status
+                locked.ci_summary = ci_summary
+                locked.ci_details = ci_details
                 await _add_panel_tasks(
                     db,
                     repo=locked_repo,
@@ -1242,6 +1539,51 @@ def _finding_fingerprint(role: str, finding: dict) -> str:
     })
 
 
+def _panel_run_verdict(run: PRReviewerRun) -> str | None:
+    """Return a frozen role verdict, including a recoverable finalizer.
+
+    The last role deliberately returns to ``reviewing`` while GitHub
+    capability/identity reads are retried.  Its parsed result fields are the
+    durable code-review evidence; the lifecycle status alone must not erase
+    that evidence or make the Panel appear incomplete.
+    """
+
+    verdict = run.verdict
+    if run.status in {"passed", "changes_required"}:
+        status_verdict = (
+            "pass" if run.status == "passed" else "changes_required"
+        )
+        # Legacy terminal Panel rows predate the explicit verdict column and
+        # remain valid code evidence. If both facts exist they must agree.
+        return (
+            status_verdict
+            if verdict is None or verdict == status_verdict
+            else None
+        )
+    if (
+        run.status not in {"finalizing", "reviewing"}
+        or verdict not in _VERDICTS
+        or not isinstance(run.result_body, str)
+        or not isinstance(run.result_json, dict)
+    ):
+        return None
+    return verdict
+
+
+def _panel_result_matches_frozen_run(
+    run: PRReviewerRun,
+    parsed: dict,
+) -> bool:
+    """Prove a retried finalizer parsed the same immutable Task result."""
+
+    return bool(
+        _panel_run_verdict(run) == parsed.get("verdict")
+        and run.result_body == parsed.get("summary")
+        and run.result_json == parsed
+        and run.completed_at is not None
+    )
+
+
 def _render_gate_body(runs: list[PRReviewerRun], findings: list[PRFinding]) -> str:
     role_labels = {
         "principal_engineer": "Principal engineer",
@@ -1301,9 +1643,9 @@ def _render_gate_body(runs: list[PRReviewerRun], findings: list[PRFinding]) -> s
         else:
             count_summary = "none"
         verdict = {
-            "passed": "Passed",
+            "pass": "Passed",
             "changes_required": "Changes required",
-        }.get(run.status)
+        }.get(_panel_run_verdict(run))
         if verdict is None:
             raise ValueError(
                 f"Reviewer role {role} has no terminal code verdict"
@@ -1544,6 +1886,12 @@ async def check_and_update_reviewer_run(
         # Deterministically malformed/terminal ownership is finalized below
         # through the normal Review error path after parsing the exact result.
         pass
+    frozen_result_present = any((
+        run.verdict is not None,
+        run.result_body is not None,
+        run.result_json is not None,
+        run.completed_at is not None,
+    ))
     claimed = await db.execute(
         update(PRReviewerRun)
         .where(
@@ -1566,7 +1914,31 @@ async def check_and_update_reviewer_run(
     except _PanelTerminalError as exc:
         terminal_error = exc
     else:
-        terminal_error = None
+        frozen_findings_match = True
+        if frozen_result_present:
+            stored_fingerprints = set((await db.execute(
+                select(PRFinding.fingerprint).where(
+                    PRFinding.reviewer_run_id == run.id
+                )
+            )).scalars())
+            expected_fingerprints = {
+                _finding_fingerprint(run.role, finding)
+                for finding in parsed["findings"]
+            }
+            frozen_findings_match = (
+                stored_fingerprints == expected_fingerprints
+            )
+        terminal_error = (
+            _PanelTerminalConflict(
+                "panel generation changed after its role verdict was frozen"
+            )
+            if frozen_result_present
+            and (
+                not _panel_result_matches_frozen_run(run, parsed)
+                or not frozen_findings_match
+            )
+            else None
+        )
     if terminal_error is not None:
         run.status = "error"
         run.error_message = str(terminal_error)
@@ -1586,22 +1958,26 @@ async def check_and_update_reviewer_run(
         await _commit_review_error(db, review)
         await pr_review_service._broadcast_review_update(review.id, "error", "error")
         return True
-    run.status = "passed" if parsed["verdict"] == "pass" else "changes_required"
-    run.verdict = parsed["verdict"]
-    run.result_body = parsed["summary"]
-    run.result_json = parsed
-    run.completed_at = datetime.utcnow()
-    for finding in parsed["findings"]:
-        db.add(PRFinding(
-            pr_review_id=review.id,
-            reviewer_run_id=run.id,
-            fingerprint=_finding_fingerprint(run.role, finding),
-            role=run.role,
-            base_sha=review.base_sha,
-            head_sha=review.head_sha,
-            thread_nonce=secrets.token_hex(24),
-            **finding,
-        ))
+    terminal_run_status = (
+        "passed" if parsed["verdict"] == "pass" else "changes_required"
+    )
+    run.status = terminal_run_status
+    if not frozen_result_present:
+        run.verdict = parsed["verdict"]
+        run.result_body = parsed["summary"]
+        run.result_json = parsed
+        run.completed_at = datetime.utcnow()
+        for finding in parsed["findings"]:
+            db.add(PRFinding(
+                pr_review_id=review.id,
+                reviewer_run_id=run.id,
+                fingerprint=_finding_fingerprint(run.role, finding),
+                role=run.role,
+                base_sha=review.base_sha,
+                head_sha=review.head_sha,
+                thread_nonce=secrets.token_hex(24),
+                **finding,
+            ))
     await db.flush()
     runs = list((await db.execute(select(PRReviewerRun).where(PRReviewerRun.pr_review_id == review.id))).scalars())
     if any(item.status == "error" for item in runs):
@@ -1619,7 +1995,7 @@ async def check_and_update_reviewer_run(
         await _commit_review_error(db, review)
         await pr_review_service._broadcast_review_update(review.id, "error", "error")
         return True
-    if not all(item.status in {"passed", "changes_required"} for item in runs):
+    if not all(_panel_run_verdict(item) is not None for item in runs):
         await db.commit()
         await pr_review_service._broadcast_review_update(review.id, "reviewing", None)
         return True
@@ -1632,6 +2008,25 @@ async def check_and_update_reviewer_run(
         review.completed_at = datetime.utcnow()
         await _commit_review_error(db, review)
         await pr_review_service._broadcast_review_update(review.id, "error", "error")
+        return True
+    if pr_monitor_run_has_terminal_intent(monitor_run):
+        # The reviewer generation was admitted before the signed terminal
+        # intent. Preserve every completed role verdict, but never arm a new
+        # GitHub publication after that lifecycle boundary.
+        review.status = "cancelled"
+        review.publication_state = "not_applicable"
+        review.failure_stage = "lifecycle"
+        review.review_summary = (
+            "Code review completed after the PR became terminal; "
+            "GitHub publication was skipped"
+        )
+        review.completed_at = datetime.utcnow()
+        await db.commit()
+        await pr_review_service._broadcast_review_update(
+            review.id,
+            "cancelled",
+            None,
+        )
         return True
     blockers = any(item.severity in BLOCKING_SEVERITIES and item.status == "open" for item in findings)
     frozen_auto_merge = (task.metadata_ or {}).get("pr_auto_merge")
@@ -1719,68 +2114,204 @@ async def check_and_update_reviewer_run(
                 .limit(1)
             )
         ).scalar_one_or_none() is not None
+    repo_record = await db.get(
+        MonitoredRepo,
+        review.repo_id,
+        populate_existing=True,
+    )
+    if repo_record is None:
+        review.status = "error"
+        review.action_taken = "error"
+        review.publication_state = "failed"
+        review.publication_error = "Panel repository no longer exists"
+        review.failure_stage = "reviewer"
+        review.completed_at = datetime.utcnow()
+        await _commit_review_error(db, review)
+        return True
+    repo_full_name = repo_record.repo_full_name
+
+    # Freeze the complete role result and every Finding before the first
+    # GitHub capability or identity read.  A transient external failure must
+    # never roll the final reviewer's valid code evidence back.  ``reviewing``
+    # plus the exact immutable result fields is the recoverable finalizer
+    # shape consumed by ``recover_panel_reviews``.
+    run.status = "reviewing"
+    review.publication_state = "reconciling"
+    review.publication_error = None
+    review.failure_stage = None
+    await db.commit()
+
     merge_method = None
+    actor = None
+    publication_failure: tuple[str, str, str] | None = None
     if action == "approved_merged":
         try:
             merge_method = await pr_review_service._freeze_safe_merge_method(
-                (await db.get(MonitoredRepo, review.repo_id)).repo_full_name
+                repo_full_name
             )
         except pr_review_service.GhRepositoryCapabilityError as exc:
-            review.status = "error"
-            review.action_taken = "error"
-            review.review_summary = (
+            publication_failure = (
+                "failed",
+                "merge",
                 "Unable to freeze a safe GitHub merge method: "
-                f"{str(exc)[:500]}"
+                f"{str(exc)[:500]}",
             )
-            review.completed_at = datetime.utcnow()
-            await _commit_review_error(db, review)
-            await pr_review_service._broadcast_review_update(
-                review.id,
-                "error",
-                "error",
+        except pr_review_service.GhError as exc:
+            publication_failure = (
+                "reconciling",
+                "merge",
+                "GitHub merge capability check is pending retry: "
+                f"{str(exc)[:500]}",
             )
-            return True
-        except pr_review_service.GhError:
-            # The exact panel generation remains durably recoverable in
-            # ``reviewing``; rollback all tentative Gate/Finding changes and
-            # let periodic recovery retry the transient GitHub read.
-            await db.rollback()
-            return False
         except Exception as exc:
-            review.status = "error"
-            review.action_taken = "error"
-            review.review_summary = (
+            publication_failure = (
+                "failed",
+                "merge",
                 "Unable to freeze a safe GitHub merge method: "
-                f"{str(exc)[:500]}"
+                f"{str(exc)[:500]}",
             )
-            review.completed_at = datetime.utcnow()
-            await _commit_review_error(db, review)
-            await pr_review_service._broadcast_review_update(
-                review.id,
-                "error",
-                "error",
+    if publication_failure is None:
+        try:
+            actor = await pr_review_service._gh_authenticated_login()
+        except pr_review_service.GhError as exc:
+            publication_failure = (
+                "reconciling",
+                "github_identity",
+                "GitHub publishing identity check is pending retry: "
+                f"{str(exc)[:500]}",
             )
-            return True
-    try:
-        actor = await pr_review_service._gh_authenticated_login()
-    except pr_review_service.GhError:
+        except Exception as exc:
+            publication_failure = (
+                "failed",
+                "github_identity",
+                "Unable to resolve the GitHub publishing identity: "
+                f"{str(exc)[:500]}",
+            )
+
+    # GitHub reads intentionally ran without a database transaction. Reclaim
+    # the exact Task -> Monitor Run -> Review -> ReviewerRun generation before
+    # recording their outcome or arming the durable publication outbox.
+    if not await _guard_exact_terminal_task(
+        db,
+        task,
+        statuses={"completed"},
+        expected_background_generation=expected_background_generation,
+    ):
         await db.rollback()
         return False
-    except Exception as exc:
-        review.status = "error"
-        review.action_taken = "error"
+    monitor_run = (
+        (
+            await db.execute(
+                select(PRMonitorRun)
+                .where(PRMonitorRun.id == monitor_run_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if monitor_run_id is not None
+        else None
+    )
+    review = (
+        await db.execute(
+            select(PRReview)
+            .where(PRReview.id == review_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    run = (
+        await db.execute(
+            select(PRReviewerRun)
+            .where(PRReviewerRun.id == reviewer_run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    task = (
+        await db.execute(
+            select(Task)
+            .where(Task.id == task_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if (
+        review is None
+        or run is None
+        or task is None
+        or review.status != "reviewing"
+        or run.status != "reviewing"
+        or run.pr_review_id != review.id
+        or run.task_id != task.id
+        or task.status != "completed"
+        or task.retry_count != retry_count
+        or task.started_at is None
+        or task.pty_background_generation != expected_background_generation
+        or review.base_sha is None
+        or review.head_sha is None
+        or not _panel_result_matches_frozen_run(run, parsed)
+        or (
+            review.monitor_run_id is not None
+            and (
+                monitor_run is None
+                or review.monitor_run_id != monitor_run.id
+                or monitor_run.current_review_id != review.id
+                or monitor_run.current_base_sha != review.base_sha
+                or monitor_run.current_head_sha != review.head_sha
+            )
+        )
+    ):
+        await db.rollback()
+        return False
+
+    if pr_monitor_run_has_terminal_intent(monitor_run):
+        run.status = terminal_run_status
+        review.status = "cancelled"
+        review.publication_state = "not_applicable"
+        review.publication_error = None
+        review.failure_stage = "lifecycle"
         review.review_summary = (
-            "Unable to resolve the GitHub publishing identity: "
-            f"{str(exc)[:500]}"
+            "Code review completed after the PR became terminal; "
+            "GitHub publication was skipped"
         )
         review.completed_at = datetime.utcnow()
-        await _commit_review_error(db, review)
+        await db.commit()
         await pr_review_service._broadcast_review_update(
             review.id,
-            "error",
-            "error",
+            "cancelled",
+            None,
         )
         return True
+
+    if publication_failure is not None:
+        publication_state, failure_stage, publication_error = (
+            publication_failure
+        )
+        review.publication_state = publication_state
+        review.publication_error = publication_error
+        review.failure_stage = failure_stage
+        if publication_state == "failed":
+            run.status = terminal_run_status
+            review.status = "error"
+            review.action_taken = "error"
+            review.completed_at = datetime.utcnow()
+            await _commit_review_error(db, review)
+            await pr_review_service._broadcast_review_update(
+                review.id,
+                "error",
+                "error",
+            )
+            return True
+        await db.commit()
+        await pr_review_service._broadcast_review_update(
+            review.id,
+            "reviewing",
+            None,
+        )
+        return False
+
+    assert isinstance(actor, str) and actor
+    run.status = terminal_run_status
     review.task_id = task.id
     review.status = "publishing"
     review.pending_action = (
@@ -1794,6 +2325,9 @@ async def check_and_update_reviewer_run(
     review.publishing_task_started_at = task.started_at
     review.publishing_started_at = datetime.utcnow()
     review.merge_method = merge_method
+    review.publication_state = "publishing"
+    review.publication_error = None
+    review.failure_stage = None
     review.review_summary = (
         "Reviewer panel Gate passed; waiting for prior Finding threads to resolve"
         if waiting_for_threads
@@ -1819,7 +2353,7 @@ async def check_and_update_reviewer_run(
     await pr_review_service._resume_publishing_review(
         db,
         review.id,
-        (await db.get(MonitoredRepo, review.repo_id)).repo_full_name,
+        repo_full_name,
         db_factory=db_factory,
     )
     return True

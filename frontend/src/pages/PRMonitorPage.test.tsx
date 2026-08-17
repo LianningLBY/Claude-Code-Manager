@@ -21,6 +21,8 @@ vi.mock('../api/client', () => ({
     regenerateSecret: vi.fn(),
     getRepoReviews: vi.fn(),
     getReviewDetail: vi.fn(),
+    rerunPRReview: vi.fn(),
+    getPRMonitorGitHubIdentity: vi.fn(),
     getPRMonitorRun: vi.fn(),
     bindPRMonitorDeveloper: vi.fn(),
     pausePRMonitorRun: vi.fn(),
@@ -62,6 +64,8 @@ const baseRepo: MonitoredRepo = {
 function reviewFixture(overrides: Partial<PRReview> = {}): PRReview {
   return {
     id: 11,
+    attempt: 1,
+    rerun_of_review_id: null,
     monitor_run_id: 21,
     repo_id: baseRepo.id,
     pr_number: 42,
@@ -146,6 +150,7 @@ async function openReview(
 
 describe('PRMonitorPage safety controls', () => {
   beforeEach(() => {
+    window.history.replaceState(null, '', '#/pr-monitor');
     localStorage.setItem('cc_user', JSON.stringify({ id: 1, role: 'admin' }));
     vi.mocked(api.config).mockResolvedValue({
       default_provider: 'codex',
@@ -178,6 +183,20 @@ describe('PRMonitorPage safety controls', () => {
     });
     vi.mocked(api.getRepoReviews).mockResolvedValue([]);
     vi.mocked(api.getReviewDetail).mockResolvedValue(reviewFixture());
+    vi.mocked(api.rerunPRReview).mockResolvedValue({
+      id: 12,
+      attempt: 2,
+      rerun_of_review_id: 11,
+      monitor_run_id: 21,
+      status: 'queued',
+      head_sha: 'head-sha',
+    });
+    vi.mocked(api.getPRMonitorGitHubIdentity).mockResolvedValue({
+      available: true,
+      actor: 'ccm-publisher',
+      error: null,
+      checked_at: '2026-08-16T01:00:00Z',
+    });
     vi.mocked(api.getPRMonitorRun).mockResolvedValue(runFixture());
     vi.mocked(api.bindPRMonitorDeveloper).mockResolvedValue(runFixture({ developer_task_id: 99 }));
     vi.mocked(api.pausePRMonitorRun).mockResolvedValue(runFixture({ status: 'paused' }));
@@ -413,6 +432,100 @@ describe('PRMonitorPage safety controls', () => {
     expect(screen.getByText('QUEUE AUTO')).toBeInTheDocument();
   });
 
+  it('shows the CCM backend publishing identity between Webhook and Review History', async () => {
+    const user = userEvent.setup();
+    await openRepo(user);
+
+    const webhook = screen.getByText('Webhook Configuration');
+    const identity = await screen.findByText('GitHub Publishing Identity');
+    const history = screen.getByText('Review History');
+    expect(webhook.compareDocumentPosition(identity) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(identity.compareDocumentPosition(history) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getByText('CCM will publish as ccm-publisher')).toBeInTheDocument();
+    expect(screen.getByText(/independent of Codex authentication/i)).toBeInTheDocument();
+    expect(screen.getByText(/browser or connector/i)).toBeInTheDocument();
+    expect(api.getPRMonitorGitHubIdentity).toHaveBeenCalledWith(baseRepo.id, false);
+  });
+
+  it('renders loading, unavailable, HTTP error, and manual identity refresh states', async () => {
+    const user = userEvent.setup();
+    const first = deferred<Awaited<ReturnType<typeof api.getPRMonitorGitHubIdentity>>>();
+    vi.mocked(api.getPRMonitorGitHubIdentity)
+      .mockReturnValueOnce(first.promise)
+      .mockRejectedValueOnce(new Error('HTTP 503'))
+      .mockResolvedValueOnce({
+        available: true,
+        actor: 'restored-publisher',
+        error: null,
+        checked_at: '2026-08-16T02:05:00Z',
+      });
+
+    await openRepo(user);
+    expect(screen.getByText('Checking the CCM backend identity…')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Checking…' })).toBeDisabled();
+
+    first.resolve({
+      available: false,
+      actor: null,
+      error: 'GitHub CLI is not authenticated',
+      checked_at: '2026-08-16T02:00:00Z',
+    });
+    expect(await screen.findByText('CCM publishing identity unavailable')).toBeInTheDocument();
+    expect(screen.getByText('GitHub CLI is not authenticated')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Refresh identity' }));
+    expect(await screen.findByText(/Identity request failed: HTTP 503/)).toBeInTheDocument();
+    expect(api.getPRMonitorGitHubIdentity).toHaveBeenLastCalledWith(baseRepo.id, true);
+
+    await user.click(screen.getByRole('button', { name: 'Refresh identity' }));
+    expect(await screen.findByText('CCM will publish as restored-publisher')).toBeInTheDocument();
+    expect(api.getPRMonitorGitHubIdentity).toHaveBeenLastCalledWith(baseRepo.id, true);
+  });
+
+  it('does not offer force-refreshing the backend identity to members', async () => {
+    localStorage.setItem('cc_user', JSON.stringify({ id: 2, role: 'member' }));
+    const user = userEvent.setup();
+    await openRepo(user);
+
+    expect(await screen.findByText('CCM will publish as ccm-publisher')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Refresh identity' })).not.toBeInTheDocument();
+    expect(api.getPRMonitorGitHubIdentity).toHaveBeenCalledWith(baseRepo.id, false);
+  });
+
+  it('ignores a stale identity response after switching repositories', async () => {
+    const repoTwo = { ...baseRepo, id: 2, repo_full_name: 'acme/other' };
+    const first = deferred<Awaited<ReturnType<typeof api.getPRMonitorGitHubIdentity>>>();
+    vi.mocked(api.getMonitoredRepos).mockResolvedValue([baseRepo, repoTwo]);
+    vi.mocked(api.getMonitoredRepo).mockImplementation(async (id: number) => (
+      id === repoTwo.id ? repoTwo : baseRepo
+    ));
+    vi.mocked(api.getPRMonitorGitHubIdentity).mockImplementation(async (repoId: number) => {
+      if (repoId === baseRepo.id) return first.promise;
+      return {
+        available: true,
+        actor: 'repo-two-publisher',
+        error: null,
+        checked_at: '2026-08-16T03:00:00Z',
+      };
+    });
+    window.history.replaceState(null, '', '#/pr-monitor?repo=1');
+    render(<PRMonitorPage />);
+    await screen.findByText('Checking the CCM backend identity…');
+
+    window.location.hash = '#/pr-monitor?repo=2';
+    expect(await screen.findByText('CCM will publish as repo-two-publisher')).toBeInTheDocument();
+    first.resolve({
+      available: true,
+      actor: 'stale-repo-one-publisher',
+      error: null,
+      checked_at: '2026-08-16T03:01:00Z',
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.queryByText('CCM will publish as stale-repo-one-publisher')).not.toBeInTheDocument();
+    expect(screen.getByText('CCM will publish as repo-two-publisher')).toBeInTheDocument();
+  });
+
   it('renders the backend human projection and reviewer summaries without canned advice', async () => {
     const user = userEvent.setup();
     const review = reviewFixture({
@@ -449,11 +562,506 @@ describe('PRMonitorPage safety controls', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('No code verdict was produced');
     expect(screen.getByText('Principal engineer')).toBeInTheDocument();
     expect(screen.getByText('one correctness issue').tagName).toBe('STRONG');
-    expect(screen.getByText('Task #301')).toBeInTheDocument();
+    expect(screen.queryByText('Task #301')).not.toBeInTheDocument();
+    expect(screen.queryByText('Task #302')).not.toBeInTheDocument();
+    expect(screen.queryByText('Task #303')).not.toBeInTheDocument();
     expect(screen.getByText(/3 reviewers/)).toBeInTheDocument();
     expect(screen.getByText(/Progress: 2 completed · 1 review failed/)).toBeInTheDocument();
     expect(screen.queryByText(/优先处理高风险和中风险问题/)).not.toBeInTheDocument();
     expect(screen.queryByText(/应用修复前下载并检查 Diff/)).not.toBeInTheDocument();
+  });
+
+  it('renders input-size admission rejection as an actionable amber result, not a system failure', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({
+      status: 'error',
+      display_status: 'Review input too large',
+      display_summary: 'The exact PR review input exceeded the configured safe model limit.',
+      outcome_kind: 'infrastructure_error',
+      verdict_state: 'unavailable',
+      aggregate_verdict: null,
+      publication_state: 'not_applicable',
+      lifecycle_state: 'reviewing',
+      failure_stage: 'reviewer',
+      error_category: 'unsupported_input_size',
+      error_measured: 786_433,
+      error_limit: 786_432,
+      error_unit: 'characters',
+      reviewer_count: 0,
+      reviewer_runs: [],
+    });
+
+    await openReview(user, review, runFixture());
+
+    const result = screen.getByRole('alert');
+    expect(result).toHaveClass('border-amber-500/30');
+    expect(result).toHaveTextContent('Review not started: input too large');
+    expect(result).toHaveTextContent('786,433 characters');
+    expect(result).toHaveTextContent('safe limit: 786,432 characters');
+    expect(result).toHaveTextContent('No Reviewer Task was created');
+    expect(screen.getByText('Failure stage: review input admission')).toHaveClass('text-amber-300');
+    expect(screen.queryByText('Review system failure')).not.toBeInTheDocument();
+    expect(screen.queryByText(/No code verdict was produced/)).not.toBeInTheDocument();
+  });
+
+  it('uses publication-action wording that never presents approved_merged as Approved', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({
+      status: 'merged',
+      action_taken: 'approved_merged',
+      lifecycle_state: 'merged',
+    });
+    vi.mocked(api.getRepoReviews).mockResolvedValue([review]);
+    await openRepo(user);
+
+    expect(await screen.findByText('Pass comment published · PR merged')).toBeInTheDocument();
+    expect(screen.queryByText(/Approved/i)).not.toBeInTheDocument();
+  });
+
+  it('keeps action failure separate from a lifecycle race', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({
+      status: 'error',
+      action_taken: 'error',
+      publication_state: 'not_applicable',
+      lifecycle_state: 'failed',
+      failure_stage: 'lifecycle',
+      display_status: 'PR lifecycle failed',
+      display_summary: 'The PR changed state before the requested action could complete.',
+    });
+
+    await openReview(user, review, runFixture({ status: 'failed' }));
+
+    expect(screen.getByText('Action not completed')).toBeInTheDocument();
+    expect(screen.getByText('GitHub publication not applicable')).toBeInTheDocument();
+    expect(screen.queryByText('GitHub publication failed')).not.toBeInTheDocument();
+  });
+
+  it('keeps a complete code verdict when publication becomes inapplicable after merge', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({
+      status: 'error',
+      display_status: 'Changes required · PR merged',
+      display_summary: 'The PR merged while CCM was reviewing this exact head, so no GitHub comment was published.',
+      outcome_kind: 'infrastructure_error',
+      verdict_state: 'complete',
+      aggregate_verdict: 'changes_required',
+      publication_state: 'not_applicable',
+      lifecycle_state: 'merged',
+      failure_stage: 'lifecycle',
+    });
+
+    await openReview(user, review, runFixture({ status: 'merged' }));
+
+    expect(screen.getByText('Code verdict: Changes required')).toBeInTheDocument();
+    expect(screen.getByText('GitHub publication not applicable')).toBeInTheDocument();
+    expect(screen.getByText('PR merged')).toBeInTheDocument();
+    expect(screen.queryByText('No code verdict was produced by this failed review run.')).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('colors a durable verdict independently from a later error status', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({
+      status: 'error',
+      display_status: 'Passed',
+      aggregate_verdict: 'pass',
+      publication_state: 'failed',
+      failure_stage: 'publication',
+    });
+    await openReview(user, review, runFixture());
+
+    const statuses = screen.getAllByText('Passed');
+    expect(statuses.length).toBeGreaterThanOrEqual(2);
+    statuses.forEach((status) => {
+      expect(status).toHaveClass('text-green-400');
+      expect(status).not.toHaveClass('text-red-400');
+    });
+  });
+
+  it('labels an immutable COMMENT publication as a GitHub comment with the CCM actor', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({
+      status: 'approved',
+      display_status: 'Pass',
+      verdict_state: 'complete',
+      aggregate_verdict: 'pass',
+      publication_state: 'published',
+      lifecycle_state: 'reviewing',
+      failure_stage: null,
+      github_event: 'COMMENT',
+      published_actor: 'youchengsong',
+      published_at: '2026-08-16T01:02:03Z',
+      github_review_id: 987,
+      github_review_url: 'https://github.com/acme/widgets/pull/42#pullrequestreview-987',
+      github_state: 'COMMENTED',
+    });
+
+    await openReview(user, review, runFixture());
+
+    expect(screen.getByText('Code verdict: Pass')).toBeInTheDocument();
+    expect(screen.getByText('GitHub comment published')).toBeInTheDocument();
+    expect(screen.getByText(/Published by CCM as youchengsong/)).toBeInTheDocument();
+    expect(screen.getByText(/GitHub COMMENTED/)).toBeInTheDocument();
+    expect(screen.queryByText('Approved')).not.toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Open published GitHub comment' })).toHaveAttribute(
+      'href',
+      'https://github.com/acme/widgets/pull/42#pullrequestreview-987',
+    );
+  });
+
+  it('renders untrusted GitHub URLs as inert text in history and detail', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({
+      pr_url: 'https://github.com.evil/acme/widgets/pull/42',
+      publication_state: 'published',
+      github_review_id: 987,
+      github_review_url: 'https://github.com/acme/other/pull/42#pullrequestreview-987',
+    });
+
+    await openReview(user, review, runFixture());
+
+    expect(screen.queryByRole('link', { name: '#42' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'Open published GitHub comment' })).not.toBeInTheDocument();
+    expect(screen.getByText('#42')).toBeInTheDocument();
+  });
+
+  it('opens an exact Review directly from the PR Monitor hash query', async () => {
+    const review = reviewFixture({ id: 113 });
+    window.history.replaceState(null, '', '#/pr-monitor?repo=1&review=113');
+    vi.mocked(api.getMonitoredRepos).mockResolvedValue([baseRepo]);
+    vi.mocked(api.getRepoReviews).mockResolvedValue([review]);
+    vi.mocked(api.getReviewDetail).mockResolvedValue(review);
+    vi.mocked(api.getPRMonitorRun).mockResolvedValue(runFixture());
+
+    render(<PRMonitorPage />);
+
+    expect(await screen.findByText('Review Detail · PR #42')).toBeInTheDocument();
+    expect(api.getReviewDetail).toHaveBeenCalledWith(113);
+    expect(window.location.hash).toBe('#/pr-monitor?repo=1&review=113');
+  });
+
+  it('responds to a new Review query while already on the PR Monitor page', async () => {
+    const first = reviewFixture({ id: 113, display_summary: 'First review summary' });
+    const second = reviewFixture({ id: 114, display_summary: 'Second review summary' });
+    window.history.replaceState(null, '', '#/pr-monitor?repo=1&review=113');
+    vi.mocked(api.getMonitoredRepos).mockResolvedValue([baseRepo]);
+    vi.mocked(api.getRepoReviews).mockResolvedValue([first, second]);
+    vi.mocked(api.getReviewDetail).mockImplementation(async (reviewId: number) => (
+      reviewId === second.id ? second : first
+    ));
+
+    render(<PRMonitorPage />);
+    expect(await screen.findByText('First review summary')).toBeInTheDocument();
+
+    window.location.hash = '#/pr-monitor?repo=1&review=114';
+
+    expect(await screen.findByText('Second review summary')).toBeInTheDocument();
+    expect(api.getReviewDetail).toHaveBeenCalledWith(114);
+  });
+
+  it('does not attach a late Monitor Run from Review A to Review B', async () => {
+    const user = userEvent.setup();
+    const first = reviewFixture({ id: 113, monitor_run_id: 21, pr_title: 'Review A', display_summary: 'Summary A' });
+    const second = reviewFixture({ id: 114, monitor_run_id: 22, pr_title: 'Review B', display_summary: 'Summary B' });
+    const firstRun = deferred<PRMonitorRun>();
+    vi.mocked(api.getRepoReviews).mockResolvedValue([first, second]);
+    vi.mocked(api.getReviewDetail).mockImplementation(async (reviewId: number) => (
+      reviewId === second.id ? second : first
+    ));
+    vi.mocked(api.getPRMonitorRun).mockImplementation(async (runId: number) => (
+      runId === 21 ? firstRun.promise : runFixture({ id: 22, status: 'waiting_for_fix' })
+    ));
+
+    await openRepo(user);
+    await user.click(await screen.findByText('Review A'));
+    expect(await screen.findByText('Summary A')).toBeInTheDocument();
+    await user.click(screen.getByText('Review B'));
+    expect(await screen.findByText('Summary B')).toBeInTheDocument();
+    firstRun.resolve(runFixture({ id: 21, status: 'paused' }));
+    await act(async () => { await Promise.resolve(); });
+
+    await user.type(screen.getByPlaceholderText('Developer Task ID'), '88');
+    await user.click(screen.getByRole('button', { name: 'Bind' }));
+    expect(api.bindPRMonitorDeveloper).toHaveBeenCalledWith(22, 88);
+    expect(api.bindPRMonitorDeveloper).not.toHaveBeenCalledWith(21, 88);
+  });
+
+  it('does not let a late rerun receipt replace a newly selected Review', async () => {
+    const user = userEvent.setup();
+    const first = reviewFixture({ id: 113, pr_title: 'Review A', display_summary: 'Summary A', can_rerun: true });
+    const second = reviewFixture({ id: 114, pr_title: 'Review B', display_summary: 'Summary B', can_rerun: false });
+    const receipt = deferred<Awaited<ReturnType<typeof api.rerunPRReview>>>();
+    vi.mocked(api.getRepoReviews).mockResolvedValue([first, second]);
+    vi.mocked(api.getReviewDetail).mockImplementation(async (reviewId: number) => (
+      reviewId === second.id ? second : first
+    ));
+    vi.mocked(api.rerunPRReview).mockReturnValue(receipt.promise);
+
+    await openRepo(user);
+    await user.click(await screen.findByText('Review A'));
+    await user.click(await screen.findByRole('button', { name: 'Re-run exact head' }));
+    await user.click(screen.getByText('Review B'));
+    expect(await screen.findByText('Summary B')).toBeInTheDocument();
+    receipt.resolve({
+      id: 115,
+      attempt: 2,
+      rerun_of_review_id: first.id,
+      monitor_run_id: first.monitor_run_id,
+      status: 'pending',
+      head_sha: first.head_sha!,
+    });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText('Summary B')).toBeInTheDocument();
+    expect(api.getReviewDetail).not.toHaveBeenCalledWith(115);
+  });
+
+  it('shows rerun lineage and opens history rows from the keyboard without link bubbling', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({ attempt: 2, rerun_of_review_id: 10 });
+    vi.mocked(api.getRepoReviews).mockResolvedValue([review]);
+    vi.mocked(api.getReviewDetail).mockResolvedValue(review);
+    await openRepo(user);
+
+    expect(screen.getByText('Attempt 2')).toBeInTheDocument();
+    expect(screen.getByText('Re-run of Review #10')).toBeInTheDocument();
+    await user.click(screen.getByRole('link', { name: '#42' }));
+    expect(api.getReviewDetail).not.toHaveBeenCalled();
+
+    const row = screen.getByLabelText('Open Review 11, attempt 2');
+    row.focus();
+    await user.keyboard('{Enter}');
+    expect(await screen.findByText('Review Detail · PR #42')).toBeInTheDocument();
+    expect(api.getReviewDetail).toHaveBeenCalledWith(11);
+  });
+
+  it('clears the selected repository when a new deep link is invalid', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getMonitoredRepos).mockResolvedValue([baseRepo]);
+    await openRepo(user);
+    expect(screen.getByRole('button', { name: 'Save Changes' })).toBeInTheDocument();
+
+    window.location.hash = '#/pr-monitor?repo=999&review=1';
+
+    expect(await screen.findByText('Monitored repository #999 was not found')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Save Changes' })).not.toBeInTheDocument();
+    expect(screen.getByText(baseRepo.repo_full_name)).toBeInTheDocument();
+  });
+
+  it('starts a distinct exact-head rerun from Review detail', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({ can_rerun: true, head_sha: 'exact-head-sha' });
+    const rerun = reviewFixture({ id: 12, can_rerun: false, head_sha: 'exact-head-sha' });
+    vi.mocked(api.rerunPRReview).mockResolvedValue({
+      id: rerun.id, attempt: 2, rerun_of_review_id: review.id,
+      monitor_run_id: rerun.monitor_run_id, status: rerun.status, head_sha: rerun.head_sha!,
+    });
+
+    await openReview(user, review, runFixture());
+    vi.mocked(api.getReviewDetail).mockResolvedValue(rerun);
+    await user.click(screen.getByRole('button', { name: 'Re-run exact head' }));
+
+    await waitFor(() => {
+      expect(api.rerunPRReview).toHaveBeenCalledWith(
+        review.id,
+        'exact-head-sha',
+        expect.any(String),
+      );
+    });
+    expect(window.location.hash).toBe('#/pr-monitor?repo=1&review=12');
+  });
+
+  it('reuses the Review-detail rerun key after a response is lost', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({ can_rerun: true, head_sha: 'exact-head-sha' });
+    const rerun = reviewFixture({ id: 12, can_rerun: false, head_sha: 'exact-head-sha' });
+    vi.mocked(api.rerunPRReview)
+      .mockRejectedValueOnce(new Error('network response lost'))
+      .mockResolvedValueOnce({
+        id: rerun.id, attempt: 2, rerun_of_review_id: review.id,
+        monitor_run_id: rerun.monitor_run_id, status: rerun.status, head_sha: rerun.head_sha!,
+      });
+
+    await openReview(user, review, runFixture());
+    vi.mocked(api.getReviewDetail).mockResolvedValue(rerun);
+    await user.click(screen.getByRole('button', { name: 'Re-run exact head' }));
+    expect(await screen.findByText(/network response lost/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Re-run exact head' }));
+
+    await waitFor(() => expect(api.rerunPRReview).toHaveBeenCalledTimes(2));
+    const firstKey = vi.mocked(api.rerunPRReview).mock.calls[0][2];
+    const secondKey = vi.mocked(api.rerunPRReview).mock.calls[1][2];
+    expect(secondKey).toBe(firstKey);
+  });
+
+  it('keeps a successful rerun successful when Monitor detail refresh fails', async () => {
+    const user = userEvent.setup();
+    const review = reviewFixture({ can_rerun: true, head_sha: 'exact-head-sha' });
+    const rerun = reviewFixture({ id: 12, can_rerun: false, head_sha: 'exact-head-sha' });
+    vi.mocked(api.rerunPRReview).mockResolvedValue({
+      id: rerun.id, attempt: 2, rerun_of_review_id: review.id,
+      monitor_run_id: rerun.monitor_run_id, status: rerun.status, head_sha: rerun.head_sha!,
+    });
+
+    await openReview(user, review, runFixture());
+    vi.mocked(api.getReviewDetail).mockResolvedValue(rerun);
+    vi.mocked(api.getPRMonitorRun).mockRejectedValueOnce(new Error('refresh unavailable'));
+    await user.click(screen.getByRole('button', { name: 'Re-run exact head' }));
+
+    expect(await screen.findByText('Exact-head review started.')).toBeInTheDocument();
+    expect(await screen.findByText('Error: refresh unavailable')).toBeInTheDocument();
+    expect(screen.queryByText(/Could not start the exact-head review/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Re-run exact head' })).not.toBeInTheDocument();
+    expect(api.rerunPRReview).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not bind a late Run action response to a newly selected Review', async () => {
+    const user = userEvent.setup();
+    const reviewA = reviewFixture({
+      id: 11,
+      monitor_run_id: 21,
+      pr_title: 'Review A with a slow pause',
+    });
+    const reviewB = reviewFixture({
+      id: 12,
+      monitor_run_id: 22,
+      pr_title: 'Review B remains current',
+      review_summary: 'Review B detail is selected.',
+    });
+    const runA = runFixture({ id: 21, status: 'waiting_for_fix' });
+    const runB = runFixture({ id: 22, status: 'ready_to_merge' });
+    const pause = deferred<PRMonitorRun>();
+    vi.mocked(api.getRepoReviews).mockResolvedValue([reviewA, reviewB]);
+    vi.mocked(api.getReviewDetail).mockImplementation(async (reviewId: number) => (
+      reviewId === reviewA.id ? reviewA : reviewB
+    ));
+    vi.mocked(api.getPRMonitorRun).mockImplementation(async (runId: number) => (
+      runId === runA.id ? runA : runB
+    ));
+    vi.mocked(api.pausePRMonitorRun).mockReturnValue(pause.promise);
+
+    await openRepo(user);
+    await user.click(await screen.findByText(reviewA.pr_title));
+    await screen.findByText('Loop: Waiting For Fix · repair 0/3');
+    await user.click(screen.getByRole('button', { name: 'Pause loop' }));
+    await user.click(screen.getByText(reviewB.pr_title));
+    expect(await screen.findByText('Review B detail is selected.')).toBeInTheDocument();
+    expect(await screen.findByText('Loop: Ready To Merge · repair 0/3')).toBeInTheDocument();
+
+    await act(async () => {
+      pause.resolve(runFixture({ id: 21, status: 'paused' }));
+      await pause.promise;
+    });
+
+    expect(screen.getByText('Review B detail is selected.')).toBeInTheDocument();
+    expect(screen.getByText('Loop: Ready To Merge · repair 0/3')).toBeInTheDocument();
+    expect(screen.queryByText('Loop: Paused · repair 0/3')).not.toBeInTheDocument();
+  });
+
+  it('keeps a newly selected Review after a late Finding rebuttal refresh', async () => {
+    const user = userEvent.setup();
+    const reviewA = reviewFixture({
+      id: 31,
+      monitor_run_id: 41,
+      pr_title: 'Review A with a slow rebuttal',
+      reviewer_runs: [{
+        id: 51,
+        role: 'principal_engineer',
+        task_id: 301,
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+        effort: 'high',
+        status: 'changes_required',
+        verdict: 'changes_required',
+        error_message: null,
+        created_at: '2026-08-02T00:00:00Z',
+        completed_at: '2026-08-02T00:05:00Z',
+        findings: [{
+          id: 61,
+          reviewer_run_id: 51,
+          role: 'principal_engineer',
+          severity: 'medium',
+          category: 'correctness',
+          path: 'backend/service.py',
+          line: 10,
+          hunk: null,
+          title: 'Slow rebuttal finding',
+          evidence: 'The result refresh can race another Review selection.',
+          impact: 'A stale Review could replace the selected detail.',
+          required_fix: 'Fence the refresh by selected Review identity.',
+          test: 'Switch Reviews before the rebuttal response completes.',
+          status: 'open',
+          thread_status: 'published_inline',
+          github_comment_id: 100,
+          github_comment_url: 'https://github.com/acme/widgets/pull/42#discussion_r100',
+          thread_error: null,
+          rebuttals: [],
+          latest_action: null,
+        }],
+      }],
+    });
+    const reviewB = reviewFixture({
+      id: 32,
+      monitor_run_id: 42,
+      pr_title: 'Review B remains selected after rebuttal',
+      display_summary: 'Review B is still selected.',
+    });
+    const submission = deferred<Awaited<ReturnType<typeof api.submitPRFindingRebuttal>>>();
+    vi.mocked(api.getRepoReviews).mockResolvedValue([reviewA, reviewB]);
+    vi.mocked(api.getReviewDetail).mockImplementation(async (reviewId: number) => (
+      reviewId === reviewA.id ? reviewA : reviewB
+    ));
+    vi.mocked(api.getPRMonitorRun).mockImplementation(async (runId: number) => (
+      runFixture({ id: runId })
+    ));
+    vi.mocked(api.submitPRFindingRebuttal).mockReturnValue(submission.promise);
+
+    await openRepo(user);
+    await user.click(await screen.findByText(reviewA.pr_title));
+    await user.type(
+      screen.getByPlaceholderText('Concrete code/test/policy evidence for this exact head'),
+      'Concrete evidence that safely disputes this finding.',
+    );
+    await user.click(screen.getByRole('button', { name: 'Submit rebuttal' }));
+    await user.click(screen.getByText(reviewB.pr_title));
+    expect(await screen.findByText('Review B is still selected.')).toBeInTheDocument();
+
+    await act(async () => {
+      submission.resolve({} as Awaited<ReturnType<typeof api.submitPRFindingRebuttal>>);
+      await submission.promise;
+    });
+
+    await waitFor(() => expect(api.getReviewDetail).toHaveBeenLastCalledWith(reviewB.id));
+    expect(screen.getByText('Review B is still selected.')).toBeInTheDocument();
+    expect(screen.queryByText(reviewA.review_summary!)).not.toBeInTheDocument();
+  });
+
+  it('opens monitored repositories from the keyboard and names icon actions', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getMonitoredRepos).mockResolvedValue([baseRepo]);
+    render(<PRMonitorPage />);
+
+    const row = await screen.findByLabelText(`Open monitored repository ${baseRepo.repo_full_name}`);
+    expect(screen.getByRole('button', {
+      name: `Disable monitoring for ${baseRepo.repo_full_name}`,
+    })).toBeInTheDocument();
+    expect(screen.getByRole('button', {
+      name: `Delete monitoring for ${baseRepo.repo_full_name}`,
+    })).toBeInTheDocument();
+
+    const toggle = screen.getByRole('button', {
+      name: `Disable monitoring for ${baseRepo.repo_full_name}`,
+    });
+    toggle.focus();
+    await user.keyboard('{Enter}');
+    expect(api.toggleMonitoredRepo).toHaveBeenCalledWith(baseRepo.id);
+    expect(screen.queryByRole('button', { name: 'Save Changes' })).not.toBeInTheDocument();
+
+    row.focus();
+    await user.keyboard('{Enter}');
+
+    expect(await screen.findByRole('button', { name: 'Save Changes' })).toBeInTheDocument();
   });
 
   it('does not infer a historical review mode from the current repository setting', async () => {
@@ -480,7 +1088,7 @@ describe('PRMonitorPage safety controls', () => {
     await openReview(user, review, runFixture(), currentPanelRepo);
 
     expect(screen.getByText('The single reviewer found one blocking issue.')).toBeInTheDocument();
-    expect(screen.getAllByText('#701').length).toBeGreaterThan(0);
+    expect(screen.queryByText('#701')).not.toBeInTheDocument();
     expect(screen.queryByText('Reviewer panel has not started yet.')).not.toBeInTheDocument();
   });
 
@@ -715,8 +1323,65 @@ describe('PRMonitorPage safety controls', () => {
     });
     await openReview(user, review, runFixture({ status: 'adjudicating' }));
 
+    expect(screen.getByRole('link', { name: 'published_inline' })).toHaveAttribute(
+      'href',
+      'https://github.com/acme/widgets/pull/42#discussion_r100',
+    );
     expect(screen.getByPlaceholderText('Concrete code/test/policy evidence for this exact head')).toBeDisabled();
     expect(screen.getByRole('button', { name: 'Adjudicating…' })).toBeDisabled();
     expect(api.submitPRFindingRebuttal).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a script URL', 'javascript:alert(1)'],
+    ['a lookalike host', 'https://github.com.evil/acme/widgets/pull/42#discussion_r100'],
+    ['a different repository', 'https://github.com/acme/other/pull/42#discussion_r100'],
+    ['a different PR', 'https://github.com/acme/widgets/pull/43#discussion_r100'],
+    ['a different comment', 'https://github.com/acme/widgets/pull/42#discussion_r101'],
+    ['an arbitrary anchor', 'https://github.com/acme/widgets/pull/42#files'],
+  ])('does not expose an untrusted Finding thread link for %s', async (_label, url) => {
+    const user = userEvent.setup();
+    const review = reviewFixture({
+      reviewer_runs: [{
+        id: 31,
+        role: 'principal',
+        task_id: 301,
+        provider: 'codex',
+        model: 'gpt-5.6-sol',
+        effort: 'high',
+        status: 'changes_required',
+        verdict: 'changes_required',
+        error_message: null,
+        created_at: '2026-08-02T00:00:00Z',
+        completed_at: '2026-08-02T00:05:00Z',
+        findings: [{
+          id: 41,
+          reviewer_run_id: 31,
+          role: 'principal',
+          severity: 'medium',
+          category: 'correctness',
+          path: 'backend/service.py',
+          line: 10,
+          hunk: null,
+          title: 'Untrusted thread URL',
+          evidence: 'The API projection is not a trusted navigation target.',
+          impact: 'An operator could be sent away from the reviewed subject.',
+          required_fix: 'Bind navigation to exact GitHub evidence.',
+          test: 'Reject non-canonical links.',
+          status: 'open',
+          thread_status: 'published_inline',
+          github_comment_id: 100,
+          github_comment_url: url,
+          thread_error: null,
+          rebuttals: [],
+          latest_action: null,
+        }],
+      }],
+    });
+
+    await openReview(user, review, runFixture());
+
+    expect(screen.getByText(/Untrusted thread URL/)).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'published_inline' })).not.toBeInTheDocument();
   });
 });

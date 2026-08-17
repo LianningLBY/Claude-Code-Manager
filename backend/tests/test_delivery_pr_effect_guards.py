@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -273,8 +274,18 @@ async def test_reserved_marker_and_delivery_run_association_both_block_legacy_ef
         review_id=malformed.id,
         reason_kind="review_blocked",
     )
-    assert wake is not None
-    assert wake.status == "shadow"
+    # A non-structured single-review failure has no actionable Finding or
+    # trusted exact-head CI evidence.  Delivery ownership still blocks every
+    # legacy effect, but there is no reason to materialize an empty shadow
+    # Repair instruction merely for audit; the public Result/Run is the audit.
+    assert wake is None
+    refreshed_monitor = await db_session.get(
+        PRMonitorRun,
+        monitor.id,
+        populate_existing=True,
+    )
+    assert refreshed_monitor is not None
+    assert refreshed_monitor.status == "waiting_for_fix"
 
 
 @pytest.mark.asyncio
@@ -300,13 +311,24 @@ async def test_delivery_monitor_rejects_legacy_run_mutations(
     )
     body = {"task_id": ids["task_id"]} if payload == "task" else None
 
-    response = await client.post(
-        f"/api/pr-monitor/runs/{ids['run_id']}/{route}",
-        json=body,
+    remote_read = AsyncMock(
+        side_effect=AssertionError(
+            "Delivery-owned bind must fail before a GitHub PR read"
+        )
     )
+    with patch(
+        "backend.services.pr_review_service._gh_pr_view",
+        remote_read,
+    ):
+        response = await client.post(
+            f"/api/pr-monitor/runs/{ids['run_id']}/{route}",
+            json=body,
+        )
 
     assert response.status_code == 409, response.text
     assert "Delivery-owned PR state" in response.json()["detail"]
+    if route == "bind-developer":
+        remote_read.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -16,6 +16,7 @@ from backend.models.pr_monitor import (
     PRFindingRebuttal,
     PRMonitorRun,
     PRReview,
+    pr_monitor_run_has_terminal_intent,
 )
 from backend.services.delivery_pr_policy import legacy_pr_effect_is_forbidden
 
@@ -75,7 +76,9 @@ async def is_current_review_snapshot(
         monitor_run = await db.get(PRMonitorRun, review.monitor_run_id)
         if monitor_run is not None:
             return (
-                monitor_run.current_review_id == review.id
+                not pr_monitor_run_has_terminal_intent(monitor_run)
+                and monitor_run.completed_at is None
+                and monitor_run.current_review_id == review.id
                 and monitor_run.current_head_sha == review.head_sha
             )
     newer = (

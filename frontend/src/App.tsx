@@ -51,7 +51,8 @@ const VALID_PAGES = new Set(['tasks', 'plans', 'delivery', 'dashboard', 'project
 
 function parseHash(): { page: string; chatTaskId: number | null; planId: number | null; deliveryRunId: number | null } {
   const hash = window.location.hash.replace(/^#\/?/, '');
-  const parts = hash.split('/');
+  const route = hash.split('?', 1)[0];
+  const parts = route.split('/');
   const page = VALID_PAGES.has(parts[0]) ? parts[0] : 'tasks';
   let chatTaskId: number | null = null;
   let planId: number | null = null;
@@ -76,6 +77,11 @@ function updateHash(page: string, chatTaskId: number | null, planId: number | nu
   if (page === 'tasks' && chatTaskId) hash += `/chat/${chatTaskId}`;
   if (page === 'plans' && planId) hash += `/${planId}`;
   if (page === 'delivery' && deliveryRunId) hash += `/${deliveryRunId}`;
+  // PR Monitor owns its repo/review query. Preserve it while App synchronizes
+  // page state so an exact Review result deep link is not immediately erased.
+  if (page === 'pr-monitor' && /^#\/?pr-monitor\?/.test(window.location.hash)) {
+    hash = window.location.hash;
+  }
   if (window.location.hash !== hash) {
     window.history.replaceState(null, '', hash);
   }
@@ -114,6 +120,9 @@ function App() {
       // returns to the exact page URL that preceded it. The state-sync effect
       // continues to use replaceState for modal/chat URL updates.
       window.history.pushState(null, '', nextHash);
+      // pushState does not emit hashchange. PR Monitor owns query-level routing,
+      // so notify mounted pages when navigation clears an existing deep link.
+      window.dispatchEvent(new HashChangeEvent('hashchange'));
     }
     setPage(p);
     if (p !== 'tasks') setChatTaskId(null);

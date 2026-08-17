@@ -447,6 +447,8 @@ async def test_running_cold_recovery_discards_cleaned_receipt_from_reused_run_id
         assert run.status == "queued"
         assert run.generation == 2
         assert run.instance_id is None
+        assert run.execution_seconds == 0
+        assert run.last_execution_started_at is None
         assert await db.get(PlanAgentRuntimeReceipt, receipt_id) is None
 
 

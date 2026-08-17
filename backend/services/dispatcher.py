@@ -2556,12 +2556,25 @@ class GlobalDispatcher:
             if owner is None and run.instance_id is not None:
                 await db.get(Instance, run.instance_id, with_for_update=True)
 
+            generation_has_steps = (
+                await db.scalar(
+                    select(PlanAgentStep.id)
+                    .where(
+                        PlanAgentStep.run_id == run.id,
+                        PlanAgentStep.generation == generation,
+                    )
+                    .limit(1)
+                )
+                is not None
+            )
+
             now = datetime.utcnow()
             if run.last_execution_started_at is not None:
-                run.execution_seconds = float(run.execution_seconds or 0) + max(
-                    0.0,
-                    (now - run.last_execution_started_at).total_seconds(),
-                )
+                if generation_has_steps:
+                    run.execution_seconds = float(run.execution_seconds or 0) + max(
+                        0.0,
+                        (now - run.last_execution_started_at).total_seconds(),
+                    )
                 run.last_execution_started_at = None
             run.instance_id = None
             run.status = "queued"

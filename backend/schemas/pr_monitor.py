@@ -255,6 +255,7 @@ class PRReviewResponse(BaseModel):
     pr_author: str
     pr_url: str
     task_id: int | None
+    display_task_id: int | None = None
     # ``task_id`` is retained for old clients.  Panel reviews have one Task
     # per role, so new clients must use this complete, deterministic list
     # instead of treating the legacy first Task as the whole review.
@@ -528,6 +529,7 @@ class PRResultFeedItem(BaseModel):
     # Single reviews created before PRMonitorRun attachment use ``review:<id>``.
     result_key: str = Field(pattern=r"^(run|review):[1-9][0-9]*$")
     run_id: int | None
+    display_task_id: int | None = None
     repo_id: int
     repo_full_name: str
     pr_number: int
@@ -645,6 +647,7 @@ class PRMonitorRunResponse(BaseModel):
     current_base_sha: str
     current_head_sha: str
     current_review_id: int | None
+    display_task_id: int | None = None
     developer_task_id: int | None
     repair_attempts: int
     max_repair_attempts: int

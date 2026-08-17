@@ -87,6 +87,15 @@ async def task_response_model(request: Request, task, db):
 
     if internal_task_wire_request(request):
         return InternalTaskResponse.model_validate(task)
+    from backend.services.pr_monitor_task_access import is_pr_monitor_display_task
+
+    if await is_pr_monitor_display_task(db, task):
+        # Display Tasks are readable projections, never editable Chat Tasks.
+        # Keep the normal public DTO (the description is bounded/safe) while
+        # marking the response read-only so the UI cannot offer controls.
+        model = TaskResponse.model_validate(task)
+        model.access_scope = "chat"
+        return model
     if await _chat_share_only_projection(request, task, db):
         return SharedTaskResponse.model_validate(task)
     return TaskResponse.model_validate(task)

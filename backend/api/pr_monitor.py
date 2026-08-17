@@ -1745,6 +1745,17 @@ async def delete_repo(repo_id: int, request: Request, db: AsyncSession = Depends
                 for review in reviews
                 if review.task_id is not None
             }
+            display_task_ids = (await db.execute(
+                select(PRMonitorRun.display_task_id).where(
+                    PRMonitorRun.id.in_(monitor_run_ids),
+                    PRMonitorRun.display_task_id.is_not(None),
+                )
+            )).scalars()
+            owned_task_ids.update(
+                task_id
+                for task_id in display_task_ids
+                if task_id is not None
+            )
             owned_task_ids.update(
                 task_id
                 for task_id in reviewer_task_ids
@@ -2653,6 +2664,11 @@ def _review_response_payload(
     payload.update({
         "review_summary": response_summary,
         "task_ids": task_ids,
+        "display_task_id": (
+            monitor_run.display_task_id
+            if monitor_run is not None
+            else None
+        ),
         "display_status": display_status,
         "display_summary": display_summary,
         "outcome_kind": outcome_kind,
@@ -2877,6 +2893,7 @@ async def list_pr_review_results(
             PRMonitorRun.status.label("result_run_status"),
             PRMonitorRun.current_head_sha.label("result_run_current_head_sha"),
             PRMonitorRun.current_review_id.label("result_run_current_review_id"),
+            PRMonitorRun.display_task_id.label("result_run_display_task_id"),
             PRMonitorRun.terminal_intent_status.label(
                 "result_run_terminal_intent_status"
             ),
@@ -2938,6 +2955,7 @@ async def list_pr_review_results(
             literal(None).label("result_run_status"),
             PRReview.head_sha.label("result_run_current_head_sha"),
             PRReview.id.label("result_run_current_review_id"),
+            literal(None).label("result_run_display_task_id"),
             literal(None).label("result_run_terminal_intent_status"),
             literal(False).label("result_run_terminal_intent_present"),
             PRReview.created_at.label("result_run_created_at"),
@@ -3047,6 +3065,7 @@ async def list_pr_review_results(
                 status=item.result_run_status,
                 current_head_sha=item.result_run_current_head_sha,
                 current_review_id=item.result_run_current_review_id,
+                display_task_id=item.result_run_display_task_id,
                 terminal_intent_status=(
                     item.result_run_terminal_intent_status
                 ),
@@ -3158,6 +3177,11 @@ async def list_pr_review_results(
                 else f"review:{review.id}"
             ),
             "run_id": monitor_run.id if monitor_run is not None else None,
+            "display_task_id": (
+                monitor_run.display_task_id
+                if monitor_run is not None
+                else None
+            ),
             "repo_id": repo.id,
             "repo_full_name": repo.repo_full_name,
             "pr_number": review.pr_number,

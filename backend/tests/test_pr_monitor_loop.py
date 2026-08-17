@@ -24,6 +24,7 @@ from backend.services.pr_monitor_loop import (
     _RepairRemoteSubject,
     _repair_remote_subject_is_current as _real_repair_remote_subject_is_current,
     attach_review_to_run,
+    backfill_pr_monitor_display_tasks,
     reconcile_terminal_review_runs,
     record_blocking_evidence,
     record_gate_pass,
@@ -39,6 +40,114 @@ from backend.tests.worker_termination_helpers import (
 
 BASE = "a" * 40
 HEAD = "b" * 40
+
+
+@pytest.mark.asyncio
+async def test_attach_review_materializes_one_stable_display_task(db_session):
+    repo = MonitoredRepo(
+        repo_full_name="owner/display-task",
+        webhook_secret="s" * 64,
+        review_mode="panel",
+    )
+    db_session.add(repo)
+    await db_session.flush()
+    review = PRReview(
+        repo_id=repo.id,
+        pr_number=42,
+        base_ref="main",
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="Display this aggregate result",
+        pr_author="alice",
+        pr_url="https://github.com/owner/display-task/pull/42",
+        status="reviewing",
+    )
+    db_session.add(review)
+    await db_session.flush()
+
+    run = await attach_review_to_run(
+        db_session,
+        repo=repo,
+        review=review,
+    )
+    first_display_id = run.display_task_id
+    assert first_display_id is not None
+    display = await db_session.get(Task, first_display_id)
+    assert display is not None
+    assert display.status == "completed"
+    assert display.archived is False
+    assert display.metadata_ == {
+        "pr_monitor_display": True,
+        "pr_monitor_run_id": run.id,
+        "pr_monitor_review_id": review.id,
+    }
+    assert "reviewer" not in (display.description or "").lower()
+
+    replacement = PRReview(
+        repo_id=repo.id,
+        pr_number=42,
+        base_ref="main",
+        base_sha=BASE,
+        head_sha="c" * 40,
+        pr_title="New head, same display Task",
+        pr_author="alice",
+        pr_url=review.pr_url,
+        status="reviewing",
+    )
+    db_session.add(replacement)
+    await db_session.flush()
+    run = await attach_review_to_run(
+        db_session,
+        repo=repo,
+        review=replacement,
+    )
+    assert run.display_task_id == first_display_id
+    display = await db_session.get(Task, first_display_id, populate_existing=True)
+    assert display.metadata_["pr_monitor_review_id"] == replacement.id
+    assert display.title.endswith("#42")
+
+
+@pytest.mark.asyncio
+async def test_backfill_display_tasks_is_idempotent(db_session):
+    repo = MonitoredRepo(
+        repo_full_name="owner/backfill-display",
+        webhook_secret="s" * 64,
+    )
+    db_session.add(repo)
+    await db_session.flush()
+    review = PRReview(
+        repo_id=repo.id,
+        pr_number=9,
+        base_ref="main",
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="Historical result",
+        pr_author="alice",
+        pr_url="https://github.com/owner/backfill-display/pull/9",
+        status="commented",
+    )
+    db_session.add(review)
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=9,
+        current_base_sha=BASE,
+        current_head_sha=HEAD,
+        current_review_id=review.id,
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review.monitor_run_id = run.id
+    await db_session.commit()
+
+    assert await backfill_pr_monitor_display_tasks(db_session) == 1
+    assert await backfill_pr_monitor_display_tasks(db_session) == 0
+    tasks = list((await db_session.execute(
+        select(Task).where(Task.metadata_["pr_monitor_display"].as_boolean().is_(True))
+    )).scalars())
+    assert len(tasks) == 1
+    await db_session.refresh(run)
+    assert run.display_task_id == tasks[0].id
 
 
 @pytest.fixture(autouse=True)

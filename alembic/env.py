@@ -34,6 +34,8 @@ from backend.models.pr_monitor import (  # noqa: F401
     PRFinding,
     PRReview,
     PRReviewerRun,
+    PRMonitorRun,
+    PRMonitorTaskTombstone,
 )
 from backend.models.worker import Worker  # noqa: F401
 from backend.models.ssh_profile import SSHProfile  # noqa: F401

@@ -103,6 +103,29 @@ def test_task_provider_is_canonicalized():
     assert updated.provider == "claude"
 
 
+def test_public_pr_monitor_task_metadata_exposes_only_result_identity():
+    metadata = public_task_metadata({
+        "pr_monitor_display": True,
+        "pr_monitor_run_id": 17,
+        "pr_monitor_review_id": 19,
+        "pr_head_sha": "a" * 40,
+        "pr_action_nonce": "secret-runtime-nonce",
+    })
+
+    assert metadata == {
+        "pr_monitor_display": True,
+        "pr_monitor_run_id": 17,
+        "pr_monitor_review_id": 19,
+    }
+
+
+def test_public_metadata_does_not_expose_pr_monitor_ids_without_display_marker():
+    assert public_task_metadata({
+        "pr_monitor_run_id": 17,
+        "pr_monitor_review_id": 19,
+    }) is None
+
+
 @pytest.mark.parametrize(
     "upload_id",
     [

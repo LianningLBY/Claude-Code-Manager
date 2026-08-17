@@ -1034,6 +1034,7 @@ async def test_public_result_feed_is_one_safe_item_per_panel_run(
     assert set(item) == {
         "result_key",
         "run_id",
+        "display_task_id",
         "repo_id",
         "repo_full_name",
         "pr_number",
@@ -1066,6 +1067,7 @@ async def test_public_result_feed_is_one_safe_item_per_panel_run(
         "can_rerun",
     }
     assert item["result_key"] == f"run:{run_id}"
+    assert item["display_task_id"] is None
     assert item["review_id"] == review_id
     assert item["verdict_state"] == "complete"
     assert item["aggregate_verdict"] == "changes_required"
@@ -1077,7 +1079,7 @@ async def test_public_result_feed_is_one_safe_item_per_panel_run(
     assert "PRIVATE_PENDING_BODY_SENTINEL" not in serialized
     assert "PRIVATE_LEASE_SENTINEL" not in serialized
     assert "PRIVATE_PUBLICATION_ERROR_SENTINEL" not in serialized
-    assert "task_id" not in serialized
+    assert '"task_id":' not in serialized
 
 
 @pytest.mark.asyncio
@@ -6203,11 +6205,16 @@ async def test_webhook_duplicate_synchronize_same_head_ignored(
 
     async with session_factory() as db:
         reviews = (await db.execute(select(PRReview))).scalars().all()
-        tasks = (await db.execute(
+        tasks = list((await db.execute(
             select(Task).where(Task.title == "PR Review: owner/repo#42")
-        )).scalars().all()
+        )).scalars())
         assert len(reviews) == 1
-        assert len(tasks) == 1
+        assert len(tasks) == 2
+        assert sum(
+            (task.metadata_ or {}).get("pr_monitor_display") is True
+            for task in tasks
+        ) == 1
+        assert sum(task.id == reviews[0].task_id for task in tasks) == 1
         assert reviews[0].delivery_id == "delivery-1"
 
 
@@ -6448,7 +6455,14 @@ async def test_webhook_maps_oversized_review_input_to_422(
         assert run.current_base_sha == review.base_sha == BASE_SHA_1
         assert run.current_head_sha == review.head_sha == HEAD_SHA_2
         assert run.status == "paused"
-        assert list((await db.execute(select(Task))).scalars()) == []
+        tasks = list((await db.execute(select(Task))).scalars())
+        assert len(tasks) == 1
+        assert tasks[0].id == run.display_task_id
+        assert tasks[0].metadata_ == {
+            "pr_monitor_display": True,
+            "pr_monitor_run_id": run.id,
+            "pr_monitor_review_id": review.id,
+        }
 
     feed = await client.get("/api/pr-monitor/results")
     assert feed.status_code == 200, feed.text
@@ -6845,7 +6859,12 @@ async def test_webhook_opened_rechecks_locked_policy_prompt_budget_before_create
         assert reviews[0].task_id is None
         assert reviews[0].publication_state == "not_applicable"
         assert reviews[0].failure_stage == "reviewer"
-        assert tasks == []
+        assert len(tasks) == 1
+        assert tasks[0].metadata_ == {
+            "pr_monitor_display": True,
+            "pr_monitor_run_id": reviews[0].monitor_run_id,
+            "pr_monitor_review_id": reviews[0].id,
+        }
 
 
 @pytest.mark.asyncio
@@ -6960,11 +6979,16 @@ async def test_webhook_concurrent_same_head_creates_one_task(
         ]
         async with file_session_factory() as db:
             reviews = (await db.execute(select(PRReview))).scalars().all()
-            tasks = (await db.execute(
+            tasks = list((await db.execute(
                 select(Task).where(Task.title == "PR Review: owner/repo#42")
-            )).scalars().all()
+            )).scalars())
             assert len(reviews) == 1
-            assert len(tasks) == 1
+            assert len(tasks) == 2
+            assert sum(
+                (task.metadata_ or {}).get("pr_monitor_display") is True
+                for task in tasks
+            ) == 1
+            assert sum(task.id == reviews[0].task_id for task in tasks) == 1
     finally:
         await engine.dispose()
 

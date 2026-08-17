@@ -22,7 +22,7 @@ vi.mock('../api/client', () => ({
     listProjects: vi.fn(),
     listTags: vi.fn(),
     getPRReviewResults: vi.fn().mockResolvedValue([]),
-    rerunPRReview: vi.fn().mockResolvedValue({}),
+    getReviewDetail: vi.fn(),
     getTask: vi.fn(),
     markTaskRead: vi.fn().mockResolvedValue({}),
     starTask: vi.fn().mockResolvedValue({}),
@@ -62,9 +62,7 @@ vi.mock('../hooks/useTaskReorder', () => ({
 }));
 
 vi.mock('../components/Tasks/TaskForm', () => ({
-  TaskForm: ({ prefill }: { prefill?: { description: string } | null }) => (
-    <div data-testid="task-form-prefill">{prefill?.description || ''}</div>
-  ),
+  TaskForm: () => null,
 }));
 vi.mock('../components/Tasks/TaskList', () => ({
   TaskList: ({
@@ -133,7 +131,14 @@ vi.mock('../components/Chat/LoopChatView', () => ({
   LoopChatView: () => null,
 }));
 vi.mock('../components/ProjectSelect', () => ({
-  ProjectSelect: () => <button type="button">Projects</button>,
+  ProjectSelect: ({ projects }: { projects: Array<{ id: number; name: string }> }) => (
+    <div>
+      <button type="button">Projects</button>
+      {projects.map((project) => (
+        <span key={project.id}>{project.name}</span>
+      ))}
+    </div>
+  ),
 }));
 vi.mock('../components/Tasks/TaskBadges', () => ({
   PluginsBadge: ({ task }: { task: { id: number } }) => (
@@ -165,51 +170,6 @@ const task = {
   has_unread: false,
   mode: 'auto',
 };
-
-const prResult = {
-  result_key: 'run:41',
-  run_id: 41,
-  repo_id: 5,
-  repo_full_name: 'acme/widget',
-  pr_number: 133,
-  pr_title: 'Review result feed',
-  pr_url: 'https://github.com/acme/widget/pull/133',
-  review_id: 113,
-  base_ref: 'main',
-  base_sha: 'b'.repeat(40),
-  head_sha: 'a'.repeat(40),
-  verdict_state: 'complete',
-  aggregate_verdict: 'changes_required',
-  publication_state: 'not_applicable',
-  lifecycle_state: 'merged',
-  failure_stage: 'lifecycle',
-  error_category: null,
-  error_measured: null,
-  error_limit: null,
-  error_unit: null,
-  display_status: 'Changes required · PR merged',
-  display_summary: 'PR merged while the exact head was under review.',
-  published_actor: null,
-  published_at: null,
-  github_review_id: null,
-  github_review_url: null,
-  github_state: null,
-  github_event: null,
-  created_at: '2026-08-16T00:00:00Z',
-  updated_at: '2026-08-16T00:01:00Z',
-  completed_at: '2026-08-16T00:01:00Z',
-  can_rerun: true,
-} as const;
-
-function deferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((promiseResolve, promiseReject) => {
-    resolve = promiseResolve;
-    reject = promiseReject;
-  });
-  return { promise, resolve, reject };
-}
 
 describe('TasksPage realtime reconciliation', () => {
   beforeEach(() => {
@@ -447,6 +407,33 @@ describe('TasksPage realtime reconciliation', () => {
     expect(searchButton.compareDocumentPosition(projectButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
+  it('keeps the internal PR-Monitor Project in the ordinary Task filter', async () => {
+    vi.mocked(api.listProjects).mockResolvedValue([
+      {
+        id: 11,
+        name: 'PR-Monitor',
+        tags: ['ccm:internal:pr-monitor'],
+        show_in_selector: false,
+      },
+      {
+        id: 12,
+        name: 'Other internal Project',
+        tags: ['ccm:internal:other'],
+        show_in_selector: false,
+      },
+    ] as never);
+
+    render(
+      <TasksPage
+        chatTaskId={null}
+        onChatTaskChange={vi.fn()}
+      />,
+    );
+
+    expect(await screen.findByText('PR-Monitor')).toBeInTheDocument();
+    expect(screen.queryByText('Other internal Project')).not.toBeInTheDocument();
+  });
+
   it('shows the attention tag in the split-mode task sidebar', async () => {
     Object.defineProperty(window, 'innerWidth', {
       configurable: true,
@@ -619,244 +606,5 @@ describe('TasksPage realtime reconciliation', () => {
 
     await userEvent.click(screen.getByText('Simulate clear attention tag'));
     expect(visibleTag).toBeEmptyDOMElement();
-  });
-
-  it('shows one safe read-only PR result card per stable result key', async () => {
-    vi.mocked(api.getPRReviewResults).mockResolvedValue([prResult, prResult] as never);
-
-    render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-
-    const cards = await screen.findAllByRole('article', {
-      name: /PR Review Result acme\/widget #133/,
-    });
-    expect(cards).toHaveLength(1);
-    expect(within(cards[0]).getByText('Code verdict: Changes required')).toBeInTheDocument();
-    expect(within(cards[0]).getByText('PR merged')).toBeInTheDocument();
-    expect(within(cards[0]).queryByText(/Reviewer Task|Infrastructure error/i)).not.toBeInTheDocument();
-    expect(within(cards[0]).queryByRole('button', { name: /Chat|Interrupt|Share|Retry Task/i })).not.toBeInTheDocument();
-  });
-
-  it('keeps distinct historical Single results when neither has a Monitor Run', async () => {
-    vi.mocked(api.getPRReviewResults).mockResolvedValue([
-      {
-        ...prResult,
-        result_key: 'review:201',
-        run_id: null,
-        review_id: 201,
-        pr_number: 201,
-        lifecycle_state: 'unknown',
-        can_rerun: false,
-      },
-      {
-        ...prResult,
-        result_key: 'review:202',
-        run_id: null,
-        review_id: 202,
-        pr_number: 202,
-        lifecycle_state: 'unknown',
-        can_rerun: false,
-      },
-    ] as never);
-
-    render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-
-    expect(await screen.findByRole('article', {
-      name: /PR Review Result acme\/widget #201/,
-    })).toBeInTheDocument();
-    expect(screen.getByRole('article', {
-      name: /PR Review Result acme\/widget #202/,
-    })).toBeInTheDocument();
-    expect(screen.getAllByText('Historical lifecycle unavailable')).toHaveLength(2);
-    expect(screen.queryByRole('button', { name: 'Re-run exact head' })).not.toBeInTheDocument();
-  });
-
-  it('makes older PR result pages reachable', async () => {
-    const firstPage = Array.from({ length: 20 }, (_, index) => ({
-      ...prResult,
-      result_key: `run:${index + 1}`,
-      run_id: index + 1,
-      review_id: index + 101,
-      pr_number: index + 1,
-      pr_title: `Recent result ${index + 1}`,
-    }));
-    const older = {
-      ...prResult,
-      result_key: 'run:older',
-      run_id: 99,
-      review_id: 199,
-      pr_number: 99,
-      pr_title: 'Reachable older result',
-    };
-    vi.mocked(api.getPRReviewResults).mockImplementation(async (requestedPage: number) => (
-      requestedPage === 2 ? [older] : firstPage
-    ) as never);
-    render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-
-    await screen.findByRole('article', { name: /PR Review Result acme\/widget #1$/ });
-    await userEvent.click(screen.getByRole('button', { name: 'Older results' }));
-
-    expect(await screen.findByRole('article', { name: /PR Review Result acme\/widget #99$/ })).toBeInTheDocument();
-    expect(api.getPRReviewResults).toHaveBeenCalledWith(2, 20);
-    expect(screen.getByText('Results page 2')).toBeInTheDocument();
-  });
-
-  it('keeps PR result cards visible while a wide split chat is open', async () => {
-    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1440 });
-    vi.mocked(api.getPRReviewResults).mockResolvedValue([prResult] as never);
-    render(<TasksPage chatTaskId={task.id} onChatTaskChange={vi.fn()} />);
-
-    expect(await screen.findByRole('article', {
-      name: /PR Review Result acme\/widget #133/,
-    })).toBeInTheDocument();
-    expect(screen.getByTestId('task-sidebar-row-7')).toBeInTheDocument();
-  });
-
-  it('subscribes only to Task/system events and leaves PR results on single-flight polling', async () => {
-    render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-
-    await waitFor(() => expect(api.getPRReviewResults).toHaveBeenCalled());
-    expect(useWebSocket).toHaveBeenCalledWith(
-      ['system', 'tasks'],
-      expect.any(Function),
-    );
-    expect(vi.mocked(useWebSocket).mock.calls.flatMap(([channels]) => channels)).not.toContain('pr-monitor');
-  });
-
-  it('coalesces an overlapping rerun refresh behind one pending feed request', async () => {
-    const pendingRefresh = deferred<readonly [typeof prResult]>();
-    const refreshedResult = {
-      ...prResult,
-      review_id: 114,
-      display_summary: 'The exact-head rerun is now visible.',
-      updated_at: '2026-08-16T00:02:00Z',
-    } as const;
-    vi.mocked(api.getPRReviewResults)
-      .mockResolvedValueOnce([prResult] as never)
-      .mockReturnValueOnce(pendingRefresh.promise as never)
-      .mockResolvedValueOnce([refreshedResult] as never);
-    vi.mocked(api.rerunPRReview).mockResolvedValue({ id: 114 } as never);
-    render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-
-    await screen.findByText(prResult.display_summary);
-    await userEvent.click(screen.getByRole('button', { name: 'Refresh' }));
-    const pendingButton = await screen.findByRole('button', { name: 'Refreshing…' });
-    expect(pendingButton).toBeDisabled();
-    await userEvent.click(screen.getByRole('button', { name: 'Re-run exact head' }));
-    await waitFor(() => expect(api.rerunPRReview).toHaveBeenCalledTimes(1));
-
-    expect(api.getPRReviewResults).toHaveBeenCalledTimes(2);
-    pendingRefresh.resolve([prResult]);
-
-    expect(await screen.findByText('The exact-head rerun is now visible.')).toBeInTheDocument();
-    expect(api.getPRReviewResults).toHaveBeenCalledTimes(3);
-    expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled();
-  });
-
-  it('does not let a completed request update the page after unmount', async () => {
-    const pending = deferred<readonly [typeof prResult]>();
-    vi.mocked(api.getPRReviewResults).mockReturnValueOnce(pending.promise as never);
-    const first = render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-
-    await waitFor(() => expect(api.getPRReviewResults).toHaveBeenCalledTimes(1));
-    first.unmount();
-    vi.mocked(api.getPRReviewResults).mockResolvedValue([]);
-    render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-    await waitFor(() => expect(api.getPRReviewResults).toHaveBeenCalledTimes(2));
-
-    pending.resolve([prResult]);
-    await act(async () => { await Promise.resolve(); });
-
-    expect(screen.queryByRole('article', { name: /PR Review Result/ })).not.toBeInTheDocument();
-  });
-
-  it('opens the exact PR Monitor review deep link', async () => {
-    vi.mocked(api.getPRReviewResults).mockResolvedValue([prResult] as never);
-    render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-
-    await userEvent.click(await screen.findByRole('button', { name: 'Open review details' }));
-
-    expect(window.location.hash).toBe('#/pr-monitor?repo=5&review=113');
-  });
-
-  it('prefills a normal follow-up Task without exposing the internal Reviewer Task', async () => {
-    vi.mocked(api.getPRReviewResults).mockResolvedValue([prResult] as never);
-    render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-
-    await userEvent.click(await screen.findByRole('button', { name: /Create follow-up Task/ }));
-
-    const draft = screen.getByTestId('task-form-prefill');
-    expect(draft).toHaveTextContent('Follow up PR acme/widget#133');
-    expect(draft).toHaveTextContent('https://github.com/acme/widget/pull/133');
-    expect(draft).not.toHaveTextContent('Task #');
-  });
-
-  it('starts a separate exact-head rerun with an idempotency key', async () => {
-    vi.mocked(api.getPRReviewResults).mockResolvedValue([prResult] as never);
-    vi.mocked(api.rerunPRReview).mockResolvedValue({ id: 114 } as never);
-    render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-
-    await userEvent.click(await screen.findByRole('button', { name: 'Re-run exact head' }));
-
-    await waitFor(() => {
-      expect(api.rerunPRReview).toHaveBeenCalledWith(
-        113,
-        'a'.repeat(40),
-        expect.any(String),
-      );
-    });
-  });
-
-  it('reuses the same rerun idempotency key after a response is lost', async () => {
-    vi.mocked(api.getPRReviewResults).mockResolvedValue([prResult] as never);
-    vi.mocked(api.rerunPRReview)
-      .mockRejectedValueOnce(new Error('network response lost'))
-      .mockResolvedValueOnce({ id: 114 } as never);
-    render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-
-    const rerun = await screen.findByRole('button', { name: 'Re-run exact head' });
-    await userEvent.click(rerun);
-    expect(await screen.findByText('network response lost')).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Re-run exact head' }));
-
-    await waitFor(() => expect(api.rerunPRReview).toHaveBeenCalledTimes(2));
-    const firstKey = vi.mocked(api.rerunPRReview).mock.calls[0][2];
-    const secondKey = vi.mocked(api.rerunPRReview).mock.calls[1][2];
-    expect(secondKey).toBe(firstKey);
-  });
-
-  it('clears a stale rerun error when the result advances to a new Review/head', async () => {
-    const advanced = {
-      ...prResult,
-      review_id: 114,
-      head_sha: 'c'.repeat(40),
-      display_summary: 'A newer exact head is now current.',
-    };
-    vi.mocked(api.getPRReviewResults).mockResolvedValue([prResult] as never);
-    vi.mocked(api.rerunPRReview).mockRejectedValue(new Error('stale rerun failure'));
-    render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-
-    await userEvent.click(await screen.findByRole('button', { name: 'Re-run exact head' }));
-    expect(await screen.findByText('stale rerun failure')).toBeInTheDocument();
-    vi.mocked(api.getPRReviewResults).mockResolvedValue([advanced] as never);
-    await userEvent.click(screen.getByRole('button', { name: 'Refresh' }));
-
-    expect(await screen.findByText('A newer exact head is now current.')).toBeInTheDocument();
-    expect(screen.queryByText('stale rerun failure')).not.toBeInTheDocument();
-  });
-
-  it('opens the returned rerun when its result refresh is delayed', async () => {
-    vi.mocked(api.getPRReviewResults)
-      .mockResolvedValueOnce([prResult] as never)
-      .mockRejectedValueOnce(new Error('result feed unavailable'));
-    vi.mocked(api.rerunPRReview).mockResolvedValue({ id: 114 } as never);
-    render(<TasksPage chatTaskId={null} onChatTaskChange={vi.fn()} />);
-
-    await userEvent.click(await screen.findByRole('button', { name: 'Re-run exact head' }));
-
-    expect(await screen.findByText(/result refresh was delayed/i)).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Re-run exact head' })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Open review details' }));
-
-    expect(window.location.hash).toBe('#/pr-monitor?repo=5&review=114');
   });
 });

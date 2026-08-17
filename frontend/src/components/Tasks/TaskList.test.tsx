@@ -3,7 +3,7 @@ import { act, render, screen, fireEvent, waitFor, createEvent } from '@testing-l
 import userEvent from '@testing-library/user-event';
 import { useState } from 'react';
 import { TaskList } from './TaskList';
-import type { Task, Project } from '../../api/client';
+import type { PRReviewResult, Task, Project } from '../../api/client';
 
 // Mock the api module
 vi.mock('../../api/client', () => ({
@@ -106,6 +106,71 @@ describe('TaskList', () => {
     render(<TaskList tasks={tasks} projects={projects} onRefresh={onRefresh} onOpenChat={onOpenChat} />);
     expect(screen.getByText('Custom Title')).toBeInTheDocument();
     expect(screen.getByText('The prompt')).toBeInTheDocument();
+  });
+
+  it('renders a PR Monitor display Task as read-only aggregate evidence', async () => {
+    const result: PRReviewResult = {
+      result_key: 'run:14',
+      run_id: 14,
+      display_task_id: 42,
+      repo_id: 3,
+      repo_full_name: 'acme/widget',
+      pr_number: 133,
+      pr_title: 'Keep exact-head review evidence',
+      pr_url: 'https://github.com/acme/widget/pull/133',
+      review_id: 113,
+      base_ref: 'main',
+      base_sha: 'b'.repeat(40),
+      head_sha: 'a'.repeat(40),
+      verdict_state: 'complete',
+      aggregate_verdict: 'changes_required',
+      publication_state: 'not_applicable',
+      lifecycle_state: 'reviewing',
+      failure_stage: null,
+      error_category: null,
+      error_measured: null,
+      error_limit: null,
+      error_unit: null,
+      display_status: 'Changes required',
+      display_summary: 'The exact head needs changes.',
+      published_actor: null,
+      published_at: null,
+      github_review_id: null,
+      github_review_url: null,
+      github_state: null,
+      github_event: null,
+      created_at: '2026-08-16T00:00:00Z',
+      updated_at: '2026-08-16T00:02:00Z',
+      completed_at: '2026-08-16T00:02:00Z',
+      can_rerun: false,
+    };
+    const task = makeTask({
+      id: 42,
+      mode: 'pr_monitor',
+      title: 'PR Monitor · acme/widget #133',
+      description: null,
+      status: 'completed',
+      metadata_: { pr_monitor_display: true },
+    });
+
+    render(
+      <TaskList
+        tasks={[task]}
+        projects={projects}
+        onRefresh={onRefresh}
+        onOpenChat={onOpenChat}
+        prResults={new Map([[42, result]])}
+      />,
+    );
+
+    expect(screen.getByText('acme/widget #133 · Keep exact-head review evidence')).toBeInTheDocument();
+    expect(screen.getAllByText('Changes required')).toHaveLength(2);
+    expect(screen.getByTitle('View PR review result')).toBeInTheDocument();
+    expect(screen.queryByTitle('Copy prompt')).not.toBeInTheDocument();
+    expect(screen.queryByTitle('More actions')).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByTitle('View PR review result'));
+    expect(onOpenChat).toHaveBeenCalledWith(task);
   });
 
   it('renders a Delivery-owned scheduler shell with Run controls but no Task mutations', async () => {

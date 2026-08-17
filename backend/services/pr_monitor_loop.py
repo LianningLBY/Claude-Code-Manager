@@ -88,6 +88,174 @@ def _apply_current_review_error(
     return True
 
 
+def _display_task_description(repo: MonitoredRepo, review: PRReview) -> str:
+    """Build a bounded description with no reviewer prompt or patch data."""
+
+    title = (review.pr_title or "").strip()[:500]
+    return (
+        f"PR review result for {repo.repo_full_name}#{review.pr_number}.\n"
+        f"{title}\n{review.pr_url}"
+    )[:1500]
+
+
+async def _is_delivery_owned_monitor_run(
+    db: AsyncSession,
+    *,
+    run: PRMonitorRun,
+    review: PRReview | None,
+) -> bool:
+    """Keep Delivery-owned review results out of ordinary Tasks."""
+
+    if (
+        isinstance(getattr(review, "delivery_id", None), str)
+        and review.delivery_id.startswith("delivery:")
+    ):
+        return True
+    from backend.models.delivery import DeliveryRun
+
+    return await db.scalar(
+        select(DeliveryRun.id)
+        .where(DeliveryRun.pr_monitor_run_id == run.id)
+        .limit(1)
+    ) is not None
+
+
+async def ensure_pr_monitor_display_task(
+    db: AsyncSession,
+    *,
+    repo: MonitoredRepo,
+    run: PRMonitorRun,
+    review: PRReview | None,
+) -> Task | None:
+    """Create or update the one stable, read-only Task for a PR Run.
+
+    This helper intentionally does not touch reviewer Task state.  The caller
+    owns the ``PRMonitorRun`` row lock, so repeated webhook/rerun attachment
+    reuses the same display identity without another Task or session.
+    """
+
+    if review is None or await _is_delivery_owned_monitor_run(
+        db,
+        run=run,
+        review=review,
+    ):
+        return None
+
+    from backend.services.pr_monitor_task_access import (
+        PR_MONITOR_DISPLAY_MARKER,
+        PR_MONITOR_DISPLAY_REVIEW_KEY,
+        PR_MONITOR_DISPLAY_RUN_KEY,
+    )
+    from backend.services.pr_review_service import _get_or_create_pr_monitor_project
+    from backend.services.task_creation import (
+        stage_task_record,
+        system_task_execution_principal_values,
+    )
+
+    project_id = await _get_or_create_pr_monitor_project(db)
+    metadata = {
+        PR_MONITOR_DISPLAY_MARKER: True,
+        PR_MONITOR_DISPLAY_RUN_KEY: run.id,
+        PR_MONITOR_DISPLAY_REVIEW_KEY: review.id,
+    }
+    title = f"PR Review: {repo.repo_full_name}#{review.pr_number}"[:200]
+    description = _display_task_description(repo, review)
+    task = None
+    if run.display_task_id is not None:
+        task = (
+            await db.execute(
+                select(Task)
+                .where(Task.id == run.display_task_id)
+                .with_for_update()
+            )
+        ).scalar_one_or_none()
+    if task is None:
+        task = await stage_task_record(
+            db,
+            title=title,
+            description=description,
+            status="completed",
+            mode="auto",
+            tags=["pr-monitor"],
+            metadata_=metadata,
+            provider="claude",
+            model=None,
+            effort_level=None,
+            project_id=project_id,
+            worker_id=None,
+            archived=False,
+            **system_task_execution_principal_values(),
+        )
+        run.display_task_id = task.id
+    else:
+        # Keep a previously created identity stable across exact-head reruns.
+        task.title = title
+        task.description = description
+        task.project_id = project_id
+        task.status = "completed"
+        task.archived = False
+        task.mode = "auto"
+        task.tags = ["pr-monitor"]
+        task.metadata_ = metadata
+        task.session_id = None
+        task.instance_id = None
+    await db.flush()
+    return task
+
+
+async def backfill_pr_monitor_display_tasks(db: AsyncSession) -> int:
+    """Idempotently materialize display Tasks for historical PR Monitor Runs."""
+
+    run_ids = list((await db.execute(
+        select(PRMonitorRun.id)
+        .where(PRMonitorRun.display_task_id.is_(None))
+        .order_by(PRMonitorRun.id)
+    )).scalars())
+    created = 0
+    for run_id in run_ids:
+        # Re-read each candidate under the Run writer fence.  Startup can be
+        # re-entered by an overlapping Manager process; a stale bulk snapshot
+        # must not cause two display identities for one PR lifecycle.
+        run = (await db.execute(
+            select(PRMonitorRun)
+            .where(
+                PRMonitorRun.id == run_id,
+                PRMonitorRun.display_task_id.is_(None),
+            )
+            .with_for_update()
+        )).scalar_one_or_none()
+        if run is None:
+            await db.rollback()
+            continue
+        review = None
+        if run.current_review_id is not None:
+            review = await db.get(PRReview, run.current_review_id)
+        if review is None:
+            review = (
+                await db.execute(
+                    select(PRReview)
+                    .where(PRReview.monitor_run_id == run.id)
+                    .order_by(PRReview.id.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        repo = await db.get(MonitoredRepo, run.repo_id)
+        if repo is None or review is None:
+            continue
+        task = await ensure_pr_monitor_display_task(
+            db,
+            repo=repo,
+            run=run,
+            review=review,
+        )
+        if task is not None:
+            await db.commit()
+            created += 1
+        else:
+            await db.rollback()
+    return created
+
+
 async def record_review_error(
     db: AsyncSession,
     *,
@@ -496,6 +664,12 @@ async def attach_review_to_run(
                 action.completed_at = datetime.utcnow()
     review.monitor_run_id = run.id
     run.current_review_id = review.id
+    await ensure_pr_monitor_display_task(
+        db,
+        repo=repo,
+        run=run,
+        review=review,
+    )
     # Only an explicitly admitted, remote-verified reopened/ready event may
     # reactivate a terminal stable Run. Ordinary attach/synchronize/rerun paths
     # must never erase a durable closed/merged intent by accident.

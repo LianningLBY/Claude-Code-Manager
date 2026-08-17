@@ -1,8 +1,8 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 
 import { api } from '../../api/client';
-import type { Task, Project } from '../../api/client';
-import { Trash2, RotateCcw, XCircle, MessageCircle, Archive, ArchiveRestore, Star, Copy, Check, MoreVertical, Pencil, Mail, MailOpen, Clock, GripVertical, UserPlus, Pin } from '../icons';
+import type { PRReviewResult, Task, Project } from '../../api/client';
+import { Trash2, RotateCcw, XCircle, MessageCircle, Archive, ArchiveRestore, Star, Copy, Check, MoreVertical, Pencil, Mail, MailOpen, Clock, GripVertical, UserPlus, Pin, GitPullRequest } from '../icons';
 import { FastModeBadge, PlanPipelineBadge, PlanRevisionBadge, PluginsBadge, SubAgentsBadge, TaskConfigBadge } from './TaskBadges';
 import { AttentionTag } from './AttentionTag';
 import { TAG_COLOR_OPTIONS } from '../TagColors';
@@ -17,8 +17,10 @@ import {
   readStoredUserIdentity,
   taskHasSession,
 } from './taskSharePermissions';
+import { isPRMonitorDisplayTask } from './prMonitorTask';
+import { PRMonitorTaskSummary } from './PRMonitorTaskSummary';
 
-interface TaskListProps {
+export interface TaskListProps {
   tasks: Task[];
   projects: Project[];
   onRefresh: () => void;
@@ -28,6 +30,8 @@ interface TaskListProps {
   autoSortOnAccess?: boolean;
   onBeforeArchive?: () => void;
   onReorder?: (tasks: Task[]) => void;
+  /** Safe aggregate PR results keyed by the durable display Task id. */
+  prResults?: ReadonlyMap<number, PRReviewResult>;
 }
 
 const statusColors: Record<string, string> = {
@@ -57,7 +61,7 @@ function canRetryTask(task: Task): boolean {
     && manualRetryableStatuses.has(task.status);
 }
 
-export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat, activeTaskId, autoSortOnAccess, onBeforeArchive, onReorder }: TaskListProps) {
+export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat, activeTaskId, autoSortOnAccess, onBeforeArchive, onReorder, prResults }: TaskListProps) {
   const currentUser = readStoredUserIdentity();
   const projectMap = useMemo(() => {
     const map: Record<number, { name: string; color: string | null }> = {};
@@ -184,9 +188,17 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
     <div className="space-y-2">
       {ghost}
       {tasks.map((t, idx) => (
+        // PR Monitor display Tasks are durable read-only projections. Their
+        // reviewer execution Tasks remain hidden and never enter this list.
+        (() => {
+        const prDisplay = isPRMonitorDisplayTask(t);
+        const prResult = prResults?.get(t.id);
+        return (
         <div
           key={t.id}
-          {...(canControlTask(t) ? targetProps(t, idx) : dropTargetProps(t, idx))}
+          {...(prDisplay
+            ? {}
+            : canControlTask(t) ? targetProps(t, idx) : dropTargetProps(t, idx))}
           className={`relative rounded-xl p-3 border transition-[opacity,border-color,box-shadow] ${
             draggingId === t.id ? 'opacity-40' : ''
           } ${overIndex === idx && draggingId !== null && draggingId !== t.id ? 'ring-2 ring-indigo-400' : ''} ${
@@ -199,7 +211,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
         >
           {/* 拖拽手柄（右下角，空间更宽裕）：卡片正文是可选中文字，整卡
               draggable 会被文本选择手势抢走，必须用显式手柄拖动 */}
-          {canControlTask(t) && t.mode !== 'delivery_loop' && (
+          {canControlTask(t) && !prDisplay && t.mode !== 'delivery_loop' && (
             <span
               {...pointerHandleProps(t, idx)}
               className="absolute bottom-1.5 right-1.5 p-1 cursor-grab active:cursor-grabbing text-gray-600 hover:text-gray-400 select-none"
@@ -236,7 +248,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                   <Pin size={11} className="shrink-0" />
                   <span className="truncate">{t.attention_tag}</span>
                 </span>
-              ) : canControlTask(t) && editingAttentionTagId !== t.id && (
+              ) : canControlTask(t) && !prDisplay && editingAttentionTagId !== t.id && (
                 <AttentionTag
                   taskId={t.id}
                   value={t.attention_tag}
@@ -247,7 +259,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                   className="max-w-[min(16rem,55vw)]"
                 />
               )}
-              {t.access_scope === 'chat' ? (
+              {prDisplay ? null : t.access_scope === 'chat' ? (
                 <span className="text-xs bg-orange-600/30 text-orange-300 px-1.5 rounded font-medium">Shared · Chat</span>
               ) : !canControlTask(t) ? (
                 <span className="text-xs bg-orange-600/30 text-orange-300 px-1.5 rounded font-medium">Restricted</span>
@@ -272,6 +284,11 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               }`}>
                 {getTaskStatusLabel(t)}
               </span>
+              {prDisplay && (
+                <span className="inline-flex items-center gap-1 rounded bg-indigo-600/20 px-1.5 py-0.5 text-[10px] font-medium text-indigo-300">
+                  <GitPullRequest size={11} aria-hidden="true" /> PR review
+                </span>
+              )}
               {canControlTask(t) && t.mode === 'delivery_loop' && t.delivery_run_id != null && (
                 <button
                   type="button"
@@ -300,13 +317,13 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                   <PlanPipelineBadge task={t} />
                   <PlanRevisionBadge task={t} />
                 </>
-              ) : (
+              ) : prDisplay ? null : (
                 <>
                   <span className={`hidden sm:inline text-xs px-1.5 rounded font-medium ${t.provider === 'codex' ? 'bg-green-600/30 text-green-300' : 'bg-blue-600/30 text-blue-300'}`}>
                     {t.provider === 'codex' ? 'Codex' : 'Claude'}
                   </span>
                   <FastModeBadge task={t} />
-                  {canControlTask(t) && t.mode !== 'delivery_loop' && (
+                  {canControlTask(t) && !prDisplay && t.mode !== 'delivery_loop' && (
                     <>
                       <TaskConfigBadge task={t} onRefresh={onRefresh} />
                       <PluginsBadge task={t} onRefresh={onRefresh} />
@@ -318,21 +335,30 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
             </div>
             {/* Action buttons — always top-right aligned */}
             <div className="flex gap-1 shrink-0 items-center">
-              {canControlTask(t) && <button
+              {!prDisplay && canControlTask(t) && <button
                   onClick={() => handleStar(t.id)}
                   className={`p-1.5 transition-colors ${t.starred ? 'text-yellow-400 hover:text-yellow-300' : 'text-gray-600 hover:text-yellow-400'}`}
                   title={t.starred ? "Unstar" : "Star"}
                 >
                   <Star size={16} fill={t.starred ? 'currentColor' : 'none'} />
                 </button>}
-              {canControlTask(t) && <button
+              {!prDisplay && canControlTask(t) && <button
                   onClick={() => handleToggleUnread(t.id, t.has_unread)}
                   className={`p-1.5 transition-colors ${t.has_unread ? 'text-indigo-400 hover:text-indigo-300' : 'text-gray-600 hover:text-indigo-400'}`}
                   title={t.has_unread ? "Mark as read" : "Mark as unread"}
                 >
                   {t.has_unread ? <MailOpen size={16} /> : <Mail size={16} />}
                 </button>}
-              {taskHasSession(t) && (
+              {prDisplay ? (
+                <button
+                  type="button"
+                  onClick={() => onOpenChat(t)}
+                  className="flex items-center gap-1 rounded bg-indigo-600/20 px-2 py-1 text-xs font-medium text-indigo-300 hover:bg-indigo-600/30"
+                  title="View PR review result"
+                >
+                  <GitPullRequest size={14} /><span className="hidden sm:inline"> View result</span>
+                </button>
+              ) : taskHasSession(t) && (
                 <button
                   onClick={() => onOpenChat(t)}
                   className="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium bg-indigo-600/20 text-indigo-400 hover:bg-indigo-600/30"
@@ -341,15 +367,15 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
                   <MessageCircle size={14} /><span className="hidden sm:inline"> Chat</span>
                 </button>
               )}
-              <button
+              {!prDisplay && <button
                 onClick={() => handleCopy(t)}
                 className="p-1.5 text-gray-600 hover:text-gray-300 transition-colors"
                 title="Copy prompt"
               >
                 {copiedId === t.id ? <Check size={16} className="text-green-400" /> : <Copy size={16} />}
-              </button>
+              </button>}
               {/* Controller-owned Delivery Tasks are read-only scheduler shells. */}
-              {canControlTask(t) && t.mode !== 'delivery_loop' && <div className="relative">
+              {!prDisplay && canControlTask(t) && t.mode !== 'delivery_loop' && <div className="relative">
                 <button
                   onClick={() => {
                     setMenuOpenId(menuOpenId === t.id ? null : t.id);
@@ -426,7 +452,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
           </div>
           {/* Row 2: title + description (full width; pr 留出右下角手柄位) */}
           <div className="mt-1 pl-[1.125rem] pr-7">
-            {canControlTask(t) && t.mode !== 'delivery_loop' && editingAttentionTagId === t.id && (
+            {canControlTask(t) && !prDisplay && t.mode !== 'delivery_loop' && editingAttentionTagId === t.id && (
               <AttentionTag
                 taskId={t.id}
                 value={t.attention_tag}
@@ -438,7 +464,7 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               />
             )}
             {/* Title (editable) */}
-            {canControlTask(t) && t.mode !== 'delivery_loop' && editingTitleId === t.id ? (
+            {canControlTask(t) && !prDisplay && t.mode !== 'delivery_loop' && editingTitleId === t.id ? (
               <input
                 ref={titleInputRef}
                 value={titleDraft}
@@ -457,7 +483,9 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
               ) : null
             )}
             {/* Description (expandable) */}
-            {t.mode === 'loop' && !t.description ? (
+            {prDisplay ? (
+              <PRMonitorTaskSummary task={t} result={prResult} />
+            ) : t.mode === 'loop' && !t.description ? (
               <p className="text-sm mt-0.5 text-gray-500 italic">{t.todo_file_path}</p>
             ) : t.description ? (
               <ExpandableText
@@ -501,6 +529,8 @@ export function TaskList({ tasks, projects, onRefresh, onTaskUpdated, onOpenChat
             />
           )}
         </div>
+        );
+        })()
       ))}
     </div>
     </>

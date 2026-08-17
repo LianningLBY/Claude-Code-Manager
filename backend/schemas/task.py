@@ -572,6 +572,13 @@ def public_task_metadata(value: object) -> dict | None:
         "plan_superseded_by_task_id",
     ):
         positive_int(key)
+    if value.get("pr_monitor_display") is True:
+        projected["pr_monitor_display"] = True
+        # These IDs are only useful for the durable display projection.  Keep
+        # them behind the marker so an internal/malformed Task cannot expose
+        # PR topology merely by placing similarly named metadata keys.
+        positive_int("pr_monitor_run_id")
+        positive_int("pr_monitor_review_id")
     for key in ("forked_from_log_id", "fork_seed_log_id"):
         nullable_positive_int(key)
     bounded_string("forked_from_turn_id", maximum=500)
@@ -785,7 +792,7 @@ class TaskResponse(_TaskResponseBase):
     session_id: str | None = Field(default=None, exclude=True)
     is_worker_managed: bool = False
     has_session: bool = False
-    access_scope: Literal["control"] = "control"
+    access_scope: Literal["control", "chat"] = "control"
 
     @model_validator(mode="after")
     def _project_public_metadata(self):

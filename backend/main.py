@@ -1070,6 +1070,21 @@ async def _runtime_lifespan(app: FastAPI):
 
     if not deployment_start.skip_mutations:
         await init_db()
+    # Materialize one stable, read-only Task for historical PR Monitor Runs.
+    # This runs before Dispatcher startup and is idempotent per Run; reviewer
+    # execution Tasks remain internal and are never reclassified here.
+    if not deployment_start.skip_mutations and settings.ccm_node_role == "manager":
+        from backend.services.pr_monitor_loop import (
+            backfill_pr_monitor_display_tasks,
+        )
+
+        async with async_session() as db:
+            backfilled_display_tasks = await backfill_pr_monitor_display_tasks(db)
+        if backfilled_display_tasks:
+            logger.info(
+                "Backfilled %d PR Monitor display Task(s)",
+                backfilled_display_tasks,
+            )
     # Bind the database identity before recovery loops, Dispatcher, Worker
     # relay or any other Task producer can run.  In particular, an upgraded
     # Worker with a stale/missing CCM_NODE_ROLE must fail startup instead of

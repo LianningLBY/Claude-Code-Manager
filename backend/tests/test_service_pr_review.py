@@ -1272,6 +1272,15 @@ async def test_create_pr_review_task_prefetches_guidance_and_freezes_nonce(
     prepared = _prepared_context(documents)
     broadcaster = MagicMock(broadcast=AsyncMock())
     dispatcher = MagicMock(wake=MagicMock())
+    token_calls = 0
+
+    def deterministic_token_hex(length: int) -> str:
+        nonlocal token_calls
+        token_calls += 1
+        if length == 24:
+            return ACTION_NONCE
+        return f"{token_calls:0{length * 2}x}"[-length * 2:]
+
     with (
         patch.object(
             pr_review_service,
@@ -1281,7 +1290,7 @@ async def test_create_pr_review_task_prefetches_guidance_and_freezes_nonce(
         patch.object(
             pr_review_service.secrets,
             "token_hex",
-            return_value=ACTION_NONCE,
+            side_effect=deterministic_token_hex,
         ),
         patch("backend.main.broadcaster", broadcaster),
         patch("backend.main.dispatcher", dispatcher),
@@ -1379,7 +1388,7 @@ async def test_create_pr_review_task_codex_uses_codex_default(
         patch.object(
             pr_review_service.secrets,
             "token_hex",
-            return_value=ACTION_NONCE,
+            side_effect=[ACTION_NONCE, "1" * 32, "2" * 32],
         ),
     ):
         review = await create_pr_review_task(db_session, repo, PR_DATA)
@@ -6547,7 +6556,14 @@ async def test_recover_superseding_input_rejection_after_cleanup_is_idempotent(
         assert old.superseding_snapshot is None
         assert old.superseding_token is None
         assert old.superseding_started_at is None
-        assert tasks == [await db.get(Task, task_id)]
+        assert len(tasks) == 2
+        assert any(task.id == task_id for task in tasks)
+        display_tasks = [
+            task for task in tasks
+            if (task.metadata_ or {}).get("pr_monitor_display") is True
+        ]
+        assert len(display_tasks) == 1
+        assert display_tasks[0].status == "completed"
         assert tasks[0].status == "completed"
         assert tasks[0].metadata_["pr_review_superseded"] is True
 

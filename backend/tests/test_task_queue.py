@@ -55,7 +55,7 @@ from backend.models.test_harness import (
     TestHarnessSandboxLease,
 )
 from backend.models.task_share import TaskShare
-from backend.models.team_share import TeamTaskShare
+from backend.models.team_share import TeamProjectShare, TeamTaskShare
 from backend.models.user_group import UserGroupMember  # noqa: F401
 from backend.models.worker import Worker
 from backend.models.worker_task_termination import WorkerTaskTerminationReceipt
@@ -3230,7 +3230,7 @@ async def test_list_tasks_filter_status(queue):
 
 
 @pytest.mark.asyncio
-async def test_ordinary_task_lists_hide_linked_pr_reviewer_tasks(queue):
+async def test_ordinary_task_lists_show_only_stable_pr_monitor_display_task(queue):
     ordinary = await queue.create(
         title="ordinary",
         description="user-visible work",
@@ -3246,6 +3246,18 @@ async def test_ordinary_task_lists_hide_linked_pr_reviewer_tasks(queue):
         title="single reviewer",
         description="internal protocol",
         target_repo="/tmp",
+        archived=True,
+    )
+    display_task = await queue.create(
+        title="PR Review: example/hidden-reviewer-tasks#17",
+        description="safe result projection",
+        target_repo="",
+        status="completed",
+        metadata_={
+            "pr_monitor_display": True,
+            "pr_monitor_run_id": 1,
+            "pr_monitor_review_id": 1,
+        },
     )
     panel_task = await queue.create(
         title="panel reviewer",
@@ -3301,6 +3313,7 @@ async def test_ordinary_task_lists_hide_linked_pr_reviewer_tasks(queue):
         current_base_sha="a" * 40,
         current_head_sha="b" * 40,
         current_review_id=review.id,
+        display_task_id=display_task.id,
     )
     queue.db.add(monitor_run)
     await queue.db.flush()
@@ -3357,16 +3370,16 @@ async def test_ordinary_task_lists_hide_linked_pr_reviewer_tasks(queue):
     for internal_task in (single_task, panel_task, fix_task, rebuttal_task):
         assert await is_pr_monitor_owned_task(queue.db, internal_task)
 
-    assert {task.id for task in await queue.list_tasks()} == {ordinary.id}
+    assert {task.id for task in await queue.list_tasks()} == {ordinary.id, display_task.id}
     assert {
         task.id for task in await queue.list_tasks(archived_only=True)
     } == {ordinary_archived.id}
     assert {
         task.id for task in await queue.list_tasks(include_archived=True)
-    } == {ordinary.id, ordinary_archived.id}
-    assert await queue.count_tasks() == 1
+    } == {ordinary.id, ordinary_archived.id, display_task.id}
+    assert await queue.count_tasks() == 2
     assert await queue.count_tasks(archived_only=True) == 1
-    assert await queue.count_tasks(include_archived=True) == 2
+    assert await queue.count_tasks(include_archived=True) == 3
 
 
 @pytest.mark.parametrize(
@@ -3578,6 +3591,71 @@ async def test_member_task_list_and_count_require_chat_share_permission(queue):
 
     assert [task.id for task in visible] == [chat_task.id]
     assert await queue.count_tasks(user_id=42) == 1
+
+
+@pytest.mark.asyncio
+async def test_member_cannot_enumerate_display_task_from_internal_project_share(queue):
+    ordinary_project = Project(name="member-pr-project", status="ready")
+    internal_project = Project(
+        name="PR-Monitor",
+        tags=["ccm:internal:pr-monitor"],
+        status="ready",
+        show_in_selector=False,
+    )
+    queue.db.add_all([ordinary_project, internal_project])
+    await queue.db.flush()
+    queue.db.add(TeamProjectShare(
+        project_id=ordinary_project.id,
+        target_type="user",
+        target_id=42,
+        shared_by=1,
+    ))
+    queue.db.add(TeamProjectShare(
+        project_id=internal_project.id,
+        target_type="user",
+        target_id=42,
+        shared_by=1,
+    ))
+    repo = MonitoredRepo(
+        repo_full_name="example/member-display",
+        project_id=ordinary_project.id,
+        webhook_secret="queue-secret",
+    )
+    queue.db.add(repo)
+    await queue.db.flush()
+    display = await queue.create(
+        title="PR Review: example/member-display#1",
+        description="safe result",
+        project_id=internal_project.id,
+        status="completed",
+        metadata_={"pr_monitor_display": True},
+    )
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=1,
+        current_base_sha="a" * 40,
+        current_head_sha="b" * 40,
+        display_task_id=display.id,
+    )
+    queue.db.add(run)
+    await queue.db.commit()
+
+    visible = await queue.list_tasks(user_id=42)
+    assert [task.id for task in visible] == [display.id]
+    assert await queue.count_tasks(user_id=42) == 1
+
+
+@pytest.mark.asyncio
+async def test_staged_display_marker_is_hidden_until_run_link_is_present(queue):
+    staged = await queue.create(
+        title="PR Review: staged",
+        description="safe result",
+        status="completed",
+        metadata_={"pr_monitor_display": True},
+    )
+
+    assert await queue.list_tasks() == []
+    assert await queue.count_tasks() == 0
 
 
 @pytest.mark.parametrize(

@@ -794,6 +794,28 @@ async def _task_access_allowed(
     # rejected callback has no reason to touch).
     if getattr(request.state, "auth_type", None) == "internal_service":
         return False
+    # The stable PR Monitor display Task is readable but never mutable. Its
+    # visibility follows the ordinary Project attached to the monitored repo;
+    # the internal PR-Monitor grouping Project and stale Task/Project shares
+    # are deliberately ignored.
+    from backend.services.pr_monitor_task_access import (
+        is_pr_monitor_display_task,
+        pr_monitor_display_project_id,
+    )
+    if await is_pr_monitor_display_task(db, task):
+        if not allow_chat_share:
+            return False
+        if is_admin(request):
+            return True
+        project_id = await pr_monitor_display_project_id(db, task.id)
+        if project_id is None:
+            return False
+        return await has_project_access(
+            request,
+            project_id,
+            db,
+            effect_fence=effect_fence,
+        )
     if is_admin(request):
         # Preserve the existing administrator diagnostics/terminal-review
         # workflow.  The boundary below prevents member grants from turning

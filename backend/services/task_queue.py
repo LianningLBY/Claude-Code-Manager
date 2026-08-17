@@ -58,6 +58,38 @@ TASK_KIND_RELATED_PLAN = "related_plan"
 TASK_KIND_MAIN = "main"
 
 
+async def _member_visible_project_ids(db: AsyncSession, user_id: int) -> list[int]:
+    """Resolve member Project shares while excluding internal grouping rows."""
+
+    from backend.models.project import Project, project_is_internal
+    from backend.models.team_share import TeamProjectShare
+    from backend.models.user_group import UserGroupMember
+
+    group_ids = select(UserGroupMember.group_id).where(
+        UserGroupMember.user_id == user_id
+    )
+    shared_ids = list((await db.execute(
+        select(TeamProjectShare.project_id)
+        .where(
+            (
+                (TeamProjectShare.target_type == "user")
+                & (TeamProjectShare.target_id == user_id)
+            )
+            | (
+                (TeamProjectShare.target_type == "group")
+                & TeamProjectShare.target_id.in_(group_ids)
+            )
+        )
+        .distinct()
+    )).scalars())
+    if not shared_ids:
+        return []
+    projects = list((await db.execute(
+        select(Project).where(Project.id.in_(shared_ids))
+    )).scalars())
+    return sorted(project.id for project in projects if not project_is_internal(project))
+
+
 class TaskWaitingCapabilityConflict(RuntimeError):
     """An ordinary Task mutation raced with its durable capability wait."""
 
@@ -154,12 +186,17 @@ def ordinary_task_visibility_predicate():
     unarchived rows, so filtering on ``Task.archived`` alone can leak raw
     Controller protocol into the normal Tasks/Chat UI. Delivery developer
     shells and their pre-PR reviewer Tasks are likewise implementation records
-    of the Delivery graph, not independent user Tasks. Durable owner links
-    classify both legacy and current workflows without relying on titles/tags.
+    of the Delivery graph, not independent user Tasks. The stable PR Monitor
+    display Task is the only exception: it is a read-only user-facing PR
+    result entry while its durable ``PRMonitorRun.display_task_id`` link
+    prevents an arbitrary Task from opting into the projection. Durable owner
+    links classify both legacy and current workflows without relying on
+    titles/tags.
     """
 
     from backend.models.code_review import CodeReviewRun
     from backend.services.pr_monitor_task_access import (
+        pr_monitor_display_task_predicate,
         pr_monitor_owned_task_predicate,
     )
 
@@ -185,7 +222,10 @@ def ordinary_task_visibility_predicate():
     return and_(
         Task.mode != "delivery_loop",
         Task.delivery_run_id.is_(None),
-        ~pr_monitor_owned_task_predicate(Task.id),
+        or_(
+            ~pr_monitor_owned_task_predicate(Task.id),
+            pr_monitor_display_task_predicate(Task.id),
+        ),
         ~delivery_code_review_task,
     )
 
@@ -983,6 +1023,10 @@ class TaskQueue:
         if user_id is not None:
             from backend.models.team_share import TeamTaskShare, TeamProjectShare
             from backend.models.user_group import UserGroupMember
+            from backend.models.pr_monitor import MonitoredRepo, PRMonitorRun
+            from backend.services.pr_monitor_task_access import (
+                pr_monitor_display_task_predicate,
+            )
             user_group_ids_q = select(UserGroupMember.group_id).where(UserGroupMember.user_id == user_id)
             shared_task_ids_q = select(TeamTaskShare.task_id).where(
                 TeamTaskShare.permission == "chat",
@@ -991,14 +1035,21 @@ class TaskQueue:
                     | ((TeamTaskShare.target_type == "group") & TeamTaskShare.target_id.in_(user_group_ids_q))
                 ),
             )
-            shared_project_ids_q = select(TeamProjectShare.project_id).where(
-                ((TeamProjectShare.target_type == "user") & (TeamProjectShare.target_id == user_id))
-                | ((TeamProjectShare.target_type == "group") & TeamProjectShare.target_id.in_(user_group_ids_q))
+            visible_project_ids = await _member_visible_project_ids(self.db, user_id)
+            display_task_ids_q = (
+                select(PRMonitorRun.display_task_id)
+                .join(MonitoredRepo, MonitoredRepo.id == PRMonitorRun.repo_id)
+                .where(
+                    PRMonitorRun.display_task_id.is_not(None),
+                    MonitoredRepo.project_id.in_(visible_project_ids),
+                )
             )
+            display_task = pr_monitor_display_task_predicate(Task.id)
             stmt = stmt.where(
                 (Task.created_by == user_id)
-                | Task.id.in_(shared_task_ids_q)
-                | Task.project_id.in_(shared_project_ids_q)
+                | and_(Task.id.in_(shared_task_ids_q), ~display_task)
+                | and_(Task.project_id.in_(visible_project_ids), ~display_task)
+                | and_(Task.id.in_(display_task_ids_q), display_task)
             )
         stmt = stmt.limit(limit).offset(offset)
         result = await self.db.execute(stmt)
@@ -1034,6 +1085,10 @@ class TaskQueue:
         if user_id is not None:
             from backend.models.team_share import TeamTaskShare, TeamProjectShare
             from backend.models.user_group import UserGroupMember
+            from backend.models.pr_monitor import MonitoredRepo, PRMonitorRun
+            from backend.services.pr_monitor_task_access import (
+                pr_monitor_display_task_predicate,
+            )
             user_group_ids_q = select(UserGroupMember.group_id).where(UserGroupMember.user_id == user_id)
             shared_task_ids_q = select(TeamTaskShare.task_id).where(
                 TeamTaskShare.permission == "chat",
@@ -1042,14 +1097,21 @@ class TaskQueue:
                     | ((TeamTaskShare.target_type == "group") & TeamTaskShare.target_id.in_(user_group_ids_q))
                 ),
             )
-            shared_project_ids_q = select(TeamProjectShare.project_id).where(
-                ((TeamProjectShare.target_type == "user") & (TeamProjectShare.target_id == user_id))
-                | ((TeamProjectShare.target_type == "group") & TeamProjectShare.target_id.in_(user_group_ids_q))
+            visible_project_ids = await _member_visible_project_ids(self.db, user_id)
+            display_task_ids_q = (
+                select(PRMonitorRun.display_task_id)
+                .join(MonitoredRepo, MonitoredRepo.id == PRMonitorRun.repo_id)
+                .where(
+                    PRMonitorRun.display_task_id.is_not(None),
+                    MonitoredRepo.project_id.in_(visible_project_ids),
+                )
             )
+            display_task = pr_monitor_display_task_predicate(Task.id)
             stmt = stmt.where(
                 (Task.created_by == user_id)
-                | Task.id.in_(shared_task_ids_q)
-                | Task.project_id.in_(shared_project_ids_q)
+                | and_(Task.id.in_(shared_task_ids_q), ~display_task)
+                | and_(Task.project_id.in_(visible_project_ids), ~display_task)
+                | and_(Task.id.in_(display_task_ids_q), display_task)
             )
         result = await self.db.execute(stmt)
         return result.scalar() or 0

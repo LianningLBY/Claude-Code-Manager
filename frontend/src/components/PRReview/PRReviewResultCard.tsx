@@ -87,9 +87,11 @@ function publicationClasses(state: PRPublicationState): string {
 
 export interface PRReviewResultCardProps {
   result: PRReviewResult;
-  onOpenDetail: (result: PRReviewResult, reviewId?: number) => void;
-  onCreateFollowUp: (result: PRReviewResult) => void;
-  onRerun: (result: PRReviewResult) => Promise<void>;
+  onOpenDetail?: (result: PRReviewResult, reviewId?: number) => void;
+  onCreateFollowUp?: (result: PRReviewResult) => void;
+  onRerun?: (result: PRReviewResult) => Promise<void>;
+  /** Hide all review mutation/deep-link actions when embedded in a display Task. */
+  readOnly?: boolean;
   rerunPending?: boolean;
   rerunError?: string | null;
   rerunSuccess?: { reviewId: number; message: string } | null;
@@ -101,6 +103,7 @@ export function PRReviewResultCard({
   onOpenDetail,
   onCreateFollowUp,
   onRerun,
+  readOnly = false,
   rerunPending = false,
   rerunError = null,
   rerunSuccess = null,
@@ -196,7 +199,7 @@ export function PRReviewResultCard({
         </p>
       )}
       {rerunError && <p className="mt-2 text-xs text-red-300" role="alert">{rerunError}</p>}
-      {rerunSuccess && (
+      {!readOnly && rerunSuccess && onOpenDetail && (
         <p className="mt-2 text-xs text-emerald-300" role="status">
           {rerunSuccess.message}{' '}
           <button
@@ -209,8 +212,8 @@ export function PRReviewResultCard({
         </p>
       )}
 
-      <div className="mt-3 flex flex-wrap gap-2">
-        <button
+      {!readOnly && <div className="mt-3 flex flex-wrap gap-2">
+        {onOpenDetail && <button
           type="button"
           onClick={() => rerunSuccess
             ? onOpenDetail(result, rerunSuccess.reviewId)
@@ -218,7 +221,7 @@ export function PRReviewResultCard({
           className="rounded bg-indigo-600 px-2.5 py-1.5 text-xs font-medium text-white hover:bg-indigo-500"
         >
           Open review details
-        </button>
+        </button>}
         {prUrl && (
           <a
             href={prUrl}
@@ -239,14 +242,14 @@ export function PRReviewResultCard({
             Open published comment
           </a>
         )}
-        <button
+        {onCreateFollowUp && <button
           type="button"
           onClick={() => onCreateFollowUp(result)}
           className="inline-flex items-center gap-1 rounded bg-gray-700 px-2.5 py-1.5 text-xs text-gray-200 hover:bg-gray-600"
         >
           <Plus size={12} /> Create follow-up Task
-        </button>
-        {canRerun && (
+        </button>}
+        {canRerun && onRerun && (
           <button
             type="button"
             disabled={rerunPending}
@@ -257,7 +260,7 @@ export function PRReviewResultCard({
             {rerunPending ? 'Starting exact-head review…' : 'Re-run exact head'}
           </button>
         )}
-      </div>
+      </div>}
     </article>
   );
 }

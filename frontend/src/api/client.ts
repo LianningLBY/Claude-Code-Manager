@@ -861,6 +861,10 @@ export interface Task {
     revised_from_plan_task_id?: number;
     plan_superseded_by_task_id?: number;
     frontend_review?: FrontendReviewConfig;
+    /** Stable, read-only PR Monitor display Task marker. */
+    pr_monitor_display?: boolean;
+    pr_monitor_run_id?: number;
+    pr_monitor_review_id?: number;
   } | null;
   context_window_usage: {
     input_tokens: number;
@@ -1639,6 +1643,7 @@ export interface PRReview {
   pr_author: string;
   pr_url: string;
   task_id: number | null;
+  display_task_id?: number | null;
   status: string;
   review_summary: string | null;
   /** Additive human-facing projection. Older CCM servers omit these fields. */
@@ -1698,6 +1703,8 @@ export interface PRMonitorRun {
   pr_number: number;
   status: string;
   current_head_sha: string;
+  /** Stable ordinary Task used to display this PR's aggregate result. */
+  display_task_id?: number | null;
   developer_task_id: number | null;
   repair_attempts: number;
   max_repair_attempts: number;
@@ -1824,6 +1831,8 @@ export interface PRReviewResult {
   /** Stable UI identity for both Run-backed and historical orphan results. */
   result_key: string;
   run_id: number | null;
+  /** Ordinary Task that renders this PR's aggregate result, when provisioned. */
+  display_task_id?: number | null;
   repo_id: number;
   repo_full_name: string;
   pr_number: number;

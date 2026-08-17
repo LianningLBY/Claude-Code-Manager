@@ -539,6 +539,16 @@ class PRMonitorRun(Base):
     current_base_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     current_head_sha: Mapped[str] = mapped_column(String(64), nullable=False)
     current_review_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # Stable human-facing Task identity for this PR lifecycle. Reviewer Tasks
+    # are immutable execution records and may be replaced on every new head;
+    # this row remains one-to-one with the repo/PR Run.
+    display_task_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("tasks.id"),
+        nullable=True,
+        index=True,
+        unique=True,
+    )
     developer_task_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("tasks.id"), nullable=True, index=True)
     head_repo_full_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     head_branch: Mapped[str | None] = mapped_column(String(200), nullable=True)

@@ -58,6 +58,19 @@ function renderCard(result: PRReviewResult = resultFixture()) {
 }
 
 describe('PRReviewResultCard', () => {
+  it('can render the aggregate projection without review mutation controls', () => {
+    render(
+      <PRReviewResultCard
+        result={resultFixture()}
+        readOnly
+      />,
+    );
+
+    expect(screen.getByRole('article', { name: /PR Review Result acme\/widget #133/ })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Open review details|Create follow-up|Re-run exact head/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Open GitHub PR|Open published comment/i })).not.toBeInTheDocument();
+  });
+
   it('keeps a complete code verdict separate from a stale publication and merged lifecycle', () => {
     renderCard();
 

@@ -10,7 +10,7 @@ import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -388,6 +388,123 @@ async def test_ordinary_running_cold_recovery_advances_only_clean_generation(
         generation=12,
         step_status="cancelled",
     )
+
+
+@pytest.mark.asyncio
+async def test_running_cold_recovery_discards_cleaned_receipt_from_reused_run_id(
+    db_factory,
+    monkeypatch,
+):
+    """A terminal receipt older than its Run cannot fence a reused SQLite ID."""
+
+    from backend.services import plan_agent_runner
+
+    monkeypatch.setattr(plan_agent_runner, "active_plan_run_ids", lambda: set())
+    async with db_factory() as db:
+        plan = Plan(
+            title="reused-run-id",
+            initial_request="recover startup",
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            status="running",
+            current_stage="planner",
+            generation=1,
+            pipeline_config={},
+            last_execution_started_at=datetime.utcnow(),
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        receipt = PlanAgentRuntimeReceipt(
+            run_id=run.id,
+            step_id=999,
+            run_generation=1,
+            attempt_index=1,
+            provider="claude",
+            runtime_token=uuid.uuid4().hex,
+            prepared_boot_id="00000000-0000-0000-0000-000000000001",
+            prepared_start_ticks=1,
+            prepared_uid=0,
+            status="cleaned",
+            created_at=run.created_at - timedelta(hours=1),
+            updated_at=run.created_at - timedelta(hours=1),
+            cleaned_at=run.created_at - timedelta(hours=1),
+        )
+        db.add(receipt)
+        await db.commit()
+        run_id = run.id
+        receipt_id = receipt.id
+
+    assert await _dispatcher(db_factory)._recover_versioned_plan_runs() is False
+
+    async with db_factory() as db:
+        run = await db.get(PlanAgentRun, run_id)
+        assert run is not None
+        assert run.status == "queued"
+        assert run.generation == 2
+        assert run.instance_id is None
+        assert await db.get(PlanAgentRuntimeReceipt, receipt_id) is None
+
+
+@pytest.mark.asyncio
+async def test_running_cold_recovery_keeps_unclean_receipt_from_reused_run_id(
+    db_factory,
+    monkeypatch,
+):
+    """An older receipt without cleanup proof still blocks automatic replay."""
+
+    from backend.services import plan_agent_runner
+
+    monkeypatch.setattr(plan_agent_runner, "active_plan_run_ids", lambda: set())
+    async with db_factory() as db:
+        plan = Plan(
+            title="unclean-reused-run-id",
+            initial_request="remain fenced",
+            pipeline_config={},
+        )
+        db.add(plan)
+        await db.flush()
+        run = PlanAgentRun(
+            plan_id=plan.id,
+            status="running",
+            current_stage="planner",
+            generation=1,
+            pipeline_config={},
+            last_execution_started_at=datetime.utcnow(),
+        )
+        db.add(run)
+        await db.flush()
+        plan.active_run_id = run.id
+        receipt = PlanAgentRuntimeReceipt(
+            run_id=run.id,
+            step_id=999,
+            run_generation=1,
+            attempt_index=1,
+            provider="claude",
+            runtime_token=uuid.uuid4().hex,
+            prepared_boot_id="00000000-0000-0000-0000-000000000001",
+            prepared_start_ticks=1,
+            prepared_uid=0,
+            status="prepared",
+            created_at=run.created_at - timedelta(hours=1),
+            updated_at=run.created_at - timedelta(hours=1),
+        )
+        db.add(receipt)
+        await db.commit()
+        run_id = run.id
+        receipt_id = receipt.id
+
+    assert await _dispatcher(db_factory)._recover_versioned_plan_runs() is True
+
+    async with db_factory() as db:
+        run = await db.get(PlanAgentRun, run_id)
+        receipt = await db.get(PlanAgentRuntimeReceipt, receipt_id)
+        assert run is not None and run.status == "running"
+        assert receipt is not None and receipt.status == "prepared"
 
 
 @pytest.mark.asyncio

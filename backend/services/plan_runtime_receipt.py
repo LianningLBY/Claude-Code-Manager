@@ -19,6 +19,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 
 from backend.models.plan_agent import (
+    PlanAgentRun,
     PlanAgentRuntimeReceipt,
     PlanAgentStep,
 )
@@ -1223,6 +1224,11 @@ async def reconcile_runtime_generation(
     generation: int,
     allow_transport_kill: bool,
 ) -> bool:
+    if not await _discard_cleaned_receipts_from_reused_run_id(
+        db_factory,
+        run_id=run_id,
+    ):
+        return False
     async with db_factory() as db:
         snapshots = await _runtime_generation_snapshots(
             db,
@@ -1260,6 +1266,52 @@ async def reconcile_runtime_generation(
             run_id=run_id,
             generation=generation,
         )
+
+
+async def _discard_cleaned_receipts_from_reused_run_id(
+    db_factory,
+    *,
+    run_id: int,
+) -> bool:
+    """Remove terminal receipts that provably predate the current Run row.
+
+    SQLite can reuse an INTEGER primary key after a deleted Plan graph. If an
+    interrupted/manual cleanup left runtime receipts behind, a later Run may
+    inherit their ``run_id`` even though those receipts belong to an older
+    aggregate. Only already-cleaned receipts created before the current Run
+    are safe to discard. Any non-terminal predecessor remains fail-closed.
+    """
+
+    async with db_factory() as db:
+        run = await db.get(
+            PlanAgentRun,
+            run_id,
+            with_for_update=True,
+            populate_existing=True,
+        )
+        if run is None:
+            await db.rollback()
+            return False
+        stale_receipts = list(
+            (
+                await db.execute(
+                    select(PlanAgentRuntimeReceipt)
+                    .where(
+                        PlanAgentRuntimeReceipt.run_id == run_id,
+                        PlanAgentRuntimeReceipt.created_at < run.created_at,
+                    )
+                    .order_by(PlanAgentRuntimeReceipt.id)
+                    .with_for_update()
+                )
+            ).scalars()
+        )
+        if any(receipt.status != "cleaned" for receipt in stale_receipts):
+            await db.rollback()
+            return False
+        for receipt in stale_receipts:
+            await db.delete(receipt)
+        await db.commit()
+        return True
 
 
 async def runtime_run_is_clean(db, *, run_id: int) -> bool:

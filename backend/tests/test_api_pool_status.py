@@ -18,16 +18,33 @@ _DISABLED_STATUS = {
     "accounts": [],
 }
 
+_CODEX_DISABLED_STATUS = {
+    **_DISABLED_STATUS,
+    "settings": {
+        "enabled": False,
+        "cooldown_seconds": 300,
+        "quota_switch_threshold_percent": 90.0,
+        "routing_policy": "api_first",
+        "preferred_account_id": None,
+    },
+}
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("module", "status_handler", "usage_handler"),
+    ("module", "status_handler", "usage_handler", "expected_status"),
     [
-        (claude_pool_api, claude_pool_api.pool_status, claude_pool_api.pool_usage),
+        (
+            claude_pool_api,
+            claude_pool_api.pool_status,
+            claude_pool_api.pool_usage,
+            _DISABLED_STATUS,
+        ),
         (
             codex_pool_api,
             codex_pool_api.codex_pool_status,
             codex_pool_api.codex_pool_usage,
+            _CODEX_DISABLED_STATUS,
         ),
     ],
 )
@@ -36,10 +53,11 @@ async def test_disabled_pool_status_is_a_successful_empty_capability_response(
     module,
     status_handler,
     usage_handler,
+    expected_status,
 ):
     monkeypatch.setattr(module, "_get_optional_pool", lambda: None)
 
-    assert await status_handler() == _DISABLED_STATUS
+    assert await status_handler() == expected_status
 
     with pytest.raises(HTTPException) as exc_info:
         await usage_handler()

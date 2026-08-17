@@ -521,7 +521,7 @@ async def test_ordinary_cancel_finalization_locks_run_before_plan_in_each_transa
     session_factory,
     monkeypatch,
 ):
-    """Owner release and terminal publication both use Run -> Plan order."""
+    """Receipt discard, owner release, and publication keep Run-first order."""
 
     graph = await _seed_run(
         session_factory,
@@ -546,7 +546,16 @@ async def test_ordinary_cancel_finalization_locks_run_before_plan_in_each_transa
     response = await client.post(f"/api/plan-runs/{graph.run_id}/cancel")
 
     assert response.status_code == 200, response.text
-    assert locked_entities == [PlanAgentRun, Plan, PlanAgentRun, Plan]
+    assert locked_entities == [
+        # Reused-ID receipt discard is its own Run-first transaction.
+        PlanAgentRun,
+        # Owner release transaction.
+        PlanAgentRun,
+        Plan,
+        # Terminal publication transaction.
+        PlanAgentRun,
+        Plan,
+    ]
 
 
 @pytest.mark.asyncio

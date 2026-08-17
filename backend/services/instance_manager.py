@@ -17519,7 +17519,7 @@ class InstanceManager:
             return stopped
 
     async def require_stop_session_preflight(self, instance_id: int) -> None:
-        """Reject a known-unsafe shared Codex stop before queue mutation."""
+        """Reject an in-flight target Codex operation before queue mutation."""
 
         process = (
             self.processes.get(instance_id)
@@ -17834,11 +17834,11 @@ class InstanceManager:
             # active: descendant cleanup can fail, yet killing the adapter
             # cannot reap that native work.
             #
-            # This is a durably claimed turn, so the registry may escalate to
-            # account transport shutdown only when no peer turn shares that
-            # process.  If isolation cannot be proven, retain every runtime
-            # and durable owner so the API can return a conflict without
-            # killing unrelated tasks.
+            # This is a durably claimed turn.  The registry unloads only the
+            # target lineage when a peer shares the account process, and may
+            # use whole-transport shutdown only for an isolated Task.  If
+            # exact cleanup cannot be proven, retain every runtime and durable
+            # owner so the API can return a retryable conflict.
             registry = self._codex_app_server
             codex_home = self._config_dirs.get(instance_id)
             if registry is None or not codex_home:

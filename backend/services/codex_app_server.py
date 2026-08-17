@@ -436,6 +436,38 @@ class CodexAppServerRequestError(CodexAppServerError):
     """The server explicitly rejected one JSON-RPC request."""
 
 
+def _missing_active_rollout_error(
+    exc: BaseException,
+    thread_id: str,
+) -> bool:
+    """Match only Codex's stable rejection for an already-archived thread."""
+
+    return (
+        isinstance(exc, CodexAppServerRequestError)
+        and str(exc)
+        == (
+            "thread/archive failed: no rollout found for thread id "
+            f"{thread_id}"
+        )
+    )
+
+
+def _missing_archived_rollout_error(
+    exc: BaseException,
+    thread_id: str,
+) -> bool:
+    """Match only Codex's stable rejection for a non-archived thread."""
+
+    return (
+        isinstance(exc, CodexAppServerRequestError)
+        and str(exc)
+        == (
+            "thread/unarchive failed: no archived rollout found for thread id "
+            f"{thread_id}"
+        )
+    )
+
+
 class CodexAppServerBusyError(CodexAppServerError):
     """The requested account home still has an active Codex turn."""
 
@@ -2203,6 +2235,16 @@ class _TurnContext:
     tool_policy_abort_task: asyncio.Task | None = None
     terminal_protocol_violation: str | None = None
     malformed_terminal_guard_task: asyncio.Task | None = None
+    # An explicit Task stop must keep the adapter/consumer generation alive
+    # until every target thread runtime has been unloaded.  Native
+    # turn/completed can race ahead of that cleanup; hold its terminal here so
+    # a retry still owns the exact process/context instead of becoming a
+    # permanently unresolvable DB claim.
+    claimed_stop_token: object | None = None
+    claimed_stop_transport_generation: object | None = None
+    claimed_stop_reason: str | None = None
+    claimed_stop_interrupt_confirmed: bool = False
+    claimed_stop_terminal_notification: dict[str, Any] | None = None
 
 
 @dataclass
@@ -2292,14 +2334,62 @@ class CodexAppServer:
             ] | None,
         ] | None = None
         self._finalized_transport_process: asyncio.subprocess.Process | None = None
+        # Changes on every real subprocess start.  Registry-side Task stops
+        # capture this token so a dead/restarted app-server object cannot pass
+        # an object-identity-only generation check (A -> B -> A ABA).
+        self._transport_generation = object()
+        # Archive may succeed while unarchive fails.  Keep an in-memory,
+        # generation-scoped receipt so the next explicit stop retries only the
+        # missing half instead of issuing a second ambiguous archive.
+        self._runtime_recycle_archived_threads: set[str] = set()
+        # A Task-scoped stop can retain an exact dead generation on an older
+        # account home while it reconciles that home's saved thread lineage.
+        # Ordinary peers may keep using a live generation, but only the stop
+        # recovery path may replace a dead one until its receipt is settled;
+        # otherwise an unrelated start/quota read can create an ABA that makes
+        # the stop receipt permanently unverifiable.
+        self._historical_stop_recovery_tokens: set[object] = set()
         # App-server keeps completed threads loaded in memory.  The registry
         # uses this set to restart an idle target server before a migrated
         # rollout is resumed there again, avoiding stale in-memory history.
         self._known_threads: set[str] = set()
 
+    def _reserve_historical_stop_recovery(self, token: object) -> None:
+        """Block ordinary dead-transport restart for one stop receipt."""
+
+        self._historical_stop_recovery_tokens.add(token)
+
+    def _release_historical_stop_recovery(self, token: object) -> None:
+        """Release one exact historical-generation restart reservation."""
+
+        self._historical_stop_recovery_tokens.discard(token)
+
     @property
     def is_alive(self) -> bool:
         return self._process is not None and self._process.returncode is None
+
+    def _require_transport_generation(
+        self,
+        expected_generation: object | None,
+        expected_process: Any,
+        *,
+        operation: str,
+    ) -> None:
+        """Reject an RPC sequence after its exact app-server process changed."""
+
+        if expected_generation is None:
+            return
+        if (
+            self._transport_generation is not expected_generation
+            or self._process is not expected_process
+            or expected_process is None
+            or expected_process.returncode is not None
+            or self._shutdown_requested
+        ):
+            raise CodexAppServerBusyError(
+                f"Codex app-server generation changed during {operation}: "
+                f"{self.codex_home}"
+            )
 
     @property
     def shutdown_requested(self) -> bool:
@@ -2734,6 +2824,14 @@ class CodexAppServer:
 
         if not self._context_is_current(context):
             return
+        if context.claimed_stop_token is not None:
+            # A Task-scoped stop owns terminal publication.  Do not let a
+            # malformed concurrent terminal detach its retry receipt or enter
+            # the ordinary protocol-violation path that may recycle a shared
+            # transport.  The stop still requires thread/read + runtime unload
+            # before it can publish the adapter terminal.
+            context.terminal_protocol_violation = reason
+            return
         error = {
             "message": f"Malformed Codex turn/completed notification: {reason}",
             "code": "ccm_malformed_turn_terminal",
@@ -2806,6 +2904,12 @@ class CodexAppServer:
             except asyncio.CancelledError:
                 raise
             except BaseException:
+                if context.claimed_stop_token is not None:
+                    # A concurrent explicit Task stop owns exact interruption
+                    # and may not escalate this target-local ambiguity into a
+                    # shared transport shutdown.
+                    context.terminal_protocol_violation = reason
+                    return
                 logger.exception(
                     "Could not confirm exact Codex interrupt after an "
                     "uncorrelated terminal thread=%s task=%s; shutting down "
@@ -2817,12 +2921,15 @@ class CodexAppServer:
                     # Do not mark the target as a user interrupt.  Protocol
                     # ambiguity is a failed turn, and every peer adapter on
                     # this now-untrusted transport must fail as well.
-                    await self.shutdown(
+                    shutdown_completed = await self.shutdown(
                         reason=(
                             "Codex app-server emitted an uncorrelated terminal: "
                             f"{reason}"
                         ),
+                        unless_claimed_context=context,
                     )
+                    if shutdown_completed is False:
+                        return
                 except asyncio.CancelledError:
                     raise
                 except BaseException:
@@ -2846,8 +2953,16 @@ class CodexAppServer:
                         reason,
                         use_context_identity=True,
                     )
-                return
+                    return
 
+            if context.claimed_stop_token is not None:
+                # The malformed-terminal guard may have started before the
+                # explicit Task stop published its claim and then completed
+                # the exact interrupt while that stop was reserving lineage.
+                # The stop now owns terminal publication and must retain this
+                # adapter as its retry receipt through runtime recycling.
+                context.terminal_protocol_violation = reason
+                return
             if self._context_is_current(context):
                 self._fail_malformed_turn_terminal(
                     context,
@@ -2868,6 +2983,11 @@ class CodexAppServer:
         """Retain ownership while asynchronously isolating an unknown terminal."""
 
         if not self._context_is_current(context):
+            return
+        if context.claimed_stop_token is not None:
+            # The explicit stop will reconcile the authoritative native state
+            # without sacrificing peers on this transport.
+            context.terminal_protocol_violation = reason
             return
         existing = context.malformed_terminal_guard_task
         if existing is not None and not existing.done():
@@ -2958,6 +3078,9 @@ class CodexAppServer:
             return
         if not self._context_is_current(context):
             return
+        if context.claimed_stop_token is not None:
+            # Exact stop cleanup must retain the adapter as its retry receipt.
+            return
         context.process.feed({
             "type": "turn.failed",
             "error": {
@@ -3002,6 +3125,8 @@ class CodexAppServer:
                 f"capability: {source}"
             )
         context.tool_policy_violation = reason
+        if context.claimed_stop_token is not None:
+            return
         context.tool_policy_abort_task = asyncio.create_task(
             self._abort_tool_free_violation(context, reason),
         )
@@ -3181,6 +3306,9 @@ class CodexAppServer:
     ) -> None:
         if not self._context_is_current(context):
             return
+        if context.claimed_stop_token is not None:
+            # A newly active child invalidates an earlier quiescence snapshot.
+            context.claimed_stop_interrupt_confirmed = False
         changed = thread_id not in context.active_descendant_thread_ids
         context.active_descendant_thread_ids.add(thread_id)
         self._publish_native_sub_agent_lifecycle(
@@ -4162,6 +4290,14 @@ class CodexAppServer:
     ) -> None:
         """Finish a regular turn or retain it for an active native Goal."""
 
+        if context.claimed_stop_token is not None:
+            # Do not let a descendant/Goal guard mutate turn identity before
+            # the stop owns every thread runtime.  The final stop outcome is
+            # always an explicit interrupt, so a bounded terminal snapshot is
+            # sufficient while the adapter remains the retry receipt.
+            context.claimed_stop_terminal_notification = dict(params)
+            return
+
         turn = params.get("turn") or {}
         runtime = self._thread_runtime.get(context.thread_id)
         goal_may_continue = bool(
@@ -4191,6 +4327,9 @@ class CodexAppServer:
         """Publish the final native terminal and close its CCM adapter."""
 
         if not self._context_is_current(context):
+            return
+        if context.claimed_stop_token is not None:
+            context.claimed_stop_terminal_notification = dict(params)
             return
         if context.background_lifecycle_started_at is not None:
             self._publish_background_lifecycle(
@@ -4421,7 +4560,12 @@ class CodexAppServer:
             return response_turn_id
         raise CodexAppServerError("Could not adopt active native Goal turn")
 
-    async def _interrupt_turn_context(self, context: _TurnContext) -> None:
+    async def _interrupt_turn_context(
+        self,
+        context: _TurnContext,
+        *,
+        authoritative_root_active: bool = False,
+    ) -> None:
         """Interrupt the actual active turn, reconciling steer-style admission ids."""
 
         if not self._interrupt_context_is_current(context):
@@ -4434,7 +4578,10 @@ class CodexAppServer:
         # Once the native parent has already reported terminal, only its
         # descendants remain interruptible.  Re-sending a root interrupt would
         # fail with "no active turn" and skip the real cleanup target.
-        if context.deferred_terminal_notification is None:
+        if authoritative_root_active or (
+            context.deferred_terminal_notification is None
+            and context.claimed_stop_terminal_notification is None
+        ):
             goal_checked = False
             if context.following_native_goal:
                 await self._pause_active_goal(context.thread_id)
@@ -4555,6 +4702,11 @@ class CodexAppServer:
             )
         if self.is_alive:
             return
+        if self._historical_stop_recovery_tokens:
+            raise CodexAppServerBusyError(
+                "Codex app-server dead-generation recovery is pending: "
+                f"{self.codex_home}"
+            )
         async with self._lifecycle_lock:
             if self._shutdown_requested:
                 raise CodexAppServerBusyError(
@@ -4562,6 +4714,24 @@ class CodexAppServer:
                 )
             if self.is_alive:
                 return
+            if self._historical_stop_recovery_tokens:
+                raise CodexAppServerBusyError(
+                    "Codex app-server dead-generation recovery is pending: "
+                    f"{self.codex_home}"
+                )
+            if any(
+                context.claimed_stop_token is not None
+                for context in self._contexts_by_thread.values()
+            ):
+                # An unexpected owner-transport exit proves that process
+                # generation is gone, but a Task-scoped stop may still be
+                # clearing copies left on older account homes.  The retained
+                # adapter/context is its retry receipt; starting a replacement
+                # generation here would destroy that exact lineage evidence.
+                raise CodexAppServerBusyError(
+                    "Codex app-server restart is blocked by a pending "
+                    f"Task-scoped stop: {self.codex_home}"
+                )
             # A dead leader may still have descendants in the independent
             # app-server process group and keep stdout open.  Stop that exact
             # generation before waiting on its readers, or the reader wait can
@@ -4581,6 +4751,110 @@ class CodexAppServer:
                 )
             await self._start()
 
+    async def restart_after_exact_transport_exit(
+        self,
+        *,
+        expected_transport_generation: object,
+        expected_transport_process: Any,
+        publish_generation: Callable[[object, Any], None] | None = None,
+    ) -> tuple[object, Any]:
+        """Replace one proven-dead generation without closing this server.
+
+        Historical Task-stop cleanup can lose its transport after an archive
+        request is on the wire.  Leader exit is not cleanup proof: descendants
+        in the same process group may still be alive, and the archive may have
+        committed.  Hold the lifecycle barrier while proving the exact dead
+        generation, settle its complete process group, and start one fresh
+        generation on the same account home for idempotent reconciliation.
+        """
+
+        async with self._lifecycle_lock:
+            exact_settled_generation = bool(
+                expected_transport_process is None
+                and self._process is None
+                and self._transport_generation
+                is expected_transport_generation
+                and not any(
+                    task is not None and not task.done()
+                    for task in (self._reader_task, self._stderr_task)
+                )
+            )
+            exact_dead_generation = bool(
+                expected_transport_process is not None
+                and self._process is expected_transport_process
+                and self._transport_generation
+                is expected_transport_generation
+                and expected_transport_process.returncode is not None
+            )
+            if (
+                self._shutdown_requested
+                or not (
+                    exact_settled_generation or exact_dead_generation
+                )
+            ):
+                raise CodexAppServerBusyError(
+                    "Codex app-server exited-generation recovery lost its "
+                    f"exact transport generation: {self.codex_home}"
+                )
+
+            if exact_dead_generation:
+                # _shutdown_locked is the process-group proof.  Do not call
+                # public shutdown here: its permanent flag would prevent this
+                # historical home from starting a reconciliation generation.
+                try:
+                    await self._shutdown_locked()
+                except BaseException:
+                    if (
+                        not self._shutdown_requested
+                        and self._transport_generation
+                        is expected_transport_generation
+                        and self._process is None
+                        and publish_generation is not None
+                    ):
+                        publish_generation(self._transport_generation, None)
+                    raise
+                if (
+                    self._shutdown_requested
+                    or self._transport_generation
+                    is not expected_transport_generation
+                    or self._process is not None
+                ):
+                    raise CodexAppServerBusyError(
+                        "Codex app-server exited-generation recovery changed "
+                        f"before restart: {self.codex_home}"
+                    )
+                if publish_generation is not None:
+                    publish_generation(self._transport_generation, None)
+
+            try:
+                await self._start()
+            except BaseException:
+                # _start changes the generation token before spawning.  If it
+                # then proves that attempted process group gone, publish a
+                # retryable settled receipt while still holding the lifecycle
+                # lock.  An unproven group sets shutdown_requested and remains
+                # fail-closed on the predecessor receipt instead.
+                if (
+                    not self._shutdown_requested
+                    and self._process is None
+                    and publish_generation is not None
+                ):
+                    publish_generation(self._transport_generation, None)
+                raise
+            process = self._process
+            if (
+                self._shutdown_requested
+                or process is None
+                or process.returncode is not None
+            ):
+                raise CodexAppServerError(
+                    "Codex app-server replacement generation did not remain "
+                    f"alive: {self.codex_home}"
+                )
+            if publish_generation is not None:
+                publish_generation(self._transport_generation, process)
+            return self._transport_generation, process
+
     async def read_rate_limits(self) -> dict[str, Any]:
         """Read the authenticated account's current rate-limit snapshot."""
 
@@ -4591,6 +4865,8 @@ class CodexAppServer:
         return await self._request("account/rateLimits/read", None)
 
     async def _start(self) -> None:
+        self._transport_generation = object()
+        self._runtime_recycle_archived_threads.clear()
         self._stderr_lines.clear()
         self._planned_shutdown = None
         self._observed_transport_exit = None
@@ -6575,6 +6851,9 @@ class CodexAppServer:
             ),
         )
         self._contexts_by_thread[thread_id] = context
+        # A successfully loaded/adopted thread invalidates any old
+        # archive-response-loss receipt for this transport generation.
+        self._runtime_recycle_archived_threads.discard(str(thread_id))
         if adopt_active_goal:
             # The app-server keeps lineage/runtime observations even when an
             # older CCM adapter detached. Re-adopt every already-known child
@@ -6807,7 +7086,7 @@ class CodexAppServer:
             if turn_cancelled:
                 raise _UnconfirmedTurnCancellation(turn_process, reason) from exc
             raise _UnconfirmedTurnStartFailure(turn_process, reason) from exc
-        except BaseException as exc:
+        except Exception as exc:
             self._detach_turn_context(context)
             await finish_prepared_turn(
                 1,
@@ -7461,7 +7740,13 @@ class CodexAppServer:
             if context.thread_id == thread_id:
                 self._contexts_by_turn.pop(turn_id, None)
 
-    async def unsubscribe_thread(self, thread_id: str) -> str:
+    async def unsubscribe_thread(
+        self,
+        thread_id: str,
+        *,
+        expected_transport_generation: object | None = None,
+        expected_transport_process: Any = None,
+    ) -> str:
         """Release this client's idle subscription while preserving history."""
 
         if not thread_id:
@@ -7470,9 +7755,25 @@ class CodexAppServer:
             raise CodexAppServerBusyError(
                 f"Codex thread {thread_id} still has an active turn"
             )
-        response = await self._request(
-            "thread/unsubscribe",
-            {"threadId": thread_id},
+        self._require_transport_generation(
+            expected_transport_generation,
+            expected_transport_process,
+            operation=f"thread unsubscribe for {thread_id}",
+        )
+        # The mutation may commit after it is written even if the caller is
+        # cancelled while waiting for the response.  Settle that exact RPC
+        # before releasing a registry rebind/stop fence so a late unsubscribe
+        # cannot unload a newly resumed generation.
+        response = await finish_awaitable(
+            self._request(
+                "thread/unsubscribe",
+                {"threadId": thread_id},
+            )
+        )
+        self._require_transport_generation(
+            expected_transport_generation,
+            expected_transport_process,
+            operation=f"thread unsubscribe for {thread_id}",
         )
         status = response.get("status")
         if status not in {"unsubscribed", "notSubscribed", "notLoaded"}:
@@ -7480,11 +7781,200 @@ class CodexAppServer:
                 f"thread/unsubscribe returned invalid status for {thread_id}: "
                 f"{status!r}"
             )
+        # unsubscribed/notSubscribed only acknowledge subscription removal;
+        # Codex shuts the listener down asynchronously.  Keep the local known
+        # marker unless the server explicitly proves the thread is not loaded.
         if status == "notLoaded":
             self._known_threads.discard(thread_id)
         return status
 
-    async def recycle_thread_runtime(self, thread_id: str) -> None:
+    async def unload_idle_thread_runtime(self, thread_id: str) -> str:
+        """Authoritatively replace and release one idle Task runtime.
+
+        A CCM context map alone cannot rule out a resumable native Goal or a
+        turn whose notification was missed.  Rebinding and historical-home
+        Task cleanup therefore share the stronger Goal + ``thread/read`` idle
+        proof, then an archive/unarchive runtime boundary, before issuing the
+        thread-scoped unsubscribe RPC.  Unsubscribe alone is not proof that
+        request-scoped MCP clients and code-mode helpers were replaced.
+        """
+
+        lineage, parents = self.thread_lineage_snapshot(thread_id)
+        results = await self.replace_idle_thread_lineage(lineage, parents)
+        return results[thread_id]
+
+    def thread_lineage_snapshot(
+        self,
+        root_thread_id: str,
+    ) -> tuple[tuple[str, ...], dict[str, str]]:
+        """Return one known native subtree in parent-before-child order."""
+
+        if not root_thread_id:
+            raise ValueError("root_thread_id is required")
+        ordered: list[str] = []
+        parents: dict[str, str] = {}
+        queue: deque[str] = deque([root_thread_id])
+        seen: set[str] = set()
+        while queue:
+            thread_id = queue.popleft()
+            if thread_id in seen:
+                raise CodexAppServerError(
+                    "Codex native thread lineage contains a cycle: "
+                    f"{thread_id}"
+                )
+            seen.add(thread_id)
+            ordered.append(thread_id)
+            for child_id in sorted(self._children_by_thread.get(thread_id, ())):
+                existing_parent = parents.get(child_id)
+                if existing_parent is not None and existing_parent != thread_id:
+                    raise CodexAppServerError(
+                        "Codex native thread lineage has conflicting parents: "
+                        f"{child_id}"
+                    )
+                parents[child_id] = thread_id
+                queue.append(child_id)
+        return tuple(ordered), parents
+
+    async def replace_idle_thread_lineage(
+        self,
+        thread_ids: Sequence[str],
+        parent_thread_ids: dict[str, str],
+        *,
+        expected_transport_generation: object | None = None,
+        expected_transport_process: Any = None,
+    ) -> dict[str, str]:
+        """Replace request-scoped runtimes and restore every archived child.
+
+        Codex 0.147 archives a spawned subtree with its root but unarchives
+        only the requested thread.  Processing a parent-before-child plan lets
+        descendants use the parent's archive proof and then be explicitly
+        restored, while unrelated peers on the same app-server stay live.
+        """
+
+        requested = tuple(dict.fromkeys(thread_ids))
+        if not requested or any(not thread_id for thread_id in requested):
+            raise ValueError("thread_ids must contain non-empty ids")
+        if expected_transport_generation is None:
+            await self.ensure_started()
+            expected_transport_generation = self._transport_generation
+            expected_transport_process = self._process
+        self._require_transport_generation(
+            expected_transport_generation,
+            expected_transport_process,
+            operation="thread lineage replacement",
+        )
+        selected = set(requested)
+        parents = {
+            child: parent
+            for child, parent in parent_thread_ids.items()
+            if child in selected and parent in selected
+        }
+        input_order = {thread_id: index for index, thread_id in enumerate(requested)}
+
+        def depth(thread_id: str) -> int:
+            current = thread_id
+            seen = {current}
+            result = 0
+            while current in parents:
+                current = parents[current]
+                if current in seen:
+                    raise CodexAppServerError(
+                        "Codex native thread lineage contains a cycle: "
+                        f"{thread_id}"
+                    )
+                seen.add(current)
+                result += 1
+            return result
+
+        ordered = tuple(sorted(
+            requested,
+            key=lambda thread_id: (depth(thread_id), input_order[thread_id]),
+        ))
+        replaced_or_restored: set[str] = set()
+        results: dict[str, str] = {}
+        try:
+            for thread_id in ordered:
+                authoritatively_not_loaded = False
+                self._require_transport_generation(
+                    expected_transport_generation,
+                    expected_transport_process,
+                    operation=f"thread lineage replacement for {thread_id}",
+                )
+                try:
+                    await self.require_thread_routing_quiescence(thread_id)
+                except CodexThreadTerminalStateError as exc:
+                    # notLoaded can be an ordinary unloaded rollout or the
+                    # committed half of an archive whose response was lost.
+                    # The idempotent archive/unarchive sequence below
+                    # distinguishes those states without guessing.
+                    if exc.state not in {"notLoaded", "systemError"}:
+                        raise
+                    if exc.state == "notLoaded":
+                        authoritatively_not_loaded = True
+                        current = thread_id
+                        seen = {current}
+                        while current in parents:
+                            current = parents[current]
+                            if current in seen:
+                                raise CodexAppServerError(
+                                    "Codex native thread lineage contains a "
+                                    f"cycle: {thread_id}"
+                                )
+                            seen.add(current)
+                            if current in replaced_or_restored:
+                                # thread/archive(parent) already moved this
+                                # descendant and unarchive(parent) deliberately
+                                # restored only the parent.  This is an exact
+                                # archive receipt, not a guess from notLoaded.
+                                self._runtime_recycle_archived_threads.add(
+                                    thread_id
+                                )
+                                break
+
+                self._require_transport_generation(
+                    expected_transport_generation,
+                    expected_transport_process,
+                    operation=f"thread lineage replacement for {thread_id}",
+                )
+                runtime_present = await self.recycle_thread_runtime(
+                    thread_id,
+                    allow_absent_runtime=authoritatively_not_loaded,
+                    expected_transport_generation=expected_transport_generation,
+                    expected_transport_process=expected_transport_process,
+                )
+                replaced_or_restored.add(thread_id)
+                if runtime_present:
+                    results[thread_id] = await self.unsubscribe_thread(
+                        thread_id,
+                        expected_transport_generation=(
+                            expected_transport_generation
+                        ),
+                        expected_transport_process=expected_transport_process,
+                    )
+                else:
+                    results[thread_id] = "notLoaded"
+        except BaseException:
+            # A partial parent-first replacement must remain discoverable on
+            # retry even when an earlier unsubscribe returned notLoaded and
+            # removed its optimistic loaded marker.
+            self._known_threads.update(ordered)
+            raise
+
+        # Unsubscribe alone is asynchronous and is not cleanup proof.  Drop
+        # loaded-copy markers only after the entire lineage crossed a
+        # synchronous archive boundary and every rollout was restored.
+        self._known_threads.difference_update(ordered)
+        return results
+
+    async def recycle_thread_runtime(
+        self,
+        thread_id: str,
+        *,
+        claimed_stop_token: object | None = None,
+        allow_absent_runtime: bool = False,
+        expected_transport_generation: object | None = None,
+        expected_transport_process: Any = None,
+    ) -> bool:
         """Reload one idle thread without changing its persisted identity.
 
         Codex keeps a resumed thread's MCP clients alive, so a later
@@ -7495,20 +7985,123 @@ class CodexAppServer:
 
         if not thread_id:
             raise ValueError("thread_id is required")
-        await self.ensure_started()
-        if self.has_active_thread(thread_id):
-            raise CodexAppServerBusyError(
-                f"Codex thread {thread_id} still has an active turn"
-            )
+        if claimed_stop_token is None:
+            if expected_transport_generation is None:
+                await self.ensure_started()
+            else:
+                self._require_transport_generation(
+                    expected_transport_generation,
+                    expected_transport_process,
+                    operation=f"thread runtime recycle for {thread_id}",
+                )
+            if self.has_active_thread(thread_id):
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} still has an active turn"
+                )
+            if thread_id in self._runtime_recycle_archived_threads:
+                _, status_type, active_turn_ids = (
+                    await self._read_descendant_status(thread_id)
+                )
+                if (
+                    not self._thread_status_is_terminal(status_type)
+                    or active_turn_ids
+                ):
+                    self._runtime_recycle_archived_threads.discard(thread_id)
+                    raise CodexAppServerBusyError(
+                        f"Codex thread {thread_id} is not authoritatively idle"
+                    )
+                if status_type != "notLoaded":
+                    # The earlier unarchive committed despite its lost
+                    # response. Re-establish a fresh archive boundary instead
+                    # of treating the stale half-receipt as current.
+                    self._runtime_recycle_archived_threads.discard(thread_id)
+        else:
+            if not self.is_alive:
+                raise CodexAppServerError(
+                    "Claimed Codex Task stop lost its app-server generation"
+                )
+            context = self._contexts_by_thread.get(thread_id)
+            if context is None:
+                context = self._contexts_by_descendant.get(thread_id)
+            if (
+                context is None
+                or not self._context_is_current(context)
+                or context.claimed_stop_token is not claimed_stop_token
+                or context.claimed_stop_transport_generation
+                is not self._transport_generation
+                or not context.claimed_stop_interrupt_confirmed
+            ):
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} has no claimed-stop idle proof"
+                )
+            if expected_transport_generation is None:
+                expected_transport_generation = (
+                    context.claimed_stop_transport_generation
+                )
+                expected_transport_process = self._process
 
-        async def _archive_then_unarchive() -> None:
-            await self._request(
-                "thread/archive",
-                {"threadId": thread_id},
+            # Always reconcile a half-archive receipt. An earlier unarchive
+            # may have committed despite a lost response, and the same thread
+            # may since have been loaded again; a thread-id-only marker must
+            # never skip the idle proof or a fresh archive boundary.
+            _, status_type, active_turn_ids = (
+                await self._read_descendant_status(thread_id)
+            )
+            if thread_id == context.thread_id:
+                self._record_thread_status(
+                    thread_id,
+                    {"type": status_type} if status_type else None,
+                )
+            else:
+                self._apply_descendant_read_state(
+                    thread_id,
+                    status_type,
+                    active_turn_ids,
+                )
+            if (
+                not self._thread_status_is_terminal(status_type)
+                or active_turn_ids
+            ):
+                self._runtime_recycle_archived_threads.discard(thread_id)
+                # A missed turn/started or status notification can make a
+                # previously confirmed snapshot stale. Preserve the stop
+                # receipt, but force its next retry back through exact native
+                # interruption instead of looping forever at the archive
+                # boundary.
+                context.claimed_stop_interrupt_confirmed = False
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} is not authoritatively idle"
+                )
+            if status_type == "notLoaded":
+                # The archive half committed and still owns the native state;
+                # continue only with its recovery half.
+                self._runtime_recycle_archived_threads.add(thread_id)
+            else:
+                # Loaded + idle means any older marker is stale (for example,
+                # unarchive committed but its response was lost). Establish a
+                # new archive/unarchive boundary for this stop generation.
+                self._runtime_recycle_archived_threads.discard(thread_id)
+
+        self._require_transport_generation(
+            expected_transport_generation,
+            expected_transport_process,
+            operation=f"thread runtime recycle for {thread_id}",
+        )
+
+        async def _unarchive() -> None:
+            self._require_transport_generation(
+                expected_transport_generation,
+                expected_transport_process,
+                operation=f"thread unarchive for {thread_id}",
             )
             response = await self._request(
                 "thread/unarchive",
                 {"threadId": thread_id},
+            )
+            self._require_transport_generation(
+                expected_transport_generation,
+                expected_transport_process,
+                operation=f"thread unarchive for {thread_id}",
             )
             thread = (
                 response.get("thread")
@@ -7521,11 +8114,92 @@ class CodexAppServer:
                     f"{thread_id}"
                 )
 
+        runtime_present = True
+
+        async def _archive_then_unarchive() -> None:
+            nonlocal runtime_present
+            if thread_id in self._runtime_recycle_archived_threads:
+                try:
+                    await _unarchive()
+                except BaseException as exc:
+                    if not _missing_archived_rollout_error(exc, thread_id):
+                        raise
+                    # The earlier unarchive committed but its response was
+                    # lost. Re-establish a fresh archive boundary below.
+                    self._runtime_recycle_archived_threads.discard(thread_id)
+                else:
+                    self._runtime_recycle_archived_threads.discard(thread_id)
+                    return
+
+            try:
+                self._require_transport_generation(
+                    expected_transport_generation,
+                    expected_transport_process,
+                    operation=f"thread archive for {thread_id}",
+                )
+                await self._request(
+                    "thread/archive",
+                    {"threadId": thread_id},
+                )
+                self._require_transport_generation(
+                    expected_transport_generation,
+                    expected_transport_process,
+                    operation=f"thread archive for {thread_id}",
+                )
+            except BaseException as exc:
+                if not _missing_active_rollout_error(exc, thread_id):
+                    raise
+                # An ancestor archive or a committed request whose response
+                # was lost may already have moved this rollout. Unarchive is
+                # the only non-destructive reconciliation.
+                try:
+                    await _unarchive()
+                except BaseException as unarchive_exc:
+                    if (
+                        not allow_absent_runtime
+                        or not _missing_archived_rollout_error(
+                            unarchive_exc,
+                            thread_id,
+                        )
+                    ):
+                        raise
+                    # ``replace_idle_thread_lineage`` already proved this
+                    # exact generation authoritatively notLoaded.  If Codex
+                    # now proves that neither the active nor archived rollout
+                    # exists, the generation-scoped _known_threads marker is
+                    # stale (typically after an app-server restart).  This is
+                    # cleanup proof, not a relaxation of ordinary resume.
+                    self._require_transport_generation(
+                        expected_transport_generation,
+                        expected_transport_process,
+                        operation=(
+                            f"absent thread reconciliation for {thread_id}"
+                        ),
+                    )
+                    self._runtime_recycle_archived_threads.discard(thread_id)
+                    runtime_present = False
+                    return
+                self._runtime_recycle_archived_threads.discard(thread_id)
+                return
+
+            self._runtime_recycle_archived_threads.add(thread_id)
+            await _unarchive()
+            self._runtime_recycle_archived_threads.discard(thread_id)
+
         # Cancellation after archive is on the wire must not leave a resumable
         # Monitor rollout stranded in the archive. Settle the whole pair before
         # propagating cancellation or any RPC failure.
         await _settle_registry_cleanup(_archive_then_unarchive())
-        self._known_threads.add(thread_id)
+        self._require_transport_generation(
+            expected_transport_generation,
+            expected_transport_process,
+            operation=f"thread runtime recycle for {thread_id}",
+        )
+        if runtime_present:
+            self._known_threads.add(thread_id)
+        else:
+            self._known_threads.discard(thread_id)
+        return runtime_present
 
     async def abandon_turn(
         self,
@@ -7570,6 +8244,148 @@ class CodexAppServer:
                 termination_kind="internal_abort",
             )
         return True
+
+    def _claimed_stop_context(
+        self,
+        process: CodexTurnProcess,
+        stop_token: object,
+    ) -> _TurnContext:
+        context = next(
+            (
+                candidate
+                for candidate in self._contexts_by_thread.values()
+                if candidate.process is process
+            ),
+            None,
+        )
+        if (
+            context is None
+            or not self._context_is_current(context)
+            or context.claimed_stop_token is not stop_token
+        ):
+            raise CodexAppServerError(
+                "Claimed Codex Task stop lost its exact turn context"
+            )
+        return context
+
+    async def interrupt_claimed_turn(
+        self,
+        process: CodexTurnProcess,
+        *,
+        stop_token: object,
+    ) -> None:
+        """Interrupt one claimed adapter without publishing its local EOF.
+
+        The native terminal and every descendant must be authoritative before
+        thread-scoped runtime recycling begins.  Keeping ``process`` live is a
+        deliberate retry receipt: InstanceManager and the durable Task/Instance
+        owner cannot split from a partially completed cleanup.
+        """
+
+        context = self._claimed_stop_context(process, stop_token)
+        if context.claimed_stop_interrupt_confirmed:
+            return
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _DESCENDANT_INTERRUPT_CONFIRM_TIMEOUT
+        while True:
+            context = self._claimed_stop_context(process, stop_token)
+            root_result = await self._read_descendant_status(context.thread_id)
+            descendant_ids = tuple(sorted(context.descendant_thread_ids))
+            descendant_results = await asyncio.gather(
+                *(
+                    self._read_descendant_status(thread_id)
+                    for thread_id in descendant_ids
+                )
+            )
+            context = self._claimed_stop_context(process, stop_token)
+
+            _, root_status, root_active_turn_ids = root_result
+            self._record_thread_status(
+                context.thread_id,
+                {"type": root_status} if root_status else None,
+            )
+            for thread_id, status_type, active_turn_ids in descendant_results:
+                self._apply_descendant_read_state(
+                    thread_id,
+                    status_type,
+                    active_turn_ids,
+                )
+
+            root_idle = bool(
+                self._thread_status_is_terminal(root_status)
+                and not root_active_turn_ids
+            )
+            descendants_idle = all(
+                self._thread_status_is_terminal(status_type)
+                and not active_turn_ids
+                for _, status_type, active_turn_ids in descendant_results
+            )
+            if (
+                root_idle
+                and descendants_idle
+                and not context.active_descendant_thread_ids
+                and set(descendant_ids) == context.descendant_thread_ids
+            ):
+                context.claimed_stop_interrupt_confirmed = True
+                return
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                blockers = ", ".join(
+                    sorted(context.active_descendant_thread_ids)
+                )
+                raise CodexAppServerError(
+                    "Could not confirm claimed Codex Task thread cleanup"
+                    + (f": {blockers}" if blockers else "")
+                )
+
+            # Read before interrupting.  A correlated terminal may already
+            # have made the root idle, while a malformed/older terminal must
+            # never suppress an exact interrupt when authoritative thread
+            # state proves a newer root turn active.
+            await self._interrupt_turn_context(
+                context,
+                authoritative_root_active=bool(
+                    root_status == "active" or root_active_turn_ids
+                ),
+            )
+            await asyncio.sleep(
+                min(_DESCENDANT_INTERRUPT_POLL_INTERVAL, remaining)
+            )
+
+    def finish_claimed_turn_stop(
+        self,
+        processes: frozenset[CodexTurnProcess],
+        *,
+        stop_token: object,
+        reason: str,
+    ) -> None:
+        """Publish target adapter terminals only after runtime cleanup."""
+
+        contexts = [
+            self._claimed_stop_context(process, stop_token)
+            for process in processes
+        ]
+        if any(
+            not context.claimed_stop_interrupt_confirmed
+            for context in contexts
+        ):
+            raise CodexAppServerError(
+                "Claimed Codex Task stop has no complete interrupt proof"
+            )
+        for context in contexts:
+            context.claimed_stop_token = None
+            context.claimed_stop_transport_generation = None
+            context.claimed_stop_reason = None
+            context.claimed_stop_terminal_notification = None
+            context.claimed_stop_interrupt_confirmed = False
+            context.process.finish(
+                130,
+                reason,
+                termination_kind="internal_abort",
+            )
+            self._detach_turn_context(context)
 
     async def steer_turn(
         self,
@@ -7821,6 +8637,7 @@ class CodexAppServer:
             if not future.done():
                 future.set_exception(error)
         self._thread_settings_waiters.clear()
+        claimed_stop_receipts: list[_TurnContext] = []
         for context in list(self._contexts_by_thread.values()):
             future = context.admission_observed_future
             if future is not None and not future.done():
@@ -7833,6 +8650,24 @@ class CodexAppServer:
                 context.process.finish(
                     130,
                     planned_shutdown[2],
+                    termination_kind="internal_abort",
+                )
+            elif context.claimed_stop_token is not None and not planned:
+                # The dead owner process proves this home's root/descendant
+                # runtime is gone, but older account homes may still retain
+                # the same Task's helpers. Keep a logical adapter/context
+                # receipt so a later stop-session retry can finish those exact
+                # historical reservations before publishing Task terminal.
+                context.claimed_stop_interrupt_confirmed = True
+                claimed_stop_receipts.append(context)
+                continue
+            elif context.claimed_stop_token is not None:
+                # Registry-wide/planned shutdown settles every managed home;
+                # no later per-Task retry can safely retain this receipt.
+                context.process.finish(
+                    130,
+                    context.claimed_stop_reason
+                    or "CCM task session interrupted",
                     termination_kind="internal_abort",
                 )
             else:
@@ -7848,6 +8683,20 @@ class CodexAppServer:
         self._contexts_by_descendant.clear()
         self._children_by_thread.clear()
         self._thread_runtime.clear()
+        for context in claimed_stop_receipts:
+            self._contexts_by_thread[context.thread_id] = context
+            if context.turn_id:
+                self._contexts_by_turn[context.turn_id] = context
+            for thread_id in context.descendant_thread_ids:
+                self._contexts_by_descendant[thread_id] = context
+                parent_thread_id = context.descendant_parent_thread_ids.get(
+                    thread_id,
+                    context.thread_id,
+                )
+                self._children_by_thread.setdefault(
+                    parent_thread_id,
+                    set(),
+                ).add(thread_id)
         if (
             self._planned_shutdown is not None
             and self._planned_shutdown[0] is process
@@ -8346,6 +9195,11 @@ class CodexAppServer:
             or context.pending_goal_terminal_notification is not None
         ):
             self._confirm_goal_continuation_started(context)
+        if method == "turn/started" and context.claimed_stop_token is not None:
+            context.claimed_stop_interrupt_confirmed = False
+            # A terminal from the older root turn cannot suppress exact
+            # interruption of this newly authoritative generation.
+            context.claimed_stop_terminal_notification = None
         if (
             context.pending_admission_notifications is not None
             and not context.admission_confirmed
@@ -8864,9 +9718,19 @@ class CodexAppServer:
         interrupted_process: CodexTurnProcess | None = None,
         interrupted_processes: frozenset[CodexTurnProcess] | None = None,
         reason: str = "CCM requested Codex app-server shutdown",
-    ) -> None:
+        unless_claimed_context: _TurnContext | None = None,
+    ) -> bool:
         """Permanently stop and verify this server object's process group."""
 
+        # This check and publication of ``_shutdown_requested`` intentionally
+        # contain no await: an already-running malformed-terminal guard may
+        # not cross the boundary after a Task-scoped stop has claimed the
+        # exact context and thereby kill an unrelated Delivery peer.
+        if (
+            unless_claimed_context is not None
+            and unless_claimed_context.claimed_stop_token is not None
+        ):
+            return False
         # Publish the close intent before waiting for the lifecycle barrier.
         # A start already inside the barrier will be stopped after it exits;
         # one queued behind it will observe this flag and cannot spawn later.
@@ -8894,6 +9758,19 @@ class CodexAppServer:
                     reason,
                 )
             await self._shutdown_locked()
+        return True
+
+
+@dataclass(frozen=True)
+class _HistoricalThreadRuntimeReservation:
+    """Exact non-owner app-server generation holding an old thread copy."""
+
+    home: str
+    server: CodexAppServer
+    transport_generation: object
+    transport_process: Any
+    thread_ids: tuple[str, ...]
+    parent_thread_ids: tuple[tuple[str, str], ...]
 
 
 class CodexAppServerRegistry:
@@ -8933,6 +9810,36 @@ class CodexAppServerRegistry:
         # checks this under the same lock so relogin cannot race between
         # server lookup and an RPC using the old auth.json.
         self._starting: dict[str, int] = {}
+        # Home-level admission accounting protects account maintenance, but a
+        # peer-preserving Task stop must distinguish an in-flight start for
+        # the target Task from unrelated Delivery/Task work on the same
+        # transport.  Keep that exact identity until the new adapter is
+        # visible in ``CodexAppServer._contexts_by_thread``.
+        self._starting_tasks: dict[int, int] = {}
+        # A thread-scoped stop keeps this fence across retryable archive /
+        # unarchive failures.  This closes both new-thread and resume
+        # admission for the target Task without draining peer Tasks.
+        self._stopping_tasks: dict[int, object] = {}
+        # ``_starting_threads`` is intentionally global by native thread id,
+        # but one Task stop can reserve the same migrated lineage on both its
+        # current and historical homes.  Track the current-home contribution
+        # separately so late descendants cannot make final cleanup decrement
+        # a home counter that this stop never incremented.
+        self._claimed_stop_threads: dict[tuple[str, str], object] = {}
+        # Older account homes can retain a loaded copy of the same migrated
+        # native thread.  Keep a per-(home, thread) reservation across a
+        # retryable stop so each home's maintenance counter is balanced even
+        # though _starting_threads is intentionally global by thread id.
+        self._historical_stop_threads: dict[tuple[str, str], object] = {}
+        # Per-thread counters are deliberately small, but they cannot recover
+        # descendants that exist only in a historical app-server generation:
+        # transport EOF clears that generation's native child graph.  Retain
+        # the complete immutable lineage and parent map until that home has
+        # crossed a verified archive/unarchive/unsubscribe boundary.
+        self._historical_stop_runtime_receipts: dict[
+            tuple[str, object],
+            _HistoricalThreadRuntimeReservation,
+        ] = {}
         # A home-level count protects maintenance; this per-thread token also
         # prevents two concurrent resumes of the same native thread. Without
         # it, a failed first request could remove the successful second
@@ -8995,6 +9902,8 @@ class CodexAppServerRegistry:
     ) -> tuple[CodexTurnProcess, str]:
         home = normalize_codex_home(codex_home)
         resume_session_id = kwargs.get("resume_session_id")
+        task_id = kwargs.get("task_id")
+        task_key = task_id if type(task_id) is int and task_id > 0 else None
         isolated_turn_lock: asyncio.Lock | None = None
         isolated_turn_lock_transferred = False
         if kwargs.get("tools_disabled") or kwargs.get("mcp_only"):
@@ -9010,6 +9919,7 @@ class CodexAppServerRegistry:
         process: CodexTurnProcess | None = None
         thread_id: str | None = None
         admitted = False
+        starting_registered = False
         starting_released = False
         try:
             async with self._lock:
@@ -9020,6 +9930,13 @@ class CodexAppServerRegistry:
                 if home in self._draining:
                     raise CodexAppServerBusyError(
                         f"Codex account app-server is draining: {home}"
+                    )
+                if (
+                    task_key is not None
+                    and task_key in self._stopping_tasks
+                ):
+                    raise CodexAppServerBusyError(
+                        f"Codex Task {task_id} is being stopped"
                     )
                 if resume_session_id:
                     if resume_session_id in self._starting_threads:
@@ -9048,6 +9965,11 @@ class CodexAppServerRegistry:
                     server = self._new_server(home)
                     self._servers[home] = server
                 self._starting[home] = self._starting.get(home, 0) + 1
+                if task_key is not None:
+                    self._starting_tasks[task_key] = (
+                        self._starting_tasks.get(task_key, 0) + 1
+                    )
+                starting_registered = True
 
             try:
                 process, thread_id = await server.start_turn(**kwargs)
@@ -9068,6 +9990,7 @@ class CodexAppServerRegistry:
                         f"Codex thread {thread_id} is already owned by {owner}, not {home}"
                     )
                 self._decrement_starting_locked(home)
+                self._decrement_starting_task_locked(task_key)
                 starting_released = True
                 self._thread_owners[thread_id] = home
                 admitted = True
@@ -9129,8 +10052,9 @@ class CodexAppServerRegistry:
             # so one request can never erase another generation's reservation.
             async def _release_start_reservations() -> None:
                 async with self._lock:
-                    if not starting_released:
+                    if starting_registered and not starting_released:
                         self._decrement_starting_locked(home)
+                        self._decrement_starting_task_locked(task_key)
                     if (
                         resume_session_id
                         and self._starting_threads.get(resume_session_id) is start_token
@@ -9161,6 +10085,20 @@ class CodexAppServerRegistry:
             self._starting[home] = starting - 1
         else:
             self._starting.pop(home, None)
+
+    def _decrement_starting_task_locked(
+        self,
+        task_key: int | None,
+    ) -> None:
+        """Release one Task admission while ``self._lock`` is held."""
+
+        if task_key is None:
+            return
+        starting = self._starting_tasks.get(task_key, 0)
+        if starting > 1:
+            self._starting_tasks[task_key] = starting - 1
+        else:
+            self._starting_tasks.pop(task_key, None)
 
     async def read_thread(
         self,
@@ -9574,17 +10512,1224 @@ class CodexAppServerRegistry:
                 self._abort_locks[home] = lock
             return lock
 
+    @staticmethod
+    def _claimed_stop_contexts(
+        server: CodexAppServer,
+        task_processes: frozenset[CodexTurnProcess],
+    ) -> tuple[_TurnContext, ...]:
+        contexts = tuple(
+            context
+            for context in server._contexts_by_thread.values()
+            if context.process in task_processes
+            and context.process.returncode is None
+        )
+        if {context.process for context in contexts} != set(task_processes):
+            raise CodexSharedTransportBusyError(
+                "Cannot stop the claimed Task because an exact turn context "
+                "generation changed"
+            )
+        return contexts
+
+    @staticmethod
+    def _claimed_stop_lineage(
+        server: CodexAppServer,
+        contexts: tuple[_TurnContext, ...],
+    ) -> frozenset[str]:
+        roots = {context.thread_id for context in contexts}
+        lineage = set(roots)
+        for context in contexts:
+            for thread_id in context.descendant_thread_ids:
+                if server._contexts_by_descendant.get(thread_id) is not context:
+                    raise CodexSharedTransportBusyError(
+                        "Cannot stop the claimed Task because descendant "
+                        f"ownership changed for {thread_id}"
+                    )
+                lineage.add(thread_id)
+
+        peer_lineage: set[str] = set()
+        target_processes = {context.process for context in contexts}
+        for context in server._contexts_by_thread.values():
+            if (
+                context.process.returncode is not None
+                or context.process in target_processes
+            ):
+                continue
+            peer_lineage.add(context.thread_id)
+            peer_lineage.update(context.descendant_thread_ids)
+        collision = lineage & peer_lineage
+        if collision:
+            raise CodexSharedTransportBusyError(
+                "Cannot stop the claimed Task because target and peer thread "
+                "lineage overlap: " + ", ".join(sorted(collision))
+            )
+        return frozenset(lineage)
+
+    def _validate_claimed_stop_task_fence_locked(
+        self,
+        home: str,
+        server: CodexAppServer,
+        contexts: tuple[_TurnContext, ...],
+        stop_token: object,
+    ) -> int | None:
+        """Validate one Task-wide admission fence without publishing it."""
+
+        task_ids = {context.task_id for context in contexts}
+        if len(task_ids) != 1:
+            raise CodexSharedTransportBusyError(
+                "Claimed Codex Task stop has inconsistent Task ownership"
+            )
+        task_id = next(iter(task_ids))
+        if type(task_id) is not int or task_id <= 0:
+            raise CodexSharedTransportBusyError(
+                "Claimed Codex Task stop has no valid Task identity fence"
+            )
+        task_key = task_id
+        existing = self._stopping_tasks.get(task_key)
+        if existing is not None and existing is not stop_token:
+            raise CodexSharedTransportBusyError(
+                f"Codex Task {task_id} already has another stop generation"
+            )
+        if self._starting_tasks.get(task_key, 0):
+            raise CodexSharedTransportBusyError(
+                "Cannot stop the claimed Task while another turn admission "
+                f"for Task {task_id} is in flight"
+            )
+        target_context_ids = {id(context) for context in contexts}
+        if any(
+            context.task_id == task_id
+            and context.process.returncode is None
+            and id(context) not in target_context_ids
+            for candidate in self._servers.values()
+            for context in candidate._contexts_by_thread.values()
+        ):
+            raise CodexSharedTransportBusyError(
+                "Cannot stop the claimed Task because another live adapter "
+                f"for Task {task_id} exists on a different transport"
+            )
+        return task_key
+
+    def _claimed_stop_historical_runtime_candidates_locked(
+        self,
+        home: str,
+        server: CodexAppServer,
+        thread_ids: Sequence[str],
+    ) -> tuple[
+        tuple[
+            str,
+            CodexAppServer,
+            tuple[str, ...],
+            tuple[tuple[str, str], ...],
+        ],
+        ...,
+    ]:
+        """Find dirty copies of the target lineage on older account homes.
+
+        ``thread/loaded/list`` is authoritative only for the current process
+        generation and cannot distinguish an ordinary unloaded rollout from
+        an archive-response-loss half receipt.  CCM owns the sole connection
+        to each managed app-server: every successful start/resume/fork records
+        its root in ``_known_threads`` before Task ownership is published, and
+        a root marker is removed only when its complete known subtree crosses
+        the archive/unarchive boundary.  The marker is therefore the
+        conservative retry receipt that cannot miss Task 300's historical
+        root; ``thread_lineage_snapshot`` expands it to spawned descendants
+        that Codex loads internally and never adds to ``_known_threads``.
+        """
+
+        ordered_ids = tuple(dict.fromkeys(thread_ids))
+        candidates: list[
+            tuple[
+                str,
+                CodexAppServer,
+                tuple[str, ...],
+                tuple[tuple[str, str], ...],
+            ]
+        ] = []
+        for candidate_home, candidate in self._servers.items():
+            if candidate_home == home or candidate is server:
+                continue
+            roots = tuple(
+                thread_id
+                for thread_id in ordered_ids
+                if candidate.knows_thread(thread_id)
+            )
+            if not roots:
+                continue
+
+            expanded: list[str] = []
+            seen: set[str] = set()
+            parents: dict[str, str] = {}
+            for root_thread_id in roots:
+                lineage, lineage_parents = candidate.thread_lineage_snapshot(
+                    root_thread_id
+                )
+                for thread_id in lineage:
+                    if thread_id not in seen:
+                        seen.add(thread_id)
+                        expanded.append(thread_id)
+                for child_id, parent_id in lineage_parents.items():
+                    previous = parents.get(child_id)
+                    if previous is not None and previous != parent_id:
+                        raise CodexSharedTransportBusyError(
+                            "Historical Codex lineage has conflicting parents "
+                            f"for {child_id}"
+                        )
+                    parents[child_id] = parent_id
+            candidates.append((
+                candidate_home,
+                candidate,
+                tuple(expanded),
+                tuple(parents.items()),
+            ))
+        return tuple(candidates)
+
+    def _reserve_claimed_stop_historical_runtimes_locked(
+        self,
+        home: str,
+        server: CodexAppServer,
+        thread_ids: Sequence[str],
+        stop_token: object,
+        task_key: int,
+        *,
+        reserve: bool,
+    ) -> tuple[_HistoricalThreadRuntimeReservation, ...]:
+        """Validate and optionally reserve exact legacy runtime generations."""
+
+        reservations: list[_HistoricalThreadRuntimeReservation] = []
+        current_thread_ids = set(thread_ids)
+        discovered = {
+            candidate_home: (
+                candidate,
+                candidate_thread_ids,
+                candidate_parent_thread_ids,
+            )
+            for (
+                candidate_home,
+                candidate,
+                candidate_thread_ids,
+                candidate_parent_thread_ids,
+            ) in self._claimed_stop_historical_runtime_candidates_locked(
+                home,
+                server,
+                thread_ids,
+            )
+        }
+        retained = {
+            receipt_home: receipt
+            for (receipt_home, receipt_token), receipt in (
+                self._historical_stop_runtime_receipts.items()
+            )
+            if receipt_token is stop_token
+        }
+        ordered_homes = tuple(dict.fromkeys((*discovered, *retained)))
+        for candidate_home in ordered_homes:
+            retained_receipt = retained.get(candidate_home)
+            discovered_candidate = discovered.get(candidate_home)
+            if retained_receipt is not None:
+                candidate = retained_receipt.server
+                candidate_thread_ids = retained_receipt.thread_ids
+                candidate_parent_thread_ids = (
+                    retained_receipt.parent_thread_ids
+                )
+                if discovered_candidate is not None:
+                    (
+                        discovered_server,
+                        discovered_thread_ids,
+                        discovered_parent_thread_ids,
+                    ) = discovered_candidate
+                    if discovered_server is not candidate:
+                        raise CodexSharedTransportBusyError(
+                            "Historical Codex runtime cleanup changed server "
+                            f"identity: {candidate_home}"
+                        )
+                    candidate_thread_ids = tuple(dict.fromkeys((
+                        *candidate_thread_ids,
+                        *discovered_thread_ids,
+                    )))
+                    parents = dict(candidate_parent_thread_ids)
+                    for child_id, parent_id in discovered_parent_thread_ids:
+                        previous = parents.get(child_id)
+                        if previous is not None and previous != parent_id:
+                            raise CodexSharedTransportBusyError(
+                                "Historical Codex lineage has conflicting "
+                                f"parents for {child_id}"
+                            )
+                        parents[child_id] = parent_id
+                    candidate_parent_thread_ids = tuple(parents.items())
+                reservation = _HistoricalThreadRuntimeReservation(
+                    home=candidate_home,
+                    server=candidate,
+                    transport_generation=(
+                        retained_receipt.transport_generation
+                    ),
+                    transport_process=retained_receipt.transport_process,
+                    thread_ids=candidate_thread_ids,
+                    parent_thread_ids=candidate_parent_thread_ids,
+                )
+            else:
+                assert discovered_candidate is not None
+                (
+                    candidate,
+                    candidate_thread_ids,
+                    candidate_parent_thread_ids,
+                ) = discovered_candidate
+                reservation = _HistoricalThreadRuntimeReservation(
+                    home=candidate_home,
+                    server=candidate,
+                    transport_generation=candidate._transport_generation,
+                    transport_process=candidate._process,
+                    thread_ids=candidate_thread_ids,
+                    parent_thread_ids=candidate_parent_thread_ids,
+                )
+
+            if (
+                self._shutdown_requested
+                or candidate_home in self._draining
+                or candidate.shutdown_requested
+                or self._servers.get(candidate_home) is not candidate
+                or candidate._transport_generation
+                is not reservation.transport_generation
+                or candidate._process is not reservation.transport_process
+            ):
+                raise CodexSharedTransportBusyError(
+                    "Historical Codex thread runtime is on an unavailable "
+                    f"account transport: {candidate_home}"
+                )
+            own_home_reservations = sum(
+                1
+                for (reserved_home, _), token in (
+                    self._historical_stop_threads.items()
+                )
+                if reserved_home == candidate_home and token is stop_token
+            )
+            if self._starting.get(candidate_home, 0) > own_home_reservations:
+                raise CodexSharedTransportBusyError(
+                    "Historical Codex runtime cleanup is blocked by an "
+                    f"in-flight operation on {candidate_home}"
+            )
+            for thread_id in candidate_thread_ids:
+                thread_reservation = self._starting_threads.get(thread_id)
+                if (
+                    thread_reservation is not None
+                    and thread_reservation is not stop_token
+                ):
+                    raise CodexSharedTransportBusyError(
+                        "Historical Codex runtime conflicts with an exact "
+                        "thread operation: "
+                        f"reservation: {thread_id}"
+                    )
+                if (
+                    reserve
+                    and thread_id in current_thread_ids
+                    and thread_reservation is not stop_token
+                ):
+                    raise CodexSharedTransportBusyError(
+                        "Historical Codex runtime lost its target thread "
+                        f"reservation: {thread_id}"
+                    )
+                if thread_id in self._rebindings:
+                    raise CodexSharedTransportBusyError(
+                        f"Codex thread {thread_id} is being rebound"
+                    )
+                root_context = candidate._contexts_by_thread.get(thread_id)
+                descendant_context = candidate._contexts_by_descendant.get(
+                    thread_id
+                )
+                if any(
+                    context is not None
+                    and context.process.returncode is None
+                    for context in (root_context, descendant_context)
+                ):
+                    raise CodexSharedTransportBusyError(
+                        "Historical Codex thread copy is still active on "
+                        f"{candidate_home}: {thread_id}"
+                    )
+                key = (candidate_home, thread_id)
+                existing = self._historical_stop_threads.get(key)
+                if existing is not None and existing is not stop_token:
+                    raise CodexSharedTransportBusyError(
+                        "Historical Codex thread already has another cleanup "
+                        f"generation: {thread_id}"
+                    )
+            reservations.append(reservation)
+        if reserve:
+            if self._stopping_tasks.get(task_key) is not stop_token:
+                raise CodexSharedTransportBusyError(
+                    "Historical Codex runtime cleanup lost its Task stop fence"
+                )
+            # Publish only after every candidate validated.  There are no
+            # awaits under this lock, so a late candidate cannot leave a
+            # partially incremented home-maintenance count.
+            for reservation in reservations:
+                reservation.server._reserve_historical_stop_recovery(
+                    stop_token
+                )
+                self._historical_stop_runtime_receipts[
+                    (reservation.home, stop_token)
+                ] = reservation
+                for thread_id in reservation.thread_ids:
+                    if thread_id not in self._starting_threads:
+                        self._starting_threads[thread_id] = stop_token
+                    key = (reservation.home, thread_id)
+                    if key not in self._historical_stop_threads:
+                        self._historical_stop_threads[key] = stop_token
+                        self._starting[reservation.home] = (
+                            self._starting.get(reservation.home, 0) + 1
+                        )
+        return tuple(reservations)
+
+    def _validate_claimed_stop_historical_runtime_locked(
+        self,
+        reservation: _HistoricalThreadRuntimeReservation,
+        stop_token: object,
+        task_key: int,
+        *,
+        allow_dead_generation: bool = False,
+    ) -> None:
+        """Prove one reserved legacy runtime still names the same process."""
+
+        if (
+            self._shutdown_requested
+            or self._servers.get(reservation.home) is not reservation.server
+            or reservation.server._transport_generation
+            is not reservation.transport_generation
+            or reservation.server._process is not reservation.transport_process
+            or (
+                reservation.transport_process is None
+                and not allow_dead_generation
+            )
+            or (
+                reservation.transport_process is not None
+                and reservation.transport_process.returncode is not None
+                and not allow_dead_generation
+            )
+            or reservation.server.shutdown_requested
+            or self._historical_stop_runtime_receipts.get(
+                (reservation.home, stop_token)
+            )
+            is not reservation
+        ):
+            raise CodexSharedTransportBusyError(
+                "Historical Codex runtime cleanup lost its exact transport "
+                f"generation: {reservation.home}"
+            )
+        if self._stopping_tasks.get(task_key) is not stop_token:
+            raise CodexSharedTransportBusyError(
+                "Historical Codex runtime cleanup lost its Task stop fence"
+            )
+        for thread_id in reservation.thread_ids:
+            if (
+                self._historical_stop_threads.get(
+                    (reservation.home, thread_id)
+                )
+                is not stop_token
+                or self._starting_threads.get(thread_id) is not stop_token
+            ):
+                raise CodexSharedTransportBusyError(
+                    "Historical Codex runtime cleanup lost its exact stop "
+                    f"reservation: {thread_id}"
+                )
+
+    async def _restart_claimed_stop_historical_runtime(
+        self,
+        reservation: _HistoricalThreadRuntimeReservation,
+        stop_token: object,
+        task_key: int,
+    ) -> _HistoricalThreadRuntimeReservation:
+        """Restart one exact dead historical generation and move its receipt."""
+
+        async def _restart_and_publish() -> _HistoricalThreadRuntimeReservation:
+            active_receipt = reservation
+
+            def _publish_generation(generation: object, process: Any) -> None:
+                # The server invokes this synchronously while holding its
+                # lifecycle lock.  Do not await the registry lock here: all
+                # fences are identity-checked below, and an await would expose
+                # a just-started generation before its retry receipt exists.
+                nonlocal active_receipt
+                if (
+                    self._shutdown_requested
+                    or self._servers.get(reservation.home)
+                    is not reservation.server
+                    or reservation.server._transport_generation
+                    is not generation
+                    or reservation.server._process is not process
+                    or (
+                        process is not None
+                        and process.returncode is not None
+                    )
+                    or reservation.server.shutdown_requested
+                    or self._stopping_tasks.get(task_key) is not stop_token
+                    or self._historical_stop_runtime_receipts.get(
+                        (reservation.home, stop_token)
+                    )
+                    is not active_receipt
+                ):
+                    raise CodexSharedTransportBusyError(
+                        "Historical Codex runtime recovery lost its exact "
+                        f"replacement generation: {reservation.home}"
+                    )
+                for thread_id in active_receipt.thread_ids:
+                    if (
+                        self._historical_stop_threads.get(
+                            (reservation.home, thread_id)
+                        )
+                        is not stop_token
+                        or self._starting_threads.get(thread_id)
+                        is not stop_token
+                    ):
+                        raise CodexSharedTransportBusyError(
+                            "Historical Codex runtime recovery lost its stop "
+                            f"reservation: {thread_id}"
+                        )
+                active_receipt = _HistoricalThreadRuntimeReservation(
+                    home=reservation.home,
+                    server=reservation.server,
+                    transport_generation=generation,
+                    transport_process=process,
+                    thread_ids=active_receipt.thread_ids,
+                    parent_thread_ids=active_receipt.parent_thread_ids,
+                )
+                self._historical_stop_runtime_receipts[
+                    (reservation.home, stop_token)
+                ] = active_receipt
+
+            generation, process = (
+                await reservation.server.restart_after_exact_transport_exit(
+                    expected_transport_generation=(
+                        reservation.transport_generation
+                    ),
+                    expected_transport_process=(
+                        reservation.transport_process
+                    ),
+                    publish_generation=_publish_generation,
+                )
+            )
+            if (
+                active_receipt.transport_generation is not generation
+                or active_receipt.transport_process is not process
+            ):
+                raise CodexSharedTransportBusyError(
+                    "Historical Codex runtime recovery did not publish its "
+                    f"replacement generation: {reservation.home}"
+                )
+            return active_receipt
+
+        # If caller cancellation lands after the replacement process starts,
+        # finish publishing its exact generation before re-delivering it.
+        # Otherwise the preserved lineage would point at the dead predecessor
+        # and every later retry would (correctly) reject the apparent ABA.
+        return await _settle_registry_cleanup(_restart_and_publish())
+
+    async def _cleanup_claimed_stop_historical_runtimes(
+        self,
+        reservations: tuple[_HistoricalThreadRuntimeReservation, ...],
+        stop_token: object,
+        task_key: int,
+        *,
+        home: str,
+        server: CodexAppServer,
+        transport_generation: object,
+        transport_process: asyncio.subprocess.Process | None,
+        contexts: tuple[_TurnContext, ...],
+    ) -> None:
+        """Recycle legacy Task runtimes while preserving every peer transport."""
+
+        for reservation in reservations:
+            recovered_generation = False
+            async with self._lock:
+                self._validate_claimed_stop_generation_locked(
+                    home,
+                    server,
+                    transport_generation,
+                    transport_process,
+                    contexts,
+                    stop_token,
+                )
+                self._validate_claimed_stop_historical_runtime_locked(
+                    reservation,
+                    stop_token,
+                    task_key,
+                    allow_dead_generation=True,
+                )
+            if (
+                reservation.transport_process is None
+                or reservation.transport_process.returncode is not None
+            ):
+                reservation = (
+                    await self._restart_claimed_stop_historical_runtime(
+                        reservation,
+                        stop_token,
+                        task_key,
+                    )
+                )
+                recovered_generation = True
+
+            try:
+                await reservation.server.replace_idle_thread_lineage(
+                    reservation.thread_ids,
+                    dict(reservation.parent_thread_ids),
+                    expected_transport_generation=(
+                        reservation.transport_generation
+                    ),
+                    expected_transport_process=reservation.transport_process,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A leader can exit after the preflight and after an archive
+                # committed. Recover that exact generation at most once in
+                # this stop attempt, then replay the saved full lineage on the
+                # new generation. Any second exit remains fenced for retry.
+                async with self._lock:
+                    self._validate_claimed_stop_historical_runtime_locked(
+                        reservation,
+                        stop_token,
+                        task_key,
+                        allow_dead_generation=True,
+                    )
+                    exited = bool(
+                        reservation.transport_process is None
+                        or reservation.transport_process.returncode is not None
+                    )
+                if recovered_generation or not exited:
+                    raise
+                reservation = (
+                    await self._restart_claimed_stop_historical_runtime(
+                        reservation,
+                        stop_token,
+                        task_key,
+                    )
+                )
+                recovered_generation = True
+                await reservation.server.replace_idle_thread_lineage(
+                    reservation.thread_ids,
+                    dict(reservation.parent_thread_ids),
+                    expected_transport_generation=(
+                        reservation.transport_generation
+                    ),
+                    expected_transport_process=reservation.transport_process,
+                )
+            async with self._lock:
+                # Validate the runtime that was actually mutated first.  The
+                # owner transport may exit after this historical RPC commits;
+                # in that case the caller can mark historical cleanup proven
+                # and settle the already-dead owner generation safely.
+                self._validate_claimed_stop_historical_runtime_locked(
+                    reservation,
+                    stop_token,
+                    task_key,
+                )
+                self._historical_stop_runtime_receipts.pop(
+                    (reservation.home, stop_token),
+                    None,
+                )
+                reservation.server._release_historical_stop_recovery(
+                    stop_token
+                )
+
+    def _release_claimed_stop_historical_runtimes_locked(
+        self,
+        stop_token: object,
+    ) -> None:
+        for key, token in list(self._historical_stop_threads.items()):
+            if token is not stop_token:
+                continue
+            self._historical_stop_threads.pop(key, None)
+            self._decrement_starting_locked(key[0])
+        for key in list(self._historical_stop_runtime_receipts):
+            if key[1] is stop_token:
+                receipt = self._historical_stop_runtime_receipts.pop(
+                    key,
+                    None,
+                )
+                if receipt is not None:
+                    receipt.server._release_historical_stop_recovery(
+                        stop_token
+                    )
+
+    def _release_claimed_stop_reservations_locked(
+        self,
+        stop_token: object,
+    ) -> None:
+        """Release only home counters actually acquired by this stop."""
+
+        for key, token in list(self._claimed_stop_threads.items()):
+            if token is not stop_token:
+                continue
+            self._claimed_stop_threads.pop(key, None)
+            self._decrement_starting_locked(key[0])
+        self._release_claimed_stop_historical_runtimes_locked(stop_token)
+        for thread_id, token in list(self._starting_threads.items()):
+            if token is stop_token:
+                self._starting_threads.pop(thread_id, None)
+
+    def _reserve_claimed_stop_lineage_locked(
+        self,
+        home: str,
+        server: CodexAppServer,
+        contexts: tuple[_TurnContext, ...],
+        stop_token: object,
+    ) -> frozenset[str]:
+        lineage = self._claimed_stop_lineage(server, contexts)
+        root_thread_ids = {context.thread_id for context in contexts}
+        for context in contexts:
+            if context.claimed_stop_token not in (None, stop_token):
+                raise CodexSharedTransportBusyError(
+                    "Claimed Codex Task stop already has another generation"
+                )
+            if (
+                context.claimed_stop_token is stop_token
+                and context.claimed_stop_transport_generation
+                is not server._transport_generation
+            ):
+                raise CodexSharedTransportBusyError(
+                    "Claimed Codex Task stop transport generation changed"
+                )
+        for thread_id in lineage:
+            existing = self._starting_threads.get(thread_id)
+            if existing is not None and existing is not stop_token:
+                raise CodexSharedTransportBusyError(
+                    "Cannot stop the claimed Task while one of its exact "
+                    f"thread operations is in flight: {thread_id}"
+                )
+            if thread_id in self._rebindings:
+                raise CodexSharedTransportBusyError(
+                    f"Cannot stop Codex thread {thread_id} while it is rebound"
+                )
+            owner = self._thread_owners.get(thread_id)
+            if thread_id in root_thread_ids and owner is None:
+                raise CodexSharedTransportBusyError(
+                    f"Claimed Codex root thread {thread_id} has no home owner"
+                )
+            if owner is not None and owner != home:
+                raise CodexSharedTransportBusyError(
+                    "Cannot stop the claimed Task because Codex thread "
+                    f"{thread_id} is bound to {owner}, not {home}"
+                )
+            current_key = (home, thread_id)
+            current_reservation = self._claimed_stop_threads.get(current_key)
+            if (
+                current_reservation is not None
+                and current_reservation is not stop_token
+            ):
+                raise CodexSharedTransportBusyError(
+                    "Claimed Codex Task thread already has another current-"
+                    f"home stop generation: {thread_id}"
+                )
+            if (
+                current_reservation is stop_token
+                and existing is not stop_token
+            ):
+                raise CodexSharedTransportBusyError(
+                    "Claimed Codex Task stop lost its global thread "
+                    f"reservation: {thread_id}"
+                )
+
+        for context in contexts:
+            if context.claimed_stop_token is None:
+                context.claimed_stop_transport_generation = (
+                    server._transport_generation
+                )
+            context.claimed_stop_token = stop_token
+        for thread_id in lineage:
+            if thread_id not in self._starting_threads:
+                self._starting_threads[thread_id] = stop_token
+            current_key = (home, thread_id)
+            if current_key not in self._claimed_stop_threads:
+                self._claimed_stop_threads[current_key] = stop_token
+                self._starting[home] = self._starting.get(home, 0) + 1
+        return lineage
+
+    @staticmethod
+    def _claimed_stop_lineage_parents(
+        contexts: tuple[_TurnContext, ...],
+    ) -> dict[str, str]:
+        parents: dict[str, str] = {}
+        for context in contexts:
+            parents.update(context.descendant_parent_thread_ids)
+            for thread_id in context.descendant_thread_ids:
+                parents.setdefault(thread_id, context.thread_id)
+        return parents
+
+    @staticmethod
+    def _claimed_stop_cleanup_order(
+        contexts: tuple[_TurnContext, ...],
+        lineage: frozenset[str],
+    ) -> tuple[str, ...]:
+        roots = {context.thread_id for context in contexts}
+        parents = CodexAppServerRegistry._claimed_stop_lineage_parents(
+            contexts
+        )
+
+        def depth(thread_id: str) -> int:
+            current = thread_id
+            seen = {current}
+            result = 0
+            while current in parents:
+                current = parents[current]
+                if current in seen:
+                    raise CodexSharedTransportBusyError(
+                        "Cannot recycle a cyclic Codex descendant lineage"
+                    )
+                seen.add(current)
+                result += 1
+                if current in roots:
+                    break
+            return result
+
+        # Codex 0.147 archives a root and its spawned subtree atomically, but
+        # unarchives only the requested thread.  Recycle roots first so each
+        # descendant subsequently observes notLoaded and is explicitly
+        # unarchived; deepest-first would strand child rollouts in archive.
+        return tuple(sorted(lineage, key=lambda item: (depth(item), item)))
+
+    def _validate_claimed_stop_generation_locked(
+        self,
+        home: str,
+        server: CodexAppServer,
+        transport_generation: object,
+        transport_process: asyncio.subprocess.Process | None,
+        contexts: tuple[_TurnContext, ...],
+        stop_token: object,
+    ) -> None:
+        if (
+            self._shutdown_requested
+            or self._servers.get(home) is not server
+            or server._transport_generation is not transport_generation
+            or server._process is not transport_process
+        ):
+            raise CodexSharedTransportBusyError(
+                "Claimed Codex Task stop lost its exact app-server generation"
+            )
+        for context in contexts:
+            if (
+                server._contexts_by_thread.get(context.thread_id) is not context
+                or context.process.returncode is not None
+                or context.claimed_stop_token is not stop_token
+                or context.claimed_stop_transport_generation
+                is not transport_generation
+            ):
+                raise CodexSharedTransportBusyError(
+                    "Claimed Codex Task stop lost its exact context generation"
+                )
+
+    async def _settle_claimed_stop_transport_exit(
+        self,
+        home: str,
+        server: CodexAppServer,
+        transport_process: asyncio.subprocess.Process | None,
+        contexts: tuple[_TurnContext, ...],
+        task_processes: frozenset[CodexTurnProcess],
+        stop_token: object,
+        task_key: int | None,
+        *,
+        reason: str,
+        historical_cleanup_confirmed: bool,
+    ) -> bool:
+        """Turn an exact dead transport into authoritative stop cleanup."""
+
+        if (
+            transport_process is None
+            or transport_process.returncode is None
+        ):
+            return False
+        if not historical_cleanup_confirmed:
+            # Losing the current owner transport proves only its own runtime
+            # is gone. A historical account home may still retain this Task's
+            # helpers, so preserve all receipts until those exact generations
+            # have crossed their own cleanup boundary.
+            return False
+
+        # If this server object still points at the exited generation, settle
+        # its entire POSIX process group before treating runtime unload as
+        # proven.  A different current process can only be installed by
+        # ensure_started after the old generation's shutdown barrier settled.
+        if server._process is transport_process:
+            try:
+                await server.shutdown(
+                    reason=(
+                        "Settling an exited Codex transport during Task stop: "
+                        f"{reason}"
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Could not settle exited Codex transport generation for "
+                    "claimed Task stop home=%s",
+                    home,
+                )
+                return False
+
+        async with self._lock:
+            if transport_process.returncode is None:
+                return False
+            for context in contexts:
+                if context.process.returncode is None:
+                    context.process.finish(
+                        130,
+                        reason,
+                        termination_kind="internal_abort",
+                    )
+                if server._contexts_by_thread.get(context.thread_id) is context:
+                    server._detach_turn_context(context)
+                context.claimed_stop_token = None
+                context.claimed_stop_transport_generation = None
+                context.claimed_stop_reason = None
+                context.claimed_stop_interrupt_confirmed = False
+                context.claimed_stop_terminal_notification = None
+            if any(process.returncode is None for process in task_processes):
+                return False
+            self._release_claimed_stop_reservations_locked(stop_token)
+            if (
+                task_key is not None
+                and self._stopping_tasks.get(task_key) is stop_token
+            ):
+                self._stopping_tasks.pop(task_key, None)
+            if (
+                self._servers.get(home) is server
+                and server.shutdown_requested
+            ):
+                self._servers.pop(home, None)
+            return True
+
+    async def _stop_claimed_turn_thread_scoped(
+        self,
+        home: str,
+        server: CodexAppServer,
+        process: CodexTurnProcess,
+        task_processes: frozenset[CodexTurnProcess],
+        *,
+        reason: str,
+    ) -> bool:
+        """Stop one Task while keeping every peer adapter/transport alive."""
+
+        async with self._lock:
+            if home in self._draining:
+                raise CodexSharedTransportBusyError(
+                    f"Codex account app-server is draining: {home}"
+                )
+            if (
+                self._servers.get(home) is not server
+                or server.shutdown_requested
+            ):
+                raise CodexSharedTransportBusyError(
+                    "Claimed Codex Task stop lost its app-server"
+                )
+            contexts = self._claimed_stop_contexts(server, task_processes)
+            existing_tokens = {
+                context.claimed_stop_token
+                for context in contexts
+                if context.claimed_stop_token is not None
+            }
+            if len(existing_tokens) > 1:
+                raise CodexSharedTransportBusyError(
+                    "Claimed Codex Task stop has conflicting retry receipts"
+                )
+            stop_token = next(iter(existing_tokens), object())
+            task_key = self._validate_claimed_stop_task_fence_locked(
+                home,
+                server,
+                contexts,
+                stop_token,
+            )
+            preview_lineage = self._claimed_stop_lineage(server, contexts)
+            # Validate every old-home copy before publishing any new receipt.
+            # Otherwise a busy historical home could leave the current Task
+            # fenced even though no interrupt was attempted.
+            self._reserve_claimed_stop_historical_runtimes_locked(
+                home,
+                server,
+                tuple(preview_lineage),
+                stop_token,
+                task_key,
+                reserve=False,
+            )
+            lineage = self._reserve_claimed_stop_lineage_locked(
+                home,
+                server,
+                contexts,
+                stop_token,
+            )
+            assert task_key is not None
+            self._stopping_tasks[task_key] = stop_token
+            historical_reservations = (
+                self._reserve_claimed_stop_historical_runtimes_locked(
+                    home,
+                    server,
+                    tuple(lineage),
+                    stop_token,
+                    task_key,
+                    reserve=True,
+                )
+            )
+            historical_cleanup_confirmed = not historical_reservations
+            for context in contexts:
+                context.claimed_stop_reason = reason
+            transport_generation = server._transport_generation
+            transport_process = server._process
+            preexisting_abort_guards = tuple(
+                task
+                for context in contexts
+                for task in (
+                    context.malformed_terminal_guard_task,
+                    context.tool_policy_abort_task,
+                )
+                if task is not None and not task.done()
+            )
+
+        try:
+            if preexisting_abort_guards:
+                await _settle_registry_cleanup(
+                    asyncio.gather(
+                        *preexisting_abort_guards,
+                        return_exceptions=True,
+                    )
+                )
+                async with self._lock:
+                    self._validate_claimed_stop_generation_locked(
+                        home,
+                        server,
+                        transport_generation,
+                        transport_process,
+                        contexts,
+                        stop_token,
+                    )
+            for task_process in task_processes:
+                await server.interrupt_claimed_turn(
+                    task_process,
+                    stop_token=stop_token,
+                )
+
+            async with self._lock:
+                self._validate_claimed_stop_generation_locked(
+                    home,
+                    server,
+                    transport_generation,
+                    transport_process,
+                    contexts,
+                    stop_token,
+                )
+                # Capture late descendants discovered while interrupt RPCs
+                # were in flight and reserve them before any runtime unload.
+                lineage = self._reserve_claimed_stop_lineage_locked(
+                    home,
+                    server,
+                    contexts,
+                    stop_token,
+                )
+                historical_reservations = (
+                    self._reserve_claimed_stop_historical_runtimes_locked(
+                        home,
+                        server,
+                        tuple(lineage),
+                        stop_token,
+                        task_key,
+                        reserve=True,
+                    )
+                )
+                if any(
+                    not context.claimed_stop_interrupt_confirmed
+                    for context in contexts
+                ):
+                    raise CodexSharedTransportBusyError(
+                        "Claimed Codex Task stop discovered new native work"
+                    )
+                cleanup_order = self._claimed_stop_cleanup_order(
+                    contexts,
+                    lineage,
+                )
+
+            # Reap copies left on older account homes first.  If this fails,
+            # the current runtime is still intact and the exact Task receipt
+            # remains retryable without touching a peer transport.
+            await self._cleanup_claimed_stop_historical_runtimes(
+                historical_reservations,
+                stop_token,
+                task_key,
+                home=home,
+                server=server,
+                transport_generation=transport_generation,
+                transport_process=transport_process,
+                contexts=contexts,
+            )
+            historical_cleanup_confirmed = True
+            if (
+                transport_process is None
+                or transport_process.returncode is not None
+            ):
+                raise CodexAppServerError(
+                    "Claimed Codex Task owner transport exited after "
+                    "historical runtime cleanup"
+                )
+
+            for thread_id in cleanup_order:
+                async with self._lock:
+                    self._validate_claimed_stop_generation_locked(
+                        home,
+                        server,
+                        transport_generation,
+                        transport_process,
+                        contexts,
+                        stop_token,
+                    )
+                    if self._starting_threads.get(thread_id) is not stop_token:
+                        raise CodexSharedTransportBusyError(
+                            f"Claimed stop lost thread reservation {thread_id}"
+                        )
+                await server.recycle_thread_runtime(
+                    thread_id,
+                    claimed_stop_token=stop_token,
+                    expected_transport_generation=transport_generation,
+                    expected_transport_process=transport_process,
+                )
+
+            async with self._lock:
+                self._validate_claimed_stop_generation_locked(
+                    home,
+                    server,
+                    transport_generation,
+                    transport_process,
+                    contexts,
+                    stop_token,
+                )
+                # Reserve any child first observed during the last recycle
+                # RPC before reporting a retryable conflict.  Otherwise that
+                # late child could accept resume/delete/rebind work between
+                # stop attempts.
+                final_lineage = self._reserve_claimed_stop_lineage_locked(
+                    home,
+                    server,
+                    contexts,
+                    stop_token,
+                )
+                final_task_id, final_task_processes = (
+                    server.live_task_turn_processes(process)
+                )
+                expected_task_id = contexts[0].task_id if contexts else None
+                if (
+                    final_task_id != expected_task_id
+                    or final_task_processes != task_processes
+                ):
+                    raise CodexSharedTransportBusyError(
+                        "Claimed Codex Task stop observed a new Task turn "
+                        "generation during runtime cleanup"
+                    )
+                if final_lineage != lineage or any(
+                    not context.claimed_stop_interrupt_confirmed
+                    for context in contexts
+                ):
+                    if final_lineage != lineage:
+                        for context in contexts:
+                            context.claimed_stop_interrupt_confirmed = False
+                    raise CodexSharedTransportBusyError(
+                        "Claimed Codex Task stop observed new native work "
+                        "during runtime cleanup"
+                    )
+
+                historical_reservations = (
+                    self._reserve_claimed_stop_historical_runtimes_locked(
+                        home,
+                        server,
+                        tuple(final_lineage),
+                        stop_token,
+                        task_key,
+                        reserve=True,
+                    )
+                )
+                if historical_reservations:
+                    historical_cleanup_confirmed = False
+
+            await self._cleanup_claimed_stop_historical_runtimes(
+                historical_reservations,
+                stop_token,
+                task_key,
+                home=home,
+                server=server,
+                transport_generation=transport_generation,
+                transport_process=transport_process,
+                contexts=contexts,
+            )
+            historical_cleanup_confirmed = True
+            if (
+                transport_process is None
+                or transport_process.returncode is not None
+            ):
+                raise CodexAppServerError(
+                    "Claimed Codex Task owner transport exited after "
+                    "historical runtime cleanup"
+                )
+
+            async with self._lock:
+                self._validate_claimed_stop_generation_locked(
+                    home,
+                    server,
+                    transport_generation,
+                    transport_process,
+                    contexts,
+                    stop_token,
+                )
+                committed_lineage = self._reserve_claimed_stop_lineage_locked(
+                    home,
+                    server,
+                    contexts,
+                    stop_token,
+                )
+                if committed_lineage != final_lineage or any(
+                    not context.claimed_stop_interrupt_confirmed
+                    for context in contexts
+                ):
+                    raise CodexSharedTransportBusyError(
+                        "Claimed Codex Task stop observed new native work "
+                        "during historical runtime cleanup"
+                    )
+                server.finish_claimed_turn_stop(
+                    task_processes,
+                    stop_token=stop_token,
+                    reason=reason,
+                )
+                self._release_claimed_stop_reservations_locked(stop_token)
+                if self._stopping_tasks.get(task_key) is stop_token:
+                    self._stopping_tasks.pop(task_key, None)
+            return False
+        except asyncio.CancelledError:
+            # Caller cancellation leaves the exact in-memory receipt fenced;
+            # a shielded API operation or the next stop request resumes it.
+            raise
+        except Exception as exc:
+            if await self._settle_claimed_stop_transport_exit(
+                home,
+                server,
+                transport_process,
+                contexts,
+                task_processes,
+                stop_token,
+                task_key,
+                reason=reason,
+                historical_cleanup_confirmed=historical_cleanup_confirmed,
+            ):
+                return True
+            if isinstance(exc, CodexSharedTransportBusyError):
+                raise
+            raise CodexSharedTransportBusyError(
+                "Target Codex Task was interrupted, but its thread-scoped "
+                "runtime cleanup is still pending; retry stop-session"
+            ) from exc
+
     async def require_claimed_turn_stop_isolated(
         self,
         codex_home: str | os.PathLike[str],
         process: CodexTurnProcess,
     ) -> None:
-        """Fail before caller-side stop effects when transport recycle is unsafe.
+        """Fail before caller-side effects when the exact target is busy.
 
         This is deliberately only a preflight: ``stop_claimed_turn`` repeats
         every check while holding the abort lock before it performs the native
-        interrupt.  Callers use this earlier check to avoid destructive queue
-        or producer cleanup for a stop that is already known to be impossible.
+        interrupt.  A live peer is allowed because its transport is preserved;
+        only target-thread operations or an isolated whole-home admission are
+        blockers.
         """
 
         home = normalize_codex_home(codex_home)
@@ -9603,6 +11748,7 @@ class CodexAppServerRegistry:
                 server = self._servers.get(home)
                 if (
                     server is None
+                    or server.shutdown_requested
                     or not server.owns_live_turn_process(process)
                 ):
                     raise CodexSharedTransportBusyError(
@@ -9610,23 +11756,129 @@ class CodexAppServerRegistry:
                         "Codex app-server transport generation is no longer "
                         f"registered: {home}"
                     )
-                starting = self._starting.get(home, 0)
-                if starting:
-                    raise CodexSharedTransportBusyError(
-                        "Cannot stop the claimed turn while "
-                        f"{starting} admitted app-server request(s) are in "
-                        f"flight on its shared transport: {home}"
-                    )
                 task_id, task_processes = server.live_task_turn_processes(
                     process
                 )
-                if server.has_live_turn_outside_task(task_id, task_processes):
+                contexts = self._claimed_stop_contexts(
+                    server,
+                    task_processes,
+                )
+                lineage = self._claimed_stop_lineage(server, contexts)
+                existing_tokens = {
+                    context.claimed_stop_token
+                    for context in contexts
+                    if context.claimed_stop_token is not None
+                }
+                if len(existing_tokens) > 1:
                     raise CodexSharedTransportBusyError(
-                        "Cannot stop the claimed Task while another live "
-                        "turn shares its Codex app-server transport from a "
-                        "different Task: "
-                        f"{home}"
+                        "Claimed Codex Task stop has conflicting retry receipts"
                     )
+                retry_token = next(iter(existing_tokens), None)
+                task_ids = {context.task_id for context in contexts}
+                if len(task_ids) != 1:
+                    raise CodexSharedTransportBusyError(
+                        "Claimed Codex Task stop has inconsistent Task ownership"
+                    )
+                task_id = next(iter(task_ids))
+                if type(task_id) is not int or task_id <= 0:
+                    raise CodexSharedTransportBusyError(
+                        "Claimed Codex Task stop has no valid Task identity "
+                        "fence"
+                    )
+                task_key = (
+                    task_id
+                    if type(task_id) is int and task_id > 0
+                    else None
+                )
+                if (
+                    task_key is not None
+                    and self._starting_tasks.get(task_key, 0)
+                ):
+                    raise CodexSharedTransportBusyError(
+                        "Cannot stop the claimed Task while another turn "
+                        f"admission for Task {task_id} is in flight"
+                    )
+                if task_key is not None:
+                    stopping_token = self._stopping_tasks.get(task_key)
+                    if (
+                        stopping_token is not None
+                        and stopping_token is not retry_token
+                    ):
+                        raise CodexSharedTransportBusyError(
+                            f"Codex Task {task_id} already has another stop "
+                            "generation"
+                        )
+                    target_context_ids = {id(item) for item in contexts}
+                    if any(
+                        candidate_context.task_id == task_id
+                        and candidate_context.process.returncode is None
+                        and id(candidate_context) not in target_context_ids
+                        for candidate_server in self._servers.values()
+                        for candidate_context in (
+                            candidate_server._contexts_by_thread.values()
+                        )
+                    ):
+                        raise CodexSharedTransportBusyError(
+                            "Cannot stop the claimed Task because another "
+                            f"live adapter for Task {task_id} exists outside "
+                            "the claimed transport"
+                        )
+                root_thread_ids = {
+                    context.thread_id for context in contexts
+                }
+                for context in contexts:
+                    if self._thread_owners.get(context.thread_id) != home:
+                        raise CodexSharedTransportBusyError(
+                            "Claimed Codex root thread has no exact home owner: "
+                            f"{context.thread_id}"
+                        )
+                for thread_id in lineage:
+                    owner = self._thread_owners.get(thread_id)
+                    if thread_id in root_thread_ids and owner is None:
+                        raise CodexSharedTransportBusyError(
+                            "Claimed Codex root thread has no exact home "
+                            f"owner: {thread_id}"
+                        )
+                    if owner is not None and owner != home:
+                        raise CodexSharedTransportBusyError(
+                            "Cannot stop the claimed Task because Codex "
+                            f"thread {thread_id} is bound to {owner}, not "
+                            f"{home}"
+                        )
+                    reservation = self._starting_threads.get(thread_id)
+                    if (
+                        reservation is not None
+                        and reservation is not retry_token
+                    ):
+                        raise CodexSharedTransportBusyError(
+                            "Cannot stop the claimed Task while one of its "
+                            f"exact thread operations is in flight: {thread_id}"
+                        )
+                    if thread_id in self._rebindings:
+                        raise CodexSharedTransportBusyError(
+                            f"Codex thread {thread_id} is being rebound"
+                        )
+                assert task_key is not None
+                self._reserve_claimed_stop_historical_runtimes_locked(
+                    home,
+                    server,
+                    tuple(lineage),
+                    retry_token if retry_token is not None else object(),
+                    task_key,
+                    reserve=False,
+                )
+                peer_present = server.has_live_turn_outside_task(
+                    task_id,
+                    task_processes,
+                )
+                if not peer_present and retry_token is None:
+                    starting = self._starting.get(home, 0)
+                    if starting:
+                        raise CodexSharedTransportBusyError(
+                            "Cannot stop the isolated claimed turn while "
+                            f"{starting} app-server request(s) are in flight: "
+                            f"{home}"
+                        )
 
     async def stop_claimed_turn(
         self,
@@ -9635,16 +11887,16 @@ class CodexAppServerRegistry:
         *,
         reason: str,
     ) -> bool:
-        """Stop one durably-owned turn and recycle its account transport.
+        """Stop one durably-owned Task without disrupting a live peer.
 
         Exact thread/turn interruption is always attempted first.  It is not,
         however, sufficient proof that task-scoped native helpers are gone:
         Codex keeps MCP servers and code-mode hosts below the persistent
-        app-server even after a turn reports ``interrupted``.  Once admission
-        is drained, therefore recycle the account transport for every explicit
-        stop.  Non-target adapters fail and use the ordinary task retry path;
-        returning success while target-owned native helpers remain alive is
-        not an acceptable outcome.
+        app-server even after a turn reports ``interrupted``.  A shared Task
+        therefore unloads only its reserved root/descendant threads; an
+        isolated Task retains whole-transport cleanup as the strongest proof.
+        Returning success while target-owned native helpers remain alive is
+        never an acceptable outcome.
 
         Returns whether transport shutdown was required.
         """
@@ -9652,6 +11904,57 @@ class CodexAppServerRegistry:
         home = normalize_codex_home(codex_home)
         abort_lock = await self._abort_lock_for_home(home)
         async with abort_lock:
+            # Select the peer-preserving path from one exact registry snapshot.
+            # A retry receipt keeps this choice sticky even if the original
+            # peer finishes before the user retries.
+            async with self._lock:
+                initial_server = self._servers.get(home)
+                if (
+                    initial_server is not None
+                    and initial_server.owns_live_turn_process(process)
+                ):
+                    initial_task_id, initial_task_processes = (
+                        initial_server.live_task_turn_processes(process)
+                    )
+                    initial_contexts = self._claimed_stop_contexts(
+                        initial_server,
+                        initial_task_processes,
+                    )
+                    initial_lineage = self._claimed_stop_lineage(
+                        initial_server,
+                        initial_contexts,
+                    )
+                    historical_runtime_present = bool(
+                        self._claimed_stop_historical_runtime_candidates_locked(
+                            home,
+                            initial_server,
+                            tuple(initial_lineage),
+                        )
+                    )
+                    thread_scoped = bool(
+                        initial_server.has_live_turn_outside_task(
+                            initial_task_id,
+                            initial_task_processes,
+                        )
+                        or historical_runtime_present
+                        or any(
+                            context.claimed_stop_token is not None
+                            for context in initial_contexts
+                        )
+                    )
+                else:
+                    thread_scoped = False
+                    initial_task_processes = frozenset()
+            if thread_scoped:
+                assert initial_server is not None
+                return await self._stop_claimed_turn_thread_scoped(
+                    home,
+                    initial_server,
+                    process,
+                    initial_task_processes,
+                    reason=reason,
+                )
+
             server: CodexAppServer | None = None
             drain_owned = False
             shutdown_attempted = False
@@ -9690,11 +11993,10 @@ class CodexAppServerRegistry:
                         task_id,
                         task_processes,
                     ):
-                        # Explicit stop currently requires recycling the whole
-                        # account transport to prove task-scoped MCP helpers
-                        # are gone.  Never interrupt first and discover peers
-                        # afterwards: recycling here would turn an unrelated
-                        # peer with emitted output/external effects into an
+                        # This branch was selected as isolated and fenced for
+                        # whole-transport cleanup.  Never interrupt first and
+                        # discover a newly admitted peer afterwards: recycling
+                        # here would turn its emitted/external effects into an
                         # unreplayable failure.
                         raise CodexSharedTransportBusyError(
                             "Cannot stop the claimed Task while another live "
@@ -9955,6 +12257,7 @@ class CodexAppServerRegistry:
         input_items: list[dict[str, Any]] | None = None,
     ) -> bool:
         home: str | None = None
+        steer_token = object()
         async with self._lock:
             if self._shutdown_requested:
                 raise CodexAppServerBusyError(
@@ -9969,11 +12272,16 @@ class CodexAppServerRegistry:
                 raise CodexAppServerBusyError(
                     f"Codex thread {thread_id} is being rebound"
                 )
+            if thread_id in self._starting_threads:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} already has an operation in flight"
+                )
             server = self._servers.get(home) if home else None
             if server is not None and home is not None:
                 # A steer can start more native work on the exact turn.  Make
                 # it an admitted home operation so claimed stop/maintenance
                 # cannot define a terminal boundary across an in-flight RPC.
+                self._starting_threads[thread_id] = steer_token
                 self._starting[home] = self._starting.get(home, 0) + 1
         if server is None:
             return False
@@ -9991,6 +12299,8 @@ class CodexAppServerRegistry:
             async def _release_steer_reservation() -> None:
                 async with self._lock:
                     self._decrement_starting_locked(home)
+                    if self._starting_threads.get(thread_id) is steer_token:
+                        self._starting_threads.pop(thread_id, None)
 
             await _settle_registry_cleanup(_release_steer_reservation())
 
@@ -10054,11 +12364,31 @@ class CodexAppServerRegistry:
         target = normalize_codex_home(target_codex_home)
         if source == target:
             async with self._lock:
+                if (
+                    thread_id in self._starting_threads
+                    or thread_id in self._rebindings
+                ):
+                    raise CodexAppServerBusyError(
+                        f"Codex thread {thread_id} already has an operation in flight"
+                    )
                 self._thread_owners[thread_id] = target
             return
 
         restart_server: CodexAppServer | None = None
+        unsubscribe_source_server: CodexAppServer | None = None
+        source_lineage: tuple[str, ...] = ()
+        source_lineage_parents: dict[str, str] = {}
+        source_transport_generation: object | None = None
+        source_transport_process: Any = None
+        target_server_snapshot: CodexAppServer | None = None
+        target_transport_generation: object | None = None
+        target_transport_process: Any = None
+        target_shutdown_started = False
         async with self._lock:
+            if self._shutdown_requested:
+                raise CodexAppServerBusyError(
+                    "Codex app-server registry is shutting down"
+                )
             if thread_id in self._rebindings:
                 raise CodexAppServerBusyError(
                     f"Codex thread {thread_id} is already being rebound"
@@ -10069,6 +12399,10 @@ class CodexAppServerRegistry:
                     f"Codex thread {thread_id} is owned by {owner}, expected {source}"
                 )
             source_server = self._servers.get(source)
+            if source in self._draining:
+                raise CodexAppServerBusyError(
+                    f"Codex source account app-server is draining: {source}"
+                )
             if self._starting.get(source, 0) > 0:
                 raise CodexAppServerBusyError(
                     f"Codex source account has a start/resume request in flight: {source}"
@@ -10077,11 +12411,32 @@ class CodexAppServerRegistry:
                 raise CodexAppServerBusyError(
                     f"Codex thread {thread_id} still has an active turn in {source}"
                 )
+            if source_server and source_server.knows_thread(thread_id):
+                # A migrated idle thread retains request-scoped MCP clients in
+                # the source app-server until this client unsubscribes.  Move
+                # history/ownership only after that exact runtime is unloaded;
+                # otherwise later Task stop cannot discover helpers stranded
+                # under an older account home.
+                unsubscribe_source_server = source_server
+                (
+                    source_lineage,
+                    source_lineage_parents,
+                ) = source_server.thread_lineage_snapshot(thread_id)
+                source_transport_generation = (
+                    source_server._transport_generation
+                )
+                source_transport_process = source_server._process
             if target in self._draining:
                 raise CodexAppServerBusyError(
                     f"Codex target account app-server is draining: {target}"
                 )
             target_server = self._servers.get(target)
+            target_server_snapshot = target_server
+            if target_server is not None:
+                target_transport_generation = (
+                    target_server._transport_generation
+                )
+                target_transport_process = target_server._process
             if target_server and target_server.knows_thread(thread_id):
                 if self._starting.get(target, 0) > 0:
                     raise CodexAppServerBusyError(
@@ -10098,7 +12453,17 @@ class CodexAppServerRegistry:
             self._rebindings[thread_id] = (source, target)
 
         try:
+            if unsubscribe_source_server is not None:
+                await unsubscribe_source_server.replace_idle_thread_lineage(
+                    source_lineage,
+                    source_lineage_parents,
+                    expected_transport_generation=(
+                        source_transport_generation
+                    ),
+                    expected_transport_process=source_transport_process,
+                )
             if restart_server is not None:
+                target_shutdown_started = True
                 await restart_server.shutdown()
                 async def _detach_restarted_target() -> None:
                     async with self._lock:
@@ -10111,6 +12476,35 @@ class CodexAppServerRegistry:
                 )
 
             async with self._lock:
+                if self._shutdown_requested:
+                    raise CodexAppServerBusyError(
+                        "Codex app-server registry shut down during thread "
+                        "rebind"
+                    )
+                if unsubscribe_source_server is not None and (
+                    self._servers.get(source) is not unsubscribe_source_server
+                    or unsubscribe_source_server._transport_generation
+                    is not source_transport_generation
+                    or unsubscribe_source_server._process
+                    is not source_transport_process
+                    or unsubscribe_source_server.shutdown_requested
+                ):
+                    raise CodexAppServerBusyError(
+                        "Codex source account generation changed during "
+                        "thread rebind"
+                    )
+                if restart_server is None and target_server_snapshot is not None and (
+                    self._servers.get(target) is not target_server_snapshot
+                    or target_server_snapshot._transport_generation
+                    is not target_transport_generation
+                    or target_server_snapshot._process
+                    is not target_transport_process
+                    or target_server_snapshot.shutdown_requested
+                ):
+                    raise CodexAppServerBusyError(
+                        "Codex target account generation changed during "
+                        "thread rebind"
+                    )
                 owner = self._thread_owners.get(thread_id)
                 if owner is not None and owner != source:
                     raise CodexThreadHomeMismatchError(
@@ -10121,6 +12515,20 @@ class CodexAppServerRegistry:
         finally:
             async def _release_rebinding() -> None:
                 async with self._lock:
+                    if (
+                        restart_server is not None
+                        and not target_shutdown_started
+                        and self._servers.get(target) is restart_server
+                        and restart_server._transport_generation
+                        is target_transport_generation
+                        and restart_server._process is target_transport_process
+                        and not restart_server.shutdown_requested
+                    ):
+                        # Source cleanup failed/cancelled before the stale
+                        # target shutdown was consumed.  Reopen only that
+                        # untouched generation; once shutdown starts its
+                        # process state is uncertain and remains fail-closed.
+                        self._draining.discard(target)
                     self._rebindings.pop(thread_id, None)
 
             await _settle_registry_cleanup(_release_rebinding())
@@ -10142,6 +12550,10 @@ class CodexAppServerRegistry:
 
         expected = normalize_codex_home(expected_codex_home)
         async with self._lock:
+            if thread_id in self._starting_threads:
+                raise CodexAppServerBusyError(
+                    f"Codex thread {thread_id} already has an operation in flight"
+                )
             if thread_id in self._rebindings:
                 raise CodexAppServerBusyError(
                     f"Codex thread {thread_id} is being rebound"
@@ -10314,10 +12726,21 @@ class CodexAppServerRegistry:
             # coordination-only state.  If another server appeared
             # concurrently, retain its evidence instead of orphaning it.
             if not failures and not self._servers:
+                for stop_token in {
+                    key[1]
+                    for key in self._historical_stop_runtime_receipts
+                }:
+                    self._release_claimed_stop_historical_runtimes_locked(
+                        stop_token
+                    )
                 self._thread_owners.clear()
                 self._rebindings.clear()
                 self._starting.clear()
+                self._starting_tasks.clear()
                 self._starting_threads.clear()
+                self._stopping_tasks.clear()
+                self._claimed_stop_threads.clear()
+                self._historical_stop_threads.clear()
                 self._draining.clear()
 
         if failures:

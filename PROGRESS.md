@@ -1230,3 +1230,10 @@ ocean/forest/rose 归入 Legacy 组。Header 顶栏导航重构为 AppShell（�
 - **问题**：首屏精简后只剩用户请求和 `Live`，Planner 没有公开输出时用户无法知道当前正在做什么。
 - **解决**：Delivery 将当前 headline、detail、角色、Provider/Model 和最近活动时间传入 Plan 子页；对话时间线在没有 Step 输出时展示紧凑的 Agent 活动消息，有输出时与现有 Planner/Reviewer 消息并存。
 - **验证**：Delivery/Plan Detail 定向前端测试 `26 passed`；TypeScript、Vite production build（4766 modules）通过，相关组件 ESLint 0 errors（仅保留既有 Hook warnings）。
+
+## 2026-08-17 — Codex 共享 app-server 的 Task 级精确停止（commit：本提交）
+
+- **问题**：同一 Codex 账号的普通 Task、Delivery/Plan 等回合会复用常驻 app-server。旧的显式停止为了证明原生 helper 已退出，只能回收整个 transport；发现共享 peer 时因此返回 409，Task 300 无法在 Task 301 运行期间停止，若放宽又会误伤 Delivery 或其他 Task。
+- **修复**：按 `task_id` 建立停止准入栅栏，冻结目标 Task 的全部 root/descendant lineage；逐个精确中断并用 `thread/read` 确认终态，再以 parent-first archive/unarchive 和 unsubscribe 只替换目标 runtime。共享 app-server 与其他 Task/Delivery peer 始终保留；账号迁移留下的历史 home 也按 exact server/process generation 清理。当前/历史 home 的 stop reservation 分开精确记账，late child 收尾不会吞掉无关 Delivery/Plan admission 的计数。失败或竞态保留可重试 receipt/fence，只有无 peer 且隔离已证明时才允许回收整个 transport。
+- **避免复发**：共享进程不是共享生命周期。停止、重绑和迁移必须以 durable Task owner、精确 thread lineage 与 process generation 为边界；不得把 app-server PID 当成 Task 所有权，也不得先中断后再检查 peer。
+- **验证**：最终代码的 Task/API/InstanceManager/Codex app-server 五文件矩阵 `1151 passed, 3 skipped`，后端整库 `8096 passed, 6 skipped`；Delivery shared-peer 精确隔离、历史 generation 恢复和 late-child + 无关 admission 组合回归均通过。前端全量 `890 passed, 7 skipped`，TypeScript 两套配置及 Vite production build（4766 modules）通过。全程未运行真实 Codex canary，未操作或重启 8002/8003、未停止生产 Task。

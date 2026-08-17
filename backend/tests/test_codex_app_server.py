@@ -13,7 +13,7 @@ import threading
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -7099,6 +7099,502 @@ async def test_recycle_thread_runtime_rejects_wrong_unarchived_thread():
 
 
 @pytest.mark.asyncio
+async def test_claimed_stop_interrupt_holds_adapter_until_runtime_cleanup():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    process = CodexTurnProcess(4321, AsyncMock(), thread_id="thread-target")
+    context = _TurnContext(
+        "thread-target",
+        process,
+        0.0,
+        task_id=160,
+        turn_id="turn-target",
+    )
+    token = object()
+    context.claimed_stop_token = token
+    server._contexts_by_thread[context.thread_id] = context
+    server._contexts_by_turn[context.turn_id] = context
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-target",
+                "status": {"type": "active"},
+                "turns": [
+                    {"id": "turn-target", "status": "inProgress"},
+                ],
+            },
+        },
+        {},
+        {
+            "thread": {
+                "id": "thread-target",
+                "status": {"type": "idle"},
+                "turns": [],
+            },
+        },
+    ])
+
+    await server.interrupt_claimed_turn(process, stop_token=token)
+
+    assert context.claimed_stop_interrupt_confirmed is True
+    assert process.returncode is None
+    assert server._contexts_by_thread["thread-target"] is context
+    assert [entry.args for entry in server._request.await_args_list] == [
+        (
+            "thread/read",
+            {"threadId": "thread-target", "includeTurns": True},
+        ),
+        (
+            "turn/interrupt",
+            {"threadId": "thread-target", "turnId": "turn-target"},
+        ),
+        (
+            "thread/read",
+            {"threadId": "thread-target", "includeTurns": True},
+        ),
+    ]
+
+    server._publish_turn_context_terminal(context, {
+        "threadId": "thread-target",
+        "turn": {
+            "id": "turn-target",
+            "status": "interrupted",
+            "error": None,
+        },
+    })
+    assert process.returncode is None
+    assert context.claimed_stop_terminal_notification is not None
+
+    server.finish_claimed_turn_stop(
+        frozenset({process}),
+        stop_token=token,
+        reason="user requested stop",
+    )
+    assert process.returncode == 130
+    assert process.termination_kind == "internal_abort"
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_runtime_recycle_recovers_failed_unarchive():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    process = CodexTurnProcess(4321, AsyncMock(), thread_id="thread-target")
+    context = _TurnContext(
+        "thread-target", process, 0.0, task_id=160,
+    )
+    token = object()
+    context.claimed_stop_token = token
+    context.claimed_stop_transport_generation = server._transport_generation
+    context.claimed_stop_interrupt_confirmed = True
+    server._contexts_by_thread[context.thread_id] = context
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-target",
+                "status": {"type": "idle"},
+                "turns": [],
+            },
+        },
+        {},
+        CodexAppServerError("unarchive unavailable"),
+        {
+            "thread": {
+                "id": "thread-target",
+                "status": {"type": "notLoaded"},
+                "turns": [],
+            },
+        },
+        {"thread": {"id": "thread-target"}},
+    ])
+
+    with pytest.raises(CodexAppServerError, match="unarchive unavailable"):
+        await server.recycle_thread_runtime(
+            "thread-target",
+            claimed_stop_token=token,
+        )
+    assert server._runtime_recycle_archived_threads == {"thread-target"}
+
+    await server.recycle_thread_runtime(
+        "thread-target",
+        claimed_stop_token=token,
+    )
+    assert server._runtime_recycle_archived_threads == set()
+    assert [entry.args for entry in server._request.await_args_list] == [
+        (
+            "thread/read",
+            {"threadId": "thread-target", "includeTurns": True},
+        ),
+        ("thread/archive", {"threadId": "thread-target"}),
+        ("thread/unarchive", {"threadId": "thread-target"}),
+        (
+            "thread/read",
+            {"threadId": "thread-target", "includeTurns": True},
+        ),
+        ("thread/unarchive", {"threadId": "thread-target"}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recycle_discards_stale_unarchive_receipt_and_rearchives():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    server._runtime_recycle_archived_threads.add("thread-target")
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-target",
+                "status": {"type": "idle"},
+                "turns": [],
+            },
+        },
+        {},
+        {"thread": {"id": "thread-target"}},
+    ])
+
+    await server.recycle_thread_runtime("thread-target")
+
+    assert [entry.args for entry in server._request.await_args_list] == [
+        (
+            "thread/read",
+            {"threadId": "thread-target", "includeTurns": True},
+        ),
+        ("thread/archive", {"threadId": "thread-target"}),
+        ("thread/unarchive", {"threadId": "thread-target"}),
+    ]
+    assert server._runtime_recycle_archived_threads == set()
+
+
+@pytest.mark.asyncio
+async def test_recycle_retry_converges_after_archive_response_loss():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    thread_id = "thread-archive-response-loss"
+    server._request = AsyncMock(side_effect=[
+        CodexAppServerError("archive response was lost"),
+        CodexAppServerRequestError(
+            "thread/archive failed: no rollout found for thread id "
+            f"{thread_id}"
+        ),
+        {"thread": {"id": thread_id}},
+    ])
+
+    with pytest.raises(CodexAppServerError, match="response was lost"):
+        await server.recycle_thread_runtime(thread_id)
+
+    await server.recycle_thread_runtime(thread_id)
+
+    assert [entry.args[0] for entry in server._request.await_args_list] == [
+        "thread/archive",
+        "thread/archive",
+        "thread/unarchive",
+    ]
+    assert server._runtime_recycle_archived_threads == set()
+    assert thread_id in server._known_threads
+
+
+@pytest.mark.asyncio
+async def test_recycle_retry_converges_after_unarchive_response_loss():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    thread_id = "thread-unarchive-response-loss"
+    server._request = AsyncMock(side_effect=[
+        {},
+        CodexAppServerError("unarchive response was lost"),
+        {
+            "thread": {
+                "id": thread_id,
+                "status": {"type": "idle"},
+                "turns": [],
+            },
+        },
+        {},
+        {"thread": {"id": thread_id}},
+    ])
+
+    with pytest.raises(CodexAppServerError, match="response was lost"):
+        await server.recycle_thread_runtime(thread_id)
+    assert server._runtime_recycle_archived_threads == {thread_id}
+
+    await server.recycle_thread_runtime(thread_id)
+
+    assert [entry.args[0] for entry in server._request.await_args_list] == [
+        "thread/archive",
+        "thread/unarchive",
+        "thread/read",
+        "thread/archive",
+        "thread/unarchive",
+    ]
+    assert server._runtime_recycle_archived_threads == set()
+    assert thread_id in server._known_threads
+
+
+@pytest.mark.asyncio
+async def test_replace_lineage_restores_descendants_archived_with_parent():
+    server = CodexAppServer("codex")
+    server.ensure_started = AsyncMock()
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    root = "thread-root"
+    child = "thread-child"
+    grandchild = "thread-grandchild"
+    state = {root: "idle", child: "idle", grandchild: "idle"}
+    server._known_threads.update(state)
+
+    async def require_quiescence(thread_id):
+        if state[thread_id] == "notLoaded":
+            raise CodexThreadTerminalStateError(
+                thread_id,
+                "notLoaded",
+                operation="lineage replacement",
+            )
+        return {"thread": {"id": thread_id}}
+
+    async def request(method, params, **_kwargs):
+        thread_id = params["threadId"]
+        if method == "thread/read":
+            return {
+                "thread": {
+                    "id": thread_id,
+                    "status": {"type": state[thread_id]},
+                    "turns": [],
+                },
+            }
+        if method == "thread/archive":
+            if thread_id == root:
+                state.update({
+                    root: "notLoaded",
+                    child: "notLoaded",
+                    grandchild: "notLoaded",
+                })
+            else:
+                state[thread_id] = "notLoaded"
+            return {}
+        if method == "thread/unarchive":
+            state[thread_id] = "idle"
+            return {"thread": {"id": thread_id}}
+        if method == "thread/unsubscribe":
+            return {"status": "unsubscribed"}
+        raise AssertionError(method)
+
+    server.require_thread_routing_quiescence = AsyncMock(
+        side_effect=require_quiescence
+    )
+    server._request = AsyncMock(side_effect=request)
+
+    results = await server.replace_idle_thread_lineage(
+        (root, child, grandchild),
+        {child: root, grandchild: child},
+    )
+
+    assert results == {
+        root: "unsubscribed",
+        child: "unsubscribed",
+        grandchild: "unsubscribed",
+    }
+    assert state == {root: "idle", child: "idle", grandchild: "idle"}
+    assert [
+        entry.args[1]["threadId"]
+        for entry in server._request.await_args_list
+        if entry.args[0] == "thread/archive"
+    ] == [root]
+    assert [
+        entry.args[1]["threadId"]
+        for entry in server._request.await_args_list
+        if entry.args[0] == "thread/unarchive"
+    ] == [root, child, grandchild]
+    assert server._known_threads == set()
+
+
+@pytest.mark.asyncio
+async def test_replace_lineage_drops_generation_scoped_stale_root_marker():
+    server = CodexAppServer("codex")
+    process = SimpleNamespace(pid=4321, returncode=None)
+    server._process = process
+    thread_id = "stale-thread"
+    server._known_threads.add(thread_id)
+    server.require_thread_routing_quiescence = AsyncMock(
+        side_effect=CodexThreadTerminalStateError(
+            thread_id,
+            "notLoaded",
+            operation="lineage replacement",
+        )
+    )
+
+    async def request(method, params, **_kwargs):
+        assert params == {"threadId": thread_id}
+        if method == "thread/archive":
+            raise CodexAppServerRequestError(
+                "thread/archive failed: no rollout found for thread id "
+                f"{thread_id}"
+            )
+        if method == "thread/unarchive":
+            raise CodexAppServerRequestError(
+                "thread/unarchive failed: no archived rollout found for "
+                f"thread id {thread_id}"
+            )
+        raise AssertionError(method)
+
+    server._request = AsyncMock(side_effect=request)
+
+    result = await server.replace_idle_thread_lineage(
+        (thread_id,),
+        {},
+        expected_transport_generation=server._transport_generation,
+        expected_transport_process=process,
+    )
+
+    assert result == {thread_id: "notLoaded"}
+    assert thread_id not in server._known_threads
+    assert [
+        entry.args[0] for entry in server._request.await_args_list
+    ] == ["thread/archive", "thread/unarchive"]
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_active_read_overrides_stale_terminal_receipt():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    process = CodexTurnProcess(4321, AsyncMock(), thread_id="thread-target")
+    context = _TurnContext(
+        "thread-target",
+        process,
+        0.0,
+        task_id=160,
+        turn_id="turn-target",
+    )
+    token = object()
+    context.claimed_stop_token = token
+    context.claimed_stop_terminal_notification = {
+        "threadId": "thread-target",
+        "turn": {"id": "turn-older", "status": "completed"},
+    }
+    server._contexts_by_thread[context.thread_id] = context
+    server._contexts_by_turn[context.turn_id] = context
+    server._request = AsyncMock(side_effect=[
+        {
+            "thread": {
+                "id": "thread-target",
+                "status": {"type": "active"},
+                "turns": [
+                    {"id": "turn-target", "status": "inProgress"},
+                ],
+            },
+        },
+        {},
+        {
+            "thread": {
+                "id": "thread-target",
+                "status": {"type": "idle"},
+                "turns": [],
+            },
+        },
+    ])
+
+    await server.interrupt_claimed_turn(process, stop_token=token)
+
+    assert context.claimed_stop_interrupt_confirmed is True
+    assert (
+        "turn/interrupt",
+        {"threadId": "thread-target", "turnId": "turn-target"},
+    ) in [entry.args for entry in server._request.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_rebinds_missed_new_root_after_old_terminal():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    process = CodexTurnProcess(4321, AsyncMock(), thread_id="thread-target")
+    context = _TurnContext(
+        "thread-target",
+        process,
+        0.0,
+        task_id=160,
+        turn_id="turn-old",
+    )
+    token = object()
+    context.claimed_stop_token = token
+    context.claimed_stop_terminal_notification = {
+        "threadId": "thread-target",
+        "turn": {"id": "turn-old", "status": "completed"},
+    }
+    server._contexts_by_thread[context.thread_id] = context
+    server._contexts_by_turn[context.turn_id] = context
+    reads = 0
+
+    async def request(method, params, **_kwargs):
+        nonlocal reads
+        if method == "thread/read":
+            reads += 1
+            if reads == 1:
+                return {
+                    "thread": {
+                        "id": "thread-target",
+                        "status": {"type": "active"},
+                        "turns": [
+                            {"id": "turn-new", "status": "inProgress"},
+                        ],
+                    },
+                }
+            return {
+                "thread": {
+                    "id": "thread-target",
+                    "status": {"type": "idle"},
+                    "turns": [],
+                },
+            }
+        if method == "turn/interrupt" and params["turnId"] == "turn-old":
+            raise CodexAppServerRequestError(
+                "expected active turn id turn-old but found turn-new"
+            )
+        if method == "thread/goal/set":
+            raise CodexAppServerError("no active goal")
+        if method == "turn/interrupt" and params["turnId"] == "turn-new":
+            return {}
+        raise AssertionError((method, params))
+
+    server._request = AsyncMock(side_effect=request)
+
+    await server.interrupt_claimed_turn(process, stop_token=token)
+
+    assert context.claimed_stop_interrupt_confirmed is True
+    interrupt_ids = [
+        entry.args[1]["turnId"]
+        for entry in server._request.await_args_list
+        if entry.args[0] == "turn/interrupt"
+    ]
+    assert interrupt_ids == ["turn-old", "turn-new"]
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_uncorrelated_terminal_is_not_root_terminal_proof():
+    server = CodexAppServer("codex")
+    process = CodexTurnProcess(4321, AsyncMock(), thread_id="thread-target")
+    context = _TurnContext(
+        "thread-target",
+        process,
+        0.0,
+        task_id=160,
+        turn_id="turn-target",
+    )
+    context.claimed_stop_token = object()
+    server._contexts_by_thread[context.thread_id] = context
+
+    server._schedule_uncorrelated_turn_terminal_abort(
+        context,
+        {
+            "threadId": "thread-target",
+            "turn": {"id": "turn-unrelated", "status": "completed"},
+        },
+        "uncorrelated terminal",
+    )
+
+    assert context.terminal_protocol_violation == "uncorrelated terminal"
+    assert context.claimed_stop_terminal_notification is None
+    assert context.malformed_terminal_guard_task is None
+
+
+@pytest.mark.asyncio
 async def test_concurrent_task_threads_keep_mcp_context_isolated():
     server = CodexAppServer("codex")
     server._process = SimpleNamespace(pid=4321, returncode=None)
@@ -10012,72 +10508,44 @@ async def test_unconfirmed_unclaimed_abort_does_not_kill_live_peer(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_claimed_stop_refuses_to_disrupt_shared_transport_with_live_peer(
+async def test_claimed_stop_cleanup_failure_preserves_shared_peer_and_retries(
     tmp_path,
 ):
-    """An explicit stop stays effective when exact descendant cleanup wedges."""
+    """A partial target cleanup remains retryable without killing its peer."""
 
     home = normalize_codex_home(tmp_path / "shared-claimed-stop")
     server = CodexAppServer("codex", codex_home=home)
     server._process = SimpleNamespace(pid=4321, returncode=None)
-    server.ensure_started = AsyncMock()
-    server._request = AsyncMock(side_effect=[
-        {"thread": {"id": "thread-target", "status": {"type": "idle"}}},
-        {"turn": {"id": "turn-target"}},
-        {"thread": {"id": "thread-peer", "status": {"type": "idle"}}},
-        {"turn": {"id": "turn-peer"}},
-        {
-            "thread": {
-                "id": "thread-child",
-                "status": {"type": "active", "activeFlags": []},
-                "turns": [],
-            },
-        },
-    ])
-    target, _ = await server.start_turn(
-        prompt="target",
-        cwd="/tmp",
-        model="gpt-5.5",
-        effort="low",
-        resume_session_id=None,
-        git_env=None,
-        task_id=16,
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    target_context = _TurnContext(
+        "thread-target", target, 0.0, task_id=16,
     )
-    peer, _ = await server.start_turn(
-        prompt="peer",
-        cwd="/tmp",
-        model="gpt-5.5",
-        effort="low",
-        resume_session_id=None,
-        git_env=None,
-        task_id=17,
+    target_context.descendant_thread_ids.add("thread-child")
+    target_context.descendant_parent_thread_ids["thread-child"] = (
+        "thread-target"
     )
-    await target.stdout.readline()
-    await peer.stdout.readline()
-    server._handle_notification("item/completed", {
-        "threadId": "thread-target",
-        "turnId": "turn-target",
-        "item": {
-            "type": "subAgentActivity",
-            "id": "spawn-1",
-            "agentThreadId": "thread-child",
-            "agentPath": "/root/child",
-            "kind": "started",
-        },
-    })
-    server._handle_notification("turn/completed", {
-        "threadId": "thread-target",
-        "turn": {
-            "id": "turn-target",
-            "status": "completed",
-            "error": None,
-        },
-    })
-    await asyncio.sleep(0)
+    peer_context = _TurnContext(
+        "thread-peer", peer, 0.0, task_id=17,
+    )
+    server._contexts_by_thread = {
+        "thread-target": target_context,
+        "thread-peer": peer_context,
+    }
+    server._contexts_by_descendant["thread-child"] = target_context
 
-    target_context = server._contexts_by_thread["thread-target"]
-    peer_context = server._contexts_by_thread["thread-peer"]
+    async def confirm_interrupt(exact_process, *, stop_token):
+        assert exact_process is target
+        assert target_context.claimed_stop_token is stop_token
+        target_context.claimed_stop_interrupt_confirmed = True
+
+    server.interrupt_claimed_turn = AsyncMock(side_effect=confirm_interrupt)
     server.shutdown = AsyncMock()
+    server.recycle_thread_runtime = AsyncMock(side_effect=[
+        CodexAppServerError("archive unavailable"),
+        None,
+        None,
+    ])
     registry = CodexAppServerRegistry("codex")
     registry._servers[home] = server
     registry._thread_owners.update({
@@ -10087,7 +10555,7 @@ async def test_claimed_stop_refuses_to_disrupt_shared_transport_with_live_peer(
 
     with pytest.raises(
         CodexSharedTransportBusyError,
-        match="another live turn shares",
+        match="cleanup is still pending",
     ):
         await registry.stop_claimed_turn(
             home,
@@ -10100,16 +10568,2351 @@ async def test_claimed_stop_refuses_to_disrupt_shared_transport_with_live_peer(
     assert peer.returncode is None
     assert server._contexts_by_thread["thread-target"] is target_context
     assert server._contexts_by_thread["thread-peer"] is peer_context
+    retry_token = target_context.claimed_stop_token
+    assert retry_token is not None
+    assert registry._starting_threads == {
+        "thread-target": retry_token,
+        "thread-child": retry_token,
+    }
     assert registry._servers[home] is server
     assert registry._thread_owners == {
         "thread-target": home,
         "thread-peer": home,
     }
+
+    assert await registry.stop_claimed_turn(
+        home,
+        target,
+        reason="user requested stop",
+    ) is False
+
+    assert target.returncode == 130
+    assert target.termination_kind == "internal_abort"
+    assert peer.returncode is None
+    assert server._contexts_by_thread == {"thread-peer": peer_context}
+    assert server.recycle_thread_runtime.await_args_list == [
+            call(
+                "thread-target",
+                claimed_stop_token=retry_token,
+                expected_transport_generation=server._transport_generation,
+                expected_transport_process=server._process,
+            ),
+            call(
+                "thread-target",
+                claimed_stop_token=retry_token,
+                expected_transport_generation=server._transport_generation,
+                expected_transport_process=server._process,
+            ),
+            call(
+                "thread-child",
+                claimed_stop_token=retry_token,
+                expected_transport_generation=server._transport_generation,
+                expected_transport_process=server._process,
+            ),
+    ]
+    server.shutdown.assert_not_awaited()
+    assert registry._starting_threads == {}
+    assert registry._starting == {}
+    assert registry._servers[home] is server
+    assert registry._thread_owners == {
+        "thread-target": home,
+        "thread-peer": home,
+    }
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_cancellation_during_recycle_preserves_receipt(
+    tmp_path,
+):
+    home = normalize_codex_home(tmp_path / "cancelled-scoped-stop")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    target_context = _TurnContext(
+        "thread-target", target, 0.0, task_id=160,
+    )
+    peer_context = _TurnContext(
+        "thread-peer", peer, 0.0, task_id=161,
+    )
+    server._contexts_by_thread = {
+        "thread-target": target_context,
+        "thread-peer": peer_context,
+    }
+    recycle_entered = asyncio.Event()
+    attempts = 0
+
+    async def confirm_interrupt(exact_process, *, stop_token):
+        assert exact_process is target
+        target_context.claimed_stop_interrupt_confirmed = True
+
+    async def recycle(_thread_id, *, claimed_stop_token, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        assert target_context.claimed_stop_token is claimed_stop_token
+        if attempts == 1:
+            recycle_entered.set()
+            await asyncio.Event().wait()
+
+    server.interrupt_claimed_turn = AsyncMock(side_effect=confirm_interrupt)
+    server.recycle_thread_runtime = AsyncMock(side_effect=recycle)
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
+
+    stop = asyncio.create_task(registry.stop_claimed_turn(
+        home,
+        target,
+        reason="user requested stop",
+    ))
+    await recycle_entered.wait()
+    stop.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stop
+
+    token = target_context.claimed_stop_token
+    assert token is not None
+    assert target_context.claimed_stop_interrupt_confirmed is True
+    assert registry._stopping_tasks == {160: token}
+    assert registry._starting == {home: 1}
+    assert registry._starting_threads == {"thread-target": token}
+    assert target.returncode is None
+    assert peer.returncode is None
+    server.shutdown.assert_not_awaited()
+
+    assert await registry.stop_claimed_turn(
+        home,
+        target,
+        reason="user requested stop",
+    ) is False
+
+    assert attempts == 2
+    assert target.returncode == 130
+    assert peer.returncode is None
+    assert server._contexts_by_thread == {"thread-peer": peer_context}
+    server.shutdown.assert_not_awaited()
+    assert registry._starting == {}
+    assert registry._starting_threads == {}
+    assert registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_cancellation_during_interrupt_preserves_receipt(
+    tmp_path,
+):
+    home = normalize_codex_home(tmp_path / "cancelled-interrupt-stop")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    target_context = _TurnContext(
+        "thread-target", target, 0.0, task_id=160,
+    )
+    peer_context = _TurnContext(
+        "thread-peer", peer, 0.0, task_id=161,
+    )
+    server._contexts_by_thread = {
+        "thread-target": target_context,
+        "thread-peer": peer_context,
+    }
+    interrupt_entered = asyncio.Event()
+
+    async def block_interrupt(_process, *, stop_token):
+        assert target_context.claimed_stop_token is stop_token
+        interrupt_entered.set()
+        await asyncio.Event().wait()
+
+    server.interrupt_claimed_turn = AsyncMock(side_effect=block_interrupt)
+    server.recycle_thread_runtime = AsyncMock()
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
+
+    stop = asyncio.create_task(registry.stop_claimed_turn(
+        home,
+        target,
+        reason="user requested stop",
+    ))
+    await interrupt_entered.wait()
+    stop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stop
+
+    token = target_context.claimed_stop_token
+    assert token is not None
+    assert target_context.claimed_stop_interrupt_confirmed is False
+    assert registry._stopping_tasks == {160: token}
+    assert registry._starting_threads == {"thread-target": token}
+    assert target.returncode is None
+    assert peer.returncode is None
+    server.shutdown.assert_not_awaited()
+
+    async def confirm_interrupt(_process, *, stop_token):
+        assert stop_token is token
+        target_context.claimed_stop_interrupt_confirmed = True
+
+    server.interrupt_claimed_turn = AsyncMock(
+        side_effect=confirm_interrupt
+    )
+    assert await registry.stop_claimed_turn(
+        home,
+        target,
+        reason="user requested stop",
+    ) is False
+
+    assert target.returncode == 130
+    assert peer.returncode is None
+    assert registry._starting == {}
+    assert registry._starting_threads == {}
+    assert registry._stopping_tasks == {}
+
+@pytest.mark.asyncio
+async def test_claimed_stop_reserves_descendant_discovered_during_cleanup(
+    tmp_path,
+):
+    home = normalize_codex_home(tmp_path / "late-child-scoped-stop")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    target_context = _TurnContext(
+        "thread-target", target, 0.0, task_id=160,
+    )
+    peer_context = _TurnContext(
+        "thread-peer", peer, 0.0, task_id=161,
+    )
+    server._contexts_by_thread = {
+        "thread-target": target_context,
+        "thread-peer": peer_context,
+    }
+
+    async def confirm_interrupt(exact_process, *, stop_token):
+        assert exact_process is target
+        target_context.claimed_stop_interrupt_confirmed = True
+
+    async def discover_late_child(
+        _thread_id, *, claimed_stop_token, **_kwargs,
+    ):
+        assert target_context.claimed_stop_token is claimed_stop_token
+        target_context.descendant_thread_ids.add("thread-late-child")
+        target_context.descendant_parent_thread_ids["thread-late-child"] = (
+            "thread-target"
+        )
+        server._contexts_by_descendant["thread-late-child"] = target_context
+
+    server.interrupt_claimed_turn = AsyncMock(side_effect=confirm_interrupt)
+    server.recycle_thread_runtime = AsyncMock(side_effect=discover_late_child)
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
+
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="new native work",
+    ):
+        await registry.stop_claimed_turn(
+            home,
+            target,
+            reason="user requested stop",
+        )
+
+    token = target_context.claimed_stop_token
+    assert token is not None
+    assert registry._starting_threads == {
+        "thread-target": token,
+        "thread-late-child": token,
+    }
+    assert registry._stopping_tasks == {160: token}
+    assert target_context.claimed_stop_interrupt_confirmed is False
+    assert target.returncode is None
+    assert peer.returncode is None
+    server.shutdown.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_task_fence_blocks_cross_home_fresh_root(tmp_path):
+    home = normalize_codex_home(tmp_path / "target-home")
+    other_home = normalize_codex_home(tmp_path / "other-home")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    target_context = _TurnContext(
+        "thread-target", target, 0.0, task_id=160,
+    )
+    peer_context = _TurnContext(
+        "thread-peer", peer, 0.0, task_id=161,
+    )
+    server._contexts_by_thread = {
+        "thread-target": target_context,
+        "thread-peer": peer_context,
+    }
+    recycle_entered = asyncio.Event()
+    release_recycle = asyncio.Event()
+
+    async def confirm_interrupt(_process, *, stop_token):
+        target_context.claimed_stop_interrupt_confirmed = True
+
+    async def blocking_recycle(
+        _thread_id, *, claimed_stop_token, **_kwargs,
+    ):
+        recycle_entered.set()
+        await release_recycle.wait()
+
+    server.interrupt_claimed_turn = AsyncMock(side_effect=confirm_interrupt)
+    server.recycle_thread_runtime = AsyncMock(side_effect=blocking_recycle)
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
+
+    stop = asyncio.create_task(registry.stop_claimed_turn(
+        home,
+        target,
+        reason="user requested stop",
+    ))
+    await recycle_entered.wait()
+    try:
+        assert 160 in registry._stopping_tasks
+        with pytest.raises(CodexAppServerBusyError, match="being stopped"):
+            await registry.start_turn(
+                codex_home=other_home,
+                prompt="late same-Task root",
+                cwd="/tmp",
+                model="gpt-5.5",
+                effort="low",
+                resume_session_id=None,
+                git_env=None,
+                task_id=160,
+            )
+        assert other_home not in registry._servers
+        assert registry._starting_tasks == {}
+        assert peer.returncode is None
+        server.shutdown.assert_not_awaited()
+    finally:
+        release_recycle.set()
+
+    assert await stop is False
+    assert target.returncode == 130
+    assert peer.returncode is None
+    assert registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_rejects_same_task_admission_already_in_flight(
+    tmp_path,
+):
+    home = normalize_codex_home(tmp_path / "inflight-task-start")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    server._contexts_by_thread = {
+        "thread-target": _TurnContext(
+            "thread-target", target, 0.0, task_id=160,
+        ),
+        "thread-peer": _TurnContext(
+            "thread-peer", peer, 0.0, task_id=161,
+        ),
+    }
+    server.interrupt_claimed_turn = AsyncMock()
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
+    registry._starting_tasks[160] = 1
+
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="admission for Task 160 is in flight",
+    ):
+        await registry.stop_claimed_turn(
+            home,
+            target,
+            reason="user requested stop",
+        )
+
+    server.interrupt_claimed_turn.assert_not_awaited()
+    server.shutdown.assert_not_awaited()
+    assert target.returncode is None
+    assert peer.returncode is None
+    assert registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_rejects_same_task_adapter_on_another_home(
+    tmp_path,
+):
+    home = normalize_codex_home(tmp_path / "task-home-a")
+    other_home = normalize_codex_home(tmp_path / "task-home-b")
+    server = CodexAppServer("codex", codex_home=home)
+    other_server = CodexAppServer("codex", codex_home=other_home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    other_server._process = SimpleNamespace(pid=5432, returncode=None)
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    escaped = CodexTurnProcess(5432, AsyncMock())
+    server._contexts_by_thread = {
+        "thread-target": _TurnContext(
+            "thread-target", target, 0.0, task_id=160,
+        ),
+        "thread-peer": _TurnContext(
+            "thread-peer", peer, 0.0, task_id=161,
+        ),
+    }
+    other_server._contexts_by_thread = {
+        "thread-escaped": _TurnContext(
+            "thread-escaped", escaped, 0.0, task_id=160,
+        ),
+    }
+    server.interrupt_claimed_turn = AsyncMock()
+    server.shutdown = AsyncMock()
+    other_server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers.update({
+        home: server,
+        other_home: other_server,
+    })
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+        "thread-escaped": other_home,
+    })
+
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="outside the claimed transport",
+    ):
+        await registry.require_claimed_turn_stop_isolated(home, target)
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="different transport",
+    ):
+        await registry.stop_claimed_turn(
+            home,
+            target,
+            reason="user requested stop",
+        )
+
+    server.interrupt_claimed_turn.assert_not_awaited()
+    server.shutdown.assert_not_awaited()
+    other_server.shutdown.assert_not_awaited()
+    assert target.returncode is None
+    assert peer.returncode is None
+    assert escaped.returncode is None
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_requires_valid_task_identity(tmp_path):
+    home = normalize_codex_home(tmp_path / "missing-task-identity")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    server._contexts_by_thread = {
+        "thread-target": _TurnContext(
+            "thread-target", target, 0.0, task_id=None,
+        ),
+        "thread-peer": _TurnContext(
+            "thread-peer", peer, 0.0, task_id=161,
+        ),
+    }
+    server.interrupt_claimed_turn = AsyncMock()
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
+
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="no valid Task identity fence",
+    ):
+        await registry.stop_claimed_turn(
+            home,
+            target,
+            reason="user requested stop",
+        )
+
+    server.interrupt_claimed_turn.assert_not_awaited()
+    server.shutdown.assert_not_awaited()
+    assert target.returncode is None
+    assert peer.returncode is None
+
+
+@pytest.mark.asyncio
+async def test_rejected_start_does_not_decrement_another_admission(tmp_path):
+    home = normalize_codex_home(tmp_path / "draining-start-counter")
+    registry = CodexAppServerRegistry("codex")
+    registry._draining.add(home)
+    registry._starting[home] = 1
+    registry._starting_tasks[161] = 1
+
+    with pytest.raises(CodexAppServerBusyError, match="draining"):
+        await registry.start_turn(
+            codex_home=home,
+            prompt="must not enter",
+            cwd="/tmp",
+            model="gpt-5.5",
+            effort="low",
+            resume_session_id=None,
+            git_env=None,
+            task_id=160,
+        )
+
+    assert registry._starting == {home: 1}
+    assert registry._starting_tasks == {161: 1}
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_transport_exit_releases_retry_fences(tmp_path):
+    home = normalize_codex_home(tmp_path / "transport-exit-stop")
+    server = CodexAppServer("codex", codex_home=home)
+    transport = SimpleNamespace(pid=4321, returncode=None)
+    server._process = transport
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    target_context = _TurnContext(
+        "thread-target", target, 0.0, task_id=160,
+    )
+    peer_context = _TurnContext(
+        "thread-peer", peer, 0.0, task_id=161,
+    )
+    server._contexts_by_thread = {
+        "thread-target": target_context,
+        "thread-peer": peer_context,
+    }
+
+    async def confirm_interrupt(_process, *, stop_token):
+        target_context.claimed_stop_interrupt_confirmed = True
+
+    async def exit_during_recycle(
+        _thread_id, *, claimed_stop_token, **_kwargs,
+    ):
+        transport.returncode = 1
+        server._shutdown_requested = True
+        server._finalize_transport_exit(transport, 1, None)
+        raise CodexAppServerError("transport exited")
+
+    server.interrupt_claimed_turn = AsyncMock(side_effect=confirm_interrupt)
+    server.recycle_thread_runtime = AsyncMock(side_effect=exit_during_recycle)
+
+    server.shutdown = AsyncMock(return_value=True)
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
+
+    assert await registry.stop_claimed_turn(
+        home,
+        target,
+        reason="user requested stop",
+    ) is True
+
+    assert target.returncode == 130
+    assert target.termination_kind == "internal_abort"
+    assert peer.returncode == 1
+    assert registry._starting_threads == {}
+    assert registry._starting == {}
+    assert registry._stopping_tasks == {}
+    assert home not in registry._servers
     assert home not in registry._draining
 
 
 @pytest.mark.asyncio
-async def test_claimed_stop_preflight_rejects_peer_without_interrupt(tmp_path):
+async def test_claimed_stop_recycles_all_same_task_lineages_parent_first(
+    tmp_path,
+):
+    home = normalize_codex_home(tmp_path / "multi-adapter-scoped-stop")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    target_a = CodexTurnProcess(4321, AsyncMock())
+    target_b = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    context_a = _TurnContext("root-a", target_a, 0.0, task_id=160)
+    context_b = _TurnContext("root-b", target_b, 0.0, task_id=160)
+    peer_context = _TurnContext("root-peer", peer, 0.0, task_id=161)
+    context_a.descendant_thread_ids.update({"child-a", "grandchild-a"})
+    context_a.descendant_parent_thread_ids.update({
+        "child-a": "root-a",
+        "grandchild-a": "child-a",
+    })
+    server._contexts_by_thread = {
+        "root-a": context_a,
+        "root-b": context_b,
+        "root-peer": peer_context,
+    }
+    server._contexts_by_descendant.update({
+        "child-a": context_a,
+        "grandchild-a": context_a,
+    })
+
+    async def confirm_interrupt(exact_process, *, stop_token):
+        context = context_a if exact_process is target_a else context_b
+        assert context.claimed_stop_token is stop_token
+        context.claimed_stop_interrupt_confirmed = True
+
+    server.interrupt_claimed_turn = AsyncMock(side_effect=confirm_interrupt)
+    server.recycle_thread_runtime = AsyncMock()
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "root-a": home,
+        "root-b": home,
+        "root-peer": home,
+    })
+
+    assert await registry.stop_claimed_turn(
+        home,
+        target_a,
+        reason="user requested stop",
+    ) is False
+
+    token = server.recycle_thread_runtime.await_args_list[0].kwargs[
+        "claimed_stop_token"
+    ]
+    assert server.recycle_thread_runtime.await_args_list == [
+            call(
+                "root-a",
+                claimed_stop_token=token,
+                expected_transport_generation=server._transport_generation,
+                expected_transport_process=server._process,
+            ),
+            call(
+                "root-b",
+                claimed_stop_token=token,
+                expected_transport_generation=server._transport_generation,
+                expected_transport_process=server._process,
+            ),
+            call(
+                "child-a",
+                claimed_stop_token=token,
+                expected_transport_generation=server._transport_generation,
+                expected_transport_process=server._process,
+            ),
+            call(
+                "grandchild-a",
+                claimed_stop_token=token,
+                expected_transport_generation=server._transport_generation,
+                expected_transport_process=server._process,
+            ),
+    ]
+    assert target_a.returncode == 130
+    assert target_b.returncode == 130
+    assert peer.returncode is None
+    assert server._contexts_by_thread == {"root-peer": peer_context}
+    server.shutdown.assert_not_awaited()
+    assert registry._servers[home] is server
+    assert registry._starting_threads == {}
+
+
+def _historical_runtime_stop_fixture(tmp_path):
+    current_home = normalize_codex_home(tmp_path / "current-home")
+    historical_home = normalize_codex_home(tmp_path / "historical-home")
+    current_server = CodexAppServer("codex", codex_home=current_home)
+    historical_server = CodexAppServer("codex", codex_home=historical_home)
+    current_transport = SimpleNamespace(pid=4321, returncode=None)
+    historical_transport = SimpleNamespace(pid=5432, returncode=None)
+    current_server._process = current_transport
+    historical_server._process = historical_transport
+
+    target = CodexTurnProcess(4321, AsyncMock())
+    current_peer = CodexTurnProcess(4321, AsyncMock())
+    historical_peer = CodexTurnProcess(5432, AsyncMock())
+    target_context = _TurnContext(
+        "thread-target", target, 0.0, task_id=160,
+    )
+    current_peer_context = _TurnContext(
+        "thread-current-peer", current_peer, 0.0, task_id=161,
+    )
+    historical_peer_context = _TurnContext(
+        "thread-historical-peer", historical_peer, 0.0, task_id=162,
+    )
+    current_server._contexts_by_thread = {
+        "thread-target": target_context,
+        "thread-current-peer": current_peer_context,
+    }
+    historical_server._contexts_by_thread = {
+        "thread-historical-peer": historical_peer_context,
+    }
+    historical_server._known_threads.add("thread-target")
+    historical_server._children_by_thread.setdefault(
+        "thread-target", set()
+    ).add("thread-old-child")
+    historical_server._children_by_thread.setdefault(
+        "thread-old-child", set()
+    ).add("thread-old-grandchild")
+
+    async def confirm_interrupt(exact_process, *, stop_token):
+        assert exact_process is target
+        assert target_context.claimed_stop_token is stop_token
+        target_context.claimed_stop_interrupt_confirmed = True
+
+    current_server.interrupt_claimed_turn = AsyncMock(
+        side_effect=confirm_interrupt
+    )
+    current_server.recycle_thread_runtime = AsyncMock()
+    current_server.steer_turn = AsyncMock(return_value=True)
+    current_server.shutdown = AsyncMock()
+    historical_server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers.update({
+        current_home: current_server,
+        historical_home: historical_server,
+    })
+    registry._thread_owners.update({
+        "thread-target": current_home,
+        "thread-current-peer": current_home,
+        "thread-historical-peer": historical_home,
+    })
+    return SimpleNamespace(
+        registry=registry,
+        current_home=current_home,
+        historical_home=historical_home,
+        current_server=current_server,
+        historical_server=historical_server,
+        current_transport=current_transport,
+        historical_transport=historical_transport,
+        target=target,
+        current_peer=current_peer,
+        historical_peer=historical_peer,
+        target_context=target_context,
+        current_peer_context=current_peer_context,
+        historical_peer_context=historical_peer_context,
+    )
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_cleans_complete_historical_lineage_without_peers(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+
+    async def cleanup_historical(
+        thread_ids,
+        parent_thread_ids,
+        *,
+        expected_transport_generation,
+        expected_transport_process,
+    ):
+        assert thread_ids == (
+            "thread-target",
+            "thread-old-child",
+            "thread-old-grandchild",
+        )
+        assert parent_thread_ids == {
+            "thread-old-child": "thread-target",
+            "thread-old-grandchild": "thread-old-child",
+        }
+        assert (
+            expected_transport_generation
+            is fixture.historical_server._transport_generation
+        )
+        assert expected_transport_process is fixture.historical_transport
+        fixture.historical_server._known_threads.difference_update(thread_ids)
+        return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+    fixture.historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=cleanup_historical
+    )
+
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is False
+
+    fixture.historical_server.replace_idle_thread_lineage.assert_awaited_once()
+    fixture.current_server.recycle_thread_runtime.assert_awaited_once_with(
+        "thread-target",
+        claimed_stop_token=ANY,
+        expected_transport_generation=(
+            fixture.current_server._transport_generation
+        ),
+        expected_transport_process=fixture.current_transport,
+    )
+    assert fixture.target.returncode == 130
+    assert fixture.current_peer.returncode is None
+    assert fixture.historical_peer.returncode is None
+    assert fixture.current_server._process is fixture.current_transport
+    assert fixture.historical_server._process is fixture.historical_transport
+    assert fixture.current_server._contexts_by_thread == {
+        "thread-current-peer": fixture.current_peer_context,
+    }
+    assert fixture.historical_server._contexts_by_thread == {
+        "thread-historical-peer": fixture.historical_peer_context,
+    }
+    fixture.current_server.shutdown.assert_not_awaited()
+    fixture.historical_server.shutdown.assert_not_awaited()
+    assert fixture.registry._starting == {}
+    assert fixture.registry._starting_threads == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_historical_late_child_preserves_unrelated_home_admission(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    discovered_late_child = False
+
+    async def cleanup_historical(thread_ids, _parents, **_kwargs):
+        fixture.historical_server._known_threads.difference_update(thread_ids)
+        return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+    async def recycle_current(thread_id, *, claimed_stop_token, **_kwargs):
+        nonlocal discovered_late_child
+        if discovered_late_child or thread_id != "thread-target":
+            return
+        discovered_late_child = True
+        context = fixture.target_context
+        assert context.claimed_stop_token is claimed_stop_token
+        context.descendant_thread_ids.add("thread-old-child")
+        context.descendant_parent_thread_ids["thread-old-child"] = (
+            "thread-target"
+        )
+        fixture.current_server._contexts_by_descendant[
+            "thread-old-child"
+        ] = context
+
+    fixture.historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=cleanup_historical
+    )
+    fixture.current_server.recycle_thread_runtime = AsyncMock(
+        side_effect=recycle_current
+    )
+
+    with pytest.raises(CodexSharedTransportBusyError, match="new native work"):
+        await fixture.registry.stop_claimed_turn(
+            fixture.current_home,
+            fixture.target,
+            reason="user requested stop",
+        )
+
+    token = fixture.target_context.claimed_stop_token
+    assert token is not None
+    assert fixture.registry._starting == {
+        fixture.current_home: 2,
+        fixture.historical_home: 3,
+    }
+
+    quota_entered = asyncio.Event()
+    release_quota = asyncio.Event()
+
+    async def read_rate_limits():
+        quota_entered.set()
+        await release_quota.wait()
+        return {"rateLimits": {}}
+
+    fixture.current_server.read_rate_limits = AsyncMock(
+        side_effect=read_rate_limits
+    )
+    quota_read = asyncio.create_task(
+        fixture.registry.read_rate_limits(fixture.current_home)
+    )
+    await quota_entered.wait()
+    try:
+        assert fixture.registry._starting[fixture.current_home] == 3
+        assert await fixture.registry.stop_claimed_turn(
+            fixture.current_home,
+            fixture.target,
+            reason="user requested stop",
+        ) is False
+
+        # The stop releases its exact root/late-child contributions and its
+        # historical-home lineage, but cannot consume the unrelated quota
+        # admission that is still in flight on the shared current home.
+        assert fixture.registry._starting == {fixture.current_home: 1}
+        assert fixture.registry._claimed_stop_threads == {}
+        assert fixture.registry._historical_stop_threads == {}
+        assert fixture.current_peer.returncode is None
+        assert fixture.historical_peer.returncode is None
+    finally:
+        release_quota.set()
+
+    assert await quota_read == {"rateLimits": {}}
+    assert fixture.registry._starting == {}
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_drops_stale_historical_marker_after_restart(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    thread_id = "thread-target"
+    # A process restart clears generation-local descendant/runtime facts but
+    # deliberately retains the conservative root marker.
+    fixture.historical_server._children_by_thread.clear()
+    fixture.historical_server.require_thread_routing_quiescence = AsyncMock(
+        side_effect=CodexThreadTerminalStateError(
+            thread_id,
+            "notLoaded",
+            operation="historical Task cleanup",
+        )
+    )
+
+    async def request(method, params, **_kwargs):
+        assert params == {"threadId": thread_id}
+        if method == "thread/archive":
+            raise CodexAppServerRequestError(
+                "thread/archive failed: no rollout found for thread id "
+                f"{thread_id}"
+            )
+        if method == "thread/unarchive":
+            raise CodexAppServerRequestError(
+                "thread/unarchive failed: no archived rollout found for "
+                f"thread id {thread_id}"
+            )
+        raise AssertionError(method)
+
+    fixture.historical_server._request = AsyncMock(side_effect=request)
+
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is False
+
+    assert thread_id not in fixture.historical_server._known_threads
+    assert fixture.target.returncode == 130
+    assert fixture.current_peer.returncode is None
+    assert fixture.historical_peer.returncode is None
+    fixture.current_server.shutdown.assert_not_awaited()
+    fixture.historical_server.shutdown.assert_not_awaited()
+    assert fixture.registry._starting == {}
+    assert fixture.registry._starting_threads == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_historical_cleanup_failure_keeps_fence_and_retries_without_peers(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    attempts = 0
+
+    async def cleanup_historical(thread_ids, _parents, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise CodexAppServerError("historical archive unavailable")
+        fixture.historical_server._known_threads.difference_update(thread_ids)
+        return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+    fixture.historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=cleanup_historical
+    )
+
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="cleanup is still pending",
+    ):
+        await fixture.registry.stop_claimed_turn(
+            fixture.current_home,
+            fixture.target,
+            reason="user requested stop",
+        )
+
+    token = fixture.target_context.claimed_stop_token
+    assert token is not None
+    fixture.current_server.recycle_thread_runtime.assert_not_awaited()
+    assert fixture.registry._stopping_tasks == {160: token}
+    assert fixture.registry._starting == {
+        fixture.current_home: 1,
+        fixture.historical_home: 3,
+    }
+    assert fixture.registry._starting_threads == {
+        "thread-target": token,
+        "thread-old-child": token,
+        "thread-old-grandchild": token,
+    }
+    assert fixture.registry._historical_stop_threads == {
+        (fixture.historical_home, "thread-target"): token,
+        (fixture.historical_home, "thread-old-child"): token,
+        (fixture.historical_home, "thread-old-grandchild"): token,
+    }
+    assert fixture.current_peer.returncode is None
+    assert fixture.historical_peer.returncode is None
+    fixture.current_server.shutdown.assert_not_awaited()
+    fixture.historical_server.shutdown.assert_not_awaited()
+
+    with pytest.raises(CodexAppServerBusyError, match="being stopped"):
+        await fixture.registry.start_turn(
+            codex_home=normalize_codex_home(tmp_path / "third-home"),
+            prompt="must remain fenced",
+            cwd="/tmp",
+            model="gpt-5.5",
+            effort="low",
+            resume_session_id=None,
+            git_env=None,
+            task_id=160,
+        )
+    with pytest.raises(CodexAppServerBusyError, match="operation in flight"):
+        await fixture.registry.read_thread(
+            fixture.historical_home,
+            "thread-old-child",
+        )
+    assert await fixture.registry.steer_turn(
+        "thread-current-peer",
+        "peer still works",
+    ) is True
+
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is False
+
+    assert attempts == 2
+    assert fixture.target.returncode == 130
+    assert fixture.current_peer.returncode is None
+    assert fixture.historical_peer.returncode is None
+    assert fixture.registry._starting == {}
+    assert fixture.registry._starting_threads == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_historical_exit_restarts_and_reconciles_saved_complete_lineage(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    historical_server = fixture.historical_server
+    old_generation = historical_server._transport_generation
+    new_generation = object()
+    new_transport = SimpleNamespace(pid=6543, returncode=None)
+    replacement_calls = []
+
+    async def replace_lineage(
+        thread_ids,
+        parent_thread_ids,
+        *,
+        expected_transport_generation,
+        expected_transport_process,
+    ):
+        replacement_calls.append((
+            thread_ids,
+            parent_thread_ids,
+            expected_transport_generation,
+            expected_transport_process,
+        ))
+        if len(replacement_calls) == 1:
+            assert expected_transport_generation is old_generation
+            assert expected_transport_process is fixture.historical_transport
+            fixture.historical_transport.returncode = 1
+            historical_server._finalize_transport_exit(
+                fixture.historical_transport,
+                1,
+                None,
+            )
+            assert historical_server._children_by_thread == {}
+            raise CodexAppServerError("historical transport exited")
+        assert expected_transport_generation is new_generation
+        assert expected_transport_process is new_transport
+        historical_server._known_threads.difference_update(thread_ids)
+        return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+    async def restart_exact_generation(
+        *,
+        expected_transport_generation,
+        expected_transport_process,
+        publish_generation,
+    ):
+        assert expected_transport_generation is old_generation
+        assert expected_transport_process is fixture.historical_transport
+        historical_server._transport_generation = new_generation
+        historical_server._process = new_transport
+        publish_generation(new_generation, new_transport)
+        return new_generation, new_transport
+
+    historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=replace_lineage
+    )
+    historical_server.restart_after_exact_transport_exit = AsyncMock(
+        side_effect=restart_exact_generation
+    )
+
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is False
+
+    expected_lineage = (
+        "thread-target",
+        "thread-old-child",
+        "thread-old-grandchild",
+    )
+    expected_parents = {
+        "thread-old-child": "thread-target",
+        "thread-old-grandchild": "thread-old-child",
+    }
+    assert [call[0] for call in replacement_calls] == [
+        expected_lineage,
+        expected_lineage,
+    ]
+    assert [call[1] for call in replacement_calls] == [
+        expected_parents,
+        expected_parents,
+    ]
+    assert fixture.target.returncode == 130
+    assert fixture.current_peer.returncode is None
+    assert fixture.current_server._process is fixture.current_transport
+    fixture.current_server.shutdown.assert_not_awaited()
+    fixture.historical_server.shutdown.assert_not_awaited()
+    assert fixture.registry._historical_stop_runtime_receipts == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settled_generation", [False, True])
+async def test_first_preflight_reserves_exact_dead_historical_generation(
+    tmp_path,
+    settled_generation,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    historical_server = fixture.historical_server
+    old_generation = historical_server._transport_generation
+    new_generation = object()
+    new_transport = SimpleNamespace(pid=6543, returncode=None)
+    fixture.historical_transport.returncode = 1
+    historical_server._finalize_transport_exit(
+        fixture.historical_transport,
+        1,
+        None,
+    )
+    if settled_generation:
+        historical_server._process = None
+    assert historical_server._children_by_thread == {}
+
+    async def restart_exact_generation(
+        *,
+        expected_transport_generation,
+        expected_transport_process,
+        publish_generation,
+    ):
+        assert expected_transport_generation is old_generation
+        assert expected_transport_process is (
+            None
+            if settled_generation
+            else fixture.historical_transport
+        )
+        historical_server._transport_generation = new_generation
+        historical_server._process = new_transport
+        publish_generation(new_generation, new_transport)
+        return new_generation, new_transport
+
+    async def replace_lineage(thread_ids, parent_thread_ids, **_kwargs):
+        assert thread_ids == ("thread-target",)
+        assert parent_thread_ids == {}
+        historical_server._known_threads.difference_update(thread_ids)
+        return {"thread-target": "unsubscribed"}
+
+    historical_server.restart_after_exact_transport_exit = AsyncMock(
+        side_effect=restart_exact_generation
+    )
+    historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=replace_lineage
+    )
+
+    # No Task-stop receipt exists yet. The exact dead process plus CCM's
+    # conservative known-root marker is enough to reserve it for recovery.
+    assert fixture.registry._historical_stop_runtime_receipts == {}
+    await fixture.registry.require_claimed_turn_stop_isolated(
+        fixture.current_home,
+        fixture.target,
+    )
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is False
+
+    assert fixture.target.returncode == 130
+    assert fixture.current_peer.returncode is None
+    assert fixture.current_server._process is fixture.current_transport
+    fixture.current_server.shutdown.assert_not_awaited()
+    fixture.historical_server.shutdown.assert_not_awaited()
+    assert fixture.registry._historical_stop_runtime_receipts == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_dead_historical_receipt_preflight_and_recovery_failure_retry(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    historical_server = fixture.historical_server
+    old_generation = historical_server._transport_generation
+    new_generation = object()
+    new_transport = SimpleNamespace(pid=6543, returncode=None)
+    restart_attempts = 0
+
+    async def replace_lineage(thread_ids, _parents, **_kwargs):
+        if fixture.historical_transport.returncode is None:
+            fixture.historical_transport.returncode = 1
+            historical_server._finalize_transport_exit(
+                fixture.historical_transport,
+                1,
+                None,
+            )
+            raise CodexAppServerError("historical transport exited")
+        historical_server._known_threads.difference_update(thread_ids)
+        return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+    async def restart_exact_generation(
+        *,
+        expected_transport_generation,
+        expected_transport_process,
+        publish_generation,
+    ):
+        nonlocal restart_attempts
+        restart_attempts += 1
+        assert expected_transport_generation is old_generation
+        assert expected_transport_process is fixture.historical_transport
+        if restart_attempts == 1:
+            raise CodexAppServerError("historical process group survived")
+        historical_server._transport_generation = new_generation
+        historical_server._process = new_transport
+        publish_generation(new_generation, new_transport)
+        return new_generation, new_transport
+
+    historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=replace_lineage
+    )
+    historical_server.restart_after_exact_transport_exit = AsyncMock(
+        side_effect=restart_exact_generation
+    )
+
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="cleanup is still pending",
+    ):
+        await fixture.registry.stop_claimed_turn(
+            fixture.current_home,
+            fixture.target,
+            reason="user requested stop",
+        )
+
+    token = fixture.target_context.claimed_stop_token
+    receipt = fixture.registry._historical_stop_runtime_receipts[
+        (fixture.historical_home, token)
+    ]
+    assert receipt.thread_ids == (
+        "thread-target",
+        "thread-old-child",
+        "thread-old-grandchild",
+    )
+    assert dict(receipt.parent_thread_ids) == {
+        "thread-old-child": "thread-target",
+        "thread-old-grandchild": "thread-old-child",
+    }
+    assert receipt.transport_generation is old_generation
+    assert receipt.transport_process is fixture.historical_transport
+    # The ordinary API preflight must accept this exact dead-generation
+    # receipt instead of rejecting it as a generic unavailable old home.
+    await fixture.registry.require_claimed_turn_stop_isolated(
+        fixture.current_home,
+        fixture.target,
+    )
+    assert historical_server._historical_stop_recovery_tokens == {token}
+
+    # Unrelated home traffic must not win ensure_started() and replace the
+    # dead generation before the retained stop receipt can reconcile it. That
+    # ABA used to make every later stop retry fail until service restart.
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="dead-generation recovery is pending",
+    ):
+        await fixture.registry.read_rate_limits(fixture.historical_home)
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="dead-generation recovery is pending",
+    ):
+        await fixture.registry.start_turn(
+            codex_home=fixture.historical_home,
+            prompt="unrelated peer",
+            cwd=str(tmp_path),
+            model="gpt-5.5",
+            effort="low",
+            resume_session_id=None,
+            git_env=None,
+            task_id=999,
+        )
+    assert restart_attempts == 1
+    assert historical_server._transport_generation is old_generation
+    assert historical_server._process is fixture.historical_transport
+    assert fixture.registry._starting.get(fixture.historical_home) == 3
+    assert fixture.current_peer.returncode is None
+    assert fixture.current_server._process is fixture.current_transport
+
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is False
+
+    assert restart_attempts == 2
+    assert fixture.target.returncode == 130
+    assert fixture.current_peer.returncode is None
+    assert fixture.current_server._process is fixture.current_transport
+    fixture.current_server.shutdown.assert_not_awaited()
+    fixture.historical_server.shutdown.assert_not_awaited()
+    assert historical_server._historical_stop_recovery_tokens == set()
+    assert fixture.registry._historical_stop_runtime_receipts == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_historical_restart_failure_publishes_settled_receipt_for_retry(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    historical_server = fixture.historical_server
+    old_generation = historical_server._transport_generation
+    failed_start_generation = object()
+    replacement_generation = object()
+    replacement_transport = SimpleNamespace(pid=6543, returncode=None)
+    fixture.historical_transport.returncode = 1
+    start_attempts = 0
+
+    async def shutdown_locked():
+        assert historical_server._transport_generation is old_generation
+        assert historical_server._process is fixture.historical_transport
+        historical_server._finalize_transport_exit(
+            fixture.historical_transport,
+            1,
+            None,
+        )
+        historical_server._process = None
+
+    async def start():
+        nonlocal start_attempts
+        start_attempts += 1
+        if start_attempts == 1:
+            historical_server._transport_generation = failed_start_generation
+            historical_server._process = None
+            raise CodexAppServerError("historical initialize unavailable")
+        historical_server._transport_generation = replacement_generation
+        historical_server._process = replacement_transport
+
+    async def replace_lineage(thread_ids, parent_thread_ids, **_kwargs):
+        assert thread_ids == (
+            "thread-target",
+            "thread-old-child",
+            "thread-old-grandchild",
+        )
+        assert parent_thread_ids == {
+            "thread-old-child": "thread-target",
+            "thread-old-grandchild": "thread-old-child",
+        }
+        historical_server._known_threads.difference_update(thread_ids)
+        return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+    historical_server._shutdown_locked = AsyncMock(
+        side_effect=shutdown_locked
+    )
+    historical_server._start = AsyncMock(side_effect=start)
+    historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=replace_lineage
+    )
+
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="cleanup is still pending",
+    ):
+        await fixture.registry.stop_claimed_turn(
+            fixture.current_home,
+            fixture.target,
+            reason="user requested stop",
+        )
+
+    token = fixture.target_context.claimed_stop_token
+    receipt = fixture.registry._historical_stop_runtime_receipts[
+        (fixture.historical_home, token)
+    ]
+    assert receipt.transport_generation is failed_start_generation
+    assert receipt.transport_process is None
+    assert receipt.thread_ids == (
+        "thread-target",
+        "thread-old-child",
+        "thread-old-grandchild",
+    )
+    assert dict(receipt.parent_thread_ids) == {
+        "thread-old-child": "thread-target",
+        "thread-old-grandchild": "thread-old-child",
+    }
+    await fixture.registry.require_claimed_turn_stop_isolated(
+        fixture.current_home,
+        fixture.target,
+    )
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="dead-generation recovery is pending",
+    ):
+        await fixture.registry.read_rate_limits(fixture.historical_home)
+    assert historical_server._transport_generation is failed_start_generation
+    assert historical_server._process is None
+    assert historical_server._start.await_count == 1
+
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is False
+
+    historical_server._shutdown_locked.assert_awaited_once_with()
+    assert historical_server._start.await_count == 2
+    assert fixture.target.returncode == 130
+    assert fixture.current_peer.returncode is None
+    assert fixture.current_server._process is fixture.current_transport
+    fixture.current_server.shutdown.assert_not_awaited()
+    fixture.historical_server.shutdown.assert_not_awaited()
+    assert fixture.registry._historical_stop_runtime_receipts == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_historical_exit_recovery_cancellation_publishes_new_receipt(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    historical_server = fixture.historical_server
+    new_generation = object()
+    new_transport = SimpleNamespace(pid=6543, returncode=None)
+    recovery_entered = asyncio.Event()
+    release_recovery = asyncio.Event()
+    replacement_attempts = 0
+
+    async def replace_lineage(thread_ids, _parents, **_kwargs):
+        nonlocal replacement_attempts
+        replacement_attempts += 1
+        if replacement_attempts == 1:
+            fixture.historical_transport.returncode = 1
+            historical_server._finalize_transport_exit(
+                fixture.historical_transport,
+                1,
+                None,
+            )
+            raise CodexAppServerError("historical transport exited")
+        historical_server._known_threads.difference_update(thread_ids)
+        return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+    async def restart_exact_generation(**kwargs):
+        recovery_entered.set()
+        await release_recovery.wait()
+        historical_server._transport_generation = new_generation
+        historical_server._process = new_transport
+        kwargs["publish_generation"](new_generation, new_transport)
+        return new_generation, new_transport
+
+    historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=replace_lineage
+    )
+    historical_server.restart_after_exact_transport_exit = AsyncMock(
+        side_effect=restart_exact_generation
+    )
+    stop = asyncio.create_task(fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ))
+    await recovery_entered.wait()
+    stop.cancel()
+    await asyncio.sleep(0)
+    release_recovery.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stop
+
+    token = fixture.target_context.claimed_stop_token
+    receipt = fixture.registry._historical_stop_runtime_receipts[
+        (fixture.historical_home, token)
+    ]
+    assert receipt.transport_generation is new_generation
+    assert receipt.transport_process is new_transport
+    assert receipt.thread_ids == (
+        "thread-target",
+        "thread-old-child",
+        "thread-old-grandchild",
+    )
+    assert fixture.current_peer.returncode is None
+    assert fixture.current_server._process is fixture.current_transport
+
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is False
+
+    assert replacement_attempts == 2
+    assert fixture.target.returncode == 130
+    assert fixture.current_peer.returncode is None
+    fixture.current_server.shutdown.assert_not_awaited()
+    fixture.historical_server.shutdown.assert_not_awaited()
+    assert fixture.registry._historical_stop_runtime_receipts == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_exact_dead_generation_restart_rejects_aba_before_shutdown():
+    server = CodexAppServer("codex")
+    expected_generation = server._transport_generation
+    expected_process = SimpleNamespace(pid=4321, returncode=1)
+    server._process = expected_process
+    server._transport_generation = object()
+    server._shutdown_locked = AsyncMock()
+    server._start = AsyncMock()
+
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="lost its exact transport generation",
+    ):
+        await server.restart_after_exact_transport_exit(
+            expected_transport_generation=expected_generation,
+            expected_transport_process=expected_process,
+        )
+
+    server._shutdown_locked.assert_not_awaited()
+    server._start.assert_not_awaited()
+    assert server._process is expected_process
+
+
+@pytest.mark.asyncio
+async def test_exact_dead_generation_restart_settles_group_before_start():
+    server = CodexAppServer("codex")
+    expected_generation = server._transport_generation
+    expected_process = SimpleNamespace(pid=4321, returncode=1)
+    replacement_generation = object()
+    replacement_process = SimpleNamespace(pid=5432, returncode=None)
+    server._process = expected_process
+    lifecycle = []
+
+    async def shutdown_locked():
+        lifecycle.append("shutdown")
+        assert server._transport_generation is expected_generation
+        assert server._process is expected_process
+        server._process = None
+
+    async def start():
+        lifecycle.append("start")
+        assert server._process is None
+        server._transport_generation = replacement_generation
+        server._process = replacement_process
+
+    server._shutdown_locked = AsyncMock(side_effect=shutdown_locked)
+    server._start = AsyncMock(side_effect=start)
+
+    generation, process = await server.restart_after_exact_transport_exit(
+        expected_transport_generation=expected_generation,
+        expected_transport_process=expected_process,
+    )
+
+    assert lifecycle == ["shutdown", "start"]
+    assert generation is replacement_generation
+    assert process is replacement_process
+    assert server.shutdown_requested is False
+
+
+@pytest.mark.asyncio
+async def test_exact_dead_generation_restart_fails_closed_on_group_failure():
+    server = CodexAppServer("codex")
+    expected_generation = server._transport_generation
+    expected_process = SimpleNamespace(pid=4321, returncode=1)
+    server._process = expected_process
+    server._shutdown_locked = AsyncMock(
+        side_effect=CodexAppServerError("process group survived SIGKILL")
+    )
+    server._start = AsyncMock()
+
+    with pytest.raises(
+        CodexAppServerError,
+        match="process group survived SIGKILL",
+    ):
+        await server.restart_after_exact_transport_exit(
+            expected_transport_generation=expected_generation,
+            expected_transport_process=expected_process,
+        )
+
+    server._shutdown_locked.assert_awaited_once_with()
+    server._start.assert_not_awaited()
+    assert server._transport_generation is expected_generation
+    assert server._process is expected_process
+    assert server.shutdown_requested is False
+
+
+@pytest.mark.asyncio
+async def test_exact_dead_generation_restart_keeps_unproven_new_group_closed():
+    server = CodexAppServer("codex")
+    expected_generation = server._transport_generation
+    expected_process = SimpleNamespace(pid=4321, returncode=1)
+    unproven_generation = object()
+    unproven_process = SimpleNamespace(pid=5432, returncode=None)
+    published = []
+    server._process = expected_process
+
+    async def shutdown_locked():
+        server._process = None
+
+    async def fail_start():
+        server._transport_generation = unproven_generation
+        server._process = unproven_process
+        server._shutdown_requested = True
+        raise CodexAppServerError("replacement group could not be reaped")
+
+    server._shutdown_locked = AsyncMock(side_effect=shutdown_locked)
+    server._start = AsyncMock(side_effect=fail_start)
+
+    with pytest.raises(
+        CodexAppServerError,
+        match="replacement group could not be reaped",
+    ):
+        await server.restart_after_exact_transport_exit(
+            expected_transport_generation=expected_generation,
+            expected_transport_process=expected_process,
+            publish_generation=lambda generation, process: published.append(
+                (generation, process)
+            ),
+        )
+
+    # Only the proven-settled predecessor is publishable. The unknown new
+    # process group must remain outside the retry receipt and fail closed.
+    assert published == [(expected_generation, None)]
+    assert server._transport_generation is unproven_generation
+    assert server._process is unproven_process
+    assert server.shutdown_requested is True
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_cleans_every_historical_home_in_migration_chain(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    oldest_home = normalize_codex_home(tmp_path / "oldest-home")
+    oldest_server = CodexAppServer("codex", codex_home=oldest_home)
+    oldest_transport = SimpleNamespace(pid=6543, returncode=None)
+    oldest_server._process = oldest_transport
+    oldest_peer = CodexTurnProcess(6543, AsyncMock())
+    oldest_peer_context = _TurnContext(
+        "thread-oldest-peer", oldest_peer, 0.0, task_id=163,
+    )
+    oldest_server._contexts_by_thread = {
+        "thread-oldest-peer": oldest_peer_context,
+    }
+    oldest_server._known_threads.add("thread-target")
+    oldest_server._children_by_thread.setdefault(
+        "thread-target", set()
+    ).add("thread-oldest-child")
+    fixture.registry._servers[oldest_home] = oldest_server
+    fixture.registry._thread_owners["thread-oldest-peer"] = oldest_home
+
+    cleaned_homes = []
+
+    def cleanup_for(server, home):
+        async def cleanup(thread_ids, _parents, **_kwargs):
+            cleaned_homes.append(home)
+            server._known_threads.difference_update(thread_ids)
+            return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+        return cleanup
+
+    fixture.historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=cleanup_for(
+            fixture.historical_server,
+            fixture.historical_home,
+        )
+    )
+    oldest_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=cleanup_for(oldest_server, oldest_home)
+    )
+    oldest_server.shutdown = AsyncMock()
+
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is False
+
+    assert cleaned_homes == [fixture.historical_home, oldest_home]
+    assert fixture.current_peer.returncode is None
+    assert fixture.historical_peer.returncode is None
+    assert oldest_peer.returncode is None
+    fixture.current_server.shutdown.assert_not_awaited()
+    fixture.historical_server.shutdown.assert_not_awaited()
+    oldest_server.shutdown.assert_not_awaited()
+    assert fixture.registry._starting == {}
+    assert fixture.registry._starting_threads == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_cancelled_historical_cleanup_keeps_retry_receipt_and_peers(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    cleanup_entered = asyncio.Event()
+
+    async def block_cleanup(*_args, **_kwargs):
+        cleanup_entered.set()
+        await asyncio.Event().wait()
+
+    fixture.historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=block_cleanup
+    )
+    stop = asyncio.create_task(fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ))
+    await cleanup_entered.wait()
+    stop.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stop
+
+    token = fixture.target_context.claimed_stop_token
+    assert token is not None
+    assert fixture.registry._stopping_tasks == {160: token}
+    assert fixture.current_peer.returncode is None
+    assert fixture.historical_peer.returncode is None
+    fixture.current_server.shutdown.assert_not_awaited()
+    fixture.historical_server.shutdown.assert_not_awaited()
+
+    async def finish_cleanup(thread_ids, _parents, **_kwargs):
+        fixture.historical_server._known_threads.difference_update(thread_ids)
+        return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+    fixture.historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=finish_cleanup
+    )
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is False
+    assert fixture.target.returncode == 130
+    assert fixture.current_peer.returncode is None
+    assert fixture.historical_peer.returncode is None
+    assert fixture.registry._starting == {}
+    assert fixture.registry._starting_threads == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_owner_transport_exit_during_historical_cleanup_remains_retryable(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+
+    async def exit_owner_after_cleanup(thread_ids, _parents, **_kwargs):
+        fixture.historical_server._known_threads.difference_update(thread_ids)
+        fixture.current_transport.returncode = 1
+        fixture.current_server._finalize_transport_exit(
+            fixture.current_transport,
+            1,
+            None,
+        )
+        return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+    fixture.historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=exit_owner_after_cleanup
+    )
+    fixture.current_server.recycle_thread_runtime = AsyncMock(
+        side_effect=CodexAppServerError("owner transport exited")
+    )
+
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is True
+
+    assert fixture.target.returncode == 130
+    assert fixture.current_peer.returncode == 1
+    assert fixture.historical_peer.returncode is None
+    assert fixture.registry._starting == {}
+    assert fixture.registry._starting_threads == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_owner_exit_and_historical_failure_retries_exact_receipt(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    attempts = 0
+
+    async def fail_once_after_owner_exit(thread_ids, _parents, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            fixture.current_transport.returncode = 1
+            fixture.current_server._finalize_transport_exit(
+                fixture.current_transport,
+                1,
+                None,
+            )
+            raise CodexAppServerError("historical cleanup unavailable")
+        fixture.historical_server._known_threads.difference_update(thread_ids)
+        return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+    fixture.historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=fail_once_after_owner_exit
+    )
+    fixture.current_server.recycle_thread_runtime = AsyncMock(
+        side_effect=CodexAppServerError("owner transport exited")
+    )
+
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="cleanup is still pending",
+    ):
+        await fixture.registry.stop_claimed_turn(
+            fixture.current_home,
+            fixture.target,
+            reason="user requested stop",
+        )
+
+    token = fixture.target_context.claimed_stop_token
+    assert token is not None
+    assert fixture.target.returncode is None
+    assert fixture.current_peer.returncode == 1
+    assert fixture.historical_peer.returncode is None
+    assert fixture.current_server._contexts_by_thread == {
+        "thread-target": fixture.target_context,
+    }
+    assert fixture.registry._stopping_tasks == {160: token}
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="pending Task-scoped stop",
+    ):
+        await fixture.current_server.ensure_started()
+
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is True
+
+    assert attempts == 2
+    assert fixture.target.returncode == 130
+    assert fixture.target.termination_kind == "internal_abort"
+    assert fixture.current_peer.returncode == 1
+    assert fixture.historical_peer.returncode is None
+    assert fixture.registry._starting == {}
+    assert fixture.registry._starting_threads == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_owner_transport_exit_retains_claimed_descendant_retry_lineage():
+    server = CodexAppServer("codex")
+    transport = SimpleNamespace(pid=4321, returncode=1)
+    server._process = transport
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    target_context = _TurnContext(
+        "thread-target", target, 0.0, task_id=160,
+    )
+    target_context.descendant_thread_ids.update({
+        "thread-child",
+        "thread-grandchild",
+    })
+    target_context.descendant_parent_thread_ids.update({
+        "thread-child": "thread-target",
+        "thread-grandchild": "thread-child",
+    })
+    target_context.claimed_stop_token = object()
+    target_context.claimed_stop_transport_generation = (
+        server._transport_generation
+    )
+    target_context.claimed_stop_reason = "user requested stop"
+    peer_context = _TurnContext(
+        "thread-peer", peer, 0.0, task_id=161,
+    )
+    server._contexts_by_thread = {
+        "thread-target": target_context,
+        "thread-peer": peer_context,
+    }
+    server._contexts_by_descendant = {
+        "thread-child": target_context,
+        "thread-grandchild": target_context,
+    }
+
+    server._finalize_transport_exit(transport, 1, None)
+
+    assert target.returncode is None
+    assert peer.returncode == 1
+    assert target_context.claimed_stop_interrupt_confirmed is True
+    assert server._contexts_by_thread == {
+        "thread-target": target_context,
+    }
+    assert server._contexts_by_descendant == {
+        "thread-child": target_context,
+        "thread-grandchild": target_context,
+    }
+    assert server._children_by_thread == {
+        "thread-target": {"thread-child"},
+        "thread-child": {"thread-grandchild"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_owner_exit_before_historical_confirmation_retries_from_receipt(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    attempts = 0
+
+    async def cleanup_historical(thread_ids, _parents, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            fixture.current_transport.returncode = 1
+            fixture.current_server._finalize_transport_exit(
+                fixture.current_transport,
+                1,
+                None,
+            )
+            raise CodexAppServerError("historical cleanup response lost")
+        fixture.historical_server._known_threads.difference_update(thread_ids)
+        return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+    async def reject_dead_current_runtime(*_args, **_kwargs):
+        raise CodexAppServerError("owner transport is already dead")
+
+    async def settle_dead_owner(**_kwargs):
+        fixture.current_server._shutdown_requested = True
+
+    fixture.historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=cleanup_historical
+    )
+    fixture.current_server.recycle_thread_runtime = AsyncMock(
+        side_effect=reject_dead_current_runtime
+    )
+    fixture.current_server.shutdown = AsyncMock(
+        side_effect=settle_dead_owner
+    )
+
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="cleanup is still pending",
+    ):
+        await fixture.registry.stop_claimed_turn(
+            fixture.current_home,
+            fixture.target,
+            reason="user requested stop",
+        )
+
+    token = fixture.target_context.claimed_stop_token
+    assert token is not None
+    assert fixture.target.returncode is None
+    assert fixture.current_peer.returncode == 1
+    assert fixture.historical_peer.returncode is None
+    assert fixture.current_server._contexts_by_thread == {
+        "thread-target": fixture.target_context,
+    }
+    assert fixture.registry._stopping_tasks == {160: token}
+    assert len(fixture.registry._historical_stop_threads) == 3
+
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is True
+
+    assert attempts == 2
+    assert fixture.target.returncode == 130
+    assert fixture.historical_peer.returncode is None
+    assert fixture.registry._starting == {}
+    assert fixture.registry._starting_threads == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+    assert fixture.current_home not in fixture.registry._servers
+
+
+@pytest.mark.asyncio
+async def test_historical_cleanup_cancellation_preserves_retry_receipt(
+    tmp_path,
+):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+    cleanup_entered = asyncio.Event()
+    attempts = 0
+
+    async def cleanup_historical(thread_ids, _parents, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            cleanup_entered.set()
+            await asyncio.Event().wait()
+        fixture.historical_server._known_threads.difference_update(thread_ids)
+        return {thread_id: "unsubscribed" for thread_id in thread_ids}
+
+    fixture.historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=cleanup_historical
+    )
+    stop = asyncio.create_task(fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ))
+    await cleanup_entered.wait()
+    stop.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stop
+
+    token = fixture.target_context.claimed_stop_token
+    assert token is not None
+    assert fixture.registry._stopping_tasks == {160: token}
+    assert len(fixture.registry._historical_stop_threads) == 3
+    assert fixture.current_server.recycle_thread_runtime.await_count == 0
+    assert fixture.target.returncode is None
+    assert fixture.current_peer.returncode is None
+    assert fixture.historical_peer.returncode is None
+    fixture.current_server.shutdown.assert_not_awaited()
+    fixture.historical_server.shutdown.assert_not_awaited()
+
+    assert await fixture.registry.stop_claimed_turn(
+        fixture.current_home,
+        fixture.target,
+        reason="user requested stop",
+    ) is False
+
+    assert attempts == 2
+    assert fixture.target.returncode == 130
+    assert fixture.current_peer.returncode is None
+    assert fixture.historical_peer.returncode is None
+    assert fixture.registry._starting == {}
+    assert fixture.registry._starting_threads == {}
+    assert fixture.registry._historical_stop_threads == {}
+    assert fixture.registry._stopping_tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_historical_generation_aba_remains_fenced_across_retry(tmp_path):
+    fixture = _historical_runtime_stop_fixture(tmp_path)
+
+    async def replace_generation(_thread_ids, _parents, **_kwargs):
+        fixture.historical_server._transport_generation = object()
+        return {}
+
+    fixture.historical_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=replace_generation
+    )
+
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="historical.*exact transport generation|Historical.*exact transport generation",
+    ):
+        await fixture.registry.stop_claimed_turn(
+            fixture.current_home,
+            fixture.target,
+            reason="user requested stop",
+        )
+
+    token = fixture.target_context.claimed_stop_token
+    assert token is not None
+    assert fixture.registry._stopping_tasks == {160: token}
+    assert len(fixture.registry._historical_stop_threads) == 3
+    assert fixture.current_server.recycle_thread_runtime.await_count == 0
+    assert fixture.target.returncode is None
+    assert fixture.current_peer.returncode is None
+    assert fixture.historical_peer.returncode is None
+    fixture.current_server.shutdown.assert_not_awaited()
+    fixture.historical_server.shutdown.assert_not_awaited()
+
+    # A later request must not bless the new generation merely because the
+    # same mutable server object/home reappeared (A -> B on one object).
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="unavailable account transport",
+    ):
+        await fixture.registry.stop_claimed_turn(
+            fixture.current_home,
+            fixture.target,
+            reason="user requested stop",
+        )
+
+    assert fixture.target.returncode is None
+    assert fixture.current_peer.returncode is None
+    assert fixture.historical_peer.returncode is None
+    assert fixture.registry._stopping_tasks == {160: token}
+    assert len(fixture.registry._historical_stop_threads) == 3
+    assert fixture.registry._historical_stop_runtime_receipts[
+        (fixture.historical_home, token)
+    ].transport_generation is not (
+        fixture.historical_server._transport_generation
+    )
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_generation_change_never_recycles_shared_transport(
+    tmp_path,
+):
+    home = normalize_codex_home(tmp_path / "scoped-stop-generation-change")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    target_context = _TurnContext(
+        "thread-target", target, 0.0, task_id=160,
+    )
+    peer_context = _TurnContext(
+        "thread-peer", peer, 0.0, task_id=161,
+    )
+    server._contexts_by_thread = {
+        "thread-target": target_context,
+        "thread-peer": peer_context,
+    }
+
+    async def confirm_interrupt(exact_process, *, stop_token):
+        assert exact_process is target
+        target_context.claimed_stop_interrupt_confirmed = True
+
+    async def replace_generation(
+        _thread_id, *, claimed_stop_token, **_kwargs,
+    ):
+        assert target_context.claimed_stop_token is claimed_stop_token
+        server._transport_generation = object()
+
+    server.interrupt_claimed_turn = AsyncMock(side_effect=confirm_interrupt)
+    server.recycle_thread_runtime = AsyncMock(side_effect=replace_generation)
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
+
+    with pytest.raises(
+        CodexSharedTransportBusyError,
+        match="exact app-server generation",
+    ):
+        await registry.stop_claimed_turn(
+            home,
+            target,
+            reason="user requested stop",
+        )
+
+    assert target.returncode is None
+    assert peer.returncode is None
+    assert server._contexts_by_thread == {
+        "thread-target": target_context,
+        "thread-peer": peer_context,
+    }
+    server.shutdown.assert_not_awaited()
+    assert registry._servers[home] is server
+    assert home not in registry._draining
+
+
+@pytest.mark.asyncio
+async def test_preexisting_malformed_guard_cannot_shutdown_scoped_stop_peer(
+    tmp_path,
+):
+    home = normalize_codex_home(tmp_path / "malformed-guard-scoped-stop")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    target_context = _TurnContext(
+        "thread-target", target, 0.0, task_id=160,
+    )
+    peer_context = _TurnContext(
+        "thread-peer", peer, 0.0, task_id=161,
+    )
+    server._contexts_by_thread = {
+        "thread-target": target_context,
+        "thread-peer": peer_context,
+    }
+    guard_entered = asyncio.Event()
+    release_guard = asyncio.Event()
+
+    async def fail_guard_interrupt(context):
+        assert context is target_context
+        guard_entered.set()
+        await release_guard.wait()
+        raise CodexAppServerError("ambiguous terminal")
+
+    server._interrupt_turn_context = AsyncMock(
+        side_effect=fail_guard_interrupt
+    )
+    server.shutdown = AsyncMock()
+    guard = asyncio.create_task(
+        server._abort_uncorrelated_turn_terminal(
+            target_context,
+            {},
+            "uncorrelated terminal",
+        )
+    )
+    target_context.malformed_terminal_guard_task = guard
+    await guard_entered.wait()
+
+    async def confirm_stop(exact_process, *, stop_token):
+        assert exact_process is target
+        target_context.claimed_stop_interrupt_confirmed = True
+
+    server.interrupt_claimed_turn = AsyncMock(side_effect=confirm_stop)
+    server.recycle_thread_runtime = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
+
+    stop = asyncio.create_task(
+        registry.stop_claimed_turn(
+            home,
+            target,
+            reason="user requested stop",
+        )
+    )
+    while target_context.claimed_stop_token is None:
+        await asyncio.sleep(0)
+    release_guard.set()
+
+    assert await stop is False
+    assert guard.done()
+    server.shutdown.assert_not_awaited()
+    assert target.returncode == 130
+    assert peer.returncode is None
+    assert server._contexts_by_thread == {"thread-peer": peer_context}
+
+
+@pytest.mark.asyncio
+async def test_preexisting_successful_malformed_guard_cannot_detach_scoped_stop_receipt(
+    tmp_path,
+):
+    home = normalize_codex_home(tmp_path / "successful-malformed-guard-stop")
+    server = CodexAppServer("codex", codex_home=home)
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    target = CodexTurnProcess(4321, AsyncMock())
+    peer = CodexTurnProcess(4321, AsyncMock())
+    target_context = _TurnContext(
+        "thread-target", target, 0.0, task_id=160,
+    )
+    peer_context = _TurnContext(
+        "thread-peer", peer, 0.0, task_id=161,
+    )
+    server._contexts_by_thread = {
+        "thread-target": target_context,
+        "thread-peer": peer_context,
+    }
+    guard_entered = asyncio.Event()
+    release_guard = asyncio.Event()
+
+    async def successful_guard_interrupt(context):
+        assert context is target_context
+        guard_entered.set()
+        await release_guard.wait()
+
+    server._interrupt_turn_context = AsyncMock(
+        side_effect=successful_guard_interrupt
+    )
+    server.shutdown = AsyncMock()
+    guard = asyncio.create_task(
+        server._abort_uncorrelated_turn_terminal(
+            target_context,
+            {},
+            "uncorrelated terminal",
+        )
+    )
+    target_context.malformed_terminal_guard_task = guard
+    await guard_entered.wait()
+
+    async def confirm_stop(exact_process, *, stop_token):
+        assert exact_process is target
+        assert target_context.claimed_stop_token is stop_token
+        target_context.claimed_stop_interrupt_confirmed = True
+
+    server.interrupt_claimed_turn = AsyncMock(side_effect=confirm_stop)
+    server.recycle_thread_runtime = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
+
+    stop = asyncio.create_task(
+        registry.stop_claimed_turn(
+            home,
+            target,
+            reason="user requested stop",
+        )
+    )
+    while target_context.claimed_stop_token is None:
+        await asyncio.sleep(0)
+    release_guard.set()
+
+    assert await stop is False
+    assert guard.done()
+    server.shutdown.assert_not_awaited()
+    assert target.returncode == 130
+    assert target.termination_kind == "internal_abort"
+    assert peer.returncode is None
+    assert server._contexts_by_thread == {"thread-peer": peer_context}
+
+
+@pytest.mark.asyncio
+async def test_tool_policy_guard_cannot_detach_claimed_stop_receipt():
+    server = CodexAppServer("codex")
+    target = CodexTurnProcess(4321, AsyncMock())
+    context = _TurnContext(
+        "thread-target", target, 0.0, task_id=160,
+    )
+    context.claimed_stop_token = object()
+    server._contexts_by_thread[context.thread_id] = context
+    server._interrupt_turn_context = AsyncMock()
+
+    await server._abort_tool_free_violation(
+        context,
+        "forbidden tool",
+    )
+
+    assert target.returncode is None
+    assert server._contexts_by_thread[context.thread_id] is context
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_preflight_allows_peer_without_interrupt(tmp_path):
     home = normalize_codex_home(tmp_path / "preflight-peer")
     server = CodexAppServer("codex", codex_home=home)
     server._process = SimpleNamespace(pid=4321, returncode=None)
@@ -10133,9 +12936,12 @@ async def test_claimed_stop_preflight_rejects_peer_without_interrupt(tmp_path):
     server.abandon_turn = AsyncMock()
     registry = CodexAppServerRegistry("codex")
     registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-peer": home,
+    })
 
-    with pytest.raises(CodexSharedTransportBusyError, match="another live turn"):
-        await registry.require_claimed_turn_stop_isolated(home, target)
+    await registry.require_claimed_turn_stop_isolated(home, target)
 
     server.abandon_turn.assert_not_awaited()
     assert target.returncode is None
@@ -10164,6 +12970,10 @@ async def test_claimed_stop_terminates_all_live_turns_for_same_task(tmp_path):
     server.shutdown = AsyncMock()
     registry = CodexAppServerRegistry("codex")
     registry._servers[home] = server
+    registry._thread_owners.update({
+        "thread-target": home,
+        "thread-descendant": home,
+    })
 
     await registry.require_claimed_turn_stop_isolated(home, target)
     assert await registry.stop_claimed_turn(
@@ -12046,11 +14856,26 @@ class _RegistryFakeServer:
         self.start_turn_calls = []
         self.create_thread_calls = []
         self.recycle_thread_calls = []
+        self.unsubscribe_thread_calls = []
+        self._transport_generation = object()
+        self._process = MagicMock(returncode=None)
+        self._shutdown_requested = False
         type(self).instances.append(self)
 
     @property
     def has_active_turns(self):
         return bool(self.active_threads)
+
+    @property
+    def is_alive(self):
+        return (
+            not self._shutdown_requested
+            and self._process.returncode is None
+        )
+
+    @property
+    def shutdown_requested(self):
+        return self._shutdown_requested
 
     def has_active_thread(self, thread_id):
         return thread_id in self.active_threads
@@ -12109,6 +14934,7 @@ class _RegistryFakeServer:
     async def unsubscribe_thread(self, thread_id):
         if thread_id in self.active_threads:
             raise CodexAppServerBusyError(f"{thread_id} is active")
+        self.unsubscribe_thread_calls.append(thread_id)
         return "unsubscribed"
 
     async def recycle_thread_runtime(self, thread_id):
@@ -12116,6 +14942,32 @@ class _RegistryFakeServer:
             raise CodexAppServerBusyError(f"{thread_id} is active")
         self.recycle_thread_calls.append(thread_id)
         self.known_threads.add(thread_id)
+
+    def thread_lineage_snapshot(self, thread_id):
+        return (thread_id,), {}
+
+    async def replace_idle_thread_lineage(
+        self,
+        thread_ids,
+        parent_thread_ids,
+        *,
+        expected_transport_generation=None,
+        expected_transport_process=None,
+    ):
+        if (
+            expected_transport_generation is not None
+            and (
+                expected_transport_generation is not self._transport_generation
+                or expected_transport_process is not self._process
+            )
+        ):
+            raise CodexAppServerBusyError("fake transport generation changed")
+        results = {}
+        for thread_id in thread_ids:
+            await self.recycle_thread_runtime(thread_id)
+            results[thread_id] = await self.unsubscribe_thread(thread_id)
+        self.known_threads.difference_update(thread_ids)
+        return results
 
     async def read_rate_limits(self):
         return {
@@ -12127,6 +14979,8 @@ class _RegistryFakeServer:
 
     async def shutdown(self):
         self.shutdown_count += 1
+        self._shutdown_requested = True
+        self._process.returncode = 0
         self.active_threads.clear()
 
 
@@ -13135,7 +15989,10 @@ async def test_registry_rebind_moves_resume_ownership_after_migration(
             resume_session_id="thread-migrated",
             task_id=1,
         )
-        _RegistryFakeServer.instances[0].active_threads.clear()
+        source_server = _RegistryFakeServer.instances[0]
+        source_server.active_threads.clear()
+        source_server.active_threads.add("thread-delivery-peer")
+        source_server.known_threads.add("thread-delivery-peer")
         await registry.rebind_thread(
             "thread-migrated",
             source_codex_home=home_a,
@@ -13154,6 +16011,9 @@ async def test_registry_rebind_moves_resume_ownership_after_migration(
             )
 
     assert len(_RegistryFakeServer.instances) == 2
+    assert source_server.unsubscribe_thread_calls == ["thread-migrated"]
+    assert source_server.active_threads == {"thread-delivery-peer"}
+    assert source_server.shutdown_count == 0
 
 
 @pytest.mark.asyncio
@@ -13269,6 +16129,129 @@ async def test_registry_rebind_rejects_source_resume_rpc_in_flight(tmp_path):
     finally:
         release.set()
         await start_task
+
+
+@pytest.mark.asyncio
+async def test_registry_rebind_source_cleanup_failure_reopens_untouched_target(
+    tmp_path,
+):
+    registry = CodexAppServerRegistry("codex")
+    source_home = normalize_codex_home(tmp_path / "source")
+    target_home = normalize_codex_home(tmp_path / "target")
+    thread_id = "thread-source-cleanup-failed"
+    source_server = _RegistryFakeServer("codex", codex_home=source_home)
+    target_server = _RegistryFakeServer("codex", codex_home=target_home)
+    source_server.known_threads.add(thread_id)
+    target_server.known_threads.add(thread_id)
+    source_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=CodexAppServerError("source archive failed")
+    )
+    registry._servers.update({
+        source_home: source_server,
+        target_home: target_server,
+    })
+    registry._thread_owners[thread_id] = source_home
+
+    with pytest.raises(CodexAppServerError, match="source archive failed"):
+        await registry.rebind_thread(
+            thread_id,
+            source_codex_home=source_home,
+            target_codex_home=target_home,
+        )
+
+    assert registry._thread_owners[thread_id] == source_home
+    assert thread_id not in registry._rebindings
+    assert target_home not in registry._draining
+    assert registry._servers[target_home] is target_server
+    assert target_server.shutdown_count == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_rebind_source_cleanup_reopens_untouched_target(
+    tmp_path,
+):
+    entered = asyncio.Event()
+
+    async def block_source_cleanup(*_args, **_kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    registry = CodexAppServerRegistry("codex")
+    source_home = normalize_codex_home(tmp_path / "source")
+    target_home = normalize_codex_home(tmp_path / "target")
+    thread_id = "thread-source-cleanup-cancelled"
+    source_server = _RegistryFakeServer("codex", codex_home=source_home)
+    target_server = _RegistryFakeServer("codex", codex_home=target_home)
+    source_server.known_threads.add(thread_id)
+    target_server.known_threads.add(thread_id)
+    source_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=block_source_cleanup
+    )
+    registry._servers.update({
+        source_home: source_server,
+        target_home: target_server,
+    })
+    registry._thread_owners[thread_id] = source_home
+
+    rebind = asyncio.create_task(registry.rebind_thread(
+        thread_id,
+        source_codex_home=source_home,
+        target_codex_home=target_home,
+    ))
+    await entered.wait()
+    assert target_home in registry._draining
+    rebind.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await rebind
+
+    assert registry._thread_owners[thread_id] == source_home
+    assert thread_id not in registry._rebindings
+    assert target_home not in registry._draining
+    assert registry._servers[target_home] is target_server
+    assert target_server.shutdown_count == 0
+
+
+@pytest.mark.asyncio
+async def test_registry_rebind_rejects_source_transport_generation_aba(
+    tmp_path,
+):
+    registry = CodexAppServerRegistry("codex")
+    source_home = normalize_codex_home(tmp_path / "source")
+    target_home = normalize_codex_home(tmp_path / "target")
+    thread_id = "thread-source-generation-aba"
+    source_server = _RegistryFakeServer("codex", codex_home=source_home)
+    target_server = _RegistryFakeServer("codex", codex_home=target_home)
+    source_server.known_threads.add(thread_id)
+
+    async def replace_generation(*_args, **_kwargs):
+        source_server._transport_generation = object()
+        source_server.known_threads.discard(thread_id)
+        return {thread_id: "unsubscribed"}
+
+    source_server.replace_idle_thread_lineage = AsyncMock(
+        side_effect=replace_generation
+    )
+    registry._servers.update({
+        source_home: source_server,
+        target_home: target_server,
+    })
+    registry._thread_owners[thread_id] = source_home
+
+    with pytest.raises(
+        CodexAppServerBusyError,
+        match="source account generation changed",
+    ):
+        await registry.rebind_thread(
+            thread_id,
+            source_codex_home=source_home,
+            target_codex_home=target_home,
+        )
+
+    assert registry._thread_owners[thread_id] == source_home
+    assert thread_id not in registry._rebindings
+    assert target_home not in registry._draining
+    assert registry._servers[target_home] is target_server
+    assert target_server.shutdown_count == 0
 
 
 @pytest.mark.asyncio
@@ -13487,6 +16470,7 @@ async def test_registry_shutdown_failure_keeps_server_and_route_draining(
     stopped_server = SimpleNamespace(shutdown=AsyncMock())
     failed_server = SimpleNamespace(
         shutdown=AsyncMock(side_effect=RuntimeError("group survived")),
+        _release_historical_stop_recovery=MagicMock(),
     )
     registry._servers = {
         stopped_home: stopped_server,
@@ -13500,6 +16484,11 @@ async def test_registry_shutdown_failure_keeps_server_and_route_draining(
         stopped_home: 1,
         failed_home: 1,
     }
+    receipt_token = object()
+    receipt = SimpleNamespace(server=failed_server)
+    registry._historical_stop_runtime_receipts[
+        (failed_home, receipt_token)
+    ] = receipt
 
     with pytest.raises(
         CodexAppServerError,
@@ -13516,6 +16505,10 @@ async def test_registry_shutdown_failure_keeps_server_and_route_draining(
     assert failed_home in registry._draining
     assert registry._starting[failed_home] == 1
     assert registry._thread_owners["thread-failed"] == failed_home
+    assert registry._historical_stop_runtime_receipts == {
+        (failed_home, receipt_token): receipt,
+    }
+    failed_server._release_historical_stop_recovery.assert_not_called()
     with pytest.raises(CodexAppServerBusyError, match="registry is shutting down"):
         await registry.start_turn(
             codex_home=tmp_path / "new-home",
@@ -13530,3 +16523,7 @@ async def test_registry_shutdown_failure_keeps_server_and_route_draining(
     assert registry._draining == set()
     assert registry._starting == {}
     assert registry._thread_owners == {}
+    assert registry._historical_stop_runtime_receipts == {}
+    failed_server._release_historical_stop_recovery.assert_called_once_with(
+        receipt_token
+    )

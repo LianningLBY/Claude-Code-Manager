@@ -7880,6 +7880,213 @@ async def test_stop_session_shared_codex_preflight_preserves_queue(
 
 
 @pytest.mark.asyncio
+async def test_stop_session_codex_keeps_shared_delivery_peer_unchanged(
+    client,
+    session_factory,
+):
+    """API stop completes its Task without mutating a shared Delivery peer."""
+
+    import backend.main
+    from backend.models.delivery import DeliveryRun
+    from backend.models.instance import Instance
+    from backend.models.project import Project
+    from backend.models.task import Task
+    from backend.services.codex_app_server import CodexTurnProcess
+
+    shared_pid = 54_321
+    target_started_at = datetime(2026, 8, 17, 10, 0, 0)
+    peer_started_at = datetime(2026, 8, 17, 10, 0, 1)
+    async with session_factory() as db:
+        project = Project(
+            name="api-stop-delivery-peer",
+            local_path="/tmp/api-stop-delivery-peer",
+            status="ready",
+        )
+        db.add(project)
+        await db.flush()
+        delivery_run = DeliveryRun(
+            admission_scope="test:api-stop",
+            idempotency_key="delivery-peer",
+            request_hash="a" * 64,
+            project_id=project.id,
+            title="API stop Delivery peer",
+            requirements="Remain untouched",
+            requirements_hash="b" * 64,
+            policy_snapshot={"provider": "codex"},
+            policy_hash="c" * 64,
+            base_branch="main",
+            delivery_branch="ccm/delivery/api-stop-peer",
+            workspace_path="/tmp/api-stop-delivery-peer",
+            phase="coding",
+            activity="running",
+            turn_count=1,
+            max_cycles=4,
+            max_no_progress=2,
+        )
+        target_instance = Instance(
+            name="api-stop-target",
+            status="running",
+            provider="codex",
+            pid=shared_pid,
+            started_at=target_started_at,
+        )
+        peer_instance = Instance(
+            name="api-stop-delivery-peer",
+            status="running",
+            provider="codex",
+            pid=shared_pid,
+            started_at=peer_started_at,
+        )
+        db.add_all([delivery_run, target_instance, peer_instance])
+        await db.flush()
+        target_task = Task(
+            title="API scoped stop target",
+            status="executing",
+            provider="codex",
+            instance_id=target_instance.id,
+        )
+        peer_task = Task(
+            title="API shared Delivery peer",
+            status="executing",
+            provider="codex",
+            instance_id=peer_instance.id,
+            project_id=project.id,
+            target_repo="/tmp/api-stop-delivery-peer",
+            mode="delivery_loop",
+            delivery_run_id=delivery_run.id,
+            delivery_role="developer",
+        )
+        db.add_all([target_task, peer_task])
+        await db.flush()
+        target_instance.current_task_id = target_task.id
+        peer_instance.current_task_id = peer_task.id
+        delivery_run.developer_task_id = peer_task.id
+        await db.commit()
+        target_instance_id = target_instance.id
+        peer_instance_id = peer_instance.id
+        target_task_id = target_task.id
+        peer_task_id = peer_task.id
+        delivery_run_id = delivery_run.id
+
+    async def interrupt():
+        raise AssertionError("registry owns the exact Codex interrupt")
+
+    target_process = CodexTurnProcess(
+        shared_pid,
+        interrupt,
+        thread_id="thread-api-stop-target",
+    )
+    peer_process = CodexTurnProcess(
+        shared_pid,
+        interrupt,
+        thread_id="thread-api-stop-delivery-peer",
+    )
+    target_release = asyncio.Event()
+    peer_release = asyncio.Event()
+    target_consumer = asyncio.create_task(target_release.wait())
+    peer_consumer = asyncio.create_task(peer_release.wait())
+    registry = MagicMock()
+    registry.require_claimed_turn_stop_isolated = AsyncMock()
+
+    async def stop_target(_home, exact_process, *, reason):
+        assert exact_process is target_process
+        target_process.finish(
+            130,
+            reason,
+            termination_kind="internal_abort",
+        )
+        return False
+
+    registry.stop_claimed_turn = AsyncMock(side_effect=stop_target)
+    manager = backend.main.instance_manager
+    previous_registry = manager._codex_app_server
+    previous_db_factory = manager.db_factory
+    manager.db_factory = session_factory
+    manager._codex_app_server = registry
+    manager._config_dirs[target_instance_id] = "/tmp/api-stop-shared-home"
+    manager._config_dirs[peer_instance_id] = "/tmp/api-stop-shared-home"
+    manager.processes[target_instance_id] = target_process
+    manager.processes[peer_instance_id] = peer_process
+    manager._track_output_consumer(
+        target_instance_id,
+        target_process,
+        target_consumer,
+        provider="codex",
+        task_id=target_task_id,
+        task_retry_count=0,
+        task_turn_generation=0,
+        instance_started_at=target_started_at,
+    )
+    manager._track_output_consumer(
+        peer_instance_id,
+        peer_process,
+        peer_consumer,
+        provider="codex",
+        task_id=peer_task_id,
+        task_retry_count=0,
+        task_turn_generation=0,
+        instance_started_at=peer_started_at,
+    )
+
+    try:
+        response = await client.post(
+            f"/api/tasks/{target_task_id}/stop-session"
+        )
+        assert response.status_code == 200, response.text
+        registry.require_claimed_turn_stop_isolated.assert_awaited_once_with(
+            "/tmp/api-stop-shared-home",
+            target_process,
+        )
+        registry.stop_claimed_turn.assert_awaited_once_with(
+            "/tmp/api-stop-shared-home",
+            target_process,
+            reason="CCM task session interrupted",
+        )
+        assert target_process.returncode == 130
+        assert peer_process.returncode is None
+        assert not peer_consumer.done()
+        assert manager.processes[peer_instance_id] is peer_process
+
+        async with session_factory() as db:
+            durable_target = await db.get(Task, target_task_id)
+            durable_target_instance = await db.get(
+                Instance,
+                target_instance_id,
+            )
+            durable_peer = await db.get(Task, peer_task_id)
+            durable_peer_instance = await db.get(Instance, peer_instance_id)
+            durable_run = await db.get(DeliveryRun, delivery_run_id)
+            assert durable_target.status == "completed"
+            assert durable_target.instance_id == target_instance_id
+            assert durable_target_instance.status == "idle"
+            assert durable_target_instance.pid is None
+            assert durable_target_instance.current_task_id is None
+            assert durable_peer.status == "executing"
+            assert durable_peer.instance_id == peer_instance_id
+            assert durable_peer_instance.status == "running"
+            assert durable_peer_instance.pid == shared_pid
+            assert durable_peer_instance.current_task_id == peer_task_id
+            assert durable_run.phase == "coding"
+            assert durable_run.activity == "running"
+            assert durable_run.developer_task_id == peer_task_id
+    finally:
+        target_release.set()
+        peer_release.set()
+        await asyncio.gather(
+            target_consumer,
+            peer_consumer,
+            return_exceptions=True,
+        )
+        manager._codex_app_server = previous_registry
+        manager.db_factory = previous_db_factory
+        for instance_id in (target_instance_id, peer_instance_id):
+            manager.processes.pop(instance_id, None)
+            manager._tasks.pop(instance_id, None)
+            manager._consumer_records.pop(instance_id, None)
+            manager._config_dirs.pop(instance_id, None)
+
+
+@pytest.mark.asyncio
 async def test_cancel_reports_unresolved_exact_owner(
     client,
     session_factory,

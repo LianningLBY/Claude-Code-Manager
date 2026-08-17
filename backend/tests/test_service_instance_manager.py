@@ -11381,6 +11381,214 @@ async def test_stop_codex_turn_preserves_claim_when_shared_transport_is_busy(
 
 
 @pytest.mark.asyncio
+async def test_stop_codex_turn_completes_target_without_touching_shared_peer(
+    db_factory,
+):
+    """Thread-scoped registry cleanup terminalizes only the selected Task."""
+
+    shared_pid = 43_212
+    target_started_at = datetime(2026, 8, 17, 9, 0, 0)
+    peer_started_at = datetime(2026, 8, 17, 9, 0, 1)
+    async with db_factory() as db:
+        delivery_project = Project(
+            name="scoped-stop-delivery-peer",
+            local_path="/tmp/scoped-stop-delivery-peer",
+            status="ready",
+        )
+        db.add(delivery_project)
+        await db.flush()
+        delivery_policy = {
+            "schema_version": 1,
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+        }
+        delivery_run = DeliveryRun(
+            admission_scope="test:scoped-stop",
+            idempotency_key="delivery-peer",
+            request_hash="a" * 64,
+            project_id=delivery_project.id,
+            title="Delivery peer",
+            requirements="Keep running while another Task stops",
+            requirements_hash="b" * 64,
+            policy_snapshot=delivery_policy,
+            policy_hash=value_hash(delivery_policy),
+            base_branch="main",
+            delivery_branch="ccm/delivery/scoped-stop-peer",
+            workspace_path="/tmp/scoped-stop-delivery-peer",
+            phase="coding",
+            activity="running",
+            turn_count=1,
+            max_cycles=4,
+            max_no_progress=2,
+        )
+        db.add(delivery_run)
+        await db.flush()
+        target_instance = Instance(
+            name="codex-scoped-stop-target",
+            status="running",
+            provider="codex",
+            pid=shared_pid,
+            started_at=target_started_at,
+        )
+        peer_instance = Instance(
+            name="codex-scoped-stop-peer",
+            status="running",
+            provider="codex",
+            pid=shared_pid,
+            started_at=peer_started_at,
+        )
+        db.add_all([target_instance, peer_instance])
+        await db.flush()
+        target_task = Task(
+            title="scoped stop target",
+            status="executing",
+            provider="codex",
+            instance_id=target_instance.id,
+        )
+        peer_task = Task(
+            title="scoped stop Delivery peer",
+            status="executing",
+            provider="codex",
+            instance_id=peer_instance.id,
+            project_id=delivery_project.id,
+            target_repo="/tmp/scoped-stop-delivery-peer",
+            mode="delivery_loop",
+            delivery_run_id=delivery_run.id,
+            delivery_role="developer",
+        )
+        db.add_all([target_task, peer_task])
+        await db.flush()
+        target_instance.current_task_id = target_task.id
+        peer_instance.current_task_id = peer_task.id
+        delivery_run.developer_task_id = peer_task.id
+        await db.commit()
+        target_instance_id = target_instance.id
+        peer_instance_id = peer_instance.id
+        target_task_id = target_task.id
+        peer_task_id = peer_task.id
+        delivery_run_id = delivery_run.id
+
+    async def interrupt():
+        raise AssertionError("the registry owns exact-turn interruption")
+
+    target_process = CodexTurnProcess(
+        shared_pid,
+        interrupt,
+        thread_id="thread-scoped-target",
+    )
+    peer_process = CodexTurnProcess(
+        shared_pid,
+        interrupt,
+        thread_id="thread-scoped-peer",
+    )
+    target_release = asyncio.Event()
+    peer_release = asyncio.Event()
+    target_consumer = asyncio.create_task(target_release.wait())
+    peer_consumer = asyncio.create_task(peer_release.wait())
+    registry = MagicMock()
+
+    async def stop_target(codex_home, exact_process, *, reason):
+        assert codex_home == "/tmp/codex-scoped-home"
+        assert exact_process is target_process
+        assert reason == "CCM task session interrupted"
+        target_process.finish(
+            130,
+            reason,
+            termination_kind="internal_abort",
+        )
+        return False
+
+    registry.stop_claimed_turn = AsyncMock(side_effect=stop_target)
+    registry.abort_unclaimed_turn = AsyncMock(
+        side_effect=AssertionError(
+            "a durably claimed Task must not use unclaimed cleanup"
+        )
+    )
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    manager._codex_app_server = registry
+    manager._config_dirs[target_instance_id] = "/tmp/codex-scoped-home"
+    manager._config_dirs[peer_instance_id] = "/tmp/codex-scoped-home"
+    manager.processes[target_instance_id] = target_process
+    manager.processes[peer_instance_id] = peer_process
+    manager._track_output_consumer(
+        target_instance_id,
+        target_process,
+        target_consumer,
+        provider="codex",
+        task_id=target_task_id,
+        task_retry_count=0,
+        task_turn_generation=0,
+        instance_started_at=target_started_at,
+    )
+    manager._track_output_consumer(
+        peer_instance_id,
+        peer_process,
+        peer_consumer,
+        provider="codex",
+        task_id=peer_task_id,
+        task_retry_count=0,
+        task_turn_generation=0,
+        instance_started_at=peer_started_at,
+    )
+
+    try:
+        assert await manager.stop(
+            target_instance_id,
+            expected_task_id=target_task_id,
+            expected_pid=shared_pid,
+            expected_started_at=target_started_at,
+            task_status="completed",
+            consumer_cancel_timeout=0.1,
+        ) is True
+
+        registry.stop_claimed_turn.assert_awaited_once_with(
+            "/tmp/codex-scoped-home",
+            target_process,
+            reason="CCM task session interrupted",
+        )
+        registry.abort_unclaimed_turn.assert_not_awaited()
+        assert target_process.returncode == 130
+        assert target_consumer.done()
+        assert peer_process.returncode is None
+        assert not peer_consumer.done()
+        assert not peer_consumer.cancelling()
+        assert manager.processes[peer_instance_id] is peer_process
+        assert manager._tasks[peer_instance_id] is peer_consumer
+        assert manager._consumer_records[peer_instance_id].process is peer_process
+
+        async with db_factory() as db:
+            durable_target_instance = await db.get(Instance, target_instance_id)
+            durable_peer_instance = await db.get(Instance, peer_instance_id)
+            durable_target_task = await db.get(Task, target_task_id)
+            durable_peer_task = await db.get(Task, peer_task_id)
+            durable_delivery_run = await db.get(
+                DeliveryRun,
+                delivery_run_id,
+            )
+            assert durable_target_instance.status == "idle"
+            assert durable_target_instance.pid is None
+            assert durable_target_instance.current_task_id is None
+            assert durable_target_task.status == "completed"
+            assert durable_peer_instance.status == "running"
+            assert durable_peer_instance.pid == shared_pid
+            assert durable_peer_instance.current_task_id == peer_task_id
+            assert durable_peer_task.status == "executing"
+            assert durable_peer_task.instance_id == peer_instance_id
+            assert durable_delivery_run.phase == "coding"
+            assert durable_delivery_run.activity == "running"
+            assert durable_delivery_run.developer_task_id == peer_task_id
+    finally:
+        target_release.set()
+        peer_release.set()
+        await asyncio.gather(
+            target_consumer,
+            peer_consumer,
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_concurrent_launches_cannot_spawn_twice_for_one_instance():
     im = InstanceManager(MagicMock(), MagicMock())
     first_entered = asyncio.Event()

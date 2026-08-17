@@ -350,7 +350,7 @@ claude-manager/
 - **Project Todo（清单）**: 每个 Project 挂一个 prompt 模板清单（`project_todos` 表）。前端 `ProjectTodoList`（Project 卡片内可折叠）「▶ Run」以 `{title, description=prompt, project_id}` 建 task（默认配置，target_repo 由 dispatcher 从 project 补全）→ 跳 chat，并把 todo 标 `done` + 记 `created_task_id`（溯源）。状态 open/done/archived（软归档，DELETE 才是永久删除）。清单语义：建 task 即划掉；非模板库，故只存 prompt 不存 task 配置
 
 - **Codex home runtime 准入**: Dispatcher 的 busy-home 快照只用于选路，direct task exec、app-server、GoalEvaluator 和 Distill 最终都必须在同一 canonical home lock 内互斥准入；direct spawn 取消后只有证明 exact process generation 已回收才可释放 home，GoalEvaluator/Distill cleanup 失败则以各自结构化 retained-process registry 继续 fail closed。若 runtime busy 排空兼容候选，统一短退避重试，不能继承其他账号的长 cooldown，也不能把保留在 disabled/retired source 的 session 判成永久失败。
-- **Codex 显式中断兜底**: app-server stop 以 CCM `task_id` 冻结同 Task 的全部 live turn adapter，逐个按 exact thread/turn/descendant 中断，再回收账号 transport，确保续接期间尚未收敛的旧 turn 与 Task 私有 helper 一并退出；未知 owner 不得归组。若 transport 上存在不同 Task 的 live turn 或已准入请求，必须在任何队列/producer 清理前返回 409 并保留原运行证据，禁止误杀其他任务。
+- **Codex 显式中断兜底**: app-server stop 以 CCM `task_id` 建 Task-wide admission fence，冻结同 Task 的全部 live adapter 与 exact root/descendant lineage；共享 transport 上逐个 `turn/interrupt` 并用权威 `thread/read` 确认终态，再以 parent-first `thread/archive`/`thread/unarchive` 替换目标 runtime、恢复所有 descendant rollout 并 unsubscribe，绝不关闭或改变其他 Task/Delivery peer。账号轮换遗留在旧 home 的已知 lineage 也须按 exact server/process generation 清理；旧 generation 的 stale root 只有在已证明 `notLoaded` 且 archive/unarchive 分别证明 active/archive rollout 都不存在时才可清 marker。失败、取消或 owner transport 意外退出必须保留可重试 receipt/fence，阻止同 Task 新准入和旧 generation 被重启；仅完全隔离且无 peer/准入时才允许 whole-transport shutdown。409 只用于目标 Task 自身 start/steer/rebind/cleanup 竞态或无法证明隔离，不能因普通 live peer 拒绝停止。
 
 ## 任务生命周期（9 步）
 

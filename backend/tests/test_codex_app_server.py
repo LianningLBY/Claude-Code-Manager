@@ -33,6 +33,7 @@ from backend.services.codex_app_server import (
     CodexThreadNotIdleError,
     CodexThreadRuntimeRecycleError,
     CodexThreadTerminalStateError,
+    CodexTurnAdmissionUncertainError,
     CodexTurnProcess,
     _TurnContext,
     _APP_SERVER_STREAM_LIMIT,
@@ -9343,7 +9344,7 @@ async def test_steer_turn_protocol_rejection_is_a_normal_false_result():
     server._request = AsyncMock(side_effect=[
         {"thread": {"id": "thread-1", "status": {"type": "idle"}}},
         {"turn": {"id": "turn-1"}},
-        CodexAppServerError("active turn changed"),
+        CodexAppServerRequestError("active turn changed"),
     ])
     await server.start_turn(
         prompt="work", cwd="/tmp", model="gpt-5.5", effort="low",
@@ -9351,6 +9352,50 @@ async def test_steer_turn_protocol_rejection_is_a_normal_false_result():
     )
 
     assert await server.steer_turn("thread-1", "late input") is False
+
+
+@pytest.mark.asyncio
+async def test_steer_turn_timeout_is_delivery_uncertain():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-uncertain", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-uncertain"}},
+        asyncio.TimeoutError(),
+    ])
+    await server.start_turn(
+        prompt="work", cwd="/tmp", model="gpt-5.5", effort="low",
+        resume_session_id=None, git_env=None, task_id=1,
+    )
+
+    with pytest.raises(
+        CodexTurnAdmissionUncertainError,
+        match="turn/steer returned no authoritative response",
+    ):
+        await server.steer_turn("thread-uncertain", "at most once")
+
+
+@pytest.mark.asyncio
+async def test_steer_turn_mismatched_ack_is_delivery_uncertain():
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-uncertain", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-uncertain"}},
+        {"turnId": "turn-other"},
+    ])
+    await server.start_turn(
+        prompt="work", cwd="/tmp", model="gpt-5.5", effort="low",
+        resume_session_id=None, git_env=None, task_id=1,
+    )
+
+    with pytest.raises(
+        CodexTurnAdmissionUncertainError,
+        match="unexpected turn id",
+    ):
+        await server.steer_turn("thread-uncertain", "at most once")
 
 
 @pytest.mark.asyncio
@@ -9902,6 +9947,476 @@ async def test_parent_completed_waits_for_active_child_and_preserves_late_output
     assert lines[1]["status"] == "completed"
     assert lines[2]["state"] == "completed"
     assert server._contexts_by_descendant == {}
+
+
+async def _retained_followup_context(
+    *,
+    thread_id: str,
+    child_thread_id: str,
+    task_id: int,
+    codex_home: str | None = None,
+):
+    server_kwargs = {"codex_home": codex_home} if codex_home else {}
+    server = CodexAppServer("codex", **server_kwargs)
+    server._process = SimpleNamespace(pid=4300 + task_id, returncode=None)
+    server.ensure_started = AsyncMock()
+    root_turn_id = f"turn-root-{task_id}"
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": thread_id, "status": {"type": "idle"}}},
+        {"turn": {"id": root_turn_id}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="coordinate agents",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=task_id,
+    )
+    await process.stdout.readline()
+    server._handle_notification("item/completed", {
+        "threadId": thread_id,
+        "turnId": root_turn_id,
+        "item": {
+            "type": "subAgentActivity",
+            "id": f"spawn-{task_id}",
+            "agentThreadId": child_thread_id,
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("thread/status/changed", {
+        "threadId": child_thread_id,
+        "status": {"type": "active", "activeFlags": []},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": thread_id,
+        "turn": {
+            "id": root_turn_id,
+            "status": "completed",
+            "error": None,
+        },
+    })
+    await asyncio.sleep(0)
+    context = server._contexts_by_thread[thread_id]
+    assert context.turn_id is None
+    assert context.deferred_terminal_notification is not None
+    assert context.active_descendant_thread_ids == {child_thread_id}
+    return server, process, context, root_turn_id
+
+
+@pytest.mark.asyncio
+async def test_followup_starts_new_root_turn_while_descendant_is_retained():
+    """A completed root accepts follow-up input without steering its dead id."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4321, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-root", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-root"}},
+        {"turn": {"id": "turn-followup"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="coordinate agents",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=16,
+    )
+    await process.stdout.readline()
+
+    server._handle_notification("item/completed", {
+        "threadId": "thread-root",
+        "turnId": "turn-root",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-1",
+            "agentThreadId": "thread-child",
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child",
+        "status": {"type": "active", "activeFlags": []},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-root",
+        "turn": {"id": "turn-root", "status": "completed", "error": None},
+    })
+    await asyncio.sleep(0)
+
+    context = server._contexts_by_thread["thread-root"]
+    assert context.turn_id is None
+    assert context.deferred_terminal_notification is not None
+    assert context.active_descendant_thread_ids == {"thread-child"}
+
+    assert await server.steer_turn("thread-root", "continue the review") is True
+    assert context.turn_id == "turn-followup"
+    assert context.active_descendant_thread_ids == {"thread-child"}
+    methods = [call.args[0] for call in server._request.await_args_list]
+    assert methods == ["thread/start", "turn/start", "turn/start"]
+    followup_params = server._request.await_args_list[-1].args[1]
+    assert followup_params["threadId"] == "thread-root"
+    assert followup_params["input"] == [
+        {"type": "text", "text": "continue the review"},
+    ]
+    assert followup_params["cwd"] == "/tmp"
+    assert followup_params["model"] == "gpt-5.5"
+    assert followup_params["effort"] == "low"
+    assert "expectedTurnId" not in followup_params
+    assert context.deferred_terminal_notification is None
+
+    # The retained child still belongs to the same root context, but once it
+    # settles the new root turn can complete normally and close the adapter.
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child",
+        "status": {"type": "idle"},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-root",
+        "turn": {
+            "id": "turn-followup",
+            "status": "completed",
+            "error": None,
+        },
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+
+
+@pytest.mark.asyncio
+async def test_followup_preserves_native_turn_observed_before_start_response():
+    """A response submission id remains an alias after native-id promotion."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4322, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-race", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-root"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="coordinate agents",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=17,
+    )
+    await process.stdout.readline()
+
+    server._handle_notification("item/completed", {
+        "threadId": "thread-race",
+        "turnId": "turn-root",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-race",
+            "agentThreadId": "thread-child-race",
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child-race",
+        "status": {"type": "active", "activeFlags": []},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-race",
+        "turn": {"id": "turn-root", "status": "completed", "error": None},
+    })
+    await asyncio.sleep(0)
+
+    async def followup_request(method, params):
+        assert method == "turn/start"
+        server._handle_notification("item/started", {
+            "threadId": "thread-race",
+            "turnId": "turn-native",
+            "item": {
+                "type": "userMessage",
+                "id": "followup-user-message",
+                "clientId": params["clientUserMessageId"],
+            },
+        })
+        return {"turn": {"id": "turn-submission"}}
+
+    server._request = AsyncMock(side_effect=followup_request)
+
+    assert await server.steer_turn("thread-race", "continue") is True
+    context = server._contexts_by_thread["thread-race"]
+    assert context.turn_id == "turn-native"
+    assert context.observed_turn_id == "turn-native"
+    assert context.admitted_turn_id == "turn-submission"
+    assert server._contexts_by_turn["turn-native"] is context
+    assert server._contexts_by_turn["turn-submission"] is context
+
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child-race",
+        "status": {"type": "idle"},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-race",
+        "turn": {
+            "id": "turn-native",
+            "status": "completed",
+            "error": None,
+        },
+    })
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 0
+
+
+@pytest.mark.asyncio
+async def test_followup_explicit_rejection_restores_retained_context():
+    """A JSON-RPC rejection is safe to expose without losing old state."""
+
+    server, process, context, root_turn_id = await _retained_followup_context(
+        thread_id="thread-rejected",
+        child_thread_id="thread-child-rejected",
+        task_id=181,
+    )
+    previous_client_id = context.client_user_message_id
+    context.usage = {"input_tokens": 17}
+    context.first_input_seen = True
+    context.first_output_seen = True
+    context.turn_started_emitted = True
+    context.non_retry_error = "previous terminal detail"
+    server._request = AsyncMock(side_effect=CodexAppServerRequestError(
+        "turn/start rejected by server"
+    ))
+    server.abandon_turn = AsyncMock()
+
+    assert await server.steer_turn("thread-rejected", "continue") is False
+
+    assert process.returncode is None
+    assert context.continuation_starting is False
+    assert context.client_user_message_id == previous_client_id
+    assert context.usage == {"input_tokens": 17}
+    assert context.first_input_seen is True
+    assert context.first_output_seen is True
+    assert context.turn_started_emitted is True
+    assert context.non_retry_error == "previous terminal detail"
+    assert context.deferred_terminal_notification is not None
+    assert server._contexts_by_turn[root_turn_id] is context
+    server.abandon_turn.assert_not_awaited()
+
+    server._detach_turn_context(context)
+    process.finish(1, "test cleanup")
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 1
+
+
+@pytest.mark.asyncio
+async def test_followup_timeout_shuts_unconfirmed_transport(tmp_path):
+    """A lost turn/start response cannot be exposed as a retryable rejection."""
+
+    home = normalize_codex_home(tmp_path / "followup-timeout")
+    server, process, _, _ = await _retained_followup_context(
+        thread_id="thread-followup-timeout",
+        child_thread_id="thread-child-timeout",
+        task_id=182,
+        codex_home=home,
+    )
+    server._request = AsyncMock(side_effect=asyncio.TimeoutError())
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners["thread-followup-timeout"] = home
+
+    assert await registry.steer_turn(
+        "thread-followup-timeout",
+        "continue",
+    ) is False
+
+    server.shutdown.assert_awaited_once_with(
+        interrupted_process=process,
+        reason=(
+            "Codex follow-up turn/start timed out with unknown server state"
+        ),
+    )
+    assert process.returncode == 130
+    assert process.termination_kind == "internal_abort"
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    assert home not in registry._servers
+    assert home not in registry._draining
+    assert home not in registry._starting
+    assert "thread-followup-timeout" not in registry._thread_owners
+
+
+@pytest.mark.asyncio
+async def test_followup_timeout_with_shared_peer_is_delivery_uncertain(
+    tmp_path,
+):
+    """An unconfirmed shared admission must never look safely retryable."""
+
+    home = normalize_codex_home(tmp_path / "followup-timeout-shared")
+    server, process, context, _ = await _retained_followup_context(
+        thread_id="thread-followup-timeout-shared",
+        child_thread_id="thread-child-timeout-shared",
+        task_id=184,
+        codex_home=home,
+    )
+    peer = CodexTurnProcess(
+        server._process.pid,
+        AsyncMock(),
+        thread_id="thread-followup-peer",
+    )
+    peer_context = _TurnContext(
+        "thread-followup-peer",
+        peer,
+        0.0,
+        task_id=185,
+    )
+    server._contexts_by_thread[peer_context.thread_id] = peer_context
+    server._request = AsyncMock(side_effect=asyncio.TimeoutError())
+    server.shutdown = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners.update({
+        context.thread_id: home,
+        peer_context.thread_id: home,
+    })
+
+    try:
+        with pytest.raises(
+            CodexTurnAdmissionUncertainError,
+            match="follow-up admission is uncertain",
+        ):
+            await registry.steer_turn(
+                context.thread_id,
+                "continue at most once",
+            )
+
+        server.shutdown.assert_not_awaited()
+        assert process.returncode is None
+        assert peer.returncode is None
+        assert home in registry._draining
+        assert registry._starting == {}
+        assert context.thread_id not in registry._starting_threads
+    finally:
+        guard = context.descendant_guard_task
+        if guard is not None and not guard.done():
+            guard.cancel()
+            await asyncio.gather(guard, return_exceptions=True)
+        server._detach_turn_context(context)
+        server._detach_turn_context(peer_context)
+        process.finish(1, "test cleanup")
+        peer.finish(1, "test cleanup")
+        registry._draining.discard(home)
+
+
+@pytest.mark.asyncio
+async def test_followup_cancellation_settles_admission_before_interrupt(tmp_path):
+    """Caller cancellation waits for turn/start, then closes the admitted turn."""
+
+    home = normalize_codex_home(tmp_path / "followup-cancel")
+    server, process, context, _ = await _retained_followup_context(
+        thread_id="thread-followup-cancel",
+        child_thread_id="thread-child-cancel",
+        task_id=183,
+        codex_home=home,
+    )
+    request_entered = asyncio.Event()
+    release_response = asyncio.Event()
+
+    async def followup_request(method, params):
+        assert method == "turn/start"
+        assert params["threadId"] == "thread-followup-cancel"
+        request_entered.set()
+        await release_response.wait()
+        return {"turn": {"id": "turn-followup-cancel"}}
+
+    server._request = AsyncMock(side_effect=followup_request)
+    server._interrupt_turn_context = AsyncMock()
+    registry = CodexAppServerRegistry("codex")
+    registry._servers[home] = server
+    registry._thread_owners["thread-followup-cancel"] = home
+    steering = asyncio.create_task(registry.steer_turn(
+        "thread-followup-cancel",
+        "continue",
+    ))
+    await request_entered.wait()
+    steering.cancel()
+    await asyncio.sleep(0)
+    assert not steering.done()
+    release_response.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await steering
+
+    server._interrupt_turn_context.assert_awaited_once_with(context)
+    assert context.turn_id == "turn-followup-cancel"
+    assert process.returncode == 130
+    assert process.termination_kind == "internal_abort"
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    assert registry._servers[home] is server
+    assert registry._thread_owners["thread-followup-cancel"] == home
+    assert home not in registry._draining
+    assert home not in registry._starting
+    assert "thread-followup-cancel" not in registry._starting_threads
+
+
+@pytest.mark.asyncio
+async def test_followup_rejects_unbindable_turn_response():
+    """A turn-id collision cannot be acknowledged as a successful follow-up."""
+
+    server = CodexAppServer("codex")
+    server._process = SimpleNamespace(pid=4323, returncode=None)
+    server.ensure_started = AsyncMock()
+    server._request = AsyncMock(side_effect=[
+        {"thread": {"id": "thread-collision", "status": {"type": "idle"}}},
+        {"turn": {"id": "turn-root"}},
+        {"turn": {"id": "turn-collision"}},
+    ])
+    process, _ = await server.start_turn(
+        prompt="coordinate agents",
+        cwd="/tmp",
+        model="gpt-5.5",
+        effort="low",
+        resume_session_id=None,
+        git_env=None,
+        task_id=18,
+    )
+    await process.stdout.readline()
+
+    server._handle_notification("item/completed", {
+        "threadId": "thread-collision",
+        "turnId": "turn-root",
+        "item": {
+            "type": "subAgentActivity",
+            "id": "spawn-collision",
+            "agentThreadId": "thread-child-collision",
+            "agentPath": "/root/child",
+            "kind": "started",
+        },
+    })
+    server._handle_notification("thread/status/changed", {
+        "threadId": "thread-child-collision",
+        "status": {"type": "active", "activeFlags": []},
+    })
+    server._handle_notification("turn/completed", {
+        "threadId": "thread-collision",
+        "turn": {"id": "turn-root", "status": "completed", "error": None},
+    })
+    await asyncio.sleep(0)
+
+    context = server._contexts_by_thread["thread-collision"]
+    server._bind_turn_context = MagicMock(return_value=False)
+    server._interrupt_turn_context = AsyncMock()
+    assert await server.steer_turn("thread-collision", "continue") is False
+
+    server._interrupt_turn_context.assert_awaited_once_with(context)
+    assert context.turn_id == "turn-collision"
+    assert context.deferred_terminal_notification is None
+    assert process.returncode == 130
+    assert process.termination_kind == "internal_abort"
+    assert server._contexts_by_thread == {}
+    assert server._contexts_by_turn == {}
+    assert await asyncio.wait_for(process.wait(), timeout=1) == 130
 
 
 @pytest.mark.asyncio

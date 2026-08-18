@@ -4788,7 +4788,14 @@ async def inject_message(
                 "Worker task 暂不支持执行中注入",
             )
         _require_no_pending_worker_routing(task)
-        if task.status not in {"in_progress", "executing"}:
+        retained_background_tail = (
+            task.status == "completed"
+            and task.pty_background_generation is not None
+        )
+        if (
+            task.status not in {"in_progress", "executing"}
+            and not retained_background_tail
+        ):
             detail = (
                 "Task is waiting for its requested capability and has no "
                 "active provider turn to inject"
@@ -4818,6 +4825,7 @@ async def inject_message(
         # tied to the exact foreground generation admitted here.
         admitted_task_id = task.id
         admitted_status = task.status
+        admitted_background_generation = task.pty_background_generation
         admitted_retry_count = task.retry_count
         admitted_turn_generation = task.turn_generation
         admitted_instance_id = task.instance_id
@@ -4835,8 +4843,13 @@ async def inject_message(
             sa_update(Task)
             .where(
                 Task.id == admitted_task_id,
-                Task.status.in_(("in_progress", "executing")),
                 Task.status == admitted_status,
+                (
+                    Task.pty_background_generation
+                    == admitted_background_generation
+                    if admitted_background_generation is not None
+                    else Task.status.in_(("in_progress", "executing"))
+                ),
                 Task.retry_count == admitted_retry_count,
                 Task.turn_generation == admitted_turn_generation,
                 (
@@ -4890,26 +4903,37 @@ async def inject_message(
         )
         if admitted_provider == "codex":
             from backend.config import settings
+            from backend.services.codex_app_server import (
+                CodexTurnAdmissionUncertainError,
+            )
 
             if not settings.codex_app_server_enabled:
                 raise HTTPException(
                     400,
                     "Codex app-server 未开启，当前 exec 链路不支持执行中注入",
                 )
-            if uploads:
-                ok = await instance_manager.inject_codex_message(
-                    admitted_session_id,
-                    transport_content,
-                    input_items=_codex_inject_input_items(
+            try:
+                if uploads:
+                    ok = await instance_manager.inject_codex_message(
+                        admitted_session_id,
                         transport_content,
-                        uploads,
-                    ),
-                )
-            else:
-                ok = await instance_manager.inject_codex_message(
-                    admitted_session_id,
-                    transport_content,
-                )
+                        input_items=_codex_inject_input_items(
+                            transport_content,
+                            uploads,
+                        ),
+                    )
+                else:
+                    ok = await instance_manager.inject_codex_message(
+                        admitted_session_id,
+                        transport_content,
+                    )
+            except CodexTurnAdmissionUncertainError as exc:
+                raise HTTPException(
+                    503,
+                    "注入结果不确定：Codex follow-up 可能已被接收，但共享 "
+                    "transport 无法安全确认或回收。系统不会自动重试；请先"
+                    "查看聊天记录或运行日志，再决定是否手动重试",
+                ) from exc
             unavailable_detail = (
                 "注入失败：当前 Codex turn 已结束、暂不可 steer、附件输入被 "
                 "transport 拒绝，或正在使用 exec fallback；空闲时请关闭注入"

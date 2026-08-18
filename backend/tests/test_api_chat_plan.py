@@ -4117,6 +4117,71 @@ async def test_inject_rejects_inactive_task_before_transport(
 
 
 @pytest.mark.asyncio
+async def test_inject_allows_exact_retained_pty_background_tail(
+    client,
+    session_factory,
+):
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+        status="completed",
+        pty_background_generation="retained-background-generation",
+    )
+    mock_im = MagicMock()
+    mock_im.pty_mode_enabled = True
+    mock_im.has_pty_session = MagicMock(return_value=True)
+    mock_im.inject_pty_message = AsyncMock(return_value=True)
+    broadcaster = MagicMock(broadcast=AsyncMock())
+
+    with patch("backend.main.instance_manager", mock_im), patch(
+        "backend.main.broadcaster",
+        broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={"message": "continue while the child finishes"},
+        )
+
+    assert response.status_code == 200, response.text
+    mock_im.inject_pty_message.assert_awaited_once()
+    assert response.json()["injected"] is True
+
+
+@pytest.mark.parametrize("terminal_status", ["failed", "cancelled"])
+@pytest.mark.asyncio
+async def test_inject_rejects_non_completed_retained_pty_tail(
+    client,
+    session_factory,
+    terminal_status,
+):
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+        status=terminal_status,
+        pty_background_generation="cleanup-background-generation",
+    )
+    mock_im = MagicMock()
+    mock_im.pty_mode_enabled = True
+    mock_im.has_pty_session = MagicMock(return_value=True)
+    mock_im.inject_pty_message = AsyncMock(return_value=True)
+
+    with patch("backend.main.instance_manager", mock_im), patch(
+        "backend.main.broadcaster",
+        MagicMock(broadcast=AsyncMock()),
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={"message": "must not restart terminal cleanup"},
+        )
+
+    assert response.status_code == 409
+    assert "no active provider turn" in response.json()["detail"]
+    mock_im.inject_pty_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_inject_requires_pty_mode(client, session_factory):
     """PTY 模式关闭时注入返回 400。"""
     task_id = await _create_task_with_session(
@@ -4765,6 +4830,39 @@ async def test_codex_inject_without_live_app_server_turn_returns_409(
 
     assert resp.status_code == 409
     assert "exec fallback" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_codex_inject_uncertain_admission_returns_503(
+    client, session_factory, monkeypatch
+):
+    from backend.config import settings
+    from backend.services.codex_app_server import (
+        CodexTurnAdmissionUncertainError,
+    )
+
+    monkeypatch.setattr(settings, "codex_app_server_enabled", True)
+    task_id = await _create_task_with_session(
+        client, session_factory, provider="codex", status="executing"
+    )
+    mock_im = MagicMock()
+    mock_im.inject_codex_message = AsyncMock(
+        side_effect=CodexTurnAdmissionUncertainError(
+            "thread-uncertain",
+            "shared transport could not prove cleanup",
+        )
+    )
+
+    with patch("backend.main.instance_manager", mock_im), \
+         patch("backend.main.broadcaster", MagicMock(broadcast=AsyncMock())):
+        resp = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={"message": "send at most once"},
+        )
+
+    assert resp.status_code == 503
+    assert "结果不确定" in resp.json()["detail"]
+    assert "不会自动重试" in resp.json()["detail"]
 
 
 @pytest.mark.asyncio

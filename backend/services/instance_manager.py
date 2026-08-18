@@ -862,6 +862,11 @@ class _PtyBackgroundState:
     started_monotonic: float
     last_event_monotonic: float
     pending_tools: int = 0
+    # User follow-ups may reuse the retained foreground Session while native
+    # descendants are still draining.  The old background epoch must not
+    # finalize (and tear down the shared consumer maps) until every such
+    # follow-up has finished pumping its ordered provider events.
+    pending_followups: int = 0
     terminal_seen: bool = False
     watcher: asyncio.Task | None = None
     done: asyncio.Event = field(default_factory=asyncio.Event)
@@ -922,6 +927,12 @@ class InstanceManager:
         # reusable slot, so a late waiter for generation A must never consume
         # (or be poisoned by) generation B's bookkeeping failure.
         self._consumer_records: dict[int, _OutputConsumerRecord] = {}
+        # A PTY foreground consumer may be waiting for an exact detached
+        # background epoch. Follow-up prompts reuse that hot Session instead
+        # of creating a second instance generation; keep their short-lived
+        # event pumps separate from the terminal consumer so stop/reap can
+        # still address the original process identity.
+        self._pty_followup_tasks: dict[int, set[asyncio.Task]] = {}
         # Holding the process object in the key also prevents Python object-id
         # reuse from ever mapping a very late failure onto a future process.
         self._consumer_errors: dict[
@@ -1148,6 +1159,178 @@ class InstanceManager:
             for session in getattr(self._pty_backend, "_sessions", {}).values()
         )
 
+    def _finalize_pty_followup_pump(
+        self,
+        key: int,
+        followup: asyncio.Task,
+        background_state: _PtyBackgroundState,
+    ) -> None:
+        """Release one pump exactly once, including pre-start cancellation."""
+
+        if getattr(followup, "_ccm_followup_finalized", False):
+            return
+        setattr(followup, "_ccm_followup_finalized", True)
+        background_state.pending_followups = max(
+            0,
+            background_state.pending_followups - 1,
+        )
+        background_state.last_event_monotonic = time.monotonic()
+        tasks = self._pty_followup_tasks.get(key)
+        if tasks is not None:
+            tasks.discard(followup)
+            if not tasks:
+                self._pty_followup_tasks.pop(key, None)
+
+    async def _run_pty_followup_prompt(
+        self,
+        key: int,
+        backend: Any,
+        session: Any,
+        content: str,
+        record: _OutputConsumerRecord,
+        background_state: _PtyBackgroundState,
+        admission: asyncio.Future[bool],
+    ) -> None:
+        """Pump one follow-up prompt through an already retained PTY Session."""
+
+        current = asyncio.current_task()
+        if current is not None:
+            setattr(current, "_ccm_output_consumer_record", record)
+            setattr(current, "_ccm_followup_started", True)
+        stream = None
+        first_event: asyncio.Task | None = None
+        delayed_cancellation: asyncio.CancelledError | None = None
+        try:
+            if backend is None:
+                admission.set_result(False)
+                return
+            launch_params = dict(
+                getattr(backend, "_launch_params", {}).get(key) or {}
+            )
+            launch_params["task_id"] = record.task_id
+            launch_params.setdefault("loop_iteration", None)
+            launch_params.update(
+                background_followup=True,
+                expected_session_id=background_state.session_id,
+                expected_background_generation=background_state.generation,
+                expected_task_retry_count=(
+                    background_state.task_retry_count
+                ),
+                expected_task_turn_generation=(
+                    background_state.task_turn_generation
+                ),
+            )
+            stream = session.send_prompt(content)
+            first_event = asyncio.create_task(
+                anext(stream),
+                name=f"pty-followup-first-event-{key}",
+            )
+            # Let the async generator execute once. A synchronous pre-delivery
+            # error/empty stream is still a rejection; otherwise the exact
+            # pump now owns the serialized send_prompt operation. Provider
+            # delivery and the JSONL prompt echo may take arbitrarily longer
+            # and are deliberately not part of this local admission receipt.
+            await asyncio.sleep(0)
+            if first_event.done():
+                try:
+                    event = first_event.result()
+                except StopAsyncIteration:
+                    admission.set_result(False)
+                    return
+            else:
+                admission.set_result(True)
+                event = await first_event
+            if not admission.done():
+                admission.set_result(True)
+            await backend.on_event(
+                key,
+                event.to_dict(),
+                **launch_params,
+            )
+            async for event in stream:
+                await backend.on_event(
+                    key,
+                    event.to_dict(),
+                    **launch_params,
+                )
+        except asyncio.CancelledError as exc:
+            delayed_cancellation = exc
+            if not admission.done():
+                admission.set_result(False)
+        except Exception:
+            if not admission.done():
+                admission.set_result(False)
+            logger.exception(
+                "PTY follow-up prompt failed for instance %s task %s",
+                key,
+                record.task_id,
+            )
+        finally:
+            if not admission.done():
+                admission.set_result(False)
+            if first_event is not None and not first_event.done():
+                first_event.cancel()
+                await asyncio.gather(first_event, return_exceptions=True)
+            try:
+                close_stream = getattr(stream, "aclose", None)
+                if callable(close_stream):
+                    close = asyncio.create_task(close_stream())
+                    close_cancellation = await await_task_completion(close)
+                    try:
+                        close.result()
+                    except asyncio.CancelledError as exc:
+                        if delayed_cancellation is None:
+                            delayed_cancellation = exc
+                    except Exception:
+                        logger.exception(
+                            "Failed to close PTY follow-up stream for instance %s",
+                            key,
+                        )
+                    if delayed_cancellation is None:
+                        delayed_cancellation = close_cancellation
+            except asyncio.CancelledError as exc:
+                if delayed_cancellation is None:
+                    delayed_cancellation = exc
+            except Exception:
+                logger.exception(
+                    "Could not create PTY follow-up stream cleanup for "
+                    "instance %s",
+                    key,
+                )
+            finally:
+                if current is not None:
+                    self._finalize_pty_followup_pump(
+                        key,
+                        current,
+                        background_state,
+                    )
+        if delayed_cancellation is not None:
+            raise delayed_cancellation
+
+    async def _cancel_pty_followup_tasks(
+        self,
+        instance_ids: set[int] | None = None,
+    ) -> None:
+        """Cancel and settle retained-Session event pumps before teardown."""
+
+        keys = (
+            set(self._pty_followup_tasks)
+            if instance_ids is None
+            else set(instance_ids)
+        )
+        pending: list[asyncio.Task] = []
+        for key in keys:
+            for followup in tuple(self._pty_followup_tasks.pop(key, set())):
+                if not followup.done():
+                    followup.cancel()
+                pending.append(followup)
+        if pending:
+            settlement = asyncio.gather(*pending, return_exceptions=True)
+            delayed_cancellation = await await_task_completion(settlement)
+            settlement.result()
+            if delayed_cancellation is not None:
+                raise delayed_cancellation
+
     async def inject_pty_message(
         self,
         session_id: str,
@@ -1255,6 +1438,131 @@ class InstanceManager:
 
             native_process = getattr(session, "active_turn_process", None)
             steer = getattr(session, "steer_active_turn", None)
+            if native_process is None:
+                # FullMirrorCCMBackend keeps the original consumer waiting on
+                # the exact background marker after the visible root turn
+                # ends. The provider Session is still alive and serializes a
+                # new prompt with its internal send lock; use a small event
+                # pump so the response follows the same durable event path.
+                send_prompt = getattr(session, "send_prompt", None)
+                if task_id is None or not callable(send_prompt):
+                    logger.info(
+                        "PTY steer rejected for session %s: turn is not "
+                        "steerable and no retained background Session is free",
+                        session_id,
+                    )
+                    return False
+                async with self.pty_background_transition(
+                    task_id,
+                    session_id,
+                ):
+                    background_generation = (
+                        self.pty_background_generation_for(
+                            task_id,
+                            session_id,
+                        )
+                    )
+                    background_state = self.pty_background_state_for(
+                        task_id,
+                        session_id,
+                        background_generation,
+                    )
+                    if background_state is None:
+                        logger.info(
+                            "PTY steer rejected for session %s: turn is not "
+                            "steerable and no retained background Session is free",
+                            session_id,
+                        )
+                        return False
+                    followups = self._pty_followup_tasks.setdefault(key, set())
+                    if any(not task.done() for task in followups):
+                        logger.info(
+                            "PTY steer rejected for session %s: a follow-up "
+                            "prompt is already being consumed",
+                            session_id,
+                        )
+                        return False
+                    background_state.pending_followups += 1
+                    admission = asyncio.get_running_loop().create_future()
+                    try:
+                        followup = asyncio.create_task(
+                            self._run_pty_followup_prompt(
+                                key,
+                                self._pty_backend,
+                                session,
+                                content,
+                                record,
+                                background_state,
+                                admission,
+                            ),
+                            name=f"pty-followup-{key}",
+                        )
+                    except Exception:
+                        background_state.pending_followups = max(
+                            0,
+                            background_state.pending_followups - 1,
+                        )
+                        logger.exception(
+                            "Could not create PTY follow-up pump for session %s",
+                            session_id,
+                        )
+                        return False
+                    setattr(followup, "_ccm_followup_finalized", False)
+
+                    def settle_followup(done: asyncio.Task) -> None:
+                        # ``Task.cancel()`` can win before the coroutine's
+                        # first bytecode executes. Resolve the local receipt
+                        # and accounting from the done callback as the exact
+                        # fallback, otherwise inject would wait forever on a
+                        # pump that never reached its ``finally`` block.
+                        if not admission.done():
+                            admission.set_result(False)
+                        self._finalize_pty_followup_pump(
+                            key,
+                            done,
+                            background_state,
+                        )
+                        try:
+                            error = done.exception()
+                        except asyncio.CancelledError:
+                            return
+                        if error is not None:
+                            logger.error(
+                                "PTY follow-up pump terminated unexpectedly "
+                                "for session %s",
+                                session_id,
+                                exc_info=(
+                                    type(error),
+                                    error,
+                                    error.__traceback__,
+                                ),
+                            )
+
+                    followup.add_done_callback(settle_followup)
+                    followups.add(followup)
+                # The pump publishes a local receipt after one generator
+                # scheduling step. This catches synchronous creation failures
+                # without coupling HTTP success to Claude's potentially slow
+                # prompt echo or ``active_turn_process`` visibility. As with
+                # live steering, caller cancellation is delayed so the API can
+                # persist its audit record for every admitted side effect.
+                caller_cancellation = await await_task_completion(admission)
+                admitted = bool(admission.result())
+                if not admitted:
+                    later_cancellation = await await_task_completion(followup)
+                    try:
+                        followup.result()
+                    except BaseException:
+                        pass
+                    if caller_cancellation is None:
+                        caller_cancellation = later_cancellation
+                if caller_cancellation is not None:
+                    logger.info(
+                        "Finished PTY follow-up admission for session %s "
+                        "after caller cancellation",
+                        session_id,
+                    )
+                return admitted
             if native_process is None or not callable(steer):
                 logger.info(
                     "PTY steer rejected for session %s: turn is not steerable",
@@ -1301,6 +1609,10 @@ class InstanceManager:
             or (not content and not input_items)
         ):
             return False
+        from backend.services.codex_app_server import (
+            CodexTurnAdmissionUncertainError,
+        )
+
         try:
             if input_items is None:
                 return await self._codex_app_server.steer_turn(
@@ -1312,6 +1624,12 @@ class InstanceManager:
                 content,
                 input_items=input_items,
             )
+        except CodexTurnAdmissionUncertainError:
+            logger.exception(
+                "Codex inject admission is uncertain for thread %s",
+                thread_id,
+            )
+            raise
         except Exception:
             logger.exception("Codex inject failed for thread %s", thread_id)
             return False
@@ -1324,11 +1642,30 @@ class InstanceManager:
             return False
         pool = self._pty_backend._pool
         session = await pool.get(session_id)
+        followup_instance_ids = (
+            {
+                key
+                for key, candidate in getattr(
+                    self._pty_backend,
+                    "_sessions",
+                    {},
+                ).items()
+                if candidate is session
+            }
+            if session is not None
+            else set()
+        )
+
+        async def cancel_followups_and_remove() -> None:
+            await self._cancel_pty_followup_tasks(followup_instance_ids)
+            await pool.remove(session_id)
+
         try:
             # SessionPool.remove() unpublishes the exact Session before it
             # awaits stop.  Keep that cleanup alive across caller
-            # cancellation so an unpublished native process cannot survive.
-            await _settle_instance_cleanup(pool.remove(session_id))
+            # cancellation so neither an unpublished native process nor its
+            # CCM-owned follow-up pump can survive the release boundary.
+            await _settle_instance_cleanup(cancel_followups_and_remove())
         except Exception:
             logger.exception("Failed to release PTY session %s", session_id)
             # If the pinned pool already popped the Session before stop
@@ -1381,7 +1718,12 @@ class InstanceManager:
         sessions = set(
             getattr(getattr(backend, "_pool", None), "_sessions", {}).values()
         )
-        await backend.shutdown()
+
+        async def cancel_followups_and_shutdown() -> None:
+            await self._cancel_pty_followup_tasks()
+            await backend.shutdown()
+
+        await _settle_instance_cleanup(cancel_followups_and_shutdown())
         for session in sessions:
             if getattr(session, "is_alive", True) is False:
                 self._release_task_runtime_scope_pty_owner(session)
@@ -7781,6 +8123,23 @@ class InstanceManager:
     ) -> bool:
         """Check live native/Bash work and its durable native-agent mirror."""
 
+        # A retained Session can accept one user follow-up while the original
+        # root consumer waits for its native descendants.  That follow-up is
+        # not represented by the autonomous tracker, but its event pump still
+        # owns the exact Task/session generation and must finish before the
+        # background marker may be cleared.
+        for instance_id, followups in self._pty_followup_tasks.items():
+            if not any(not task.done() for task in followups):
+                continue
+            record = self._consumer_records.get(instance_id)
+            process = getattr(record, "process", None)
+            if (
+                record is not None
+                and record.task_id == task_id
+                and getattr(process, "session", None) is session
+            ):
+                return True
+
         ccm_tracker = getattr(
             session, "_ccm_background_work_tracker", None
         )
@@ -9055,6 +9414,8 @@ class InstanceManager:
     ) -> bool:
         key = (state.task_id, state.session_id)
         if self._pty_background_states.get(key) is not state:
+            return False
+        if state.pending_followups:
             return False
         if await self.pty_background_activity_pending(
             state.task_id, state.session
@@ -14583,6 +14944,7 @@ class InstanceManager:
         *,
         consumer_record: _OutputConsumerRecord | None = None,
         detached_autonomous: bool = False,
+        background_followup: bool = False,
         expected_session_id: str | None = None,
         expected_background_generation: str | None = None,
         expected_task_retry_count: int | None = None,
@@ -14608,6 +14970,7 @@ class InstanceManager:
         )
         if event_record is not None:
             provider = str(event_record.provider or provider).lower()
+        background_scoped = detached_autonomous or background_followup
 
         def owns_event_generation() -> bool:
             if event_record is None:
@@ -14632,7 +14995,7 @@ class InstanceManager:
                 Task.id == task_id,
                 task_retry_not_superseded_predicate(),
             ]
-            if detached_autonomous:
+            if background_scoped:
                 predicates.extend(
                     [
                         Task.session_id == expected_session_id,
@@ -14678,7 +15041,7 @@ class InstanceManager:
         async def guard_managed_event_generation(db) -> bool:
             """Lock the exact durable Task→Instance event generation."""
 
-            if detached_autonomous:
+            if background_scoped:
                 if (
                     task_id is None
                     or expected_session_id is None
@@ -14686,6 +15049,8 @@ class InstanceManager:
                     or expected_task_retry_count is None
                     or expected_task_turn_generation is None
                 ):
+                    return False
+                if background_followup and not owns_event_generation():
                     return False
                 task_guard = await db.execute(
                     update(Task)
@@ -14697,7 +15062,13 @@ class InstanceManager:
                     )
                     .values(status=Task.status)
                 )
-                return bool(task_guard.rowcount)
+                return bool(
+                    task_guard.rowcount
+                    and (
+                        not background_followup
+                        or owns_event_generation()
+                    )
+                )
             if event_record is None:
                 return True
             if not owns_event_generation():
@@ -14745,7 +15116,11 @@ class InstanceManager:
             )
             return
         fatal_provider_error = self._fatal_provider_error_for_event(event)
-        if fatal_provider_error and event_record is not None:
+        if (
+            fatal_provider_error
+            and event_record is not None
+            and not background_followup
+        ):
             # Keep the first (usually detailed upstream) message. A later
             # synthetic "api_error: turn aborted" marker must not replace it.
             if event_record.fatal_provider_error is None:
@@ -14799,7 +15174,7 @@ class InstanceManager:
                 )
                 return
             broadcast_data = {k: v for k, v in event.items() if k != "raw_json"}
-            if detached_autonomous:
+            if background_scoped:
                 broadcast_data["task_retry_count"] = (
                     expected_task_retry_count
                 )
@@ -14834,12 +15209,12 @@ class InstanceManager:
                     await db.rollback()
                     logger.info(
                         "Dropping stale %s delta for task %s on instance %s",
-                        "autonomous" if detached_autonomous else "foreground",
+                        "background" if background_scoped else "foreground",
                         task_id,
                         instance_id,
                     )
                     return
-                if not detached_autonomous:
+                if not background_scoped:
                     await self.broadcaster.broadcast(
                         f"instance:{instance_id}", broadcast_data
                     )
@@ -14862,6 +15237,7 @@ class InstanceManager:
             and event["event_type"] in ("message", "tool_use")
             and not event.get("orphan")
             and not event.get("autonomous")
+            and not background_followup
             and owns_event_generation()
         ):
             reactivated_completed_at: datetime | None = None
@@ -15228,7 +15604,7 @@ class InstanceManager:
                         .where(*task_event_predicates())
                         .values(**task_values)
                     )
-            if not detached_autonomous:
+            if not background_scoped:
                 instance_values = {"last_heartbeat": datetime.utcnow()}
                 if cost_usd is not None:
                     instance_values["total_cost_usd"] = cost_usd
@@ -15287,6 +15663,7 @@ class InstanceManager:
             event.get("is_error")
             and not event.get("orphan")
             and not event.get("autonomous")
+            and not background_followup
         ):
             from backend.services.claude_pool import is_transient_for
             event_content = event.get("content") or ""
@@ -15301,10 +15678,10 @@ class InstanceManager:
         # PTY rate-limit detection: actionable rate_limit_event during this turn
         if (
             provider == "claude"
-            and
-            event.get("event_type") == "rate_limit_event"
+            and event.get("event_type") == "rate_limit_event"
             and not event.get("orphan")
             and not event.get("autonomous")
+            and not background_followup
         ):
             from backend.services.claude_pool import rate_limit_event_is_actionable
             info = event.get("rate_limit_info")
@@ -15327,11 +15704,11 @@ class InstanceManager:
         # _check_rate_limit_and_rotate (which needs exit_code != 0) never fires.
         if (
             provider == "claude"
-            and
-            event.get("role") == "assistant"
+            and event.get("role") == "assistant"
             and event.get("event_type") in ("message", "result")
             and not event.get("orphan")
             and not event.get("autonomous")
+            and not background_followup
         ):
             content = event.get("content") or ""
             if content:
@@ -15393,7 +15770,7 @@ class InstanceManager:
             broadcast_data["native_turn_id"] = entry.native_turn_id
         if loop_iteration is not None:
             broadcast_data["loop_iteration"] = loop_iteration
-        if not detached_autonomous:
+        if not background_scoped:
             await self.broadcaster.broadcast(
                 f"instance:{instance_id}", broadcast_data
             )
@@ -17939,6 +18316,11 @@ class InstanceManager:
                 if record is not None and record.pty_terminal_owner == "stop":
                     record.pty_terminal_owner = None
                 return False
+            # Follow-up prompts reuse the retained Session but are separate
+            # event pumps. Once this exact stop owns the PTY generation, cancel
+            # those pumps before tearing down the native process so no late
+            # follow-up event can mutate the stopped Task.
+            await self._cancel_pty_followup_tasks({instance_id})
             await self._pty_backend.stop(instance_id)
             # claude-pty normally completes its asyncio-compatible proxy from
             # the consumer's on_exit callback. A forced Interrupt may cancel

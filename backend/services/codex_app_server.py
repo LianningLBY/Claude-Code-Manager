@@ -476,6 +476,19 @@ class CodexSharedTransportBusyError(CodexAppServerBusyError):
     """A claimed turn cannot be stopped without disrupting a shared transport."""
 
 
+class CodexTurnAdmissionUncertainError(CodexAppServerError):
+    """A follow-up may have started, but cleanup could not prove rejection."""
+
+    def __init__(self, thread_id: str, reason: str) -> None:
+        super().__init__(
+            f"Codex follow-up admission is uncertain for thread {thread_id}: "
+            f"{reason}"
+        )
+        self.thread_id = thread_id
+        self.reason = reason
+        self.delivery_uncertain = True
+
+
 class CodexThreadNotIdleError(CodexAppServerBusyError):
     """A native thread can still execute outside CCM's current turn adapter."""
 
@@ -2183,6 +2196,11 @@ class _TurnContext:
     admitted_turn_id: str | None = None
     observed_turn_id: str | None = None
     client_user_message_id: str | None = None
+    # The app-server keeps thread settings sticky, but a retained descendant
+    # lineage may need a fresh root turn after the previous turn completed.
+    # Keep the exact admitted turn parameters so that continuation stays on
+    # the same isolated thread/profile instead of reconstructing ambient state.
+    turn_start_params: dict[str, Any] | None = None
     provisional_started_turn_ids: set[str] = field(default_factory=set)
     usage: dict[str, int] | None = None
     first_input_seen: bool = False
@@ -2213,6 +2231,7 @@ class _TurnContext:
     descendant_interrupt_lock: asyncio.Lock | None = None
     descendant_guard_task: asyncio.Task | None = None
     deferred_terminal_notification: dict[str, Any] | None = None
+    continuation_starting: bool = False
     background_lifecycle_started_at: datetime | None = None
     background_lifecycle_last_activity_at: datetime | None = None
     background_lifecycle_last_published_monotonic: float | None = None
@@ -4016,6 +4035,19 @@ class CodexAppServer:
                     changed = asyncio.Event()
                     context.descendant_state_changed = changed
                 changed.clear()
+                if context.continuation_starting:
+                    # A follow-up turn is being admitted on the same native
+                    # thread. Do not let the old parent terminal win the tiny
+                    # gap between clearing its turn id and receiving the new
+                    # turn/start response.
+                    try:
+                        await asyncio.wait_for(
+                            changed.wait(),
+                            timeout=_DESCENDANT_RECONCILE_INTERVAL,
+                        )
+                    except asyncio.TimeoutError:
+                        continue
+                    continue
                 if not context.active_descendant_thread_ids:
                     # A second loop turn closes the status-idle /
                     # child-turn-completed ordering window and preserves any
@@ -4098,6 +4130,19 @@ class CodexAppServer:
                 and runtime.goal_status == "active"
             )
         )
+        if (
+            turn.get("status", "completed") == "completed"
+            and context.claimed_stop_token is None
+        ):
+            # The root turn is idle even though its native descendants are
+            # retained. Release the stale turn identity immediately so a
+            # follow-up can use turn/start instead of steering a dead id.
+            previous_turn_id = context.turn_id
+            self._reset_goal_turn_identity(context)
+            # Keep a short-lived notification alias so output already queued
+            # by the app-server for the just-completed parent is not lost.
+            if previous_turn_id:
+                self._contexts_by_turn[previous_turn_id] = context
         if turn.get("status", "completed") == "completed" and goal_may_continue:
             # Goal continuation is allowed as soon as the root thread is idle,
             # even while native descendants from the older turn are still
@@ -4105,7 +4150,6 @@ class CodexAppServer:
             # next turn can bind without dropping early output. The newer turn
             # invalidates this older deferred terminal below, while descendant
             # ownership remains attached to the shared context.
-            self._reset_goal_turn_identity(context)
             self._mark_following_native_goal(context)
         guard = context.descendant_guard_task
         if guard is None or guard.done():
@@ -6936,6 +6980,10 @@ class CodexAppServer:
                 "excludeTmpdirEnvVar": False,
                 "excludeSlashTmp": False,
             }
+        # A retained descendant lineage can accept another root turn after
+        # this one becomes idle. Store only the already-admitted parameters;
+        # follow-up input replaces the original ``input`` and client id.
+        context.turn_start_params = dict(turn_params)
         if on_turn_prepared is not None:
             try:
                 # All fallible pure preflight is complete. Publish the exact
@@ -8450,11 +8498,24 @@ class CodexAppServer:
             if not steer_input:
                 raise ValueError("Codex steer input cannot be empty")
         context = self._contexts_by_thread.get(thread_id)
+        if context is None or context.process.returncode is not None:
+            return False
+
+        # ``turn/completed`` is allowed to arrive before native descendants
+        # settle. In that state the old turn id is intentionally released, but
+        # the shared adapter remains open so the user can continue the same
+        # thread. Start a fresh root turn on the exact retained context rather
+        # than sending ``turn/steer`` with a stale id.
         if (
-            context is None
-            or context.turn_id is None
-            or context.process.returncode is not None
+            context.turn_id is None
+            and context.deferred_terminal_notification is not None
+            and context.claimed_stop_token is None
         ):
+            return await self._start_followup_turn(
+                context,
+                steer_input,
+            )
+        if context.turn_id is None:
             return False
 
         expected_turn_id = context.turn_id
@@ -8488,9 +8549,31 @@ class CodexAppServer:
                         },
                     )
                 except Exception as retry_exc:
+                    if not isinstance(
+                        retry_exc,
+                        CodexAppServerRequestError,
+                    ):
+                        raise CodexTurnAdmissionUncertainError(
+                            thread_id,
+                            "turn/steer retry returned no authoritative "
+                            f"response: {retry_exc}",
+                        ) from retry_exc
                     exc = retry_exc
                 else:
-                    return response.get("turnId") == actual_turn_id
+                    response_turn_id = response.get("turnId")
+                    if response_turn_id != actual_turn_id:
+                        raise CodexTurnAdmissionUncertainError(
+                            thread_id,
+                            "turn/steer retry acknowledged an unexpected "
+                            f"turn id: {response_turn_id!r}",
+                        )
+                    return True
+            if not isinstance(exc, CodexAppServerRequestError):
+                raise CodexTurnAdmissionUncertainError(
+                    thread_id,
+                    "turn/steer returned no authoritative response: "
+                    f"{exc}",
+                ) from exc
             # A normal turn-boundary race and non-steerable turns (review or
             # manual compact) are protocol rejections, not transport crashes.
             logger.info(
@@ -8500,7 +8583,231 @@ class CodexAppServer:
                 exc,
             )
             return False
-        return response.get("turnId") == expected_turn_id
+        response_turn_id = response.get("turnId")
+        if response_turn_id != expected_turn_id:
+            raise CodexTurnAdmissionUncertainError(
+                thread_id,
+                "turn/steer acknowledged an unexpected turn id: "
+                f"{response_turn_id!r}",
+            )
+        return True
+
+    async def _start_followup_turn(
+        self,
+        context: _TurnContext,
+        steer_input: list[dict[str, Any]],
+    ) -> bool:
+        """Start one root turn while an older root retains child threads."""
+
+        if context.turn_start_params is None or context.continuation_starting:
+            return False
+        context.continuation_starting = True
+        release_continuation_guard = True
+        previous_turn_state = {
+            "client_user_message_id": context.client_user_message_id,
+            "usage": context.usage,
+            "first_input_seen": context.first_input_seen,
+            "first_output_seen": context.first_output_seen,
+            "turn_started_emitted": context.turn_started_emitted,
+            "non_retry_error": context.non_retry_error,
+        }
+        client_user_message_id = uuid.uuid4().hex
+        params = dict(context.turn_start_params)
+        params["threadId"] = context.thread_id
+        params["input"] = list(steer_input)
+        params["clientUserMessageId"] = client_user_message_id
+        context.client_user_message_id = client_user_message_id
+        context.usage = None
+        context.first_input_seen = False
+        context.first_output_seen = False
+        context.turn_started_emitted = False
+        context.non_retry_error = None
+
+        def release_followup_guard() -> None:
+            context.continuation_starting = False
+            state_changed = context.descendant_state_changed
+            if state_changed is not None:
+                state_changed.set()
+
+        async def abort_failed_followup(
+            reason: str,
+            *,
+            cause: BaseException | None,
+            caller_cancellation: asyncio.CancelledError | None,
+        ) -> bool:
+            """Stop a possibly-admitted follow-up before allowing a retry."""
+
+            nonlocal release_continuation_guard
+            if context.turn_id:
+                # The old root terminal must not suppress interruption of the
+                # newly admitted root. Descendants remain attached and are
+                # reconciled by ``abandon_turn`` before the adapter closes.
+                context.deferred_terminal_notification = None
+            cleanup = asyncio.create_task(self.abandon_turn(
+                context.process,
+                reason,
+            ))
+            cleanup_cancellation = await await_task_completion(cleanup)
+            delayed_cancellation = (
+                caller_cancellation or cleanup_cancellation
+            )
+            try:
+                interrupt_confirmed = bool(cleanup.result())
+            except BaseException:
+                interrupt_confirmed = False
+                logger.exception(
+                    "Failed to settle rejected Codex follow-up thread=%s",
+                    context.thread_id,
+                )
+            if interrupt_confirmed:
+                release_followup_guard()
+                if delayed_cancellation is not None:
+                    raise delayed_cancellation
+                return False
+
+            # Keep the descendant terminal guard fenced until the registry
+            # drains this home and either proves an exact interrupt or stops
+            # the transport. Letting the old terminal detach this adapter here
+            # would make unknown server-side work look safely rejected.
+            release_continuation_guard = False
+            if delayed_cancellation is not None:
+                raise _UnconfirmedTurnCancellation(
+                    context.process,
+                    reason,
+                ) from cause
+            raise _UnconfirmedTurnStartFailure(
+                context.process,
+                reason,
+            ) from cause
+
+        turn_request = asyncio.create_task(self._request(
+            "turn/start",
+            params,
+        ))
+        caller_cancellation = await await_task_completion(turn_request)
+        try:
+            response = turn_request.result()
+        except CodexAppServerRequestError as exc:
+            if context.turn_id is not None or context.observed_turn_id is not None:
+                return await abort_failed_followup(
+                    "Codex follow-up turn/start was rejected after native "
+                    "admission was observed",
+                    cause=exc,
+                    caller_cancellation=caller_cancellation,
+                )
+            for attribute, value in previous_turn_state.items():
+                setattr(context, attribute, value)
+            logger.info(
+                "Codex follow-up turn explicitly rejected thread=%s reason=%s",
+                context.thread_id,
+                exc,
+            )
+            release_followup_guard()
+            if caller_cancellation is not None:
+                raise caller_cancellation
+            return False
+        except BaseException as exc:
+            if isinstance(exc, asyncio.TimeoutError):
+                reason = (
+                    "Codex follow-up turn/start timed out with unknown "
+                    "server state"
+                )
+            else:
+                reason = (
+                    "Codex follow-up turn/start failed with unknown server "
+                    f"state: {exc}"
+                )
+            return await abort_failed_followup(
+                reason,
+                cause=exc,
+                caller_cancellation=caller_cancellation,
+            )
+
+        try:
+            turn = response.get("turn") if isinstance(response, dict) else None
+            turn_id = turn.get("id") if isinstance(turn, dict) else None
+            if not isinstance(turn_id, str) or not turn_id:
+                error = CodexAppServerError(
+                    "Codex follow-up turn/start returned no turn id"
+                )
+                return await abort_failed_followup(
+                    str(error),
+                    cause=error,
+                    caller_cancellation=caller_cancellation,
+                )
+            if context.process.returncode is not None:
+                return await abort_failed_followup(
+                    "Codex follow-up adapter became terminal after turn/start",
+                    cause=None,
+                    caller_cancellation=caller_cancellation,
+                )
+            context.admitted_turn_id = turn_id
+            # Notifications can win the response race and bind a client-id
+            # correlated native turn before turn/start returns its submission
+            # id. Mirror initial admission: preserve that observed owner and
+            # keep the response id only as an alias; otherwise bind the
+            # response id as the authoritative turn.
+            if context.observed_turn_id is None:
+                if not self._bind_turn_context(
+                    context,
+                    turn_id,
+                    observed=False,
+                ):
+                    # The response proves this turn was admitted. Retain its
+                    # exact id locally for cleanup without overwriting the
+                    # conflicting reverse mapping owned by another context.
+                    context.turn_id = turn_id
+                    context.process.native_turn_id = turn_id
+                    error = CodexAppServerError(
+                        "Codex follow-up turn id collided with another context"
+                    )
+                    return await abort_failed_followup(
+                        str(error),
+                        cause=error,
+                        caller_cancellation=caller_cancellation,
+                    )
+            elif not self._alias_turn_context(context, turn_id):
+                error = CodexAppServerError(
+                    "Codex follow-up turn alias collided with another context"
+                )
+                return await abort_failed_followup(
+                    str(error),
+                    cause=error,
+                    caller_cancellation=caller_cancellation,
+                )
+            retained_turn_ids = {
+                candidate
+                for candidate in (
+                    context.turn_id,
+                    context.admitted_turn_id,
+                    context.observed_turn_id,
+                )
+                if candidate
+            }
+            for old_turn_id, candidate in list(self._contexts_by_turn.items()):
+                if (
+                    candidate is context
+                    and old_turn_id not in retained_turn_ids
+                ):
+                    self._contexts_by_turn.pop(old_turn_id, None)
+            context.deferred_terminal_notification = None
+            guard = context.descendant_guard_task
+            context.descendant_guard_task = None
+            if guard is not None and not guard.done():
+                guard.cancel()
+            state_changed = context.descendant_state_changed
+            if state_changed is not None:
+                state_changed.set()
+            if caller_cancellation is not None:
+                return await abort_failed_followup(
+                    "Codex follow-up turn admission was cancelled",
+                    cause=caller_cancellation,
+                    caller_cancellation=caller_cancellation,
+                )
+            return True
+        finally:
+            if release_continuation_guard:
+                release_followup_guard()
 
     async def _request(
         self,
@@ -12293,6 +12600,33 @@ class CodexAppServerRegistry:
                 content,
                 input_items=input_items,
             )
+        except (
+            _UnconfirmedTurnCancellation,
+            _UnconfirmedTurnStartFailure,
+        ) as exc:
+            assert home is not None
+            cleanup = asyncio.create_task(self.abort_unclaimed_turn(
+                home,
+                exc.process,
+                reason=exc.reason,
+            ))
+            cleanup_cancellation = await await_task_completion(cleanup)
+            try:
+                cleanup.result()
+            except BaseException as cleanup_exc:
+                # The turn/start request may already have reached Codex. If
+                # exact interruption and transport shutdown cannot prove that
+                # it did not, exposing this as a normal False/409 invites an
+                # automatic retry of the same user input.
+                raise CodexTurnAdmissionUncertainError(
+                    thread_id,
+                    exc.reason,
+                ) from cleanup_exc
+            if isinstance(exc, _UnconfirmedTurnCancellation):
+                raise asyncio.CancelledError(exc.reason) from exc
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation
+            return False
         finally:
             assert home is not None
 

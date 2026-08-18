@@ -79,7 +79,11 @@ interface QueuedMessage {
   uploadResults?: UploadResult[];
   planTaskIds?: number[];
   planVersionIds?: number[];
+  /** The previous transport may have accepted this input without returning an ACK. */
+  requiresConfirmation?: boolean;
 }
+
+type InjectOutcome = 'injected' | 'rejected' | 'uncertain';
 
 const WORKSPACE_REVIEW_START_TOOLS = new Set([
   'ccm_workspace_review.test_current_changes',
@@ -126,6 +130,10 @@ interface TaskTurnIdentity {
   taskId: number;
   retryCount: number;
   turnGeneration: number;
+}
+
+interface SuppressedCompletedLifecycle extends TaskTurnIdentity {
+  suppressedAt: number;
 }
 
 interface LiveStreamCacheEntry extends TaskTurnIdentity {
@@ -332,6 +340,7 @@ function parseStoredMessageQueue(raw: string | null): QueuedMessage[] {
       return [{
         text: candidate.text,
         uploadResults: uploadResults?.length ? uploadResults : undefined,
+        requiresConfirmation: candidate.requiresConfirmation === true,
       }];
     });
   } catch {
@@ -465,6 +474,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const deliveryReadOnly = task.mode === 'delivery_loop' || task.delivery_run_id != null;
   const [messages, setMessages] = useState<ChatMessage[]>(() => restoreLiveStreamCache(task));
   const activeTaskTurnRef = useRef<TaskTurnIdentity>(taskTurnIdentity(task));
+  const [suppressedCompletedLifecycleTurn, setSuppressedCompletedLifecycleTurn] =
+    useState<SuppressedCompletedLifecycle | null>(null);
   const storedUser = readStoredUserIdentity();
   const storagePrincipal = typeof storedUser.id === 'number'
     ? `user-${storedUser.id}`
@@ -628,6 +639,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (incoming.taskId !== current.taskId) {
       clearLiveStreamCache(current.taskId, current);
       activeTaskTurnRef.current = incoming;
+      setSuppressedCompletedLifecycleTurn(null);
       setTerminalReconciliationPending(false);
       setMessages(restoreLiveStreamCache(task));
       return;
@@ -638,6 +650,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
     clearLiveStreamCache(task.id, current);
     activeTaskTurnRef.current = incoming;
+    setSuppressedCompletedLifecycleTurn(null);
     setTerminalReconciliationPending(false);
     setMessages((previous) => {
       const next = removeOtherTurnProvisionals(previous, incoming);
@@ -720,11 +733,35 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     return () => document.removeEventListener('mousedown', handle);
   }, [showModelMenu, modelOptions.length, task.provider]);
 
-  const handleInject = async (text: string, uploadResults: UploadResult[]) => {
-    if ((!text && uploadResults.length === 0) || injectingRef.current) return;
+  const handleInject = async (
+    text: string,
+    uploadResults: UploadResult[],
+    preserveComposer = false,
+  ): Promise<InjectOutcome> => {
+    if ((!text && uploadResults.length === 0) || injectingRef.current) {
+      return 'rejected';
+    }
     injectingRef.current = true;
     setInjecting(true);
     setError(null);
+    let transportAttempted = false;
+    const reportUnconfirmed = (
+      outcome: Exclude<InjectOutcome, 'injected'>,
+      reason: unknown,
+    ): InjectOutcome => {
+      // A rejected injection did not start a new turn; an uncertain one may
+      // have started it but has no client-visible acknowledgement. In either
+      // case, restore the prior lifecycle hint until history reconciliation.
+      setSuppressedCompletedLifecycleTurn(null);
+      const detail = reason instanceof Error ? reason.message : String(reason);
+      setError(outcome === 'uncertain'
+        ? `注入结果不确定，消息和附件已保留且不会自动重试；请先查看聊天记录或运行日志，再决定是否手动重试：${detail}`
+        : `未收到注入成功确认，消息和附件已保留：${detail}`
+      );
+      onTaskUpdated?.();
+      refreshHistoryRef.current();
+      return outcome;
+    };
     try {
       if (uploadResults.length > 0) {
         const capabilities = await api.getInjectCapabilities(task.id);
@@ -734,6 +771,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           );
         }
       }
+      transportAttempted = true;
       const result = await api.injectTaskMessage(
         task.id,
         text || '(files attached)',
@@ -745,7 +783,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         uploadResults.length > 0 ? injectAttachments(uploadResults) : undefined,
       );
       if (!result.ok || !result.injected) {
-        throw new Error('服务器没有确认消息已注入，输入和附件已保留');
+        return reportUnconfirmed(
+          'rejected',
+          new Error('服务器没有确认消息已注入'),
+        );
       }
       if (
         uploadResults.length > 0
@@ -754,23 +795,25 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           || result.attachment_count !== uploadResults.length
         )
       ) {
-        throw new Error(
-          '服务器没有确认全部附件均已注入，输入和附件已保留',
+        return reportUnconfirmed(
+          'uncertain',
+          new Error('服务器没有确认全部附件均已注入'),
         );
       }
-      setInput((current) => (
-        current.trim() === text ? '' : current
-      ));
-      fileUpload.clear();
-      consumeForkSeedUploads();
+      if (!preserveComposer) {
+        setInput((current) => (
+          current.trim() === text ? '' : current
+        ));
+        fileUpload.clear();
+        consumeForkSeedUploads();
+      }
+      return 'injected';
     } catch (e) {
-      setError(
-        `未收到注入成功确认，消息和附件已保留；请先查看聊天记录或运行日志，再决定是否重试：${
-          e instanceof Error ? e.message : String(e)
-        }`,
+      const explicitRejection = isApiRequestError(e) && e.status < 500;
+      return reportUnconfirmed(
+        transportAttempted && !explicitRejection ? 'uncertain' : 'rejected',
+        e,
       );
-      onTaskUpdated?.();
-      refreshHistoryRef.current();
     } finally {
       injectingRef.current = false;
       setInjecting(false);
@@ -1024,20 +1067,60 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     setSelectedSecretIds([]);
   }, [hasControlAccess]);
   const effectiveStatus = localStatus || task.status;
-  const backgroundActive = localBackgroundActive ?? task.background_active === true;
+  // Codex descendants are task-thread scoped, not PTY background generations,
+  // so their durable Task projection deliberately keeps ``background_active``
+  // false.  A current-turn lifecycle record is the authoritative signal for
+  // that retained native work, including after reconnect/history reload.
+  const rawBackgroundLifecycle = useMemo(
+    () => latestBackgroundLifecycle(messages, activeTaskTurnRef.current),
+    [messages, task.retry_count, task.turn_generation],
+  );
+  const backgroundActive = (
+    rawBackgroundLifecycle?.state === 'running'
+    || (localBackgroundActive ?? task.background_active === true)
+  );
   const isWaitingCapability = effectiveStatus === 'waiting_capability';
   const canInjectNow = canInject && !isWaitingCapability;
-  const effectiveStatusRef = useRef(effectiveStatus);
-  effectiveStatusRef.current = effectiveStatus;
+  // A retained background marker is itself authoritative evidence that an
+  // exact provider session still exists. Do not wait for the asynchronously
+  // loaded runtime-settings toggle before routing a follow-up, or a message
+  // sent immediately after opening the Task can race onto the ordinary /chat
+  // path. The backend remains the final exact-session admission check.
+  const canInjectBackgroundFollowup = (
+    hasControlAccess
+    && !deliveryReadOnly
+    && task.worker_id == null
+    && task.shared_from_id == null
+    && !isWaitingCapability
+  );
   useEffect(() => {
     if (isWaitingCapability && injectMode) setInjectMode(false);
   }, [injectMode, isWaitingCapability]);
-  // A native agent/monitor tail can remain active while the owning foreground
-  // turn is still `executing`; keep the marker independently visible.
-  const isProcessing = sending || backgroundActive || ['in_progress', 'executing', 'waiting_capability'].includes(effectiveStatus);
-  const backgroundLifecycle = useMemo(
-    () => latestBackgroundLifecycle(messages, activeTaskTurnRef.current),
-    [messages, task.retry_count, task.turn_generation],
+  // A provider may keep the Task row executing while its root response has
+  // already ended and only native/background work remains. That lifecycle is
+  // visible through ``backgroundActive``; it must not turn the composer into
+  // a queue-only control.
+  const foregroundActive = sending
+    || (
+      !backgroundActive
+      && ['in_progress', 'executing', 'waiting_capability'].includes(effectiveStatus)
+  );
+  const backgroundOnly = backgroundActive && !foregroundActive;
+  const hasActiveWork = foregroundActive || backgroundActive;
+  // Starting a new turn must not reuse the previous turn's terminal lifecycle
+  // as an optimistic status. Running descendants remain visible throughout.
+  const lifecycleTimestamp = rawBackgroundLifecycle
+    ? Date.parse(rawBackgroundLifecycle.last_activity_at || rawBackgroundLifecycle.started_at)
+    : Number.NaN;
+  const suppressesCurrentLifecycle = (
+    rawBackgroundLifecycle?.state === 'completed'
+    && suppressedCompletedLifecycleTurn
+    && sameTaskTurn(suppressedCompletedLifecycleTurn, activeTaskTurnRef.current)
+    && (!Number.isFinite(lifecycleTimestamp)
+      || lifecycleTimestamp <= suppressedCompletedLifecycleTurn.suppressedAt)
+  );
+  const backgroundLifecycle = (
+    suppressesCurrentLifecycle ? null : rawBackgroundLifecycle
   );
   const [, refreshBackgroundAge] = useState(0);
   useEffect(() => {
@@ -1058,7 +1141,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     && task.shared_from_id == null
     && hasTaskSession
     && ['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus)
-    && !isProcessing
+    && !hasActiveWork
     && workspaceReviewCanBeConfigured
   );
   const canStartConfiguredBrowserReview = (
@@ -1066,7 +1149,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     && task.worker_id == null
     && task.shared_from_id == null
     && ['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus)
-    && !isProcessing
+    && !hasActiveWork
   );
   const canStartFrontendReviewGoal = (
     hasControlAccess
@@ -1074,7 +1157,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     && task.shared_from_id == null
     && hasTaskSession
     && ['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus)
-    && !isProcessing
+    && !hasActiveWork
     && frontendReviewGoalCapability?.available === true
     && workspaceReviewCanBeConfigured
   );
@@ -1082,7 +1165,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     ? '此 Task 仅授予聊天权限'
     : !hasTaskSession
     ? 'Task 完成并建立 session 后才能审查当前分支'
-    : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || isProcessing
+    : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || hasActiveWork
       ? 'Task 正在执行；Agent 可在对话中调用测试工具，或等待完成后从这里启动'
       : frontendReviewGoalCapabilityLoading
         ? '正在确认本地 Git 仓库与 Preview 配置…'
@@ -1091,7 +1174,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     ? '此 Task 仅授予聊天权限'
     : !hasTaskSession
     ? 'Task 完成并建立 session 后才能启动循环审查'
-    : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || isProcessing
+    : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || hasActiveWork
       ? 'Task 正在执行，请等待完成后再启动循环审查'
       : frontendReviewGoalCapabilityLoading
         ? '正在确认可修改的本地 Git 仓库…'
@@ -1102,7 +1185,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     ? 'Worker Task 暂不支持从 Manager 界面直接启动网站测试'
     : task.shared_from_id != null
       ? '共享 Task 只能查看已有测试记录'
-      : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || isProcessing
+      : !['completed', 'failed', 'cancelled', 'conflict'].includes(effectiveStatus) || hasActiveWork
         ? 'Task 正在执行；Agent 可在对话中调用测试工具，或等待完成后从这里启动'
         : null;
   const isFrontendReviewGoal = task.metadata_?.frontend_review?.mode === 'goal';
@@ -1122,7 +1205,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     turn: task.goal_turns_used || 0,
     maxTurns: task.goal_max_turns || 5,
     lastReason: task.goal_last_reason,
-    active: isProcessing,
+    active: foregroundActive,
   });
   useEffect(() => {
     setFrontendReviewGoalProgress({
@@ -1133,8 +1216,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     });
   }, [task.id, task.goal_turns_used, task.goal_max_turns, task.goal_last_reason, task.status]);
   useEffect(() => {
-    setFrontendReviewGoalProgress((current) => ({ ...current, active: isProcessing }));
-  }, [isProcessing]);
+    setFrontendReviewGoalProgress((current) => ({ ...current, active: foregroundActive }));
+  }, [foregroundActive]);
   useEffect(() => {
     if (!stillRunning) return;
     const timer = window.setTimeout(() => {
@@ -1391,12 +1474,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     });
   }, []);
 
-  // Auto-dequeue: triggered by process_exit via flag increment
+  // Auto-dequeue requests come from terminal/process_exit reconciliation and
+  // from the foreground -> retained-background handoff below.
   const [autoDequeueFlag, setAutoDequeueFlag] = useState(0);
-  const sendingRef = useRef(false);
-  sendingRef.current = sending;
-  const backgroundActiveRef = useRef(false);
-  backgroundActiveRef.current = backgroundActive;
+  const foregroundActiveRef = useRef(false);
+  foregroundActiveRef.current = foregroundActive;
   const handleSendRef = useRef<(
     text: string,
     uploadResults?: UploadResult[],
@@ -1406,21 +1488,19 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
   useEffect(() => {
     if (autoDequeueFlag === 0) return;
-    // Delay to let React flush setSending(false) from status_change/process_exit
-    // before we check sendingRef. Without this, PTY mode (no process_exit)
+    // Delay to let React flush the foreground state from status_change/process_exit
+    // before checking the shared predicate. Without this, PTY mode
     // triggers autoDequeue in the same cycle as setSending(false) and the
-    // ref still reads true → skips the queued message.
+    // ref still reads true and skips the queued message.
     const timer = setTimeout(() => {
-      if (
-        sendingRef.current
-        || backgroundActiveRef.current
-        || ['in_progress', 'executing', 'waiting_capability'].includes(
-          effectiveStatusRef.current,
-        )
-      ) return;
+      if (foregroundActiveRef.current) return;
       const queue = messageQueueRef.current;
       if (queue.length > 0) {
         const next = queue[0];
+        // An acknowledgement was lost after this item may already have been
+        // accepted. Preserve ordering and require an explicit human edit/send
+        // instead of ever replaying it from a later terminal transition.
+        if (next.requiresConfirmation) return;
         setMessageQueue(prev => prev.slice(1));
         setTimeout(
           () => handleSendRef.current(
@@ -1435,6 +1515,28 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }, 200);
     return () => clearTimeout(timer);
   }, [autoDequeueFlag]);
+
+  // Codex deliberately keeps its Task adapter executing while native
+  // descendants remain, so neither a terminal status nor process_exit is
+  // guaranteed at the root-turn handoff. Attempt one dequeue when this exact
+  // Task turn first becomes background-only. Mark the epoch attempted even
+  // when the queue is empty so an injection failure that requeues the item
+  // cannot create an automatic retry loop in the same retained tail.
+  const backgroundOnlyEpoch = backgroundOnly
+    ? `${activeTaskTurnRef.current.taskId}:${activeTaskTurnRef.current.retryCount}:${activeTaskTurnRef.current.turnGeneration}`
+    : null;
+  const attemptedBackgroundOnlyEpochRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (backgroundOnlyEpoch === null) {
+      attemptedBackgroundOnlyEpochRef.current = null;
+      return;
+    }
+    if (attemptedBackgroundOnlyEpochRef.current === backgroundOnlyEpoch) return;
+    attemptedBackgroundOnlyEpochRef.current = backgroundOnlyEpoch;
+    if (messageQueueRef.current.length > 0) {
+      setAutoDequeueFlag((flag) => flag + 1);
+    }
+  }, [backgroundOnlyEpoch]);
 
   useEffect(() => {
     const prev = document.title;
@@ -1453,6 +1555,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (comparison > 0) {
       clearLiveStreamCache(current.taskId, current);
       activeTaskTurnRef.current = incoming;
+      setSuppressedCompletedLifecycleTurn(null);
       setTerminalReconciliationPending(false);
     }
     return comparison;
@@ -1576,6 +1679,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           ? msg.data.background_last_activity_at
           : null,
       };
+      if (lifecycle.state === 'running') {
+        // This record is emitted only after the root Codex turn has reached
+        // its native terminal boundary and CCM is retaining descendants/Goal
+        // work. The adapter remains `executing`, so clear the foreground UI
+        // explicitly instead of waiting for a process_exit that may not occur.
+        setSending(false);
+        setStillRunning(false);
+      }
       const persistedId = Number(msg.data.id);
       const entry: ChatMessage = {
         id: Number.isFinite(persistedId) && persistedId > 0
@@ -1819,13 +1930,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         // old exit may refresh history, but it must not stop the new spinner
         // or dequeue another prompt into that active native session.
         if (!sameTaskTurn(exitIdentity, activeTaskTurnRef.current)) return;
-        // A foreground process_exit is not terminal while an exact native
-        // background epoch is still active. Its false marker will drive the
-        // normal terminal effect after the final autonomous output arrives.
-        if (backgroundActiveRef.current) {
-          refreshHistoryRef.current();
-          return;
-        }
         // A process exit can arrive without its preceding terminal status
         // event (for example during a WebSocket gap). Re-read the authoritative
         // Task before clearing the exact generation, rather than leaving a
@@ -2314,14 +2418,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // Also trigger auto-dequeue so pending box messages get sent.
   useEffect(() => {
     if (
-      !backgroundActive
-      && ['completed', 'failed', 'cancelled', 'conflict', 'pending'].includes(effectiveStatus)
+      ['completed', 'failed', 'cancelled', 'conflict', 'pending'].includes(effectiveStatus)
     ) {
       clearLiveStreamCache(task.id);
       setSending(false);
       setAutoDequeueFlag(f => f + 1);
     }
-  }, [backgroundActive, effectiveStatus, task.id]);
+  }, [effectiveStatus, task.id]);
 
   // Load chat history
   useEffect(() => {
@@ -2578,14 +2681,83 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
     // 注入模式：文本和已上传附件直达当前 turn，不新开 turn、不排队。
     if (injectMode && canInjectNow && !fromQueue) {
-      if (!isProcessing) {
+      if (!foregroundActive && !backgroundActive) {
         setError('注入仅在 turn 正在运行时可用；空闲时请关闭注入模式发送普通消息。');
         return;
+      }
+      if (backgroundActive) {
+        setSuppressedCompletedLifecycleTurn({
+          ...activeTaskTurnRef.current,
+          suppressedAt: Date.now(),
+        });
       }
       await handleInject(
         text,
         uploadedResultsForTurn,
       );
+      return;
+    }
+
+    // Once the visible root turn has handed ownership to a retained native
+    // child/session, a regular follow-up is a new provider input on that same
+    // hot session. Route it through the exact injection protocol so it does
+    // not sit behind the background marker in the dispatcher queue.
+    if (backgroundActive && canInjectBackgroundFollowup) {
+      // The exact injection protocol has no Plan application fields. Preserve
+      // those messages as ordinary next-turn work instead of silently dropping
+      // their selected Plan/Version metadata.
+      if (planIdsForTurn.length > 0 || planVersionIdsForTurn.length > 0) {
+        if (fromQueue) {
+          setMessageQueue((previous) => [{
+            text,
+            uploadResults: preUploadedResults,
+            planTaskIds: preSelectedPlanIds,
+            planVersionIds: preSelectedPlanVersionIds,
+          }, ...previous]);
+        } else {
+          addToQueue(
+            text,
+            uploadedResultsForTurn.length > 0 ? uploadedResultsForTurn : undefined,
+            planIdsForTurn.length > 0 ? [...planIdsForTurn] : undefined,
+            planVersionIdsForTurn.length > 0 ? [...planVersionIdsForTurn] : undefined,
+          );
+          setInput('');
+          fileUpload.clear();
+          consumeForkSeedUploads();
+          setError('后台仍在运行；关联 Plan 的消息已保留在队列中，将在普通 next turn 发送。');
+        }
+        return;
+      }
+      setSuppressedCompletedLifecycleTurn({
+        ...activeTaskTurnRef.current,
+        suppressedAt: Date.now(),
+      });
+      const outcome = await handleInject(
+        text,
+        uploadedResultsForTurn,
+        fromQueue === true,
+      );
+      if (outcome !== 'injected' && fromQueue && (text || preUploadedResults?.length)) {
+        setMessageQueue((previous) => [{
+          text,
+          uploadResults: preUploadedResults,
+          planTaskIds: preSelectedPlanIds,
+          planVersionIds: preSelectedPlanVersionIds,
+          requiresConfirmation: outcome === 'uncertain',
+        }, ...previous]);
+      }
+      return;
+    }
+
+    // A retained tail cannot safely accept a queued message through /chat.
+    // Keep it queued until the exact injection transport becomes available.
+    if (backgroundActive && fromQueue) {
+      setMessageQueue((previous) => [{
+        text,
+        uploadResults: preUploadedResults,
+        planTaskIds: preSelectedPlanIds,
+        planVersionIds: preSelectedPlanVersionIds,
+      }, ...previous]);
       return;
     }
 
@@ -2633,7 +2805,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
 
     // If currently sending and not from auto-dequeue, add to queue (with already-uploaded results)
-    if (isProcessing && !fromQueue) {
+    if (foregroundActive && !fromQueue) {
       if (text || sendableAttachmentCount > 0) {
         addToQueue(
           text,
@@ -2651,6 +2823,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (!fromQueue) {
       setInput('');
     }
+    setSuppressedCompletedLifecycleTurn({
+      ...activeTaskTurnRef.current,
+      suppressedAt: Date.now(),
+    });
     setSending(true);
     setError(null);
 
@@ -3091,7 +3267,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             >
               <Star size={18} fill={starred ? 'currentColor' : 'none'} />
             </button>}
-            {hasControlAccess && !deliveryReadOnly && (isProcessing || stillRunning) && (
+            {hasControlAccess && !deliveryReadOnly && (hasActiveWork || stillRunning) && (
               <button
                 onClick={async () => {
                   setInterrupting(true);
@@ -3608,7 +3784,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             />
           )
         )}
-        {isProcessing && backgroundLifecycle && (() => {
+        {backgroundActive && backgroundLifecycle && (() => {
           if (backgroundLifecycle.state === 'completed') {
             return (
               <div className="mx-3 flex items-center gap-2 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300">
@@ -3648,7 +3824,13 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             </div>
           );
         })()}
-        {isProcessing && !backgroundLifecycle && (
+        {backgroundActive && !backgroundLifecycle && (
+          <div className="mx-3 flex items-center gap-2 rounded-lg border border-sky-500/25 bg-sky-500/10 px-3 py-2 text-sm text-sky-300">
+            <Loader2 size={14} className="animate-spin" />
+            <span>{foregroundActive ? '后台子 Agent 仍在运行' : '主回复已完成，后台仍在运行'}</span>
+          </div>
+        )}
+        {foregroundActive && (
           <div className="flex gap-2 items-start text-gray-500 text-sm px-3">
             <Loader2 size={14} className="animate-spin" />
             {showFrontendReviewGoal ? (
@@ -3713,6 +3895,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 <div key={idx} className="flex items-center gap-1.5 group/q">
                   <span className="text-[10px] text-gray-600 w-4 text-right shrink-0">{idx + 1}</span>
                   <div className="flex-1 min-w-0 bg-gray-800/60 rounded px-2.5 py-1 text-xs text-gray-300 truncate flex items-center gap-1.5">
+                    {item.requiresConfirmation && (
+                      <span
+                        className="inline-flex shrink-0 items-center gap-0.5 text-red-300"
+                        title="上次发送结果不确定；此消息不会自动重试，请先核对聊天记录后手动编辑发送"
+                      >
+                        <AlertCircle size={10} />
+                        <span className="text-[10px]">需确认</span>
+                      </span>
+                    )}
                     {item.planTaskIds && item.planTaskIds.length > 0 && (
                       <span
                         className="inline-flex shrink-0 items-center gap-0.5 text-indigo-300"
@@ -4027,7 +4218,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               </button>
             )}
             {hasControlAccess && task.provider === 'codex' && hasTaskSession && task.worker_id == null && task.shared_from_id == null && (
-              <ForkButton onClick={openFork} disabled={isProcessing} />
+              <ForkButton onClick={openFork} disabled={hasActiveWork} />
             )}
             {/* Message navigation — always visible, right-aligned */}
             <div className="ml-auto flex items-center gap-0.5">
@@ -4087,7 +4278,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                       ? '描述这次要循环审查的页面、URL、流程或前端改动...'
                     : workspaceReviewComposerMode
                       ? '描述要验证的功能、页面和关键流程；无需提供 URL...'
-                    : isProcessing
+                    : foregroundActive
                       ? 'Type next message to queue...'
                       : 'Type a follow-up message...'
               }
@@ -4098,22 +4289,22 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             />
             <button
               onClick={() => handleSend()}
-              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim()) || (!hasTaskSession && !task.shared_from_id) || (frontendReviewComposerMode && !canStartFrontendReviewGoal) || (workspaceReviewComposerMode && !canStartWorkspaceReview) || (injectMode && canInjectNow && !isProcessing) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
+              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim()) || (!hasTaskSession && !task.shared_from_id) || (frontendReviewComposerMode && !canStartFrontendReviewGoal) || (workspaceReviewComposerMode && !canStartWorkspaceReview) || (injectMode && canInjectNow && !foregroundActive && !backgroundActive) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
               title={fileUpload.hasFailed
                 ? 'Retry or remove failed attachments before sending'
                 : injectMode && canInjectNow
-                ? (isProcessing ? '注入到运行中的 turn (Ctrl+Enter)' : '注入模式：仅在 turn 运行中可用，空闲时请关闭注入模式')
+                ? (foregroundActive || backgroundActive ? '注入到运行中的 Session (Ctrl+Enter)' : '注入模式：仅在 turn 运行中可用，空闲时请关闭注入模式')
                 : frontendReviewComposerMode ? '启动循环审查 (Ctrl+Enter)'
                 : workspaceReviewComposerMode ? '启动单次审查 (Ctrl+Enter)'
-                : isProcessing ? 'Add to queue (Ctrl+Enter)' : 'Send (Ctrl+Enter)'}
+                : foregroundActive ? 'Add to queue (Ctrl+Enter)' : 'Send (Ctrl+Enter)'}
               className={`p-2.5 text-white rounded-xl transition-colors disabled:opacity-40 disabled:cursor-not-allowed shadow-md ${
                 injectMode && canInjectNow ? 'bg-teal-600 hover:bg-teal-700 shadow-teal-600/20'
                 : frontendReviewComposerMode ? 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
                 : workspaceReviewComposerMode ? 'bg-cyan-600 hover:bg-cyan-500 shadow-cyan-600/25'
-                : isProcessing ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
+                : foregroundActive ? 'bg-amber-600 hover:bg-amber-700 shadow-amber-600/20' : 'bg-indigo-600 hover:bg-indigo-500 shadow-indigo-600/25'
               }`}
             >
-              {injectMode && canInjectNow ? <Syringe size={18} /> : frontendReviewComposerMode ? <RefreshCw size={18} /> : workspaceReviewComposerMode ? <Eye size={18} /> : isProcessing ? <ListPlus size={18} /> : <Send size={18} />}
+              {injectMode && canInjectNow ? <Syringe size={18} /> : frontendReviewComposerMode ? <RefreshCw size={18} /> : workspaceReviewComposerMode ? <Eye size={18} /> : foregroundActive ? <ListPlus size={18} /> : <Send size={18} />}
             </button>
           </div>
           </div>
@@ -4123,7 +4314,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         </div>
         {hasControlAccess && <BrowserReviewPanel
           taskId={task.id}
-          taskActive={isProcessing}
+          taskActive={hasActiveWork}
           taskProvider={task.provider}
           taskModel={task.model}
           taskEffort={task.effort_level}

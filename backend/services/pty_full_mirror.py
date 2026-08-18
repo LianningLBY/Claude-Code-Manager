@@ -307,6 +307,7 @@ class FullMirrorCCMBackend(CCMBackend):
         """Forward a foreground event with its immutable PTY turn identity."""
 
         await self._im.wait_for_pty_launch_metadata(key)
+        background_followup = bool(context.get("background_followup"))
         consumer = asyncio.current_task()
         record = getattr(
             consumer, "_ccm_output_consumer_record", None
@@ -349,7 +350,11 @@ class FullMirrorCCMBackend(CCMBackend):
         fatal_provider_error = self._im._fatal_provider_error_for_event(
             event_dict
         )
-        if fatal_provider_error and record is not None:
+        if (
+            fatal_provider_error
+            and record is not None
+            and not background_followup
+        ):
             if getattr(record, "fatal_provider_error", None) is None:
                 object.__setattr__(
                     record,
@@ -377,6 +382,7 @@ class FullMirrorCCMBackend(CCMBackend):
                     not hard_limit
                     or event_dict.get("orphan")
                     or event_dict.get("autonomous")
+                    or background_followup
                 ):
                     # Keep the compatibility clear for older claude-pty
                     # sessions that latched every structured quota event, and
@@ -398,6 +404,17 @@ class FullMirrorCCMBackend(CCMBackend):
                 event_dict,
                 context.get("loop_iteration"),
                 consumer_record=record,
+                background_followup=background_followup,
+                expected_session_id=context.get("expected_session_id"),
+                expected_background_generation=context.get(
+                    "expected_background_generation"
+                ),
+                expected_task_retry_count=context.get(
+                    "expected_task_retry_count"
+                ),
+                expected_task_turn_generation=context.get(
+                    "expected_task_turn_generation"
+                ),
             )
         except Exception:
             logger.exception(

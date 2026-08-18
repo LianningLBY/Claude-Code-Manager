@@ -1805,6 +1805,229 @@ async def test_inject_pty_message_rejects_same_slot_replacement_proof(
 
 
 @pytest.mark.asyncio
+async def test_retained_pty_followup_replacement_persists_uncertain_boundary(
+    db_factory,
+):
+    """A replacement cannot turn dropped retained output into completed."""
+
+    (
+        manager,
+        backend,
+        old_consumer,
+        proof,
+        state,
+        instance_id,
+        task_id,
+    ) = await _proof_only_pty_followup_manager(
+        db_factory,
+        session_id="claude-session-proof-pump-replacement",
+    )
+    prompt_started = asyncio.Event()
+    release_output = asyncio.Event()
+
+    class Event:
+        def to_dict(self):
+            return {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "must be rejected with the old proof",
+            }
+
+    async def send_prompt(_text: str):
+        prompt_started.set()
+        await release_output.wait()
+        yield Event()
+
+    proof.session.send_prompt = send_prompt
+    replacement_consumer = asyncio.create_task(asyncio.Event().wait())
+    replacement_session = types.SimpleNamespace(
+        session_id=proof.session_id,
+        is_alive=True,
+        active_turn_process=None,
+    )
+    replacement_proxy = types.SimpleNamespace(
+        session=replacement_session,
+        pid=81235,
+        returncode=None,
+    )
+    try:
+        assert await manager.inject_pty_message(
+            proof.session_id,
+            "continue until replacement",
+            task_id=task_id,
+            task_retry_count=state.task_retry_count,
+            task_turn_generation=state.task_turn_generation,
+            expected_instance_id=instance_id,
+            followup_operation_id="proof-replacement-followup",
+        ) is True
+        await asyncio.wait_for(prompt_started.wait(), timeout=1)
+        followups = tuple(manager._pty_followup_tasks.get(instance_id, ()))
+        assert len(followups) == 1
+
+        backend._sessions[instance_id] = replacement_session
+        backend._consumers[instance_id] = replacement_consumer
+        backend._proxies[instance_id] = replacement_proxy
+        manager.processes[instance_id] = replacement_proxy
+        manager._track_output_consumer(
+            instance_id,
+            replacement_proxy,
+            replacement_consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=state.task_retry_count,
+            task_turn_generation=state.task_turn_generation + 1,
+            instance_started_at=proof.record.instance_started_at
+            + timedelta(seconds=1),
+        )
+        assert (task_id, proof.session_id) not in (
+            manager._pty_post_exit_generations
+        )
+
+        release_output.set()
+        await asyncio.wait_for(
+            asyncio.gather(*followups, return_exceptions=False),
+            timeout=1,
+        )
+
+        async with db_factory() as db:
+            result = await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type
+                    == "pty_background_followup_boundary",
+                )
+            )
+            boundaries = result.scalars().all()
+        assert len(boundaries) == 1
+        payload = json.loads(boundaries[0].raw_json)
+        assert payload["followup_operation_id"] == (
+            "proof-replacement-followup"
+        )
+        assert payload["state"] == "uncertain"
+        assert boundaries[0].is_error is True
+        backend.on_event.assert_not_awaited()
+    finally:
+        release_output.set()
+        await manager._cancel_pty_followup_tasks({instance_id})
+        manager._discard_pty_background_state(
+            (task_id, proof.session_id),
+            state.generation,
+        )
+        for consumer in (old_consumer, replacement_consumer):
+            consumer.cancel()
+        await asyncio.gather(
+            old_consumer,
+            replacement_consumer,
+            return_exceptions=True,
+        )
+
+
+@pytest.mark.asyncio
+async def test_chat_post_exit_proof_pending_probe_has_hard_ttl(
+    db_factory,
+    monkeypatch,
+):
+    """A wedged native pending probe cannot retain an ownerless proof forever."""
+
+    import backend.services.instance_manager as instance_manager_module
+
+    (
+        manager,
+        _backend,
+        consumer,
+        proof,
+        state,
+        _instance_id,
+        task_id,
+    ) = await _proof_only_pty_followup_manager(
+        db_factory,
+        session_id="claude-session-proof-hard-ttl",
+    )
+    key = (task_id, proof.session_id)
+    try:
+        for watcher in (state.watcher, proof.watcher):
+            if watcher is not None and not watcher.done():
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
+        manager._pty_background_states.pop(key, None)
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.pty_background_generation = None
+            await db.commit()
+
+        monkeypatch.setattr(
+            instance_manager_module,
+            "PTY_POST_EXIT_CHAT_GRACE_SECONDS",
+            0.0,
+        )
+        monkeypatch.setattr(
+            instance_manager_module,
+            "PTY_POST_EXIT_CHAT_HARD_TTL_SECONDS",
+            0.08,
+        )
+        pending = AsyncMock(return_value=True)
+        manager.pty_background_activity_pending = pending
+        proof.created_monotonic = time.monotonic()
+        proof.watcher = asyncio.create_task(
+            manager._watch_pty_post_exit_generation(proof)
+        )
+
+        await asyncio.wait_for(proof.watcher, timeout=1)
+        assert pending.await_count >= 1
+        assert key not in manager._pty_post_exit_generations
+    finally:
+        manager._pty_post_exit_generations.pop(key, None)
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_chat_post_exit_proof_active_state_has_hard_ttl(
+    db_factory,
+    monkeypatch,
+):
+    """An indexed background state cannot lease a chat proof forever."""
+
+    import backend.services.instance_manager as instance_manager_module
+
+    (
+        manager,
+        _backend,
+        consumer,
+        proof,
+        state,
+        _instance_id,
+        task_id,
+    ) = await _proof_only_pty_followup_manager(
+        db_factory,
+        session_id="claude-session-proof-state-hard-ttl",
+    )
+    key = (task_id, proof.session_id)
+    try:
+        if proof.watcher is not None and not proof.watcher.done():
+            proof.watcher.cancel()
+            await asyncio.gather(proof.watcher, return_exceptions=True)
+        monkeypatch.setattr(
+            instance_manager_module,
+            "PTY_POST_EXIT_CHAT_HARD_TTL_SECONDS",
+            0.08,
+        )
+        proof.created_monotonic = time.monotonic()
+        proof.watcher = asyncio.create_task(
+            manager._watch_pty_post_exit_generation(proof)
+        )
+
+        await asyncio.wait_for(proof.watcher, timeout=1)
+        assert key not in manager._pty_post_exit_generations
+        assert manager._pty_background_states.get(key) is state
+    finally:
+        manager._discard_pty_background_state(key, state.generation)
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_inject_pty_background_followup_slow_echo_is_admitted_once():
     """Local pump ownership, not active_turn_process/JSONL echo, is the receipt."""
 

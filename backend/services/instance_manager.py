@@ -190,6 +190,10 @@ TERMINAL_TASK_OPERATION_LOCK_POLL_SECONDS = 0.05
 PTY_BACKGROUND_POLL_SECONDS = 5.0
 PTY_BACKGROUND_MAX_SECONDS = 4 * 60 * 60
 PTY_POST_EXIT_CHAT_GRACE_SECONDS = 30.0
+# Keep the absolute chat-proof lease aligned with the maximum native
+# background-work lifetime.  The watcher still retires a proof much sooner
+# when the exact child/state has settled; this is only a final leak bound.
+PTY_POST_EXIT_CHAT_HARD_TTL_SECONDS = PTY_BACKGROUND_MAX_SECONDS
 _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS = (
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -771,6 +775,7 @@ class _PtyPostExitGeneration:
     process: Any
     record: _OutputConsumerRecord
     created_monotonic: float
+    invalidated: bool = False
     watcher: asyncio.Task | None = None
 
 
@@ -1379,6 +1384,7 @@ class InstanceManager:
         background_generation: str,
         followup_operation_id: str,
         state: str,
+        post_exit_proof: _PtyPostExitGeneration | None = None,
     ) -> bool:
         """Persist one retained-PTY follow-up receipt independently.
 
@@ -1392,25 +1398,46 @@ class InstanceManager:
 
         if state not in {"completed", "uncertain"} or not followup_operation_id:
             return False
+
+        def proof_is_current() -> bool:
+            if post_exit_proof is None:
+                return True
+            return bool(
+                not post_exit_proof.invalidated
+                and self._pty_post_exit_generation_is_current(
+                    post_exit_proof,
+                    instance_id=instance_id,
+                    task_id=task_id,
+                    session_id=session_id,
+                    task_retry_count=task_retry_count,
+                    task_turn_generation=task_turn_generation,
+                    background_generation=background_generation,
+                    require_background_state=True,
+                )
+            )
+
+        def encoded_boundary(boundary_state: str) -> str:
+            return json.dumps(
+                {
+                    "type": "pty.background_followup_boundary",
+                    "version": 1,
+                    "followup_operation_id": followup_operation_id,
+                    "state": boundary_state,
+                    "background_generation": background_generation,
+                },
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+
+        if state == "completed" and not proof_is_current():
+            state = "uncertain"
         lock_key = (task_id, followup_operation_id)
         lock = self._pty_followup_boundary_locks.setdefault(
             lock_key,
             asyncio.Lock(),
         )
         async with lock:
-            payload = {
-                "type": "pty.background_followup_boundary",
-                "version": 1,
-                "followup_operation_id": followup_operation_id,
-                "state": state,
-                "background_generation": background_generation,
-            }
-            raw_json = json.dumps(
-                payload,
-                ensure_ascii=True,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
             for attempt in range(2):
                 try:
                     entry_id: int | None = None
@@ -1457,6 +1484,12 @@ class InstanceManager:
                                 existing = candidate
                                 break
                         if existing is None:
+                            effective_state = state
+                            if (
+                                effective_state == "completed"
+                                and not proof_is_current()
+                            ):
+                                effective_state = "uncertain"
                             now = datetime.utcnow()
                             entry = LogEntry(
                                 instance_id=instance_id,
@@ -1469,12 +1502,21 @@ class InstanceManager:
                                 ),
                                 role="system",
                                 content=None,
-                                raw_json=raw_json,
-                                is_error=state == "uncertain",
+                                raw_json=encoded_boundary(effective_state),
+                                is_error=effective_state == "uncertain",
                                 timestamp=now,
                             )
                             db.add(entry)
                             await db.flush()
+                            if (
+                                effective_state == "completed"
+                                and not proof_is_current()
+                            ):
+                                effective_state = "uncertain"
+                                entry.raw_json = encoded_boundary(
+                                    effective_state
+                                )
+                                entry.is_error = True
                             entry_id = entry.id
                             entry_timestamp = now
                             await db.commit()
@@ -1493,6 +1535,34 @@ class InstanceManager:
                                 == "completed"
                             ):
                                 effective_state = "completed"
+
+                    # Invalidation can land while the database commit yields.
+                    # Repair that just-written row before any live publication;
+                    # a replacement must never expose dropped output as complete.
+                    if (
+                        entry_id is not None
+                        and effective_state == "completed"
+                        and not proof_is_current()
+                    ):
+                        async with self.db_factory() as repair_db:
+                            if not await _fence_worker_runtime_mutation(
+                                repair_db,
+                                producer="PTY follow-up boundary repair",
+                            ):
+                                return False
+                            repaired = await repair_db.execute(
+                                update(LogEntry)
+                                .where(LogEntry.id == entry_id)
+                                .values(
+                                    raw_json=encoded_boundary("uncertain"),
+                                    is_error=True,
+                                )
+                            )
+                            if not repaired.rowcount:
+                                await repair_db.rollback()
+                                return False
+                            await repair_db.commit()
+                        effective_state = "uncertain"
 
                     if entry_id is None:
                         return False
@@ -1605,6 +1675,148 @@ class InstanceManager:
             state=state,
         )
 
+    def _pty_followup_proof_is_current(
+        self,
+        key: int,
+        session: Any,
+        record: _OutputConsumerRecord,
+        background_state: _PtyBackgroundState,
+        post_exit_proof: _PtyPostExitGeneration | None,
+    ) -> bool:
+        """Whether a retained follow-up still owns its exact output epoch."""
+
+        task_id = record.task_id
+        session_id = background_state.session_id
+        if task_id is None:
+            return False
+        state_key = (task_id, session_id)
+        if (
+            self._pty_background_states.get(state_key) is not background_state
+            or not getattr(background_state, "accepting_events", True)
+            or getattr(session, "session_id", None) != session_id
+            or getattr(session, "is_alive", True) is False
+            or key in self._stopping
+            or key in self._launch_reservations
+        ):
+            return False
+        if post_exit_proof is None:
+            return bool(
+                self._consumer_records.get(key) is record
+                and self._tasks.get(key) is record.task
+                and self.processes.get(key) is record.process
+                and getattr(record.process, "session", None) is session
+            )
+        return bool(
+            not post_exit_proof.invalidated
+            and post_exit_proof.instance_id == key
+            and post_exit_proof.session is session
+            and post_exit_proof.record is record
+            and self._pty_post_exit_generation_is_current(
+                post_exit_proof,
+                instance_id=key,
+                task_id=task_id,
+                session_id=session_id,
+                task_retry_count=background_state.task_retry_count,
+                task_turn_generation=background_state.task_turn_generation,
+                background_generation=background_state.generation,
+                require_background_state=True,
+            )
+        )
+
+    async def _settle_pty_followup_boundary(
+        self,
+        key: int,
+        backend: Any,
+        session: Any,
+        record: _OutputConsumerRecord,
+        background_state: _PtyBackgroundState,
+        post_exit_proof: _PtyPostExitGeneration | None,
+        launch_params: dict[str, Any],
+        followup_operation_id: str,
+        *,
+        stream_completed: bool,
+        ownership_lost: bool,
+        cancelled: bool,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Publish one receipt with the captured proof as a downgrade fence."""
+
+        ownership_current = self._pty_followup_proof_is_current(
+            key,
+            session,
+            record,
+            background_state,
+            post_exit_proof,
+        )
+        boundary_state = (
+            "completed"
+            if (
+                stream_completed
+                and not ownership_lost
+                and not cancelled
+                and ownership_current
+            )
+            else "uncertain"
+        )
+        boundary_payload = {
+            "type": "pty.background_followup_boundary",
+            "version": 1,
+            "followup_operation_id": followup_operation_id,
+            "state": boundary_state,
+            "background_generation": background_state.generation,
+        }
+        boundary_event = {
+            "event_type": "pty_background_followup_boundary",
+            "role": "system",
+            "content": None,
+            "raw_json": json.dumps(
+                boundary_payload,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            "is_error": boundary_state == "uncertain",
+            "followup_operation_id": followup_operation_id,
+            "pty_followup_state": boundary_state,
+            "state": boundary_state,
+            "pty_background_generation": background_state.generation,
+            "task_id": record.task_id,
+            "task_retry_count": background_state.task_retry_count,
+            "task_turn_generation": background_state.task_turn_generation,
+            # FullMirrorCCMBackend handles this synthetic event with the
+            # strict receipt writer; ordinary output callbacks retain their
+            # historical error-swallowing behavior.
+            "pty_followup_boundary": True,
+        }
+        if post_exit_proof is not None:
+            boundary_ok = await self.persist_pty_followup_boundary(
+                instance_id=key,
+                task_id=record.task_id,
+                task_retry_count=background_state.task_retry_count,
+                task_turn_generation=background_state.task_turn_generation,
+                session_id=background_state.session_id,
+                background_generation=background_state.generation,
+                followup_operation_id=followup_operation_id,
+                state=boundary_state,
+                post_exit_proof=post_exit_proof,
+            )
+        else:
+            boundary_ok = await self._publish_pty_followup_boundary(
+                backend,
+                key,
+                boundary_event,
+                launch_params,
+                task_id=record.task_id,
+                task_retry_count=background_state.task_retry_count,
+                task_turn_generation=(
+                    background_state.task_turn_generation
+                ),
+                session_id=background_state.session_id,
+                background_generation=background_state.generation,
+                followup_operation_id=followup_operation_id,
+                state=boundary_state,
+            )
+        return boundary_ok, boundary_event
+
     async def _run_pty_followup_prompt(
         self,
         key: int,
@@ -1613,6 +1825,7 @@ class InstanceManager:
         content: str,
         record: _OutputConsumerRecord,
         background_state: _PtyBackgroundState,
+        post_exit_proof: _PtyPostExitGeneration | None,
         admission: asyncio.Future[bool],
         followup_operation_id: str,
     ) -> None:
@@ -1627,6 +1840,7 @@ class InstanceManager:
         delayed_cancellation: asyncio.CancelledError | None = None
         admitted_locally = False
         stream_completed = False
+        ownership_lost = False
         try:
             if backend is None:
                 admission.set_result(False)
@@ -1647,6 +1861,15 @@ class InstanceManager:
                     background_state.task_turn_generation
                 ),
             )
+            if not self._pty_followup_proof_is_current(
+                key,
+                session,
+                record,
+                background_state,
+                post_exit_proof,
+            ):
+                admission.set_result(False)
+                return
             stream = session.send_prompt(content)
             first_event = asyncio.create_task(
                 anext(stream),
@@ -1671,18 +1894,54 @@ class InstanceManager:
             if not admission.done():
                 admitted_locally = True
                 admission.set_result(True)
-            await backend.on_event(
+            if not self._pty_followup_proof_is_current(
                 key,
-                event.to_dict(),
-                **launch_params,
-            )
-            async for event in stream:
+                session,
+                record,
+                background_state,
+                post_exit_proof,
+            ):
+                ownership_lost = True
+            if not ownership_lost:
                 await backend.on_event(
                     key,
                     event.to_dict(),
                     **launch_params,
                 )
-            stream_completed = True
+                if not self._pty_followup_proof_is_current(
+                    key,
+                    session,
+                    record,
+                    background_state,
+                    post_exit_proof,
+                ):
+                    ownership_lost = True
+            if not ownership_lost:
+                async for event in stream:
+                    if not self._pty_followup_proof_is_current(
+                        key,
+                        session,
+                        record,
+                        background_state,
+                        post_exit_proof,
+                    ):
+                        ownership_lost = True
+                        break
+                    await backend.on_event(
+                        key,
+                        event.to_dict(),
+                        **launch_params,
+                    )
+                    if not self._pty_followup_proof_is_current(
+                        key,
+                        session,
+                        record,
+                        background_state,
+                        post_exit_proof,
+                    ):
+                        ownership_lost = True
+                        break
+                stream_completed = not ownership_lost
         except asyncio.CancelledError as exc:
             delayed_cancellation = exc
             if not admission.done():
@@ -1732,58 +1991,19 @@ class InstanceManager:
             # receipt. A cancellation after admission is explicitly uncertain
             # rather than an invisible side effect that can strand the UI.
             if admitted_locally:
-                boundary_state = (
-                    "completed"
-                    if stream_completed and delayed_cancellation is None
-                    else "uncertain"
-                )
-                boundary_payload = {
-                    "type": "pty.background_followup_boundary",
-                    "version": 1,
-                    "followup_operation_id": followup_operation_id,
-                    "state": boundary_state,
-                    "background_generation": background_state.generation,
-                }
-                boundary_event = {
-                    "event_type": "pty_background_followup_boundary",
-                    "role": "system",
-                    "content": None,
-                    "raw_json": json.dumps(
-                        boundary_payload,
-                        ensure_ascii=True,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    ),
-                    "is_error": boundary_state == "uncertain",
-                    "followup_operation_id": followup_operation_id,
-                    "pty_followup_state": boundary_state,
-                    "state": boundary_state,
-                    "pty_background_generation": background_state.generation,
-                    "task_id": record.task_id,
-                    "task_retry_count": background_state.task_retry_count,
-                    "task_turn_generation": (
-                        background_state.task_turn_generation
-                    ),
-                    # FullMirrorCCMBackend handles this synthetic event with
-                    # the strict receipt writer; ordinary output callbacks
-                    # retain their historical error-swallowing behavior.
-                    "pty_followup_boundary": True,
-                }
                 boundary_task = asyncio.create_task(
-                    self._publish_pty_followup_boundary(
-                        backend,
+                    self._settle_pty_followup_boundary(
                         key,
-                        boundary_event,
+                        backend,
+                        session,
+                        record,
+                        background_state,
+                        post_exit_proof,
                         launch_params,
-                        task_id=record.task_id,
-                        task_retry_count=background_state.task_retry_count,
-                        task_turn_generation=(
-                            background_state.task_turn_generation
-                        ),
-                        session_id=background_state.session_id,
-                        background_generation=background_state.generation,
-                        followup_operation_id=followup_operation_id,
-                        state=boundary_state,
+                        followup_operation_id,
+                        stream_completed=stream_completed,
+                        ownership_lost=ownership_lost,
+                        cancelled=delayed_cancellation is not None,
                     ),
                     name=f"pty-followup-boundary-{key}",
                 )
@@ -1800,8 +2020,9 @@ class InstanceManager:
                     boundary_task
                 )
                 boundary_ok = False
+                boundary_event: dict[str, Any] = {}
                 try:
-                    boundary_ok = bool(boundary_task.result())
+                    boundary_ok, boundary_event = boundary_task.result()
                 except asyncio.CancelledError as exc:
                     if delayed_cancellation is None:
                         delayed_cancellation = exc
@@ -1826,6 +2047,7 @@ class InstanceManager:
                     }
                     volatile_boundary["pty_followup_state"] = "uncertain"
                     volatile_boundary["state"] = "uncertain"
+                    volatile_boundary["is_error"] = True
                     fallback_task = asyncio.create_task(
                         self.broadcaster.broadcast(
                             f"task:{record.task_id}",
@@ -1856,7 +2078,14 @@ class InstanceManager:
                     current,
                     background_state,
                 )
-        if delayed_cancellation is not None:
+        # A proof invalidation is an internal replacement/stop cancellation;
+        # its uncertainty has already been recorded and must not surface as a
+        # cancelled pump to the teardown waiter.  Preserve propagation of a
+        # cancellation delivered by the API/dispatcher caller itself.
+        proof_was_invalidated = bool(
+            post_exit_proof is not None and post_exit_proof.invalidated
+        )
+        if delayed_cancellation is not None and not proof_was_invalidated:
             raise delayed_cancellation
 
     async def _cancel_pty_followup_tasks(
@@ -2173,6 +2402,7 @@ class InstanceManager:
                                 content,
                                 followup_record,
                                 background_state,
+                                retained_proof,
                                 admission,
                                 resolved_followup_operation_id,
                             ),
@@ -2189,6 +2419,11 @@ class InstanceManager:
                         )
                         return False
                     setattr(followup, "_ccm_followup_finalized", False)
+                    setattr(
+                        followup,
+                        "_ccm_pty_post_exit_proof",
+                        retained_proof,
+                    )
 
                     def settle_followup(done: asyncio.Task) -> None:
                         # ``Task.cancel()`` can win before the coroutine's
@@ -8478,7 +8713,20 @@ class InstanceManager:
 
         if self._pty_post_exit_generations.get(key) is not proof:
             return False
+        proof.invalidated = True
         self._pty_post_exit_generations.pop(key, None)
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        for followup in tuple(self._pty_followup_tasks.get(proof.instance_id, ())):
+            if (
+                followup is not current_task
+                and not followup.done()
+                and getattr(followup, "_ccm_pty_post_exit_proof", None)
+                is proof
+            ):
+                followup.cancel()
         watcher = proof.watcher
         try:
             current = asyncio.current_task()
@@ -8550,6 +8798,17 @@ class InstanceManager:
                 # Let the dispatcher/Ralph waiter that was awakened by
                 # process.complete() reach its result CAS before polling.
                 await asyncio.sleep(poll_delay)
+                # The chat proof is a bounded handoff lease even while a
+                # background-state row or an exact-stop operation remains
+                # visible. A wedged stop/state watcher must not turn that
+                # lease into an unbounded owner of a reusable PTY slot.
+                if (
+                    proof.record.chat_initiated
+                    and time.monotonic() - proof.created_monotonic
+                    >= PTY_POST_EXIT_CHAT_HARD_TTL_SECONDS
+                ):
+                    self._discard_pty_post_exit_generation(key, proof)
+                    return
                 if proof.instance_id in self._stopping:
                     # A successful exact stop invalidates both proof and
                     # handoff after its Task+Instance CAS. Do not let this
@@ -8639,22 +8898,24 @@ class InstanceManager:
                     # A late native child may be registered just after the
                     # foreground terminal commit.  Keep the chat proof during
                     # a short handoff grace, and longer while durable/native
-                    # background work is demonstrably still running.
-                    within_grace = (
-                        time.monotonic() - proof.created_monotonic
-                        < PTY_POST_EXIT_CHAT_GRACE_SECONDS
-                    )
-                    pending_activity = within_grace
-                    if not pending_activity:
+                    # background work is demonstrably still running.  The
+                    # native/durable pending probe is not an unbounded lease:
+                    # if it wedges, retire the ownerless proof at the hard TTL.
+                    proof_age = time.monotonic() - proof.created_monotonic
+                    if proof_age < PTY_POST_EXIT_CHAT_HARD_TTL_SECONDS:
                         pending_activity = (
-                            await self.pty_background_activity_pending(
-                                proof.task_id,
-                                proof.session,
-                            )
+                            proof_age < PTY_POST_EXIT_CHAT_GRACE_SECONDS
                         )
-                    if pending_activity:
-                        poll_delay = min(1.0, poll_delay * 2)
-                        continue
+                        if not pending_activity:
+                            pending_activity = (
+                                await self.pty_background_activity_pending(
+                                    proof.task_id,
+                                    proof.session,
+                                )
+                            )
+                        if pending_activity:
+                            poll_delay = min(1.0, poll_delay * 2)
+                            continue
                 if not still_exact:
                     if any(
                         owner_proof is proof

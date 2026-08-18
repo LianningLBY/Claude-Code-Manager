@@ -8962,6 +8962,41 @@ async def test_goal_continuation_rebinds_while_descendant_is_finishing():
 
 
 @pytest.mark.asyncio
+async def test_goal_continuation_rearms_descendant_terminal_timer_for_new_turn():
+    """A Goal continuation cannot inherit a timer from the old turn."""
+
+    server = CodexAppServer("codex")
+    process = SimpleNamespace(returncode=None, feed=MagicMock())
+    context = _TurnContext(
+        thread_id="thread-goal-timer-fence",
+        process=process,
+        launch_started=0.0,
+        task_id=309,
+    )
+    server._contexts_by_thread[context.thread_id] = context
+    server._record_child_relation(context.thread_id, "thread-goal-child")
+    server._attach_descendant(context, "thread-goal-child", active=True)
+    context.pending_goal_terminal_notification = {
+        "threadId": context.thread_id,
+        "turn": {"id": "turn-goal-old", "status": "completed"},
+    }
+    server._record_thread_status("thread-goal-child", {"type": "idle"})
+    old_handle = context.descendant_terminal_debounce_handles[
+        "thread-goal-child"
+    ]
+
+    server._confirm_goal_continuation_started(context)
+
+    assert old_handle.cancelled()
+    new_handle = context.descendant_terminal_debounce_handles[
+        "thread-goal-child"
+    ]
+    assert new_handle is not old_handle
+    new_handle.cancel()
+    context.descendant_terminal_debounce_handles.clear()
+
+
+@pytest.mark.asyncio
 async def test_standard_resume_adopts_detached_active_goal_before_steering():
     """A pending chat recovers an already-detached Goal without a race window."""
 

@@ -4690,12 +4690,15 @@ class CodexAppServer:
     ) -> None:
         """Let a newer turn invalidate the older turn's Goal-state query."""
 
+        # Any descendant terminal timers belong to the previous root
+        # generation.  Cancel them for every Goal continuation shape, not only
+        # the path that also retained a regular deferred terminal.
+        self._cancel_all_descendant_terminal_debounces(context)
         if context.pending_goal_terminal_notification is not None:
             context.pending_goal_terminal_notification = None
             context.goal_terminal_generation += 1
         if context.deferred_terminal_notification is not None:
             context.deferred_terminal_notification = None
-            self._cancel_all_descendant_terminal_debounces(context)
             guard = context.descendant_guard_task
             context.descendant_guard_task = None
             if guard is not None and not guard.done():
@@ -4703,7 +4706,7 @@ class CodexAppServer:
             state_changed = context.descendant_state_changed
             if state_changed is not None:
                 state_changed.set()
-            self._rearm_pending_descendant_terminal_debounces(context)
+        self._rearm_pending_descendant_terminal_debounces(context)
         self._mark_following_native_goal(context)
         context.usage = None
         context.first_input_seen = False

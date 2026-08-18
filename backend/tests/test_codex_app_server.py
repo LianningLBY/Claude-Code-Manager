@@ -10622,14 +10622,27 @@ async def test_followup_preserves_native_turn_observed_before_start_response():
 
 
 @pytest.mark.asyncio
-async def test_followup_explicit_rejection_restores_retained_context():
+async def test_followup_explicit_rejection_restores_retained_context(
+    monkeypatch,
+):
     """A JSON-RPC rejection is safe to expose without losing old state."""
 
+    monkeypatch.setattr(
+        "backend.services.codex_app_server._DESCENDANT_TERMINAL_DEBOUNCE",
+        1.0,
+    )
     server, process, context, root_turn_id = await _retained_followup_context(
         thread_id="thread-rejected",
         child_thread_id="thread-child-rejected",
         task_id=181,
     )
+    server._record_thread_status(
+        "thread-child-rejected",
+        {"type": "idle"},
+    )
+    old_handle = context.descendant_terminal_debounce_handles[
+        "thread-child-rejected"
+    ]
     previous_client_id = context.client_user_message_id
     context.usage = {"input_tokens": 17}
     context.first_input_seen = True
@@ -10653,6 +10666,12 @@ async def test_followup_explicit_rejection_restores_retained_context():
     assert context.non_retry_error == "previous terminal detail"
     assert context.deferred_terminal_notification is not None
     assert server._contexts_by_turn[root_turn_id] is context
+    new_handle = context.descendant_terminal_debounce_handles[
+        "thread-child-rejected"
+    ]
+    assert old_handle.cancelled()
+    assert new_handle is not old_handle
+    assert not new_handle.cancelled()
     server.abandon_turn.assert_not_awaited()
 
     server._detach_turn_context(context)

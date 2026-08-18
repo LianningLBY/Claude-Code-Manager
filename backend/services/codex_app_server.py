@@ -9208,6 +9208,10 @@ class CodexAppServer:
                 )
             for attribute, value in previous_turn_state.items():
                 setattr(context, attribute, value)
+            # The admission was rejected before a new native turn existed.
+            # Restore the old root generation's pending child terminals after
+            # the entry fence canceled their relation-stabilization timers.
+            self._rearm_pending_descendant_terminal_debounces(context)
             logger.info(
                 "Codex follow-up turn explicitly rejected thread=%s reason=%s",
                 context.thread_id,

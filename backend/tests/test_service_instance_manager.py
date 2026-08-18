@@ -1431,6 +1431,379 @@ def _retained_pty_followup_manager(
     return manager, backend, consumer, background_state
 
 
+async def _proof_only_pty_followup_manager(
+    db_factory,
+    *,
+    instance_id_name: str = "proof-only-pty",
+    task_title: str = "proof-only-pty-task",
+    session_id: str = "claude-session-proof-only",
+    retry_count: int = 7,
+    turn_generation: int = 11,
+):
+    """Build a completed chat tail whose ordinary PTY maps are gone."""
+
+    started_at = datetime.utcnow()
+    pid = 81234
+    async with db_factory() as db:
+        instance = Instance(
+            name=instance_id_name,
+            status="running",
+            pid=pid,
+            provider="claude",
+            started_at=started_at,
+        )
+        task = Task(
+            title=task_title,
+            description=task_title,
+            status="executing",
+            retry_count=retry_count,
+            turn_generation=turn_generation,
+            session_id=session_id,
+            provider="claude",
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        await db.commit()
+        instance_id = instance.id
+        task_id = task.id
+
+    session = types.SimpleNamespace(
+        session_id=session_id,
+        is_alive=True,
+        active_turn_process=None,
+    )
+
+    class Proxy:
+        def __init__(self):
+            self.session = session
+            self.pid = pid
+            self.returncode = 0
+
+    proxy = Proxy()
+    consumer = asyncio.create_task(asyncio.Event().wait())
+    backend = types.SimpleNamespace(
+        _sessions={instance_id: session},
+        _consumers={instance_id: consumer},
+        _proxies={instance_id: proxy},
+        _launch_params={instance_id: {"task_id": task_id}},
+        on_event=AsyncMock(),
+    )
+    broadcaster = types.SimpleNamespace(broadcast=AsyncMock())
+    manager = InstanceManager(db_factory, broadcaster)
+    manager._pty_backend = backend
+    manager.processes[instance_id] = proxy
+    manager._tasks[instance_id] = consumer
+    record = manager._track_output_consumer(
+        instance_id,
+        proxy,
+        consumer,
+        chat_initiated=True,
+        provider="claude",
+        task_id=task_id,
+        task_retry_count=retry_count,
+        task_turn_generation=turn_generation,
+        instance_started_at=started_at,
+    )
+    manager._claim_pty_terminal_owner(record, "consumer")
+    proof = manager.retain_pty_post_exit_generation(
+        instance_id,
+        task_id,
+        session_id,
+        session,
+        record,
+    )
+    assert proof is not None
+
+    generation = "proof-only-background-generation"
+    state = manager.register_pty_background_generation(
+        task_id,
+        session_id,
+        generation,
+        session,
+        task_retry_count=retry_count,
+        task_turn_generation=turn_generation,
+    )
+    async with db_factory() as db:
+        task = await db.get(Task, task_id)
+        instance = await db.get(Instance, instance_id)
+        task.status = "completed"
+        task.completed_at = datetime.utcnow()
+        task.pty_background_generation = generation
+        instance.status = "idle"
+        instance.pid = None
+        instance.current_task_id = None
+        await db.commit()
+
+    # This is the production handoff: FullMirror has completed the proxy and
+    # released every reusable instance-keyed map, while the exact proof/state
+    # remain the only valid route to the retained Session.
+    manager._consumer_records.pop(instance_id, None)
+    manager._tasks.pop(instance_id, None)
+    manager.processes.pop(instance_id, None)
+    backend._sessions.pop(instance_id, None)
+    backend._consumers.pop(instance_id, None)
+    backend._proxies.pop(instance_id, None)
+    return (
+        manager,
+        backend,
+        consumer,
+        proof,
+        state,
+        instance_id,
+        task_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_inject_pty_message_uses_chat_post_exit_proof_after_maps_clear(
+    db_factory,
+):
+    """A retained chat tail remains injectable after FullMirror map cleanup."""
+
+    (
+        manager,
+        backend,
+        consumer,
+        proof,
+        state,
+        instance_id,
+        task_id,
+    ) = await _proof_only_pty_followup_manager(db_factory)
+    sent: list[str] = []
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Event:
+        def to_dict(self):
+            return {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "proof-backed follow-up",
+            }
+
+    async def send_prompt(text: str):
+        sent.append(text)
+        started.set()
+        await release.wait()
+        yield Event()
+
+    manager._pty_post_exit_generations[(task_id, proof.session_id)] = proof
+    proof.session.send_prompt = send_prompt
+    try:
+        assert manager.has_pty_session(proof.session_id) is True
+        assert await manager.inject_pty_message(
+            proof.session_id,
+            "continue through the retained tail",
+            task_id=task_id,
+            task_retry_count=state.task_retry_count,
+            task_turn_generation=state.task_turn_generation,
+            expected_instance_id=instance_id,
+            followup_operation_id="proof-only-followup",
+        ) is True
+        await asyncio.wait_for(started.wait(), timeout=1)
+        followups = tuple(manager._pty_followup_tasks.get(instance_id, ()))
+        assert followups
+        assert sent == ["continue through the retained tail"]
+
+        release.set()
+        await asyncio.wait_for(
+            asyncio.gather(*followups, return_exceptions=False),
+            timeout=1,
+        )
+        assert state.pending_followups == 0
+        assert any(
+            call.kwargs.get("background_followup") is True
+            and call.kwargs.get("expected_session_id") == proof.session_id
+            and call.kwargs.get("expected_background_generation")
+            == state.generation
+            for call in backend.on_event.await_args_list
+        )
+        manager._stopping[instance_id] = 1
+        assert manager.has_pty_session(proof.session_id) is False
+        assert await manager.inject_pty_message(
+            proof.session_id,
+            "must not cross an exact stop fence",
+            task_id=task_id,
+            task_retry_count=state.task_retry_count,
+            task_turn_generation=state.task_turn_generation,
+            expected_instance_id=instance_id,
+        ) is False
+        manager._stopping.pop(instance_id, None)
+    finally:
+        manager._stopping.pop(instance_id, None)
+        release.set()
+        manager._discard_pty_background_state(
+            (task_id, proof.session_id),
+            state.generation,
+        )
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_process_event_accepts_exact_chat_proof_after_maps_clear(
+    db_factory,
+):
+    """Proof-backed follow-up events persist without reactivating a completed Task."""
+
+    (
+        manager,
+        _backend,
+        consumer,
+        proof,
+        state,
+        instance_id,
+        task_id,
+    ) = await _proof_only_pty_followup_manager(
+        db_factory,
+        session_id="claude-session-proof-event",
+    )
+    try:
+        await manager._process_event(
+            instance_id,
+            task_id,
+            {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "proof-only event persisted",
+            },
+            consumer_record=proof.record,
+            background_followup=True,
+            expected_session_id=proof.session_id,
+            expected_background_generation=state.generation,
+            expected_task_retry_count=state.task_retry_count,
+            expected_task_turn_generation=state.task_turn_generation,
+        )
+        async with db_factory() as db:
+            result = await db.execute(
+                select(LogEntry).where(LogEntry.task_id == task_id)
+            )
+            entries = [
+                entry
+                for entry in result.scalars().all()
+                if entry.content == "proof-only event persisted"
+            ]
+        assert len(entries) == 1
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            assert task.status == "completed"
+            assert task.pty_background_generation == state.generation
+
+        manager._discard_pty_background_state(
+            (task_id, proof.session_id),
+            state.generation,
+        )
+        assert (task_id, proof.session_id) not in (
+            manager._pty_post_exit_generations
+        )
+        await manager._process_event(
+            instance_id,
+            task_id,
+            {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "stale proof event",
+            },
+            consumer_record=proof.record,
+            background_followup=True,
+            expected_session_id=proof.session_id,
+            expected_background_generation=state.generation,
+            expected_task_retry_count=state.task_retry_count,
+            expected_task_turn_generation=state.task_turn_generation,
+        )
+        async with db_factory() as db:
+            stale = await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.content == "stale proof event",
+                )
+            )
+            assert stale.scalar_one_or_none() is None
+    finally:
+        manager._discard_pty_background_state(
+            (task_id, proof.session_id),
+            state.generation,
+        )
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_inject_pty_message_rejects_same_slot_replacement_proof(
+    db_factory,
+):
+    """A same-session ABA replacement cannot borrow the old chat proof."""
+
+    (
+        manager,
+        backend,
+        old_consumer,
+        proof,
+        state,
+        instance_id,
+        task_id,
+    ) = await _proof_only_pty_followup_manager(
+        db_factory,
+        session_id="claude-session-proof-replacement",
+    )
+
+    replacement_session = types.SimpleNamespace(
+        session_id=proof.session_id,
+        is_alive=True,
+        active_turn_process=None,
+    )
+
+    class ReplacementProxy:
+        def __init__(self):
+            self.session = replacement_session
+            self.pid = 81235
+            self.returncode = None
+
+    replacement_proxy = ReplacementProxy()
+    replacement_consumer = asyncio.create_task(asyncio.Event().wait())
+    backend._sessions[instance_id] = replacement_session
+    backend._consumers[instance_id] = replacement_consumer
+    backend._proxies[instance_id] = replacement_proxy
+    manager.processes[instance_id] = replacement_proxy
+    manager._track_output_consumer(
+        instance_id,
+        replacement_proxy,
+        replacement_consumer,
+        chat_initiated=True,
+        provider="claude",
+        task_id=task_id,
+        task_retry_count=state.task_retry_count,
+        task_turn_generation=state.task_turn_generation + 1,
+        instance_started_at=proof.record.instance_started_at
+        + timedelta(seconds=1),
+    )
+    try:
+        assert (task_id, proof.session_id) not in (
+            manager._pty_post_exit_generations
+        )
+        assert await manager.inject_pty_message(
+            proof.session_id,
+            "must not reach replacement",
+            task_id=task_id,
+            task_retry_count=state.task_retry_count,
+            task_turn_generation=state.task_turn_generation,
+            expected_instance_id=instance_id,
+        ) is False
+    finally:
+        manager._discard_pty_background_state(
+            (task_id, proof.session_id),
+            state.generation,
+        )
+        for consumer in (old_consumer, replacement_consumer):
+            consumer.cancel()
+        await asyncio.gather(
+            old_consumer,
+            replacement_consumer,
+            return_exceptions=True,
+        )
+
+
 @pytest.mark.asyncio
 async def test_inject_pty_background_followup_slow_echo_is_admitted_once():
     """Local pump ownership, not active_turn_process/JSONL echo, is the receipt."""

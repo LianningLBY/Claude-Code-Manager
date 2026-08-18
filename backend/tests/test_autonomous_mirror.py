@@ -1125,6 +1125,7 @@ class TestFullMirrorBackend:
             task.status = "executing"
             task.retry_count = 4
             task.instance_id = instance_id
+            task.session_id = "chat-post-exit-retained-session"
             inst = await db.get(Instance, instance_id)
             inst.status = "running"
             inst.pid = 321
@@ -1132,16 +1133,26 @@ class TestFullMirrorBackend:
             inst.started_at = started_at
             await db.commit()
 
+        class Session:
+            session_id = "chat-post-exit-retained-session"
+            is_alive = True
+
+            def __init__(self):
+                self._reader = MagicMock()
+                self._reader._tracker.has_pending = False
+
         class Proxy:
             pid = 321
             returncode = None
 
+            def __init__(self, session):
+                self.session = session
+
             def complete(self, code=0):
                 self.returncode = code
 
-        proxy = Proxy()
-        session = MagicMock()
-        session._reader._tracker.has_pending = False
+        session = Session()
+        proxy = Proxy(session)
         backend._sessions[instance_id] = session
         backend._proxies[instance_id] = proxy
         im._launch_params[instance_id] = {"_retried": True}
@@ -1150,6 +1161,7 @@ class TestFullMirrorBackend:
             consumer = asyncio.current_task()
             backend._consumers[instance_id] = consumer
             im.processes[instance_id] = proxy
+            im._tasks[instance_id] = consumer
             im._track_output_consumer(
                 instance_id,
                 proxy,
@@ -1169,7 +1181,7 @@ class TestFullMirrorBackend:
                 chat_initiated=True,
             )
 
-        await exit_turn()
+        await asyncio.wait_for(asyncio.create_task(exit_turn()), timeout=1)
 
         async with db_factory() as db:
             task = await db.get(Task, task_id)
@@ -1180,6 +1192,23 @@ class TestFullMirrorBackend:
             assert inst.pid is None
             assert inst.current_task_id is None
         assert proxy.returncode == 0
+        proof = im._pty_post_exit_generations.get(
+            (task_id, session.session_id)
+        )
+        assert proof is not None
+        assert proof.session is session
+        assert proof.process is proxy
+        assert proof.record.chat_initiated is True
+        assert instance_id not in im.processes
+        assert instance_id not in im._tasks
+        assert instance_id not in im._consumer_records
+        await asyncio.sleep(0.1)
+        assert im._pty_post_exit_generations.get(
+            (task_id, session.session_id)
+        ) is proof
+        im._discard_pty_post_exit_generation(
+            (task_id, session.session_id), proof
+        )
         status_events = [
             call.args[1]
             for call in broadcaster.broadcast.await_args_list

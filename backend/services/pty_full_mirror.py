@@ -428,24 +428,42 @@ class FullMirrorCCMBackend(CCMBackend):
                     if session is not None:
                         session._rate_limited_turn = False
         try:
-            await self._im._process_event(
-                key,
-                context.get("task_id"),
-                event_dict,
-                context.get("loop_iteration"),
-                consumer_record=record,
-                background_followup=background_followup,
-                expected_session_id=context.get("expected_session_id"),
-                expected_background_generation=context.get(
+            event_context = {
+                "background_followup": background_followup,
+                "expected_session_id": context.get("expected_session_id"),
+                "expected_background_generation": context.get(
                     "expected_background_generation"
                 ),
-                expected_task_retry_count=context.get(
+                "expected_task_retry_count": context.get(
                     "expected_task_retry_count"
                 ),
-                expected_task_turn_generation=context.get(
+                "expected_task_turn_generation": context.get(
                     "expected_task_turn_generation"
                 ),
-            )
+            }
+            # Keep the historical callback shape for ordinary foreground
+            # events. Besides avoiding needless kwargs on older adapters, this
+            # preserves compatibility with integrations that wrap
+            # ``_process_event`` and only accept the original arguments. Any
+            # background follow-up or generation context uses the strict
+            # proof-aware call below.
+            if not background_followup and not any(event_context.values()):
+                await self._im._process_event(
+                    key,
+                    context.get("task_id"),
+                    event_dict,
+                    context.get("loop_iteration"),
+                    consumer_record=record,
+                )
+            else:
+                await self._im._process_event(
+                    key,
+                    context.get("task_id"),
+                    event_dict,
+                    context.get("loop_iteration"),
+                    consumer_record=record,
+                    **event_context,
+                )
         except Exception:
             logger.exception(
                 "PTY on_event failed for instance %s task %s",
@@ -776,14 +794,13 @@ class FullMirrorCCMBackend(CCMBackend):
         ):
             await self._maybe_retry_empty_reply(key, task_id)
 
-        # Dispatcher/Ralph own non-chat Task finalization. Completing the proxy
-        # below wakes them before their DB result CAS, and the normal
-        # instance-keyed consumer maps are then released. Retain one immutable
-        # generation proof so an autonomous callback already arriving in that
-        # narrow gap can pre-arm only this exact Task/session/consumer epoch.
+        # Completing the proxy below wakes dispatcher/Ralph and releases the
+        # normal instance-keyed consumer maps. Retain one immutable generation
+        # proof for every successful PTY turn, including chat: a late native
+        # child can arm the detached background epoch after this cleanup, and a
+        # user follow-up must still address the exact retained Session/record.
         if (
-            not chat_initiated
-            and transition_eligible
+            transition_eligible
             and background_generation is None
             and record is not None
             and session is not None

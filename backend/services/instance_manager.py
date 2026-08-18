@@ -189,6 +189,7 @@ DEFAULT_CONSUMER_CANCEL_TIMEOUT = 5.0
 TERMINAL_TASK_OPERATION_LOCK_POLL_SECONDS = 0.05
 PTY_BACKGROUND_POLL_SECONDS = 5.0
 PTY_BACKGROUND_MAX_SECONDS = 4 * 60 * 60
+PTY_POST_EXIT_CHAT_GRACE_SECONDS = 30.0
 _CLOUDROUTER_CLAUDE_AUTH_ENV_KEYS = (
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -754,11 +755,12 @@ class _PtyPostExitGeneration:
     """Exact PTY foreground generation retained across terminal handoff.
 
     ``FullMirrorCCMBackend.on_exit`` completes its proxy before dispatcher/Ralph
-    commits the Task result.  The ordinary instance-keyed process/consumer maps
-    are intentionally released at that point, but an already-arriving idle
-    watcher callback still needs immutable proof that it belongs to that exact
-    Task/session/turn.  This record is that short-lived proof; it is never an
-    execution owner and cannot be used to address a reusable Instance slot.
+    commits the Task result, and a successful chat turn can release the same
+    maps just before a late native child arms its detached background epoch.
+    The ordinary instance-keyed process/consumer maps are intentionally
+    released at that point, but an already-arriving callback or retained chat
+    follow-up still needs immutable proof that it belongs to that exact
+    Task/session/turn.  This record is never a reusable Instance-slot owner.
     """
 
     token: object
@@ -768,6 +770,7 @@ class _PtyPostExitGeneration:
     session: Any
     process: Any
     record: _OutputConsumerRecord
+    created_monotonic: float
     watcher: asyncio.Task | None = None
 
 
@@ -1120,10 +1123,10 @@ class InstanceManager:
         self._pty_autonomous_activity_handoff_owner_callbacks: set[
             asyncio.Task[Any]
         ] = set()
-        # A successful non-chat PTY consumer releases its process proxy before
-        # dispatcher/Ralph commits the Task terminal state. Retain one immutable
-        # proof across that handoff so an autonomous callback already arriving
-        # in the gap can pre-arm only its exact Task/session/consumer epoch.
+        # A successful PTY consumer can release its process proxy before either
+        # a lifecycle terminal commit or a late chat child handoff is visible.
+        # Retain one immutable proof so only that exact Task/session/consumer
+        # epoch can admit the callback or retained follow-up.
         self._pty_post_exit_generations: dict[
             tuple[int, str], _PtyPostExitGeneration
         ] = {}
@@ -1169,10 +1172,128 @@ class InstanceManager:
 
         if self._pty_backend is None or not session_id:
             return False
-        return any(
+        if any(
             getattr(session, "session_id", None) == session_id
             for session in getattr(self._pty_backend, "_sessions", {}).values()
+        ):
+            return True
+        # FullMirror releases the ordinary slot maps before a late native
+        # child can publish its background marker.  Keep routing aware of the
+        # exact retained Session during that handoff, but never treat a stale
+        # or replaced proof as a live PTY owner.
+        return any(
+            proof.session_id == session_id
+            and self._pty_post_exit_generation_is_current(proof)
+            for proof in tuple(self._pty_post_exit_generations.values())
         )
+
+    def _pty_post_exit_generation_is_current(
+        self,
+        proof: _PtyPostExitGeneration,
+        *,
+        instance_id: int | None = None,
+        task_id: int | None = None,
+        session_id: str | None = None,
+        task_retry_count: int | None = None,
+        task_turn_generation: int | None = None,
+        background_generation: str | None = None,
+        require_background_state: bool = False,
+    ) -> bool:
+        """Validate one immutable PTY post-exit proof without DB awaits.
+
+        A proof may outlive the instance-keyed maps, but it may not survive a
+        stop, launch reservation, same-slot replacement, native Session death,
+        or an ABA identity mismatch.  Callers that handle background output
+        additionally require the exact accepting background epoch.
+        """
+
+        key = (proof.task_id, proof.session_id)
+        if self._pty_post_exit_generations.get(key) is not proof:
+            return False
+        if instance_id is not None and proof.instance_id != instance_id:
+            return False
+        if task_id is not None and proof.task_id != task_id:
+            return False
+        if session_id is not None and proof.session_id != session_id:
+            return False
+        if (
+            task_retry_count is not None
+            and proof.record.task_retry_count != task_retry_count
+        ):
+            return False
+        if (
+            task_turn_generation is not None
+            and proof.record.task_turn_generation != task_turn_generation
+        ):
+            return False
+        if (
+            proof.record.provider != "claude"
+            or proof.record.task_id != proof.task_id
+            or proof.record.task_retry_count is None
+            or proof.record.task_turn_generation is None
+            or proof.record.instance_started_at is None
+            or proof.record.pty_terminal_owner != "consumer"
+            or getattr(proof.session, "session_id", None) != proof.session_id
+            or getattr(proof.session, "is_alive", True) is False
+            or getattr(proof.process, "session", None) is not proof.session
+            or proof.instance_id in self._stopping
+            or proof.instance_id in self._launch_reservations
+        ):
+            return False
+
+        # The maps may be absent after FullMirror cleanup, but if any of them
+        # still has an entry it must be the exact old generation.  A new value
+        # under the reusable key is an ABA replacement and rejects the proof.
+        backend = self._pty_backend
+        map_checks = (
+            (self._consumer_records, proof.record),
+            (self._tasks, proof.record.task),
+            (self.processes, proof.process),
+        )
+        for mapping, expected in map_checks:
+            current = mapping.get(proof.instance_id)
+            if current is not None and current is not expected:
+                return False
+        if backend is not None:
+            for mapping, expected in (
+                (
+                    getattr(backend, "_sessions", {}),
+                    proof.session,
+                ),
+                (
+                    getattr(backend, "_consumers", {}),
+                    proof.record.task,
+                ),
+                (
+                    getattr(backend, "_proxies", {}),
+                    proof.process,
+                ),
+            ):
+                current = mapping.get(proof.instance_id)
+                if current is not None and current is not expected:
+                    return False
+        if any(
+            pending_key[0] == proof.instance_id
+            and pending_key[1] is proof.process
+            for pending_key in self._consumer_recovery_pending
+        ):
+            return False
+
+        if require_background_state:
+            state = self._pty_background_states.get(key)
+            if (
+                state is None
+                or not state.accepting_events
+                or state.session is not proof.session
+                or state.task_retry_count != proof.record.task_retry_count
+                or state.task_turn_generation != proof.record.task_turn_generation
+                or (
+                    background_generation is not None
+                    and state.generation != background_generation
+                )
+            ):
+                return False
+        return True
 
     def _finalize_pty_followup_pump(
         self,
@@ -1792,31 +1913,92 @@ class InstanceManager:
             return False
 
         sessions = getattr(self._pty_backend, "_sessions", {})
-        if expected_instance_id is not None:
-            candidate = sessions.get(expected_instance_id)
-            candidates = (
-                [(expected_instance_id, candidate)]
-                if candidate is not None
+        ordinary_candidates = [
+            (candidate_key, candidate)
+            for candidate_key, candidate in sessions.items()
+            if (
+                (expected_instance_id is None
+                 or candidate_key == expected_instance_id)
                 and getattr(candidate, "session_id", None) == session_id
-                else []
             )
-        else:
-            candidates = [
-                (key, candidate)
-                for key, candidate in sessions.items()
-                if getattr(candidate, "session_id", None) == session_id
-            ]
-        # A duplicated native session registration is an ABA ambiguity, not a
-        # reason to pick whichever dict entry happens to appear first.
-        if len(candidates) != 1:
+        ]
+        # A retained proof is the only valid route once FullMirror has
+        # released the ordinary PTY maps.  Resolve it by immutable generation,
+        # never by choosing an arbitrary same-session dictionary entry.
+        proof_candidates: list[_PtyPostExitGeneration] = []
+        if (
+            task_id is not None
+            and task_retry_count is not None
+            and task_turn_generation is not None
+        ):
+            for proof in tuple(self._pty_post_exit_generations.values()):
+                if (
+                    proof.session_id != session_id
+                    or (
+                        expected_instance_id is not None
+                        and proof.instance_id != expected_instance_id
+                    )
+                    or not self._pty_post_exit_generation_is_current(
+                        proof,
+                        task_id=task_id,
+                        session_id=session_id,
+                        task_retry_count=task_retry_count,
+                        task_turn_generation=task_turn_generation,
+                    )
+                ):
+                    continue
+                proof_candidates.append(proof)
+
+        candidate_keys = {
+            candidate_key for candidate_key, _candidate in ordinary_candidates
+        }
+        candidate_keys.update(proof.instance_id for proof in proof_candidates)
+        # A duplicated native session registration or proof is an ABA
+        # ambiguity, not a reason to pick whichever entry appears first.
+        if len(candidate_keys) != 1:
             return False
-        key, candidate = candidates[0]
+        key = next(iter(candidate_keys))
+        candidate = next(
+            (
+                ordinary_candidate
+                for candidate_key, ordinary_candidate in ordinary_candidates
+                if candidate_key == key
+            ),
+            None,
+        )
+        proof_candidate = next(
+            (proof for proof in proof_candidates if proof.instance_id == key),
+            None,
+        )
+        if (
+            candidate is not None
+            and proof_candidate is not None
+            and candidate is not proof_candidate.session
+        ):
+            return False
+        if candidate is None and proof_candidate is None:
+            return False
+        if candidate is None:
+            candidate = proof_candidate.session
         lifecycle_lock = self._instance_lifecycle_lock(key)
         async with lifecycle_lock:
-            session = getattr(self._pty_backend, "_sessions", {}).get(key)
+            attached_session = getattr(self._pty_backend, "_sessions", {}).get(
+                key
+            )
+            proof_candidate = (
+                self._pty_post_exit_generations.get((task_id, session_id))
+                if task_id is not None
+                else None
+            )
+            if attached_session is not None and attached_session is not candidate:
+                return False
+            if attached_session is None and (
+                proof_candidate is None or proof_candidate.session is not candidate
+            ):
+                return False
+            session = attached_session or candidate
             if (
-                session is not candidate
-                or getattr(session, "session_id", None) != session_id
+                getattr(session, "session_id", None) != session_id
                 or not getattr(session, "is_alive", False)
                 or key in self._stopping
                 or key in self._launch_reservations
@@ -1834,6 +2016,23 @@ class InstanceManager:
             record = self._consumer_records.get(key)
             process = self.processes.get(key)
             proxy = getattr(self._pty_backend, "_proxies", {}).get(key)
+            background_generation = (
+                self.pty_background_generation_for(task_id, session_id)
+                if task_id is not None
+                else None
+            )
+            retained_proof = None
+            if proof_candidate is not None and self._pty_post_exit_generation_is_current(
+                proof_candidate,
+                instance_id=key,
+                task_id=task_id,
+                session_id=session_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+                background_generation=background_generation,
+                require_background_state=True,
+            ):
+                retained_proof = proof_candidate
             cancelling = getattr(consumer, "cancelling", None)
             exact_turn = bool(
                 consumer is not None
@@ -1861,7 +2060,7 @@ class InstanceManager:
                     and record.task_retry_count == task_retry_count
                     and record.task_turn_generation == task_turn_generation
                 )
-            if not exact_turn:
+            if not exact_turn and retained_proof is None:
                 logger.info(
                     "PTY steer rejected for session %s: stale foreground turn",
                     session_id,
@@ -1871,6 +2070,13 @@ class InstanceManager:
             native_process = getattr(session, "active_turn_process", None)
             steer = getattr(session, "steer_active_turn", None)
             if native_process is not None:
+                if retained_proof is not None and not exact_turn:
+                    logger.info(
+                        "PTY steer rejected for session %s: retained proof "
+                        "has no idle follow-up boundary",
+                        session_id,
+                    )
+                    return False
                 # A retained follow-up pump owns the Session's current native
                 # process after ``send_prompt`` starts.  Do not mistake that
                 # process for an independent foreground turn: steering it
@@ -1891,7 +2097,16 @@ class InstanceManager:
                 # new prompt with its internal send lock; use a small event
                 # pump so the response follows the same durable event path.
                 send_prompt = getattr(session, "send_prompt", None)
-                if task_id is None or not callable(send_prompt):
+                followup_record = (
+                    retained_proof.record
+                    if retained_proof is not None
+                    else record
+                )
+                if (
+                    task_id is None
+                    or followup_record is None
+                    or not callable(send_prompt)
+                ):
                     logger.info(
                         "PTY steer rejected for session %s: turn is not "
                         "steerable and no retained background Session is free",
@@ -1920,6 +2135,22 @@ class InstanceManager:
                             session_id,
                         )
                         return False
+                    if retained_proof is not None and not self._pty_post_exit_generation_is_current(
+                        retained_proof,
+                        instance_id=key,
+                        task_id=task_id,
+                        session_id=session_id,
+                        task_retry_count=task_retry_count,
+                        task_turn_generation=task_turn_generation,
+                        background_generation=background_generation,
+                        require_background_state=True,
+                    ):
+                        logger.info(
+                            "PTY follow-up rejected for session %s: retained "
+                            "proof was replaced or stopped",
+                            session_id,
+                        )
+                        return False
                     followups = self._pty_followup_tasks.setdefault(key, set())
                     if any(not task.done() for task in followups):
                         logger.info(
@@ -1940,7 +2171,7 @@ class InstanceManager:
                                 self._pty_backend,
                                 session,
                                 content,
-                                record,
+                                followup_record,
                                 background_state,
                                 admission,
                                 resolved_followup_operation_id,
@@ -8182,7 +8413,7 @@ class InstanceManager:
         session: Any,
         record: _OutputConsumerRecord,
     ) -> _PtyPostExitGeneration | None:
-        """Retain one exact non-chat PTY turn across proxy→Task handoff.
+        """Retain one exact PTY turn across proxy→Task handoff.
 
         Registration is deliberately synchronous and succeeds only while all
         ordinary instance-keyed maps still identify ``record``.  The retained
@@ -8192,8 +8423,7 @@ class InstanceManager:
 
         process = record.process
         if (
-            record.chat_initiated
-            or record.provider != "claude"
+            record.provider != "claude"
             or record.task_id != task_id
             or record.task_retry_count is None
             or record.task_turn_generation is None
@@ -8231,6 +8461,7 @@ class InstanceManager:
             session=session,
             process=process,
             record=record,
+            created_monotonic=time.monotonic(),
         )
         self._pty_post_exit_generations[key] = proof
         proof.watcher = asyncio.create_task(
@@ -8325,10 +8556,29 @@ class InstanceManager:
                     # observer retire only the proof in the middle of that
                     # operation and leave a waiting callback reusable.
                     continue
-                if self._pty_background_states.get(key) is not None:
+                state = self._pty_background_states.get(key)
+                if state is not None:
+                    # Non-chat proofs only bridge the autonomous callback
+                    # race.  A chat proof is also the immutable record needed
+                    # by a follow-up pump after the ordinary maps disappear,
+                    # so keep it for the exact accepting epoch.  The epoch's
+                    # terminal cleanup retires this proof.
+                    if (
+                        proof.record.chat_initiated
+                        and self._pty_post_exit_generation_is_current(
+                            proof,
+                            require_background_state=True,
+                            background_generation=state.generation,
+                        )
+                    ):
+                        poll_delay = min(1.0, poll_delay * 2)
+                        continue
                     self._discard_pty_post_exit_generation(key, proof)
                     return
                 if getattr(proof.session, "is_alive", True) is False:
+                    self._discard_pty_post_exit_generation(key, proof)
+                    return
+                if not self._pty_post_exit_generation_is_current(proof):
                     self._discard_pty_post_exit_generation(key, proof)
                     return
                 try:
@@ -8353,6 +8603,27 @@ class InstanceManager:
                             and owner.started_at
                             == proof.record.instance_started_at
                         )
+                        terminal_exact = bool(
+                            proof.record.chat_initiated
+                            and task is not None
+                            and owner is not None
+                            and task.status == "completed"
+                            and task.completed_at is not None
+                            and task.worker_id is None
+                            and task.shared_from_id is None
+                            and task.instance_id == proof.instance_id
+                            and task.session_id == proof.session_id
+                            and task.retry_count
+                            == proof.record.task_retry_count
+                            and task.turn_generation
+                            == proof.record.task_turn_generation
+                            and task.pty_background_generation is None
+                            and owner.status == "idle"
+                            and owner.current_task_id is None
+                            and owner.pid is None
+                            and owner.started_at
+                            == proof.record.instance_started_at
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception:
@@ -8364,6 +8635,26 @@ class InstanceManager:
                     )
                     poll_delay = min(1.0, poll_delay * 2)
                     continue
+                if not still_exact and terminal_exact:
+                    # A late native child may be registered just after the
+                    # foreground terminal commit.  Keep the chat proof during
+                    # a short handoff grace, and longer while durable/native
+                    # background work is demonstrably still running.
+                    within_grace = (
+                        time.monotonic() - proof.created_monotonic
+                        < PTY_POST_EXIT_CHAT_GRACE_SECONDS
+                    )
+                    pending_activity = within_grace
+                    if not pending_activity:
+                        pending_activity = (
+                            await self.pty_background_activity_pending(
+                                proof.task_id,
+                                proof.session,
+                            )
+                        )
+                    if pending_activity:
+                        poll_delay = min(1.0, poll_delay * 2)
+                        continue
                 if not still_exact:
                     if any(
                         owner_proof is proof
@@ -8798,6 +9089,18 @@ class InstanceManager:
         self._pty_background_states.pop(key, None)
         state.accepting_events = False
         state.done.set()
+        # A chat post-exit proof is the event-consumer identity for this
+        # detached epoch.  Retire only the proof that belongs to this exact
+        # Session/retry/turn; a same-key replacement must remain untouched.
+        proof = self._pty_post_exit_generations.get(key)
+        if (
+            proof is not None
+            and proof.session is state.session
+            and proof.record.task_retry_count == state.task_retry_count
+            and proof.record.task_turn_generation
+            == state.task_turn_generation
+        ):
+            self._discard_pty_post_exit_generation(key, proof)
         watcher = state.watcher
         if (
             watcher is not None
@@ -9418,9 +9721,10 @@ class InstanceManager:
                 )
                 state = self._pty_background_states.get(key)
                 generation = candidate
-                self._discard_pty_post_exit_generation(
-                    key, owned_post_exit_proof
-                )
+                if not owned_post_exit_proof.record.chat_initiated:
+                    self._discard_pty_post_exit_generation(
+                        key, owned_post_exit_proof
+                    )
 
         async with self.db_factory() as db:
             fence = (
@@ -9500,7 +9804,10 @@ class InstanceManager:
             or resolved_task_turn_generation is None
         ):
             return None
-        if owned_post_exit_proof is not None:
+        if (
+            owned_post_exit_proof is not None
+            and not owned_post_exit_proof.record.chat_initiated
+        ):
             self._discard_pty_post_exit_generation(
                 key, owned_post_exit_proof
             )
@@ -15439,7 +15746,7 @@ class InstanceManager:
         def owns_event_generation() -> bool:
             if event_record is None:
                 return False
-            return (
+            ordinary_owner = (
                 event_record.task_id == task_id
                 and (
                     task_id is None
@@ -15452,6 +15759,33 @@ class InstanceManager:
                 and self._consumer_records.get(instance_id) is event_record
                 and self._tasks.get(instance_id) is event_record.task
                 and self.processes.get(instance_id) is event_record.process
+            )
+            if ordinary_owner:
+                return True
+            if not background_followup:
+                return False
+            if (
+                task_id is None
+                or expected_session_id is None
+                or expected_background_generation is None
+                or expected_task_retry_count is None
+                or expected_task_turn_generation is None
+            ):
+                return False
+            proof = self._pty_post_exit_generations.get(
+                (task_id, expected_session_id)
+            )
+            if proof is None or proof.record is not event_record:
+                return False
+            return self._pty_post_exit_generation_is_current(
+                proof,
+                instance_id=instance_id,
+                task_id=task_id,
+                session_id=expected_session_id,
+                task_retry_count=expected_task_retry_count,
+                task_turn_generation=expected_task_turn_generation,
+                background_generation=expected_background_generation,
+                require_background_state=True,
             )
 
         def task_event_predicates() -> list:

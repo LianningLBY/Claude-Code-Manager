@@ -4313,6 +4313,17 @@ class CodexAppServer:
     ) -> None:
         if status_type is None:
             return
+        if status_type == "active" and not active_turn_ids:
+            # ``thread/read`` can lag a just-delivered idle/paused event and
+            # report only a weak active status (no active turn list).  Once a
+            # terminal edge is pending, that snapshot must not resurrect the
+            # child; a real new turn is represented by a non-empty turn list
+            # or by an explicit lifecycle notification.
+            if any(
+                thread_id in context.descendant_pending_terminal_status
+                for context in self._contexts_tracking_descendant(thread_id)
+            ):
+                return
         runtime = self._runtime_state_for(thread_id)
         if active_turn_ids is not None:
             runtime.active_turn_ids = set(active_turn_ids)
@@ -4377,6 +4388,39 @@ class CodexAppServer:
             self._context_is_current(context)
             and thread_id in context.active_descendant_thread_ids
         ):
+            # A stop/Goal pause can publish an authoritative terminal status
+            # before thread/read catches up.  During the short relation grace
+            # window, reading the stale ``active`` snapshot would re-open the
+            # child and keep the root adapter alive indefinitely.  Let the
+            # pending terminal edge settle first; a genuinely new turn still
+            # emits an explicit active/started notification and clears it.
+            terminal_handle = context.descendant_terminal_debounce_handles.get(
+                thread_id,
+            )
+            if (
+                thread_id in context.descendant_pending_terminal_status
+                and terminal_handle is not None
+                and not terminal_handle.cancelled()
+            ):
+                changed = context.descendant_state_changed
+                if changed is None:
+                    changed = asyncio.Event()
+                    context.descendant_state_changed = changed
+                changed.clear()
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+                try:
+                    await asyncio.wait_for(
+                        changed.wait(),
+                        timeout=min(
+                            _DESCENDANT_INTERRUPT_POLL_INTERVAL,
+                            remaining,
+                        ),
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                continue
             (
                 _,
                 status_type,

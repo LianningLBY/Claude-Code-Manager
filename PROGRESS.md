@@ -4,6 +4,12 @@
 
 ## 已完成功能
 
+### 2026-08-18：一键更新 SQLite 快照提速
+
+- [x] 权威 Alembic revision 已是最新时不再生成数据库回滚快照；有待迁移项时只预留路径，由停服后的外部 worker 生成一次权威快照，取消会被立即覆盖的在线全量备份。
+- [x] 保留目标快照 `PRAGMA integrity_check` 与 fsync，去掉复制前重复的源库全量扫描；数据库恢复点上限从 5 个收紧为 2 个。
+- [x] 更新/迁移/回滚/部署租约专项回归 142 passed，覆盖无在线拷贝、保留策略、空目标快照创建和迁移失败恢复（`ee894bc`）。
+
 ### 阶段 1：基础设施
 - [x] 项目初始化 (pyproject.toml, .gitignore, .env)
 - [x] SQLAlchemy async + SQLite 数据库

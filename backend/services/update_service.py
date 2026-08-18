@@ -38,7 +38,10 @@ from backend.services.ws_broadcaster import WebSocketBroadcaster
 logger = logging.getLogger(__name__)
 
 WS_CHANNEL = "system_update"
-MAX_BACKUPS = 5
+# A database snapshot is only useful for the deployment that produced it (plus
+# one previous recovery point).  Large SQLite deployments can otherwise consume
+# tens of GiB after only a handful of updates.
+MAX_BACKUPS = 2
 ACTIVE_TASK_STATUSES = ("in_progress", "executing")
 DRY_RUN_CACHE_SECONDS = 30.0
 DRY_RUN_ERROR_CACHE_SECONDS = 5.0
@@ -2539,21 +2542,11 @@ class UpdateService:
         }
         await self._complete_step(step)
 
-        # Step 3: backup database
+        # Step 3 is completed only after the authoritative revision check below.
+        # No database bytes have changed yet, so taking an online snapshot here
+        # would only be overwritten by the stopped-service snapshot immediately
+        # before Alembic runs.
         step = state.steps[2]
-        if self._automatic_rollback_supported:
-            await self._start_step(step)
-            try:
-                state.backup_file = await self._backup_database()
-                await self._complete_step(step)
-            except Exception as e:
-                await self._fail_step(step, state, f"备份数据库失败: {e}")
-                return
-        else:
-            step.status = "skipped"
-            step.message = "当前数据库不是可安全自动恢复的文件型 SQLite"
-            await self._broadcast_step(step)
-
         try:
             state.frontend_dist_backup = await self._backup_frontend_dist()
         except Exception as exc:
@@ -2661,6 +2654,23 @@ class UpdateService:
             )
             return
 
+        if has_new_migrations:
+            await self._start_step(step)
+            try:
+                state.backup_file = self._reserve_database_backup()
+                step.message = "已预留回滚快照路径，停服后生成权威快照"
+                await self._complete_step(step)
+            except Exception as exc:
+                await self._fail_step(
+                    step, state, f"无法准备数据库回滚快照: {exc}"
+                )
+                return
+        else:
+            step.status = "skipped"
+            step.message = "数据库已是最新，无需生成回滚快照"
+            await self._broadcast_step(step)
+        self._update_deployment_lease(backup_file=state.backup_file)
+
         # Steps 8-10: migration path vs fast path
         active_tasks = await self._get_blocking_tasks()
         if active_tasks:
@@ -2701,20 +2711,6 @@ class UpdateService:
                 await self._broadcast_step(state.steps[index])
 
         backup_step = state.steps[2]
-        if self._automatic_rollback_supported:
-            await self._start_step(backup_step)
-            try:
-                state.backup_file = await self._backup_database()
-                await self._complete_step(backup_step)
-            except Exception as exc:
-                await self._fail_step(
-                    backup_step, state, f"备份数据库失败: {exc}"
-                )
-                return
-        else:
-            backup_step.status = "skipped"
-            backup_step.message = "当前数据库不支持 CCM 自动回滚"
-            await self._broadcast_step(backup_step)
 
         try:
             state.frontend_dist_backup = await self._backup_frontend_dist()
@@ -2823,8 +2819,26 @@ class UpdateService:
                     "当前数据库无法由 CCM 自动快照回滚，拒绝自动迁移",
                 )
                 return
+            await self._start_step(backup_step)
+            try:
+                state.backup_file = self._reserve_database_backup()
+                backup_step.message = (
+                    "已预留回滚快照路径，停服后生成权威快照"
+                )
+                await self._complete_step(backup_step)
+            except Exception as exc:
+                await self._fail_step(
+                    backup_step,
+                    state,
+                    f"无法准备数据库回滚快照: {exc}",
+                )
+                return
+            self._update_deployment_lease(backup_file=state.backup_file)
             await self._migration_path(state)
         else:
+            backup_step.status = "skipped"
+            backup_step.message = "数据库已是最新，无需生成回滚快照"
+            await self._broadcast_step(backup_step)
             await self._fast_restart_path(state)
 
     async def _fail_and_maybe_rollback(
@@ -3209,9 +3223,7 @@ class UpdateService:
             return [self._tools["sudo"], "-n", self._tools["systemd-run"]]
         return [self._tools["systemd-run"], "--user"]
 
-    async def _backup_database(self) -> str:
-        import sqlite3 as _sqlite3
-
+    def _reserve_database_backup(self) -> str:
         if not self._automatic_rollback_supported:
             raise RuntimeError("当前数据库不是可安全自动恢复的文件型 SQLite")
         db_path = self.db_path
@@ -3222,36 +3234,12 @@ class UpdateService:
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         backup_path = backup_dir / f"claude_manager.db.bak.{timestamp}"
-        temporary = backup_path.with_suffix(f"{backup_path.suffix}.tmp")
-
-        def do_backup():
-            src = _sqlite3.connect(str(db_path))
-            dst = _sqlite3.connect(str(temporary))
-            try:
-                src.backup(dst)
-                result = dst.execute("PRAGMA integrity_check").fetchone()
-                if not result or str(result[0]).lower() != "ok":
-                    raise RuntimeError("SQLite 备份完整性检查失败")
-                dst.commit()
-            finally:
-                dst.close()
-                src.close()
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, backup_path)
-            directory_fd = os.open(backup_dir, os.O_DIRECTORY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-
-        try:
-            await asyncio.get_event_loop().run_in_executor(None, do_backup)
-        finally:
-            try:
-                temporary.unlink()
-            except OSError:
-                pass
-        self._cleanup_old_backups(backup_dir)
+        if backup_path.exists():
+            raise RuntimeError("数据库回滚快照路径已存在")
+        # The external worker creates the snapshot atomically after stopping all
+        # writers.  Make room first so the newly-created snapshot leaves at most
+        # MAX_BACKUPS recovery points.
+        self._cleanup_old_backups(backup_dir, keep=MAX_BACKUPS - 1)
         return str(backup_path)
 
     async def _backup_frontend_dist(self) -> str:
@@ -3280,9 +3268,11 @@ class UpdateService:
             shutil.rmtree(snapshots.pop(0), ignore_errors=True)
         return str(destination)
 
-    def _cleanup_old_backups(self, backup_dir: Path):
+    def _cleanup_old_backups(
+        self, backup_dir: Path, *, keep: int = MAX_BACKUPS
+    ) -> None:
         backups = sorted(backup_dir.glob("claude_manager.db.bak.*"), key=lambda p: p.stat().st_mtime)
-        while len(backups) > MAX_BACKUPS:
+        while len(backups) > keep:
             old = backups.pop(0)
             old.unlink()
             logger.info("Removed old backup: %s", old.name)

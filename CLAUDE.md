@@ -200,6 +200,8 @@ claude-manager/
 
 ## 关键约定
 
+- **数据库更新快照**: 数据库回滚快照只在权威 Alembic revision 检查确认有待迁移项时生成，并且只能由停服后的外部 worker 一次性生成、目标完整性检查和 fsync；禁止先做在线全量快照再被停服快照覆盖的双重 I/O。默认只保留当前和上一个恢复点。
+
 - **Codex 号池在线策略**: `pool_settings` 与账号记录一起原子保存在 `CODEX_POOL_CONFIG_PATH` 的私有 JSON 中，前端可在线修改启停、冷却、主动换号阈值、API/OAuth 路由顺序和首选账号并立即生效；部署级总开关和路径仍由环境变量控制。暂停后所有新 Codex 主任务、Monitor、Sub-Agent 与 Distill 必须 fail closed，禁止回落到 ambient `CODEX_HOME`。Worker 上的设置和首选账号写入必须参加 node account-mutation fence。
 - **Test Harness 慢扫描隔离**: `test-runs`/兼容 Workspace 列表完成 ACL 后必须先结束 request DB transaction；只有存在 completed `current_workspace` 证据时才允许做 Git staleness snapshot。同 Task 并发刷新共用 single-flight，Git/文件 I/O 期间不得持有 DB connection，最终按 Project→Task writer 复验 route/config 后才投影 stale。Workspace 首次物化也只能先短事务创建 Harness Run，随后释放 owner/manager/DB fence 做 snapshot，再按 owner fence→manager lock→node-control→Task→Harness Run 原子复验并链接；未跟踪文件读取必须移出 event loop。前端只能在前一请求 settle 后自调度下一次轮询：活跃/等待 Run 为 1s、普通执行中 Task 的发现轮询为 5s，失败指数退避并禁止 `setInterval` 重入；这些约束用于保护 stop/cancel 等控制面准入。
 - **MCP 内部回调地址**: MCP/AskUser 子进程回调 origin 统一由 `internal_api_endpoint.py` 解析：显式配置优先，否则使用可信 ASGI `scope["server"]` 捕获的真实监听地址，最后才回退 `settings.host/port`；禁止依赖可能与 Uvicorn `--port` 不一致的静态端口。

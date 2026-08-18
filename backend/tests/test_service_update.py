@@ -940,7 +940,9 @@ async def test_pipeline_rechecks_tasks_before_restart_and_resumes_dispatcher(tmp
         return {"returncode": 0, "stdout": "", "stderr": ""}
 
     svc._run_cmd = AsyncMock(side_effect=run_cmd)
-    svc._backup_database = AsyncMock(return_value=str(tmp_path / "backup.db"))
+    svc._reserve_database_backup = MagicMock(
+        return_value=str(tmp_path / "backup.db")
+    )
     svc._get_active_tasks = AsyncMock(return_value=[
         {"id": 12, "title": "started during update", "status": "executing"}
     ])

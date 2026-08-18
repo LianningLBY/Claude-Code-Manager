@@ -1187,13 +1187,13 @@ async def test_repair_rechecks_dirty_checkout_before_backup(tmp_path):
     service._dirty_worktree_files = AsyncMock(
         return_value=[" M frontend/package.json"]
     )
-    service._backup_database = AsyncMock()
+    service._reserve_database_backup = MagicMock()
 
     await service._repair_inner(state, skip_frontend_build=False)
 
     assert state.status == "failed"
     assert "本地改动" in state.error
-    service._backup_database.assert_not_awaited()
+    service._reserve_database_backup.assert_not_called()
 
 
 def _configure_same_commit_update_pipeline(
@@ -1246,7 +1246,7 @@ def _configure_changed_commit_update_pipeline(
     service._fetch_and_validate_target_protocol = AsyncMock(
         return_value=(True, "", new_commit)
     )
-    service._backup_database = AsyncMock(
+    service._reserve_database_backup = MagicMock(
         return_value=str(Path(service.project_dir) / "before.db")
     )
     service._backup_frontend_dist = AsyncMock(
@@ -1419,7 +1419,7 @@ async def test_repair_rebuilds_before_authoritative_revision_check(
         "repair", allow_failed=True
     )
     order: list[str] = []
-    service._backup_database = AsyncMock(
+    service._reserve_database_backup = MagicMock(
         return_value=str(tmp_path / "before.db")
     )
     service._backup_frontend_dist = AsyncMock(
@@ -1578,7 +1578,7 @@ async def test_same_commit_repair_transition_failure_stops_pipeline(
         }
     )
     service._repair_inner = AsyncMock()
-    service._backup_database = AsyncMock()
+    service._reserve_database_backup = MagicMock()
     real_lease_update = service._update_deployment_lease
 
     def update_lease(**updates):
@@ -1601,7 +1601,7 @@ async def test_same_commit_repair_transition_failure_stops_pipeline(
     assert state.deployment_incomplete is True
     assert "修复事务" in state.error
     service._repair_inner.assert_not_awaited()
-    service._backup_database.assert_not_awaited()
+    service._reserve_database_backup.assert_not_called()
     assert service._read_deployment_lease()["operation"] == "update"
 
 
@@ -2025,3 +2025,36 @@ async def test_frontend_snapshot_records_that_dist_was_absent(tmp_path):
 
     assert snapshot.is_dir()
     assert (snapshot / ".ccm-dist-absent").is_file()
+
+
+def test_database_backup_reservation_does_not_copy_live_database(tmp_path):
+    service = _service(tmp_path)
+    service.db_path = tmp_path / "claude_manager.db"
+    service.db_path.write_bytes(b"live database bytes")
+
+    reserved = Path(service._reserve_database_backup())
+
+    assert reserved.parent == tmp_path / "backups"
+    assert reserved.name.startswith("claude_manager.db.bak.")
+    assert not reserved.exists()
+
+
+def test_database_backup_reservation_keeps_one_previous_snapshot(tmp_path):
+    service = _service(tmp_path)
+    service.db_path = tmp_path / "claude_manager.db"
+    service.db_path.write_bytes(b"live database bytes")
+    backup_dir = tmp_path / "backups"
+    backup_dir.mkdir(exist_ok=True)
+    snapshots = []
+    for index in range(4):
+        snapshot = backup_dir / f"claude_manager.db.bak.{index}"
+        snapshot.write_bytes(str(index).encode())
+        os.utime(snapshot, (index + 1, index + 1))
+        snapshots.append(snapshot)
+
+    reserved = Path(service._reserve_database_backup())
+
+    assert not reserved.exists()
+    assert [path.name for path in backup_dir.glob("claude_manager.db.bak.*")] == [
+        snapshots[-1].name
+    ]

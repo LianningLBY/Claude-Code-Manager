@@ -1287,9 +1287,10 @@ try:
     source = sqlite3.connect(str(source_path))
     destination = sqlite3.connect(str(temporary))
     try:
-        source_check = [row[0] for row in source.execute("PRAGMA integrity_check")]
-        if source_check != ["ok"]:
-            raise RuntimeError("source SQLite integrity check failed")
+        # sqlite3_backup reads a transactionally consistent source snapshot and
+        # the destination integrity_check below validates every copied page.
+        # Scanning the multi-GiB source first duplicates that full-table work
+        # without improving the rollback artifact's guarantee.
         source.backup(destination)
         destination.commit()
         backup_check = [row[0] for row in destination.execute("PRAGMA integrity_check")]

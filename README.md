@@ -432,7 +432,7 @@ curl -X POST http://localhost:8000/api/system/restart \
   -H "Authorization: Bearer $AUTH_TOKEN"
 ```
 
-更新事务使用仓库内的持久 deployment lease 记录 token、worker PID 身份、期望 commit 和迁移结果。服务启动前会先检查该 lease；若上一次迁移或回滚没有完整结束，CCM 只启动一个不访问业务数据库的维护界面，Dispatcher、Worker 和普通 API 不会启动，管理员仍可查看状态并执行修复/回滚。迁移脚本会在服务完全停止后重新生成 SQLite 快照；数据库恢复、代码回退、依赖恢复或前端恢复任一步失败，服务保持停止，避免启动代码、依赖和 schema 混合的版本。
+更新事务使用仓库内的持久 deployment lease 记录 token、worker PID 身份、期望 commit 和迁移结果。服务启动前会先检查该 lease；若上一次迁移或回滚没有完整结束，CCM 只启动一个不访问业务数据库的维护界面，Dispatcher、Worker 和普通 API 不会启动，管理员仍可查看状态并执行修复/回滚。只有 Alembic revision 确认存在待迁移项时才生成数据库回滚快照；迁移脚本在服务完全停止后一次性生成并校验权威 SQLite 快照，不再先做一份会被覆盖的在线快照。数据库恢复、代码回退、依赖恢复或前端恢复任一步失败，服务保持停止，避免启动代码、依赖和 schema 混合的版本。数据库快照默认只保留当前和上一个恢复点。
 
 一键更新和自动修复仅支持文件型 SQLite，因为 CCM 必须能在停服后制作并验证快照，才能承诺自动回滚。PostgreSQL/MySQL 等外部数据库仍可在版本完全一致时使用「重启」，但更新和修复必须由管理员先完成数据库备份，再按数据库自己的迁移/恢复流程部署。迁移失败通常来自数据库 schema 漂移、迁移脚本本身报错、数据库文件被其他进程占用、权限/磁盘空间问题或新服务未在健康检查期限内启动；页面和 deployment status 会保留失败步骤与日志，不应通过反复点击更新绕过。
 

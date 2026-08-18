@@ -444,9 +444,8 @@ def test_success_refreshes_stopped_snapshot_and_requires_target_commit(
 ) -> None:
     project, old_commit, new_commit = _git_project(tmp_path)
     database = tmp_path / "live.db"
-    backup = tmp_path / "stale-online.db"
+    backup = tmp_path / "reserved-final.db"
     _write_sqlite(database, "latest-before-stop")
-    _write_sqlite(backup, "stale")
     env, service_log, uv_log, python_wrapper = _fake_tools(tmp_path)
     env.update(
         {
@@ -485,9 +484,8 @@ def test_migration_failure_restores_final_snapshot_and_old_code(
 ) -> None:
     project, old_commit, _ = _git_project(tmp_path)
     database = tmp_path / "live.db"
-    backup = tmp_path / "stale-online.db"
+    backup = tmp_path / "reserved-final.db"
     _write_sqlite(database, "latest-before-stop")
-    _write_sqlite(backup, "stale")
     env, _, _, python_wrapper = _fake_tools(tmp_path)
     env.update(
         {

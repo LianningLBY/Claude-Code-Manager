@@ -1276,7 +1276,7 @@ describe('ChatView', () => {
       }
     });
 
-    it('keeps an ownerless background tail visible and cancellable without queueing follow-ups', async () => {
+    it('keeps an ownerless background tail visible and drains one queued follow-up after the boundary', async () => {
       const task = makeTask({
         id: 34,
         status: 'completed',
@@ -1312,6 +1312,64 @@ describe('ChatView', () => {
       });
       expect(api.sendTaskChat).not.toHaveBeenCalled();
       expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
+
+      vi.mocked(api.injectTaskMessage).mockResolvedValue({
+        ok: true,
+        injected: true,
+        operation_id: 'retained-34-followup',
+      });
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:34',
+          data: {
+            event_type: 'user_message',
+            content: 'continue alongside background work',
+            followup_operation_id: 'retained-34-followup',
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+      expect(screen.getByText('后台子 Agent 仍在运行')).toBeInTheDocument();
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+
+      fireEvent.change(
+        screen.getByPlaceholderText(/Type next message to queue/i),
+        { target: { value: 'queued after retained follow-up' } },
+      );
+      await userEvent.click(screen.getByTitle(/Add to queue/));
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:34',
+          data: {
+            event_type: 'pty_background_followup_boundary',
+            state: 'completed',
+            followup_operation_id: 'retained-34-followup',
+            task_id: task.id,
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+            background_generation: 'retained-34',
+          },
+        });
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('Claude is thinking...')).not.toBeInTheDocument();
+        expect(screen.getByText('主回复已完成，后台仍在运行')).toBeInTheDocument();
+      });
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          34,
+          'queued after retained follow-up',
+          {
+            provider: 'claude',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+        );
+      });
 
       const interrupt = screen.getByTitle('Interrupt session');
       expect(interrupt).toBeEnabled();
@@ -1362,6 +1420,212 @@ describe('ChatView', () => {
         );
       });
       expect(api.sendTaskChat).not.toHaveBeenCalled();
+    });
+
+    it('holds the queue until an out-of-order Claude boundary has an HTTP receipt', async () => {
+      const task = makeTask({
+        id: 342,
+        status: 'completed',
+        background_active: true,
+      });
+      let resolveFirst!: (value: {
+        ok: boolean;
+        injected: boolean;
+        operation_id: string;
+      }) => void;
+      const firstInjection = new Promise<{
+        ok: boolean;
+        injected: boolean;
+        operation_id: string;
+      }>((resolve) => { resolveFirst = resolve; });
+      vi.mocked(api.injectTaskMessage)
+        .mockReturnValueOnce(firstInjection)
+        .mockResolvedValue({
+          ok: true,
+          injected: true,
+          operation_id: 'out-of-order-next',
+        });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type a follow-up message/i),
+        'first retained follow-up',
+      );
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+      await waitFor(() => expect(api.injectTaskMessage).toHaveBeenCalledTimes(1));
+
+      // The provider boundary can be committed before the API's user-message
+      // audit reaches this browser. It must not unlock a second send yet.
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'pty_background_followup_boundary',
+            followup_operation_id: 'out-of-order-first',
+            pty_followup_state: 'completed',
+            task_id: task.id,
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'user_message',
+            content: 'first retained follow-up',
+            followup_operation_id: 'out-of-order-first',
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+      expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+
+      fireEvent.change(
+        screen.getByPlaceholderText(/Type next message to queue/i),
+        { target: { value: 'second queued follow-up' } },
+      );
+      await userEvent.click(screen.getByTitle(/Add to queue/));
+      expect(screen.getByText('Queued messages (1)')).toBeInTheDocument();
+
+      resolveFirst({
+        ok: true,
+        injected: true,
+        operation_id: 'out-of-order-first',
+      });
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          task.id,
+          'second queued follow-up',
+          {
+            provider: 'claude',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+        );
+      });
+    });
+
+    it('does not let a late reconciled audit clear a newer Claude follow-up', async () => {
+      const task = makeTask({
+        id: 343,
+        status: 'completed',
+        background_active: true,
+      });
+      vi.mocked(api.injectTaskMessage)
+        .mockResolvedValueOnce({
+          ok: true,
+          injected: true,
+          operation_id: 'late-audit-followup',
+        })
+        .mockResolvedValueOnce({
+          ok: true,
+          injected: true,
+          operation_id: 'new-followup',
+        });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type a follow-up message/i),
+        'first retained follow-up',
+      );
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+      await waitFor(() => expect(api.injectTaskMessage).toHaveBeenCalledTimes(1));
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'pty_background_followup_boundary',
+            state: 'completed',
+            followup_operation_id: 'late-audit-followup',
+            task_id: task.id,
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('Claude is thinking...')).not.toBeInTheDocument();
+      });
+
+      // The audit can arrive after the boundary. It must not recreate the
+      // completed operation or interfere with the next retained follow-up.
+      act(() => {
+        capturedOnMessage?.({
+          channel: `task:${task.id}`,
+          data: {
+            event_type: 'user_message',
+            content: 'first retained follow-up',
+            followup_operation_id: 'late-audit-followup',
+            task_retry_count: task.retry_count,
+            task_turn_generation: task.turn_generation,
+          },
+        });
+      });
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type a follow-up message/i),
+        'second retained follow-up',
+      );
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledTimes(2);
+        expect(screen.getByText('Claude is thinking...')).toBeInTheDocument();
+      });
+    });
+
+    it('does not clear the new composer when an old injection resolves after a turn change', async () => {
+      const task = makeTask({
+        id: 344,
+        status: 'completed',
+        background_active: true,
+      });
+      let resolveInjection!: (value: {
+        ok: boolean;
+        injected: boolean;
+        operation_id: string;
+      }) => void;
+      vi.mocked(api.injectTaskMessage).mockReturnValueOnce(
+        new Promise((resolve) => { resolveInjection = resolve; }),
+      );
+      const { rerender } = render(
+        <ChatView task={task} projects={projects} onBack={onBack} />,
+      );
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type a follow-up message/i),
+        'old turn input',
+      );
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+      await waitFor(() => expect(api.injectTaskMessage).toHaveBeenCalledTimes(1));
+
+      const nextTask = {
+        ...task,
+        status: 'executing' as const,
+        background_active: false,
+        turn_generation: task.turn_generation + 1,
+      };
+      rerender(<ChatView task={nextTask} projects={projects} onBack={onBack} />);
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText(/Type next message to queue/i)).toBeInTheDocument();
+      });
+      fireEvent.change(
+        screen.getByPlaceholderText(/Type next message to queue/i),
+        { target: { value: 'new turn input' } },
+      );
+
+      resolveInjection({
+        ok: true,
+        injected: true,
+        operation_id: 'old-turn-operation',
+      });
+      await waitFor(() => {
+        expect(screen.getByPlaceholderText(/Type next message to queue/i)).toHaveValue(
+          'new turn input',
+        );
+      });
     });
 
     it('auto-dequeues a locally restored message on an initial Claude retained tail', async () => {
@@ -1528,6 +1792,39 @@ describe('ChatView', () => {
       expect(api.sendTaskChat).not.toHaveBeenCalled();
       await waitFor(() => {
         expect(screen.queryByText('Queued messages (1)')).not.toBeInTheDocument();
+      });
+    });
+
+    it('keeps a Codex retained follow-up active from the HTTP admission before its audit event', async () => {
+      const task = makeTask({
+        id: 345,
+        provider: 'codex',
+        status: 'completed',
+        background_active: true,
+      });
+      vi.mocked(api.injectTaskMessage).mockResolvedValueOnce({
+        ok: true,
+        injected: true,
+      });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+
+      await userEvent.type(
+        screen.getByPlaceholderText(/Type a follow-up message/i),
+        'steer Codex while child runs',
+      );
+      await userEvent.click(screen.getByTitle(/Send \(Ctrl\+Enter\)/));
+      await waitFor(() => {
+        expect(api.injectTaskMessage).toHaveBeenCalledWith(
+          task.id,
+          'steer Codex while child runs',
+          {
+            provider: 'codex',
+            model: null,
+            codex_service_tier: 'default',
+          },
+          undefined,
+        );
+        expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
       });
     });
 
@@ -4460,6 +4757,26 @@ describe('Codex app-server 增量消息', () => {
     await act(async () => {
       resolveInjection({ ok: true, injected: true });
     });
+    // A periodic/late running lifecycle can belong to the retained root
+    // generation even after this follow-up has been admitted. It must not
+    // clear the newer follow-up's foreground indicator.
+    act(() => {
+      capturedOnMessage?.({
+        channel: `task:${task.id}`,
+        data: {
+          event_type: 'background_lifecycle',
+          background_state: 'running',
+          background_reason: 'waiting_for_descendants',
+          background_active_count: 1,
+          background_active_thread_ids: ['child-206'],
+          background_started_at: backgroundStartedAt,
+          background_last_activity_at: backgroundStartedAt,
+          task_retry_count: task.retry_count,
+          task_turn_generation: task.turn_generation,
+        },
+      });
+    });
+    expect(screen.getByText('Codex is thinking...')).toBeInTheDocument();
     expect(screen.queryByText('后台任务已完成，正在收尾…')).not.toBeInTheDocument();
   });
 

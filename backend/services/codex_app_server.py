@@ -219,6 +219,11 @@ _MODEL_LIST_MAX_PAGES = 20
 # read closes listener-attachment races without busy polling.
 _DESCENDANT_RECONCILE_INTERVAL = 5.0
 _DESCENDANT_RECONCILE_REQUEST_TIMEOUT = 5.0
+# A child can publish its own terminal status just before the app-server
+# delivers the ``thread/started`` relation for a nested child.  Keep the
+# public terminal edge in a short stabilization window so that this normal
+# cross-thread ordering cannot flash as "completed" and then reopen.
+_DESCENDANT_TERMINAL_DEBOUNCE = 0.1
 _DESCENDANT_INTERRUPT_CONFIRM_TIMEOUT = 10.0
 _DESCENDANT_INTERRUPT_POLL_INTERVAL = 0.1
 _BACKGROUND_LIFECYCLE_ACTIVITY_INTERVAL = 60.0
@@ -2227,6 +2232,16 @@ class _TurnContext:
     descendant_lifecycle_states: dict[str, str] = field(default_factory=dict)
     descendant_lifecycle_sequences: dict[str, int] = field(default_factory=dict)
     descendant_lifecycle_summaries: dict[str, str] = field(default_factory=dict)
+    # A child thread can report its own turn terminal before descendants that
+    # it spawned have settled.  Keep that terminal proof pending while the
+    # child remains a blocker in the root lineage; the final descendant edge
+    # then settles the parent exactly once.
+    descendant_pending_terminal_status: dict[str, str] = field(
+        default_factory=dict
+    )
+    descendant_terminal_debounce_handles: dict[str, asyncio.TimerHandle] = (
+        field(default_factory=dict)
+    )
     descendant_state_changed: asyncio.Event | None = None
     descendant_interrupt_lock: asyncio.Lock | None = None
     descendant_guard_task: asyncio.Task | None = None
@@ -2554,6 +2569,13 @@ class CodexAppServer:
         state_changed = getattr(context, "descendant_state_changed", None)
         if state_changed is not None:
             state_changed.set()
+        for handle in getattr(
+            context,
+            "descendant_terminal_debounce_handles",
+            {},
+        ).values():
+            if handle is not None and not handle.cancelled():
+                handle.cancel()
         for thread_id in list(
             getattr(context, "descendant_thread_ids", set())
         ):
@@ -2569,6 +2591,8 @@ class CodexAppServer:
             "descendant_lifecycle_states",
             "descendant_lifecycle_sequences",
             "descendant_lifecycle_summaries",
+            "descendant_pending_terminal_status",
+            "descendant_terminal_debounce_handles",
         ):
             mapping = getattr(context, attribute, None)
             if mapping is not None:
@@ -3209,7 +3233,20 @@ class CodexAppServer:
         """Retain only bounded public metadata for one native child thread."""
 
         if parent_thread_id:
-            context.descendant_parent_thread_ids[thread_id] = parent_thread_id
+            existing_parent = context.descendant_parent_thread_ids.get(thread_id)
+            if existing_parent is None:
+                context.descendant_parent_thread_ids[thread_id] = parent_thread_id
+            elif existing_parent != parent_thread_id:
+                # A native thread has one immutable parent.  Keep the first
+                # accepted edge so a conflicting replay cannot rewrite the
+                # public hierarchy or the stop/reconcile lineage proof.
+                logger.error(
+                    "Keeping first Codex parent for descendant %s: %s; "
+                    "ignoring conflicting parent %s",
+                    thread_id,
+                    existing_parent,
+                    parent_thread_id,
+                )
         details = context.descendant_lifecycle_details.setdefault(thread_id, {})
         item = item if isinstance(item, dict) else {}
         state = state if isinstance(state, dict) else {}
@@ -3325,6 +3362,10 @@ class CodexAppServer:
     ) -> None:
         if not self._context_is_current(context):
             return
+        # A fresh active proof supersedes a previously deferred terminal edge
+        # for this exact native thread (for example a retained Goal turn).
+        self._cancel_descendant_terminal_debounce(context, thread_id)
+        context.descendant_pending_terminal_status.pop(thread_id, None)
         if context.claimed_stop_token is not None:
             # A newly active child invalidates an earlier quiescence snapshot.
             context.claimed_stop_interrupt_confirmed = False
@@ -3340,16 +3381,69 @@ class CodexAppServer:
             self._publish_background_lifecycle_activity(context)
         self._signal_descendant_state_change(context)
 
-    def _mark_descendant_terminal(
+    def _cancel_descendant_terminal_debounce(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+    ) -> None:
+        handle = context.descendant_terminal_debounce_handles.pop(
+            thread_id,
+            None,
+        )
+        if handle is not None and not handle.cancelled():
+            handle.cancel()
+
+    def _cancel_all_descendant_terminal_debounces(
+        self,
+        context: _TurnContext,
+    ) -> None:
+        """Cancel timers belonging to the previous root-turn observation."""
+
+        for thread_id in tuple(context.descendant_terminal_debounce_handles):
+            self._cancel_descendant_terminal_debounce(context, thread_id)
+
+    def _rearm_pending_descendant_terminal_debounces(
+        self,
+        context: _TurnContext,
+    ) -> None:
+        """Start a fresh grace window after a root turn generation changes."""
+
+        if not self._context_is_current(context):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        for thread_id in tuple(
+            context.descendant_pending_terminal_status
+        ):
+            if self._descendant_has_active_children(context, thread_id):
+                continue
+            if thread_id in context.descendant_terminal_debounce_handles:
+                continue
+            context.descendant_terminal_debounce_handles[thread_id] = (
+                loop.call_later(
+                    _DESCENDANT_TERMINAL_DEBOUNCE,
+                    self._flush_debounced_descendant_terminal,
+                    context,
+                    thread_id,
+                )
+            )
+
+    def _publish_descendant_terminal_now(
         self,
         context: _TurnContext,
         thread_id: str,
         *,
-        status: str = "completed",
+        status: str,
         summary: str | None = None,
     ) -> None:
+        """Publish a proven terminal edge and settle any waiting ancestors."""
+
         if not self._context_is_current(context):
             return
+        self._cancel_descendant_terminal_debounce(context, thread_id)
+        context.descendant_pending_terminal_status.pop(thread_id, None)
         changed = thread_id in context.active_descendant_thread_ids
         context.active_descendant_thread_ids.discard(thread_id)
         self._publish_native_sub_agent_lifecycle(
@@ -3361,6 +3455,343 @@ class CodexAppServer:
         if changed:
             self._publish_background_lifecycle_activity(context)
         self._signal_descendant_state_change(context)
+        self._settle_pending_descendant_terminals(context)
+
+    def _flush_debounced_descendant_terminal(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+    ) -> None:
+        """Close a terminal edge after the relation-discovery grace period."""
+
+        context.descendant_terminal_debounce_handles.pop(thread_id, None)
+        if not self._context_is_current(context):
+            return
+        status = context.descendant_pending_terminal_status.get(thread_id)
+        if status is None:
+            return
+        # A nested relation arrived during the grace period.  The parent is
+        # now handled by the ordinary pending-child settlement path.
+        if self._descendant_has_active_children(context, thread_id):
+            return
+        self._publish_descendant_terminal_now(
+            context,
+            thread_id,
+            status=status,
+            summary=context.descendant_lifecycle_summaries.get(thread_id),
+        )
+
+    def _defer_unknown_descendant_terminal(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+        *,
+        status: str,
+        summary: str | None = None,
+    ) -> None:
+        """Hold a terminal edge briefly while late child relations arrive."""
+
+        if not self._context_is_current(context):
+            return
+        # The first terminal proof wins, including failure over a later idle.
+        status = context.descendant_pending_terminal_status.setdefault(
+            thread_id,
+            status,
+        )
+        was_active = thread_id in context.active_descendant_thread_ids
+        context.active_descendant_thread_ids.add(thread_id)
+        if context.descendant_lifecycle_states.get(thread_id) != "running":
+            self._publish_native_sub_agent_lifecycle(
+                context,
+                thread_id,
+                status="running",
+                summary=summary,
+            )
+        elif summary is not None:
+            bounded_summary = self._bounded_descendant_text(summary, 2000)
+            if bounded_summary is not None:
+                context.descendant_lifecycle_summaries[thread_id] = (
+                    bounded_summary
+                )
+        if not was_active:
+            self._publish_background_lifecycle_activity(context)
+
+        # Direct unit callers can run outside an event loop.  Production
+        # notifications always have one, where the short timer coalesces
+        # already-buffered relation/status messages.
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._publish_descendant_terminal_now(
+                context,
+                thread_id,
+                status=status,
+                summary=summary,
+            )
+        else:
+            handle = context.descendant_terminal_debounce_handles.get(
+                thread_id,
+            )
+            if handle is None or handle.cancelled():
+                context.descendant_terminal_debounce_handles[thread_id] = (
+                    loop.call_later(
+                        _DESCENDANT_TERMINAL_DEBOUNCE,
+                        self._flush_debounced_descendant_terminal,
+                        context,
+                        thread_id,
+                    )
+                )
+        self._signal_descendant_state_change(context)
+
+    def _register_descendant_tree(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+        *,
+        ordered: list[str],
+        seen: set[str],
+    ) -> None:
+        """Register a native subtree before evaluating any lifecycle state."""
+
+        if (
+            not thread_id
+            or thread_id == context.thread_id
+            or thread_id in seen
+            or not self._context_is_current(context)
+        ):
+            return
+        seen.add(thread_id)
+        ordered.append(thread_id)
+        context.descendant_thread_ids.add(thread_id)
+        owner = self._contexts_by_descendant.get(thread_id)
+        if owner is None or owner is context or not self._context_is_current(owner):
+            self._contexts_by_descendant[thread_id] = context
+        elif owner is not context:
+            logger.error(
+                "Codex descendant %s is already fenced to task %s; "
+                "task %s will reconcile it without stealing ownership",
+                thread_id,
+                owner.task_id,
+                context.task_id,
+            )
+
+        for child_id in self._children_by_thread.get(thread_id, set()):
+            context.descendant_parent_thread_ids.setdefault(
+                child_id,
+                thread_id,
+            )
+            self._register_descendant_tree(
+                context,
+                child_id,
+                ordered=ordered,
+                seen=seen,
+            )
+
+    def _descendant_has_active_children(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+        *,
+        seen: set[str] | None = None,
+    ) -> bool:
+        """Whether a native thread still owns an active descendant.
+
+        ``turn/completed`` is only terminal for the reported thread.  Codex
+        can keep a child thread idle while a grandchild continues working, so
+        the root projection must consult the relation graph instead of using
+        the child's own turn as a recursive completion proof.
+        """
+
+        visited = seen if seen is not None else set()
+        if thread_id in visited:
+            return False
+        visited.add(thread_id)
+        for child_id in self._children_by_thread.get(thread_id, set()):
+            if child_id not in context.descendant_thread_ids:
+                continue
+            child_runtime = self._thread_runtime.get(child_id)
+            if (
+                child_id in context.active_descendant_thread_ids
+                or context.descendant_lifecycle_states.get(child_id)
+                == "running"
+                or child_id in context.descendant_pending_terminal_status
+                or (
+                    child_runtime is not None
+                    and (
+                        child_runtime.status_type == "active"
+                        or bool(child_runtime.active_turn_ids)
+                    )
+                )
+            ):
+                return True
+            if self._descendant_has_active_children(
+                context,
+                child_id,
+                seen=visited,
+            ):
+                return True
+        return False
+
+    def _settle_pending_descendant_terminals(
+        self,
+        context: _TurnContext,
+    ) -> None:
+        """Close deferred parent edges after their last child settles."""
+
+        if not self._context_is_current(context):
+            return
+        # A grandchild terminal can make several ancestor edges settle in one
+        # notification.  Iterate until no pending edge became terminal.
+        changed = True
+        while changed:
+            changed = False
+            for thread_id, status in list(
+                context.descendant_pending_terminal_status.items()
+            ):
+                if self._descendant_has_active_children(context, thread_id):
+                    continue
+                # A direct terminal proof is still inside its relation
+                # stabilization window.  Let that timer decide; otherwise a
+                # sibling notification could reintroduce the very done-flash
+                # this fence is meant to prevent.
+                if thread_id in context.descendant_terminal_debounce_handles:
+                    continue
+                context.descendant_pending_terminal_status.pop(
+                    thread_id,
+                    None,
+                )
+                self._publish_descendant_terminal_now(
+                    context,
+                    thread_id,
+                    status=status,
+                    summary=context.descendant_lifecycle_summaries.get(
+                        thread_id
+                    ),
+                )
+                changed = True
+
+    def _restore_terminal_ancestors_for_active_descendant(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+    ) -> None:
+        """Reopen terminal ancestors when a child relation arrives late.
+
+        App-server notifications from different native threads can interleave.
+        A child may therefore publish its own terminal edge before CCM learns
+        that it spawned another active thread.  Preserve the earlier terminal
+        status as a deferred edge and immediately reactivate each affected
+        ancestor so the public lifecycle keeps representing the live lineage.
+        """
+
+        parent_id = context.descendant_parent_thread_ids.get(thread_id)
+        seen = {thread_id}
+        while parent_id and parent_id != context.thread_id:
+            if parent_id in seen:
+                logger.error(
+                    "Ignoring cyclic Codex descendant lineage at %s",
+                    parent_id,
+                )
+                return
+            seen.add(parent_id)
+            previous = context.descendant_lifecycle_states.get(parent_id)
+            if previous in {"completed", "failed", "cancelled"}:
+                self._cancel_descendant_terminal_debounce(context, parent_id)
+                context.descendant_pending_terminal_status.setdefault(
+                    parent_id,
+                    previous,
+                )
+                changed = (
+                    parent_id not in context.active_descendant_thread_ids
+                )
+                context.active_descendant_thread_ids.add(parent_id)
+                self._publish_native_sub_agent_lifecycle(
+                    context,
+                    parent_id,
+                    status="running",
+                )
+                if changed:
+                    self._publish_background_lifecycle_activity(context)
+            parent_id = context.descendant_parent_thread_ids.get(parent_id)
+        self._signal_descendant_state_change(context)
+
+    def _mark_descendant_terminal(
+        self,
+        context: _TurnContext,
+        thread_id: str,
+        *,
+        status: str = "completed",
+        summary: str | None = None,
+    ) -> None:
+        if not self._context_is_current(context):
+            return
+        if self._descendant_has_active_children(context, thread_id):
+            # The thread's own turn is done, but its lineage is not. Keep the
+            # child visible as running and defer its terminal edge until the
+            # last known descendant is proven terminal.
+            context.descendant_pending_terminal_status.setdefault(
+                thread_id,
+                status,
+            )
+            was_active = thread_id in context.active_descendant_thread_ids
+            context.active_descendant_thread_ids.add(thread_id)
+            if context.descendant_lifecycle_states.get(thread_id) != "running":
+                # A stale terminal notification may have raced graph
+                # discovery, or the child may have been discovered only after
+                # its own turn ended. Publish/re-publish running so the public
+                # mirror cannot remain terminal (or invisible) while work is
+                # still active.
+                self._publish_native_sub_agent_lifecycle(
+                    context,
+                    thread_id,
+                    status="running",
+                    summary=summary,
+                )
+            elif summary is not None:
+                bounded_summary = self._bounded_descendant_text(
+                    summary,
+                    2000,
+                )
+                if bounded_summary is not None:
+                    context.descendant_lifecycle_summaries[thread_id] = (
+                        bounded_summary
+                    )
+            if not was_active:
+                self._publish_background_lifecycle_activity(context)
+            self._signal_descendant_state_change(context)
+            return
+        previous = context.descendant_lifecycle_states.get(thread_id)
+        if (
+            previous in {"completed", "failed", "cancelled"}
+            and thread_id not in context.descendant_pending_terminal_status
+        ):
+            return
+        # Once the root turn has already entered its guarded terminal/stop
+        # path, delaying a child's terminal edge would hold the safety guard
+        # open unnecessarily.  At that point no new root output can be
+        # mistaken for the child's late relation, so settle directly.
+        if (
+            context.deferred_terminal_notification is not None
+            and context.claimed_stop_token is not None
+        ):
+            self._publish_descendant_terminal_now(
+                context,
+                thread_id,
+                status=(
+                    context.descendant_pending_terminal_status.get(
+                        thread_id,
+                        status,
+                    )
+                ),
+                summary=summary,
+            )
+            return
+        self._defer_unknown_descendant_terminal(
+            context,
+            thread_id,
+            status=status,
+            summary=summary,
+        )
 
     def _publish_descendant_message_summary(
         self,
@@ -3386,11 +3817,17 @@ class CodexAppServer:
         summary = self._bounded_descendant_text(item.get("text"), 2000)
         if summary is None:
             return
-        self._mark_descendant_active(
+        # A public child message can arrive after the child's own turn ended
+        # while a nested descendant is still active.  It is progress for the
+        # already-running lifecycle, not a fresh terminal/turn proof; do not
+        # clear the deferred parent terminal in that case.
+        self._publish_native_sub_agent_lifecycle(
             context,
             thread_id,
+            status="running",
             summary=summary,
         )
+        self._signal_descendant_state_change(context)
 
     def _publish_background_lifecycle(
         self,
@@ -3531,18 +3968,38 @@ class CodexAppServer:
         self,
         parent_thread_id: str,
         child_thread_id: str,
-    ) -> None:
+    ) -> bool:
         if not parent_thread_id or not child_thread_id:
-            return
+            return False
         if parent_thread_id == child_thread_id:
             logger.error(
                 "Ignoring cyclic Codex child-thread relation %s",
                 child_thread_id,
             )
-            return
+            return False
+        # Reject longer cycles before they enter the lineage graph.  A cycle
+        # would otherwise leave every edge waiting on another pending edge and
+        # make descendant cleanup impossible to prove.
+        pending = [child_thread_id]
+        seen: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current == parent_thread_id:
+                logger.error(
+                    "Ignoring cyclic Codex child-thread relation parent=%s "
+                    "child=%s",
+                    parent_thread_id,
+                    child_thread_id,
+                )
+                return False
+            if current in seen:
+                continue
+            seen.add(current)
+            pending.extend(self._children_by_thread.get(current, ()))
         self._children_by_thread.setdefault(parent_thread_id, set()).add(
             child_thread_id
         )
+        return True
 
     def _attach_descendant(
         self,
@@ -3558,66 +4015,112 @@ class CodexAppServer:
             return
         if not self._context_is_current(context):
             return
-        seen = _seen if _seen is not None else set()
-        if thread_id in seen:
+        # The first phase registers every known edge.  Without this barrier a
+        # parent terminal notification can run before its nested child is in
+        # ``descendant_thread_ids`` and falsely publish the parent as done.
+        if _seen is not None:
+            # ``_seen`` was only used by the old recursive implementation;
+            # retain the guard for defensive callers while all normal calls
+            # use the two-phase path below.
+            if thread_id in _seen:
+                return
+            _seen.add(thread_id)
+        ordered: list[str] = []
+        self._register_descendant_tree(
+            context,
+            thread_id,
+            ordered=ordered,
+            seen=set(),
+        )
+        if not ordered:
             return
-        seen.add(thread_id)
-        context.descendant_thread_ids.add(thread_id)
-        owner = self._contexts_by_descendant.get(thread_id)
-        if owner is None or owner is context or not self._context_is_current(owner):
-            self._contexts_by_descendant[thread_id] = context
-        elif owner is not context:
-            logger.error(
-                "Codex descendant %s is already fenced to task %s; "
-                "task %s will reconcile it without stealing ownership",
-                thread_id,
-                owner.task_id,
-                context.task_id,
-            )
 
-        runtime = self._thread_runtime.get(thread_id)
-        if active is True:
-            self._mark_descendant_active(
-                context,
-                thread_id,
-                summary=summary,
-            )
-        elif active is False:
-            self._mark_descendant_terminal(
-                context,
-                thread_id,
-                status=terminal_status,
-                summary=summary,
-            )
-        elif runtime is None:
-            # A discovered child with no status proof is a blocker, not an
-            # implicit success.
-            self._mark_descendant_active(context, thread_id)
-        elif (
-            runtime.status_type == "active"
-            or bool(runtime.active_turn_ids)
-        ):
-            self._mark_descendant_active(context, thread_id)
-        elif self._thread_status_is_terminal(runtime.status_type):
-            self._mark_descendant_terminal(
-                context,
-                thread_id,
-                status=self._descendant_terminal_status(runtime.status_type),
-            )
-        else:
-            self._mark_descendant_active(context, thread_id)
+        requested_states: dict[str, tuple[bool, str, str | None]] = {}
+        for candidate in ordered:
+            candidate_active: bool | None
+            candidate_terminal_status = "completed"
+            candidate_summary: str | None = None
+            if candidate == thread_id:
+                candidate_active = active
+                candidate_terminal_status = terminal_status
+                candidate_summary = summary
+            else:
+                candidate_active = None
+            runtime = self._thread_runtime.get(candidate)
+            if candidate_active is True:
+                requested_states[candidate] = (
+                    True,
+                    candidate_terminal_status,
+                    candidate_summary,
+                )
+            elif candidate_active is False:
+                requested_states[candidate] = (
+                    False,
+                    candidate_terminal_status,
+                    candidate_summary,
+                )
+            elif runtime is None:
+                # A discovered child with no status proof is a blocker, not
+                # an implicit success.
+                requested_states[candidate] = (
+                    True,
+                    candidate_terminal_status,
+                    candidate_summary,
+                )
+            elif (
+                runtime.status_type == "active"
+                or bool(runtime.active_turn_ids)
+            ):
+                requested_states[candidate] = (
+                    True,
+                    candidate_terminal_status,
+                    candidate_summary,
+                )
+            elif self._thread_status_is_terminal(runtime.status_type):
+                requested_states[candidate] = (
+                    False,
+                    self._descendant_terminal_status(runtime.status_type),
+                    candidate_summary,
+                )
+            else:
+                requested_states[candidate] = (
+                    True,
+                    candidate_terminal_status,
+                    candidate_summary,
+                )
 
-        for child_id in self._children_by_thread.get(thread_id, set()):
-            context.descendant_parent_thread_ids.setdefault(
-                child_id,
-                thread_id,
+        # Seed all active descendants before processing terminal edges.  This
+        # makes a parent terminal defer even when the child itself is only
+        # discovered through the same recursive attach operation.
+        for candidate in ordered:
+            candidate_active, _, candidate_summary = requested_states[candidate]
+            if candidate_active:
+                self._mark_descendant_active(
+                    context,
+                    candidate,
+                    summary=(candidate_summary if candidate == thread_id else None),
+                )
+
+        # Settle terminal edges deepest-first so a terminal child is never
+        # hidden behind a parent that was processed before its descendants.
+        for candidate in reversed(ordered):
+            candidate_active, candidate_terminal_status, candidate_summary = (
+                requested_states[candidate]
             )
-            self._attach_descendant(
-                context,
-                child_id,
-                active=None,
-                _seen=seen,
-            )
+            if not candidate_active:
+                self._mark_descendant_terminal(
+                    context,
+                    candidate,
+                    status=candidate_terminal_status,
+                    summary=(candidate_summary if candidate == thread_id else None),
+                )
+
+        for candidate in ordered:
+            if candidate in context.active_descendant_thread_ids:
+                self._restore_terminal_ancestors_for_active_descendant(
+                    context,
+                    candidate,
+                )
 
     def _track_collaboration_item(
         self,
@@ -3633,7 +4136,8 @@ class CodexAppServer:
             if not child_id:
                 return
             child_id = str(child_id)
-            self._record_child_relation(event_thread_id, child_id)
+            if not self._record_child_relation(event_thread_id, child_id):
+                return
             self._remember_descendant_lifecycle_details(
                 context,
                 child_id,
@@ -3705,7 +4209,8 @@ class CodexAppServer:
         }
         for raw_child_id in receiver_ids:
             child_id = str(raw_child_id)
-            self._record_child_relation(sender_id, child_id)
+            if not self._record_child_relation(sender_id, child_id):
+                continue
             state = agent_states.get(child_id)
             agent_status = (
                 str(state.get("status") or "")
@@ -4190,6 +4695,7 @@ class CodexAppServer:
             context.goal_terminal_generation += 1
         if context.deferred_terminal_notification is not None:
             context.deferred_terminal_notification = None
+            self._cancel_all_descendant_terminal_debounces(context)
             guard = context.descendant_guard_task
             context.descendant_guard_task = None
             if guard is not None and not guard.done():
@@ -4197,6 +4703,7 @@ class CodexAppServer:
             state_changed = context.descendant_state_changed
             if state_changed is not None:
                 state_changed.set()
+            self._rearm_pending_descendant_terminal_debounces(context)
         self._mark_following_native_goal(context)
         context.usage = None
         context.first_input_seen = False
@@ -8602,6 +9109,7 @@ class CodexAppServer:
         if context.turn_start_params is None or context.continuation_starting:
             return False
         context.continuation_starting = True
+        self._cancel_all_descendant_terminal_debounces(context)
         release_continuation_guard = True
         previous_turn_state = {
             "client_user_message_id": context.client_user_message_id,
@@ -8791,6 +9299,7 @@ class CodexAppServer:
                 ):
                     self._contexts_by_turn.pop(old_turn_id, None)
             context.deferred_terminal_notification = None
+            self._rearm_pending_descendant_terminal_debounces(context)
             guard = context.descendant_guard_task
             context.descendant_guard_task = None
             if guard is not None and not guard.done():
@@ -9182,6 +9691,7 @@ class CodexAppServer:
             if isinstance(thread, dict):
                 child_id = thread.get("id")
                 parent_id = thread.get("parentThreadId")
+                relation_recorded = False
                 if isinstance(child_id, str):
                     self._record_thread_status(
                         child_id,
@@ -9191,8 +9701,15 @@ class CodexAppServer:
                     isinstance(child_id, str)
                     and isinstance(parent_id, str)
                 ):
-                    self._record_child_relation(parent_id, child_id)
-                    lineage_context = self._lineage_context_for_thread(parent_id)
+                    relation_recorded = self._record_child_relation(
+                        parent_id,
+                        child_id,
+                    )
+                    lineage_context = (
+                        self._lineage_context_for_thread(parent_id)
+                        if relation_recorded
+                        else None
+                    )
                     if lineage_context is not None:
                         self._remember_descendant_lifecycle_details(
                             lineage_context,
@@ -9222,6 +9739,7 @@ class CodexAppServer:
                     proxy is not None
                     and isinstance(child_id, str)
                     and isinstance(parent_id, str)
+                    and relation_recorded
                 ):
                     try:
                         proxy.register_thread_parent(child_id, parent_id)

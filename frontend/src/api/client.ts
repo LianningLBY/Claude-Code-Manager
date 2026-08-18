@@ -949,6 +949,10 @@ export interface ChatMessage {
   native_item_type?: string | null;
   native_item_status?: string | null;
   background_lifecycle?: BackgroundLifecycle | null;
+  /** Exact retained Claude follow-up correlated with its durable boundary. */
+  followup_operation_id?: string | null;
+  pty_followup_state?: 'completed' | 'uncertain' | null;
+  pty_background_generation?: string | null;
   /** True when this row came from persisted chat history, not live optimism. */
   persisted?: boolean;
   // 权限透传卡片（event_type === 'permission_request' 时存在）
@@ -2865,7 +2869,12 @@ export const api = {
     expectedRouting?: TaskRoutingExpectation,
     uploads?: InjectTaskAttachments,
   ) =>
-    request<{ ok: boolean; injected: boolean; attachment_count?: number }>(`/api/tasks/${taskId}/inject`, {
+    request<{
+      ok: boolean;
+      injected: boolean;
+      attachment_count?: number;
+      operation_id?: string | null;
+    }>(`/api/tasks/${taskId}/inject`, {
       method: 'POST',
       body: JSON.stringify({
         message,

@@ -11,6 +11,7 @@ import secrets
 import signal
 import threading
 import time
+import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -933,6 +934,20 @@ class InstanceManager:
         # event pumps separate from the terminal consumer so stop/reap can
         # still address the original process identity.
         self._pty_followup_tasks: dict[int, set[asyncio.Task]] = {}
+        # The API may allocate a provisional follow-up id from the durable
+        # retained-background marker before the Session route is inspected.
+        # Keep the exact route selected under the lifecycle lock so a race
+        # with a newly started foreground turn cannot make the API publish an
+        # id for which no retained boundary will ever be emitted.
+        self._pty_followup_operation_routes: weakref.WeakKeyDictionary[
+            asyncio.Task[Any], dict[str, str | None]
+        ] = weakref.WeakKeyDictionary()
+        # Boundary receipts are idempotent by (Task, operation). Keep a small
+        # in-process fence so retries cannot create duplicate history rows or
+        # publish competing states.
+        self._pty_followup_boundary_locks: dict[
+            tuple[int, str], asyncio.Lock
+        ] = {}
         # Holding the process object in the key also prevents Python object-id
         # reuse from ever mapping a very late failure onto a future process.
         self._consumer_errors: dict[
@@ -1181,6 +1196,294 @@ class InstanceManager:
             if not tasks:
                 self._pty_followup_tasks.pop(key, None)
 
+    def _record_pty_followup_operation_route(
+        self,
+        requested_operation_id: str | None,
+        actual_operation_id: str | None,
+    ) -> None:
+        """Record the transport selected for one API provisional id.
+
+        This is intentionally an in-memory handoff: the user-message audit is
+        written immediately after the provider acknowledgement, while the
+        retained boundary itself is persisted by the follow-up pump.  The
+        caller consumes the entry synchronously, so no durable state depends
+        on this map surviving a process restart.
+        """
+
+        if not requested_operation_id:
+            return
+        try:
+            owner = asyncio.current_task()
+        except RuntimeError:
+            owner = None
+        if owner is None:
+            return
+        routes = self._pty_followup_operation_routes.setdefault(owner, {})
+        routes[requested_operation_id] = actual_operation_id
+
+    def consume_pty_followup_operation_route(
+        self,
+        requested_operation_id: str | None,
+    ) -> tuple[bool, str | None]:
+        """Return and remove the exact route selected by a PTY injection.
+
+        The boolean distinguishes a real foreground result of ``None`` from
+        an older test double/manager that does not implement this handoff.
+        """
+
+        if not requested_operation_id:
+            return False, None
+        try:
+            owner = asyncio.current_task()
+        except RuntimeError:
+            owner = None
+        if owner is None:
+            return False, None
+        routes = self._pty_followup_operation_routes.get(owner)
+        if routes is None or requested_operation_id not in routes:
+            return False, None
+        route = routes.pop(requested_operation_id)
+        if not routes:
+            self._pty_followup_operation_routes.pop(owner, None)
+        return True, route
+
+    async def persist_pty_followup_boundary(
+        self,
+        *,
+        instance_id: int,
+        task_id: int,
+        task_retry_count: int,
+        task_turn_generation: int,
+        session_id: str,
+        background_generation: str,
+        followup_operation_id: str,
+        state: str,
+    ) -> bool:
+        """Persist one retained-PTY follow-up receipt independently.
+
+        This is an audit of an already admitted provider side effect. It must
+        survive a concurrent stop/retry that changes the mutable Task marker,
+        so it deliberately keys the row by the admitted retry/turn identity
+        instead of requiring the current ``pty_background_generation``. The
+        operation id makes retries idempotent and the committed row lets a
+        reconnect recover even when the live WebSocket publication was lost.
+        """
+
+        if state not in {"completed", "uncertain"} or not followup_operation_id:
+            return False
+        lock_key = (task_id, followup_operation_id)
+        lock = self._pty_followup_boundary_locks.setdefault(
+            lock_key,
+            asyncio.Lock(),
+        )
+        async with lock:
+            payload = {
+                "type": "pty.background_followup_boundary",
+                "version": 1,
+                "followup_operation_id": followup_operation_id,
+                "state": state,
+                "background_generation": background_generation,
+            }
+            raw_json = json.dumps(
+                payload,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            for attempt in range(2):
+                try:
+                    entry_id: int | None = None
+                    entry_timestamp: datetime | None = None
+                    effective_state = state
+                    async with self.db_factory() as db:
+                        if not await _fence_worker_runtime_mutation(
+                            db,
+                            producer="PTY follow-up boundary",
+                        ):
+                            return False
+                        candidates = (
+                            await db.execute(
+                                select(LogEntry)
+                                .where(
+                                    LogEntry.task_id == task_id,
+                                    LogEntry.task_retry_count
+                                    == task_retry_count,
+                                    LogEntry.task_turn_generation
+                                    == task_turn_generation,
+                                    LogEntry.event_type
+                                    == "pty_background_followup_boundary",
+                                    LogEntry.native_turn_id
+                                    == background_generation,
+                                )
+                                .order_by(LogEntry.id.desc())
+                            )
+                        ).scalars().all()
+                        existing = None
+                        for candidate in candidates:
+                            try:
+                                candidate_payload = json.loads(
+                                    candidate.raw_json or "{}"
+                                )
+                            except (TypeError, ValueError):
+                                continue
+                            if (
+                                isinstance(candidate_payload, dict)
+                                and candidate_payload.get(
+                                    "followup_operation_id"
+                                )
+                                == followup_operation_id
+                            ):
+                                existing = candidate
+                                break
+                        if existing is None:
+                            now = datetime.utcnow()
+                            entry = LogEntry(
+                                instance_id=instance_id,
+                                task_id=task_id,
+                                task_retry_count=task_retry_count,
+                                task_turn_generation=task_turn_generation,
+                                native_turn_id=background_generation,
+                                event_type=(
+                                    "pty_background_followup_boundary"
+                                ),
+                                role="system",
+                                content=None,
+                                raw_json=raw_json,
+                                is_error=state == "uncertain",
+                                timestamp=now,
+                            )
+                            db.add(entry)
+                            await db.flush()
+                            entry_id = entry.id
+                            entry_timestamp = now
+                            await db.commit()
+                        else:
+                            entry_id = existing.id
+                            entry_timestamp = existing.timestamp
+                            try:
+                                existing_payload = json.loads(
+                                    existing.raw_json or "{}"
+                                )
+                            except (TypeError, ValueError):
+                                existing_payload = {}
+                            if (
+                                isinstance(existing_payload, dict)
+                                and existing_payload.get("state")
+                                == "completed"
+                            ):
+                                effective_state = "completed"
+
+                    if entry_id is None:
+                        return False
+                    broadcast = {
+                        "event_type": (
+                            "pty_background_followup_boundary"
+                        ),
+                        "role": "system",
+                        "content": None,
+                        "is_error": effective_state == "uncertain",
+                        "followup_operation_id": followup_operation_id,
+                        "pty_followup_state": effective_state,
+                        "state": effective_state,
+                        "pty_background_generation": background_generation,
+                        "background_generation": background_generation,
+                        "task_id": task_id,
+                        "instance_id": instance_id,
+                        "task_retry_count": task_retry_count,
+                        "task_turn_generation": task_turn_generation,
+                        "native_turn_id": background_generation,
+                        "id": entry_id,
+                        "timestamp": (
+                            entry_timestamp or datetime.utcnow()
+                        ).isoformat(),
+                    }
+                    try:
+                        await self.broadcaster.broadcast(
+                            f"task:{task_id}",
+                            broadcast,
+                        )
+                    except Exception:
+                        # The committed row is the recovery source; a
+                        # transient WebSocket failure must not make the pump
+                        # report that the receipt was not recorded.
+                        logger.warning(
+                            "PTY follow-up boundary broadcast failed for "
+                            "task %s operation %s",
+                            task_id,
+                            followup_operation_id,
+                            exc_info=True,
+                        )
+                    return True
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "PTY follow-up boundary persistence attempt %s "
+                        "failed for task %s operation %s",
+                        attempt + 1,
+                        task_id,
+                        followup_operation_id,
+                        exc_info=True,
+                    )
+                    if attempt == 0:
+                        await asyncio.sleep(0.05)
+            return False
+
+    async def _publish_pty_followup_boundary(
+        self,
+        backend: Any,
+        key: int,
+        event: dict,
+        launch_params: dict[str, Any],
+        *,
+        task_id: int,
+        task_retry_count: int,
+        task_turn_generation: int,
+        session_id: str,
+        background_generation: str,
+        followup_operation_id: str,
+        state: str,
+    ) -> bool:
+        """Publish through the backend, then repair a swallowed boundary.
+
+        Older PTY adapters intentionally swallow ordinary callback failures.
+        That compatibility behavior is useful for autonomous mirroring but
+        cannot apply to a follow-up receipt. An explicit ``False`` result or
+        exception falls back to the independent durable audit writer; ``None``
+        remains a compatibility success for older adapters and test doubles.
+        """
+
+        try:
+            result = await backend.on_event(
+                key,
+                event,
+                **launch_params,
+            )
+            if result is True:
+                return True
+            # Compatibility test doubles and older adapters return ``None``
+            # after accepting the callback. Only an explicit ``False`` means
+            # the strict writer declined the receipt and needs repair.
+            if result is not False:
+                return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "PTY follow-up boundary callback failed for task %s",
+                task_id,
+            )
+        return await self.persist_pty_followup_boundary(
+            instance_id=key,
+            task_id=task_id,
+            task_retry_count=task_retry_count,
+            task_turn_generation=task_turn_generation,
+            session_id=session_id,
+            background_generation=background_generation,
+            followup_operation_id=followup_operation_id,
+            state=state,
+        )
+
     async def _run_pty_followup_prompt(
         self,
         key: int,
@@ -1190,6 +1493,7 @@ class InstanceManager:
         record: _OutputConsumerRecord,
         background_state: _PtyBackgroundState,
         admission: asyncio.Future[bool],
+        followup_operation_id: str,
     ) -> None:
         """Pump one follow-up prompt through an already retained PTY Session."""
 
@@ -1200,6 +1504,8 @@ class InstanceManager:
         stream = None
         first_event: asyncio.Task | None = None
         delayed_cancellation: asyncio.CancelledError | None = None
+        admitted_locally = False
+        stream_completed = False
         try:
             if backend is None:
                 admission.set_result(False)
@@ -1238,9 +1544,11 @@ class InstanceManager:
                     admission.set_result(False)
                     return
             else:
+                admitted_locally = True
                 admission.set_result(True)
                 event = await first_event
             if not admission.done():
+                admitted_locally = True
                 admission.set_result(True)
             await backend.on_event(
                 key,
@@ -1253,6 +1561,7 @@ class InstanceManager:
                     event.to_dict(),
                     **launch_params,
                 )
+            stream_completed = True
         except asyncio.CancelledError as exc:
             delayed_cancellation = exc
             if not admission.done():
@@ -1297,13 +1606,135 @@ class InstanceManager:
                     "instance %s",
                     key,
                 )
-            finally:
-                if current is not None:
-                    self._finalize_pty_followup_pump(
+        try:
+            # Once the provider accepted the prompt, always leave a durable
+            # receipt. A cancellation after admission is explicitly uncertain
+            # rather than an invisible side effect that can strand the UI.
+            if admitted_locally:
+                boundary_state = (
+                    "completed"
+                    if stream_completed and delayed_cancellation is None
+                    else "uncertain"
+                )
+                boundary_payload = {
+                    "type": "pty.background_followup_boundary",
+                    "version": 1,
+                    "followup_operation_id": followup_operation_id,
+                    "state": boundary_state,
+                    "background_generation": background_state.generation,
+                }
+                boundary_event = {
+                    "event_type": "pty_background_followup_boundary",
+                    "role": "system",
+                    "content": None,
+                    "raw_json": json.dumps(
+                        boundary_payload,
+                        ensure_ascii=True,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                    "is_error": boundary_state == "uncertain",
+                    "followup_operation_id": followup_operation_id,
+                    "pty_followup_state": boundary_state,
+                    "state": boundary_state,
+                    "pty_background_generation": background_state.generation,
+                    "task_id": record.task_id,
+                    "task_retry_count": background_state.task_retry_count,
+                    "task_turn_generation": (
+                        background_state.task_turn_generation
+                    ),
+                    # FullMirrorCCMBackend handles this synthetic event with
+                    # the strict receipt writer; ordinary output callbacks
+                    # retain their historical error-swallowing behavior.
+                    "pty_followup_boundary": True,
+                }
+                boundary_task = asyncio.create_task(
+                    self._publish_pty_followup_boundary(
+                        backend,
                         key,
-                        current,
-                        background_state,
+                        boundary_event,
+                        launch_params,
+                        task_id=record.task_id,
+                        task_retry_count=background_state.task_retry_count,
+                        task_turn_generation=(
+                            background_state.task_turn_generation
+                        ),
+                        session_id=background_state.session_id,
+                        background_generation=background_state.generation,
+                        followup_operation_id=followup_operation_id,
+                        state=boundary_state,
+                    ),
+                    name=f"pty-followup-boundary-{key}",
+                )
+                # The strict boundary callback is part of this same retained
+                # output generation. Preserve the consumer record on the
+                # helper task so backend adapters can apply the same exact
+                # generation fence as the ordinary output pump.
+                setattr(
+                    boundary_task,
+                    "_ccm_output_consumer_record",
+                    record,
+                )
+                boundary_cancellation = await await_task_completion(
+                    boundary_task
+                )
+                boundary_ok = False
+                try:
+                    boundary_ok = bool(boundary_task.result())
+                except asyncio.CancelledError as exc:
+                    if delayed_cancellation is None:
+                        delayed_cancellation = exc
+                except Exception:
+                    logger.exception(
+                        "PTY follow-up boundary task failed for instance %s",
+                        key,
                     )
+                if (
+                    boundary_cancellation is not None
+                    and delayed_cancellation is None
+                ):
+                    delayed_cancellation = boundary_cancellation
+                if not boundary_ok:
+                    # There is no durable recovery path left after repeated
+                    # DB failure, but an uncertain live signal still prevents
+                    # a mounted client from waiting forever. History remains
+                    # conservative: the queue will require confirmation.
+                    volatile_boundary = {
+                        k: v for k, v in boundary_event.items()
+                        if k not in {"raw_json", "pty_followup_boundary"}
+                    }
+                    volatile_boundary["pty_followup_state"] = "uncertain"
+                    volatile_boundary["state"] = "uncertain"
+                    fallback_task = asyncio.create_task(
+                        self.broadcaster.broadcast(
+                            f"task:{record.task_id}",
+                            volatile_boundary,
+                        ),
+                        name=f"pty-followup-boundary-fallback-{key}",
+                    )
+                    fallback_cancellation = await await_task_completion(
+                        fallback_task
+                    )
+                    try:
+                        fallback_task.result()
+                    except Exception:
+                        logger.exception(
+                            "PTY follow-up volatile boundary failed for "
+                            "instance %s",
+                            key,
+                        )
+                    if (
+                        fallback_cancellation is not None
+                        and delayed_cancellation is None
+                    ):
+                        delayed_cancellation = fallback_cancellation
+        finally:
+            if current is not None:
+                self._finalize_pty_followup_pump(
+                    key,
+                    current,
+                    background_state,
+                )
         if delayed_cancellation is not None:
             raise delayed_cancellation
 
@@ -1341,6 +1772,7 @@ class InstanceManager:
         task_turn_generation: int | None = None,
         expected_instance_id: int | None = None,
         require_host_file_access: bool = False,
+        followup_operation_id: str | None = None,
     ) -> bool:
         """Steer one exact live Claude PTY foreground turn via stdin.
 
@@ -1438,6 +1870,20 @@ class InstanceManager:
 
             native_process = getattr(session, "active_turn_process", None)
             steer = getattr(session, "steer_active_turn", None)
+            if native_process is not None:
+                # A retained follow-up pump owns the Session's current native
+                # process after ``send_prompt`` starts.  Do not mistake that
+                # process for an independent foreground turn: steering it
+                # would bypass the serialized follow-up slot and leave the
+                # second API operation waiting for a boundary it cannot own.
+                followups = self._pty_followup_tasks.get(key, ())
+                if any(not followup.done() for followup in followups):
+                    logger.info(
+                        "PTY steer rejected for session %s: a retained "
+                        "follow-up prompt is already being consumed",
+                        session_id,
+                    )
+                    return False
             if native_process is None:
                 # FullMirrorCCMBackend keeps the original consumer waiting on
                 # the exact background marker after the visible root turn
@@ -1483,6 +1929,9 @@ class InstanceManager:
                         )
                         return False
                     background_state.pending_followups += 1
+                    resolved_followup_operation_id = (
+                        followup_operation_id or secrets.token_hex(16)
+                    )
                     admission = asyncio.get_running_loop().create_future()
                     try:
                         followup = asyncio.create_task(
@@ -1494,6 +1943,7 @@ class InstanceManager:
                                 record,
                                 background_state,
                                 admission,
+                                resolved_followup_operation_id,
                             ),
                             name=f"pty-followup-{key}",
                         )
@@ -1562,6 +2012,11 @@ class InstanceManager:
                         "after caller cancellation",
                         session_id,
                     )
+                if admitted:
+                    self._record_pty_followup_operation_route(
+                        followup_operation_id,
+                        resolved_followup_operation_id,
+                    )
                 return admitted
             if native_process is None or not callable(steer):
                 logger.info(
@@ -1585,6 +2040,15 @@ class InstanceManager:
                         "Finished PTY steer acknowledgement for session %s "
                         "after caller cancellation",
                         session_id,
+                    )
+                if result:
+                    # The durable marker may still be present while a new
+                    # foreground native turn has already started.  This
+                    # transport has no retained boundary, so explicitly map
+                    # the provisional API id to ``None``.
+                    self._record_pty_followup_operation_route(
+                        followup_operation_id,
+                        None,
                     )
                 return result
             except Exception:

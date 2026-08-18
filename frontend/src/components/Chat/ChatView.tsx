@@ -83,6 +83,13 @@ interface QueuedMessage {
   requiresConfirmation?: boolean;
 }
 
+type PtyFollowupBoundaryState = 'completed' | 'uncertain';
+
+interface ActivePtyFollowup {
+  operationId: string;
+  httpSettled: boolean;
+}
+
 type InjectOutcome = 'injected' | 'rejected' | 'uncertain';
 
 const WORKSPACE_REVIEW_START_TOOLS = new Set([
@@ -527,6 +534,36 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
   });
   const [sending, setSending] = useState(false);
+  const [injecting, setInjecting] = useState(false);
+  const injectingRef = useRef(false);
+  // A retained follow-up shares the Task generation with the lifecycle record
+  // that handed the root turn off to background descendants. Keep that exact
+  // generation fenced so a late ``background_lifecycle: running`` event cannot
+  // turn a newer follow-up back into an apparently idle composer.
+  const retainedFollowupTurnRef = useRef<TaskTurnIdentity | null>(null);
+  const activePtyFollowupRef = useRef<ActivePtyFollowup | null>(null);
+  const pendingPtyFollowupRequestRef = useRef(false);
+  const ptyFollowupRequestEpochRef = useRef(0);
+  const historyRequestEpochRef = useRef(0);
+  const ptyFollowupBoundaryReceiptsRef = useRef(
+    new Map<string, PtyFollowupBoundaryState>(),
+  );
+  const reconciledPtyFollowupOperationsRef = useRef(new Set<string>());
+  const [ptyFollowupBoundaryEpoch, setPtyFollowupBoundaryEpoch] = useState(0);
+  const rememberPtyFollowupBoundary = useCallback((
+    operationId: string,
+    state: PtyFollowupBoundaryState,
+  ) => {
+    const receipts = ptyFollowupBoundaryReceiptsRef.current;
+    receipts.delete(operationId);
+    receipts.set(operationId, state);
+    while (receipts.size > 100) {
+      const oldest = receipts.keys().next().value as string | undefined;
+      if (!oldest) break;
+      receipts.delete(oldest);
+    }
+    setPtyFollowupBoundaryEpoch((epoch) => epoch + 1);
+  }, []);
   const [forkOpen, setForkOpen] = useState(false);
   const [forkAnchors, setForkAnchors] = useState<CodexForkAnchor[]>([]);
   const [selectedForkAnchor, setSelectedForkAnchor] = useState<CodexForkAnchor | null>(null);
@@ -567,6 +604,23 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [stillRunning, setStillRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dropError, setDropError] = useState<string | null>(null);
+  const resetPtyFollowupTracking = useCallback(() => {
+    ptyFollowupRequestEpochRef.current += 1;
+    retainedFollowupTurnRef.current = null;
+    activePtyFollowupRef.current = null;
+    pendingPtyFollowupRequestRef.current = false;
+    ptyFollowupBoundaryReceiptsRef.current.clear();
+    reconciledPtyFollowupOperationsRef.current.clear();
+    injectingRef.current = false;
+    setInjecting(false);
+    setSending(false);
+    setStillRunning(false);
+    setLocalStatus(null);
+    setLocalBackgroundActive(null);
+    lastWsStatusAt.current = 0;
+    lastWsBackgroundAt.current = 0;
+    setPtyFollowupBoundaryEpoch((epoch) => epoch + 1);
+  }, []);
   const initialDraftUploads = useMemo(() => {
     try {
       const key = localStorage.getItem(draftUploadsKey) !== null
@@ -638,7 +692,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     const current = activeTaskTurnRef.current;
     if (incoming.taskId !== current.taskId) {
       clearLiveStreamCache(current.taskId, current);
+      resetPtyFollowupTracking();
       activeTaskTurnRef.current = incoming;
+      setSending(false);
       setSuppressedCompletedLifecycleTurn(null);
       setTerminalReconciliationPending(false);
       setMessages(restoreLiveStreamCache(task));
@@ -649,7 +705,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
 
     clearLiveStreamCache(task.id, current);
+    resetPtyFollowupTracking();
     activeTaskTurnRef.current = incoming;
+    setSending(false);
     setSuppressedCompletedLifecycleTurn(null);
     setTerminalReconciliationPending(false);
     setMessages((previous) => {
@@ -657,7 +715,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       syncLiveStreamCache(incoming, next);
       return next;
     });
-  }, [task.id, task.retry_count, task.turn_generation]);
+  }, [resetPtyFollowupTracking, task.id, task.retry_count, task.turn_generation]);
 
   useVisualViewportBounds(chatRootRef, !inline);
 
@@ -671,8 +729,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const [codexAppServerEnabled, setCodexAppServerEnabled] = useState(false);
   const [codexMainMcpEnabled, setCodexMainMcpEnabled] = useState<boolean | null>(null);
   const [codexMonitorEnabled, setCodexMonitorEnabled] = useState<boolean | null>(null);
-  const [injecting, setInjecting] = useState(false);
-  const injectingRef = useRef(false);
   // 注入模式开关：开启后「发送」直达当前 turn，而不是排队新 turn。
   const [injectMode, setInjectMode] = useState(false);
   const canInject = hasControlAccess && !deliveryReadOnly && task.worker_id == null && task.shared_from_id == null && (
@@ -737,18 +793,31 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     text: string,
     uploadResults: UploadResult[],
     preserveComposer = false,
+    expectPtyFollowupBoundary = false,
   ): Promise<InjectOutcome> => {
     if ((!text && uploadResults.length === 0) || injectingRef.current) {
       return 'rejected';
     }
+    const requestEpoch = ++ptyFollowupRequestEpochRef.current;
+    const requestIdentity = { ...activeTaskTurnRef.current };
+    const requestStillCurrent = () => (
+      ptyFollowupRequestEpochRef.current === requestEpoch
+      && sameTaskTurn(requestIdentity, activeTaskTurnRef.current)
+    );
     injectingRef.current = true;
+    pendingPtyFollowupRequestRef.current = expectPtyFollowupBoundary;
     setInjecting(true);
     setError(null);
     let transportAttempted = false;
+    let settledFollowupOperationId: string | null = null;
     const reportUnconfirmed = (
       outcome: Exclude<InjectOutcome, 'injected'>,
       reason: unknown,
     ): InjectOutcome => {
+      if (!requestStillCurrent()) return outcome;
+      if (sameTaskTurn(requestIdentity, activeTaskTurnRef.current)) {
+        retainedFollowupTurnRef.current = null;
+      }
       // A rejected injection did not start a new turn; an uncertain one may
       // have started it but has no client-visible acknowledgement. In either
       // case, restore the prior lifecycle hint until history reconciliation.
@@ -782,6 +851,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         },
         uploadResults.length > 0 ? injectAttachments(uploadResults) : undefined,
       );
+      if (typeof result.operation_id === 'string' && result.operation_id) {
+        settledFollowupOperationId = result.operation_id;
+      }
       if (!result.ok || !result.injected) {
         return reportUnconfirmed(
           'rejected',
@@ -800,7 +872,25 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           new Error('服务器没有确认全部附件均已注入'),
         );
       }
-      if (!preserveComposer) {
+      if (
+        requestStillCurrent()
+        && (
+          task.provider === 'codex'
+          || (
+            settledFollowupOperationId !== null
+            && !reconciledPtyFollowupOperationsRef.current.has(
+              settledFollowupOperationId,
+            )
+          )
+        )
+      ) {
+        // The HTTP admission is the first reliable foreground receipt for
+        // Codex (which has no PTY boundary operation id). Claude may also
+        // reach this point after its durable boundary; do not resurrect a
+        // receipt already reconciled by the boundary/user-message pair.
+        setSending(true);
+      }
+      if (!preserveComposer && requestStillCurrent()) {
         setInput((current) => (
           current.trim() === text ? '' : current
         ));
@@ -815,8 +905,32 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         e,
       );
     } finally {
-      injectingRef.current = false;
-      setInjecting(false);
+      // A task turn can advance while the HTTP request is unwinding.  The
+      // old request must not re-install its operation receipt or clear state
+      // belonging to the newer turn.
+      if (ptyFollowupRequestEpochRef.current === requestEpoch) {
+        injectingRef.current = false;
+        pendingPtyFollowupRequestRef.current = false;
+        if (
+          settledFollowupOperationId
+          && sameTaskTurn(requestIdentity, activeTaskTurnRef.current)
+          && !reconciledPtyFollowupOperationsRef.current.has(
+            settledFollowupOperationId,
+          )
+        ) {
+          const current = activePtyFollowupRef.current;
+          if (!current || current.operationId === settledFollowupOperationId) {
+            activePtyFollowupRef.current = {
+              operationId: settledFollowupOperationId,
+              httpSettled: true,
+            };
+            setSending(true);
+            setPtyFollowupBoundaryEpoch((epoch) => epoch + 1);
+            refreshHistoryRef.current();
+          }
+        }
+        setInjecting(false);
+      }
     }
   };
 
@@ -1488,6 +1602,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
   useEffect(() => {
     if (autoDequeueFlag === 0) return;
+    if (historyLoading) return;
     // Delay to let React flush the foreground state from status_change/process_exit
     // before checking the shared predicate. Without this, PTY mode
     // triggers autoDequeue in the same cycle as setSending(false) and the
@@ -1514,7 +1629,53 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       }
     }, 200);
     return () => clearTimeout(timer);
-  }, [autoDequeueFlag]);
+  }, [autoDequeueFlag, historyLoading]);
+
+  // A retained Claude follow-up has two independent acknowledgements: the
+  // HTTP transport admission and the provider's foreground boundary. Either
+  // can arrive first. Reconcile only after both are present, then wake one
+  // queued item; this prevents an early boundary from racing the user_message
+  // audit or an injectingRef that is still in flight.
+  useEffect(() => {
+    const active = activePtyFollowupRef.current;
+    if (!active?.httpSettled) return;
+    const boundary = ptyFollowupBoundaryReceiptsRef.current.get(
+      active.operationId,
+    );
+    if (!boundary) return;
+    activePtyFollowupRef.current = null;
+    const reconciled = reconciledPtyFollowupOperationsRef.current;
+    reconciled.add(active.operationId);
+    while (reconciled.size > 100) {
+      const oldest = reconciled.values().next().value as string | undefined;
+      if (!oldest) break;
+      reconciled.delete(oldest);
+    }
+    if (
+      retainedFollowupTurnRef.current
+      && sameTaskTurn(
+        retainedFollowupTurnRef.current,
+        activeTaskTurnRef.current,
+      )
+    ) {
+      retainedFollowupTurnRef.current = null;
+    }
+    setSending(false);
+    setStillRunning(false);
+    if (boundary === 'completed') {
+      setAutoDequeueFlag((generation) => generation + 1);
+    } else {
+      setError(
+        'Claude follow-up 的结果状态不确定；系统不会自动发送下一条排队消息，请先核对聊天记录。',
+      );
+      setMessageQueue((previous) => {
+        if (previous.length === 0) return previous;
+        const [first, ...rest] = previous;
+        return [{ ...first, requiresConfirmation: true }, ...rest];
+      });
+      refreshHistoryRef.current();
+    }
+  }, [ptyFollowupBoundaryEpoch]);
 
   // Codex deliberately keeps its Task adapter executing while native
   // descendants remain, so neither a terminal status nor process_exit is
@@ -1527,6 +1688,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     : null;
   const attemptedBackgroundOnlyEpochRef = useRef<string | null>(null);
   useEffect(() => {
+    if (historyLoading) return;
     if (backgroundOnlyEpoch === null) {
       attemptedBackgroundOnlyEpochRef.current = null;
       return;
@@ -1536,7 +1698,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (messageQueueRef.current.length > 0) {
       setAutoDequeueFlag((flag) => flag + 1);
     }
-  }, [backgroundOnlyEpoch]);
+  }, [backgroundOnlyEpoch, historyLoading]);
 
   useEffect(() => {
     const prev = document.title;
@@ -1554,12 +1716,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     const comparison = compareTaskTurn(incoming, current);
     if (comparison > 0) {
       clearLiveStreamCache(current.taskId, current);
+      resetPtyFollowupTracking();
       activeTaskTurnRef.current = incoming;
+      setSending(false);
       setSuppressedCompletedLifecycleTurn(null);
       setTerminalReconciliationPending(false);
     }
     return comparison;
-  }, []);
+  }, [resetPtyFollowupTracking]);
 
   const handleWsMessage = useCallback((raw: Record<string, unknown>) => {
     const msg = raw as { channel?: string; data?: Record<string, unknown> };
@@ -1624,6 +1788,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         ['completed', 'failed', 'cancelled', 'conflict'].includes(newStatus)
         && nextBackground !== true
       ) {
+        retainedFollowupTurnRef.current = null;
         setStillRunning(false);
       }
       return;
@@ -1664,6 +1829,22 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     if (msg.channel !== `task:${task.id}` || !msg.data) return;
 
     const eventType = msg.data.event_type as string || (msg.data.event as string);
+    if (eventType === 'pty_background_followup_boundary') {
+      const identity = eventTaskTurnIdentity(msg.data, task.id);
+      if (!identity || observeTaskTurn(identity) < 0) return;
+      const operationId = typeof msg.data.followup_operation_id === 'string'
+        ? msg.data.followup_operation_id
+        : null;
+      const boundaryState = (
+        msg.data.pty_followup_state || msg.data.state
+      ) as string | undefined;
+      if (
+        !operationId
+        || (boundaryState !== 'completed' && boundaryState !== 'uncertain')
+      ) return;
+      rememberPtyFollowupBoundary(operationId, boundaryState);
+      return;
+    }
     if (eventType === 'background_lifecycle') {
       const identity = eventTaskTurnIdentity(msg.data, task.id);
       if (!identity || observeTaskTurn(identity) < 0) return;
@@ -1684,8 +1865,17 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         // its native terminal boundary and CCM is retaining descendants/Goal
         // work. The adapter remains `executing`, so clear the foreground UI
         // explicitly instead of waiting for a process_exit that may not occur.
-        setSending(false);
-        setStillRunning(false);
+        const retainedFollowupIsActive = (
+          retainedFollowupTurnRef.current !== null
+          && sameTaskTurn(
+            retainedFollowupTurnRef.current,
+            activeTaskTurnRef.current,
+          )
+        );
+        if (!retainedFollowupIsActive) {
+          setSending(false);
+          setStillRunning(false);
+        }
       }
       const persistedId = Number(msg.data.id);
       const entry: ChatMessage = {
@@ -1955,6 +2145,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             lastWsBackgroundAt.current = reconciledAt;
             setLocalStatus(updated.status);
             setLocalBackgroundActive(updated.background_active === true);
+            retainedFollowupTurnRef.current = null;
             setSending(false);
             setStillRunning(false);
             setAutoDequeueFlag(f => f + 1);
@@ -1968,6 +2159,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             setTerminalReconciliationPending(false);
           }
         });
+        retainedFollowupTurnRef.current = null;
         setSending(false);
         setStillRunning(false);
         // Keep an already observed terminal status sticky. A late process_exit
@@ -2009,6 +2201,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     // WS user_message: append unless already shown (optimistic queue send).
     // Also trigger "thinking" indicator.
     if (eventType === 'user_message') {
+      const userIdentity = eventTaskTurnIdentity(msg.data, task.id);
+      if (
+        (userIdentity && observeTaskTurn(userIdentity) < 0)
+        || (!userIdentity && eventDeclaresTaskTurn(msg.data))
+      ) return;
       const content = (msg.data.content as string) || '';
       const source = (msg.data.source as string) || null;
       const rawContent = typeof msg.data.raw_content === 'string' ? msg.data.raw_content : null;
@@ -2018,6 +2215,10 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const persistedId = Number(msg.data.id);
       const isPersisted = Number.isFinite(persistedId) && persistedId > 0;
       const eventTimestamp = (msg.data.timestamp as string) || new Date().toISOString();
+      const followupOperationId = (
+        typeof msg.data.followup_operation_id === 'string'
+        && msg.data.followup_operation_id
+      ) || null;
       const entry: ChatMessage = {
         id: isPersisted ? persistedId : Date.now() + Math.random(),
         role: 'user',
@@ -2034,9 +2235,38 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         source,
         raw_content: rawContent,
         applied_plans: appliedPlans,
+        followup_operation_id: followupOperationId,
         persisted: isPersisted,
       };
-      setSending(true);
+      if (followupOperationId) {
+        const alreadyReconciled = reconciledPtyFollowupOperationsRef.current.has(
+          followupOperationId,
+        );
+        const current = activePtyFollowupRef.current;
+        // The durable user-message audit may arrive after the boundary. It is
+        // still a real chat bubble, but must not resurrect its spinner.
+        if (
+          !alreadyReconciled
+          && (!current || current.operationId === followupOperationId)
+        ) {
+          activePtyFollowupRef.current = current || {
+            operationId: followupOperationId,
+            httpSettled: !pendingPtyFollowupRequestRef.current,
+          };
+          const tracker = activePtyFollowupRef.current;
+          const boundary = ptyFollowupBoundaryReceiptsRef.current.get(
+            followupOperationId,
+          );
+          setSending(
+            boundary === undefined || tracker?.httpSettled === false,
+          );
+          if (boundary !== undefined) {
+            setPtyFollowupBoundaryEpoch((epoch) => epoch + 1);
+          }
+        }
+      } else {
+        setSending(true);
+      }
       setMessages((prev) => {
         // Reconcile the optimistic bubble with the authoritative broadcast.
         // The optimistic content can be raw text while the server content is
@@ -2229,9 +2459,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       syncLiveStreamCache(activeTaskTurnRef.current, next);
       return next;
     });
-  }, [hasControlAccess, markAskUserResolved, observeTaskTurn, onTaskUpdated, refreshVersionedPlans, task.goal_max_turns, task.id, task.worker_id]);
+  }, [hasControlAccess, markAskUserResolved, observeTaskTurn, onTaskUpdated, refreshVersionedPlans, rememberPtyFollowupBoundary, task.goal_max_turns, task.id, task.worker_id]);
 
   const fetchHistory = useCallback(() => {
+    const requestEpoch = ++historyRequestEpochRef.current;
+    const requestIdentity = { ...activeTaskTurnRef.current };
+    const requestTaskTurnVersion = `${task.retry_count}:${task.turn_generation}`;
     setHistoryLoading(true);
     Promise.all([
       api.getTaskChatHistory(
@@ -2243,12 +2476,84 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       ),
       api.getAskUserPending(task.id).catch(() => ({ pending: [] as { request_id: string; questions: AskUserQuestion[] }[] })),
     ]).then(([msgs, askPending]) => {
+      if (
+        historyRequestEpochRef.current !== requestEpoch
+        || !sameTaskTurn(requestIdentity, activeTaskTurnRef.current)
+        || requestTaskTurnVersion
+          !== `${activeTaskTurnRef.current.retryCount}:${activeTaskTurnRef.current.turnGeneration}`
+      ) return;
       const filtered = msgs
         .filter((m) =>
           !isLegacyCodexCollabCompleted(m) &&
           !((m.event_type === 'message' || m.event_type === 'result') && !m.content)
         )
         .map((m) => ({ ...m, persisted: true }));
+      let receiptChanged = false;
+      for (const message of filtered) {
+        if (
+          message.event_type !== 'pty_background_followup_boundary'
+          || !messageMatchesTaskTurn(message, requestIdentity)
+          || !message.followup_operation_id
+          || (
+            message.pty_followup_state !== 'completed'
+            && message.pty_followup_state !== 'uncertain'
+          )
+        ) continue;
+        const receipts = ptyFollowupBoundaryReceiptsRef.current;
+        if (
+          receipts.get(message.followup_operation_id)
+          !== message.pty_followup_state
+        ) {
+          receipts.set(
+            message.followup_operation_id,
+            message.pty_followup_state,
+          );
+          receiptChanged = true;
+        }
+      }
+      const historyReceipts = ptyFollowupBoundaryReceiptsRef.current;
+      while (historyReceipts.size > 100) {
+        const oldest = historyReceipts.keys().next().value as string | undefined;
+        if (!oldest) break;
+        historyReceipts.delete(oldest);
+      }
+      const latestFollowupMessage = [...filtered].reverse().find((message) => (
+        message.event_type === 'user_message'
+        && messageMatchesTaskTurn(message, requestIdentity)
+        && Boolean(message.followup_operation_id)
+      ));
+      const latestOperationId = latestFollowupMessage?.followup_operation_id;
+      if (latestOperationId) {
+        const boundary = ptyFollowupBoundaryReceiptsRef.current.get(
+          latestOperationId,
+        );
+        const active = activePtyFollowupRef.current;
+        if (!active || active.operationId === latestOperationId) {
+          if (!boundary && task.background_active === true) {
+            activePtyFollowupRef.current = {
+              operationId: latestOperationId,
+              httpSettled: true,
+            };
+            setSending(true);
+          } else if (
+            boundary === 'uncertain'
+            && !reconciledPtyFollowupOperationsRef.current.has(
+              latestOperationId,
+            )
+          ) {
+            activePtyFollowupRef.current = {
+              operationId: latestOperationId,
+              httpSettled: true,
+            };
+            receiptChanged = true;
+          } else if (active && boundary) {
+            receiptChanged = true;
+          }
+        }
+      }
+      if (receiptChanged) {
+        setPtyFollowupBoundaryEpoch((epoch) => epoch + 1);
+      }
       const pageOldestId = filtered.reduce<number | null>(
         (oldest, message) => (
           oldest === null ? message.id : Math.min(oldest, message.id)
@@ -2297,8 +2602,18 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         syncLiveStreamCache(activeTaskTurnRef.current, next);
         return next;
       });
-    }).catch(() => {}).finally(() => setHistoryLoading(false));
-  }, [hasControlAccess, task.id]);
+    }).catch(() => {}).finally(() => {
+      if (historyRequestEpochRef.current === requestEpoch) {
+        setHistoryLoading(false);
+      }
+    });
+  }, [
+    hasControlAccess,
+    task.background_active,
+    task.id,
+    task.retry_count,
+    task.turn_generation,
+  ]);
   useEffect(() => {
     refreshHistoryRef.current = fetchHistory;
   }, [fetchHistory]);
@@ -2686,6 +3001,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         return;
       }
       if (backgroundActive) {
+        retainedFollowupTurnRef.current = { ...activeTaskTurnRef.current };
         setSuppressedCompletedLifecycleTurn({
           ...activeTaskTurnRef.current,
           suppressedAt: Date.now(),
@@ -2694,6 +3010,8 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       await handleInject(
         text,
         uploadedResultsForTurn,
+        false,
+        task.provider === 'claude' && backgroundOnly,
       );
       return;
     }
@@ -2702,7 +3020,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     // child/session, a regular follow-up is a new provider input on that same
     // hot session. Route it through the exact injection protocol so it does
     // not sit behind the background marker in the dispatcher queue.
-    if (backgroundActive && canInjectBackgroundFollowup) {
+    if (backgroundOnly && canInjectBackgroundFollowup) {
       // The exact injection protocol has no Plan application fields. Preserve
       // those messages as ordinary next-turn work instead of silently dropping
       // their selected Plan/Version metadata.
@@ -2728,6 +3046,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         }
         return;
       }
+      retainedFollowupTurnRef.current = { ...activeTaskTurnRef.current };
       setSuppressedCompletedLifecycleTurn({
         ...activeTaskTurnRef.current,
         suppressedAt: Date.now(),
@@ -2736,6 +3055,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         text,
         uploadedResultsForTurn,
         fromQueue === true,
+        task.provider === 'claude',
       );
       if (outcome !== 'injected' && fromQueue && (text || preUploadedResults?.length)) {
         setMessageQueue((previous) => [{
@@ -3273,6 +3593,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                   setInterrupting(true);
                   try {
                     const resp = await api.stopTaskSession(task.id);
+                    retainedFollowupTurnRef.current = null;
                     setSending(false);
                     setStillRunning(false);
                     const stoppedStatus = resp.task_status
@@ -3304,6 +3625,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                     }
                     onTaskUpdated?.();
                   } catch (interruptError) {
+                    retainedFollowupTurnRef.current = null;
                     setSending(false);
                     const noRunningSession = isApiRequestError(interruptError)
                       && interruptError.status === 400
@@ -4282,14 +4604,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                       ? 'Type next message to queue...'
                       : 'Type a follow-up message...'
               }
-              disabled={injecting || (!hasTaskSession && !task.shared_from_id)}
+              disabled={(injecting && (!foregroundActive || injectMode)) || (!hasTaskSession && !task.shared_from_id)}
               rows={1}
               className="flex-1 bg-gray-800 text-foreground rounded-xl px-4 py-2.5 text-sm border border-gray-700/70 focus:outline-none focus:border-indigo-500 focus:ring-2 focus:ring-indigo-500/25 resize-none disabled:opacity-50 max-h-48 overflow-y-auto transition-colors"
               style={{ minHeight: '40px' }}
             />
             <button
               onClick={() => handleSend()}
-              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim()) || (!hasTaskSession && !task.shared_from_id) || (frontendReviewComposerMode && !canStartFrontendReviewGoal) || (workspaceReviewComposerMode && !canStartWorkspaceReview) || (injectMode && canInjectNow && !foregroundActive && !backgroundActive) || injecting || fileUpload.isUploading || fileUpload.hasFailed}
+              disabled={(!input.trim() && fileUpload.uploadedResults.length === 0 && forkSeedUploads.length === 0) || ((frontendReviewComposerMode || workspaceReviewComposerMode) && !input.trim()) || (!hasTaskSession && !task.shared_from_id) || (frontendReviewComposerMode && !canStartFrontendReviewGoal) || (workspaceReviewComposerMode && !canStartWorkspaceReview) || (injectMode && canInjectNow && !foregroundActive && !backgroundActive) || (injecting && (!foregroundActive || injectMode)) || fileUpload.isUploading || fileUpload.hasFailed}
               title={fileUpload.hasFailed
                 ? 'Retry or remove failed attachments before sending'
                 : injectMode && canInjectNow
@@ -4947,7 +5269,10 @@ const MessageBubble = memo(function MessageBubble({
 }) {
   const isUser = message.role === 'user';
 
-  if (message.event_type === 'background_lifecycle') return null;
+  if (
+    message.event_type === 'background_lifecycle'
+    || message.event_type === 'pty_background_followup_boundary'
+  ) return null;
 
   if (message.event_type === 'permission_request') {
     return (

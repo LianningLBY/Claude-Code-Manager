@@ -1140,6 +1140,7 @@ async def test_inject_pty_steers_exact_foreground_turn_without_channel():
             task_retry_count=2,
             task_turn_generation=3,
             expected_instance_id=7,
+            followup_operation_id="provisional-foreground",
         ) is True
     finally:
         consumer.cancel()
@@ -1150,6 +1151,9 @@ async def test_inject_pty_steers_exact_foreground_turn_without_channel():
         expected_process=native_process,
     )
     session.inject.assert_not_awaited()
+    assert manager.consume_pty_followup_operation_route(
+        "provisional-foreground"
+    ) == (True, None)
 
 
 @pytest.mark.asyncio
@@ -1173,6 +1177,7 @@ async def test_inject_pty_reuses_background_session_without_second_consumer():
         session_id="claude-session-background",
         is_alive=True,
         active_turn_process=None,
+        steer_active_turn=AsyncMock(return_value=True),
     )
 
     async def send_prompt(text: str):
@@ -1198,8 +1203,10 @@ async def test_inject_pty_reuses_background_session_without_second_consumer():
     )
     observed_records: list[_OutputConsumerRecord | None] = []
     observed_contexts: list[dict] = []
+    observed_events: list[dict] = []
 
     async def on_event(_key, _event, **event_context):
+        observed_events.append(_event)
         observed_records.append(
             getattr(asyncio.current_task(), "_ccm_output_consumer_record", None)
         )
@@ -1212,7 +1219,8 @@ async def test_inject_pty_reuses_background_session_without_second_consumer():
         _launch_params={7: {"task_id": 99}},
         on_event=on_event,
     )
-    manager = InstanceManager(MagicMock(), MagicMock())
+    broadcaster = types.SimpleNamespace(broadcast=AsyncMock())
+    manager = InstanceManager(MagicMock(), broadcaster)
     manager._pty_backend = backend
     manager.processes[7] = proxy
     manager._tasks[7] = consumer
@@ -1235,7 +1243,11 @@ async def test_inject_pty_reuses_background_session_without_second_consumer():
             task_retry_count=2,
             task_turn_generation=3,
             expected_instance_id=7,
+            followup_operation_id="followup-99",
         ) is True
+        assert manager.consume_pty_followup_operation_route(
+            "followup-99"
+        ) == (True, "followup-99")
         await followup_started.wait()
         assert sent == ["continue while child runs"]
         assert manager._pty_backend._consumers[7] is consumer
@@ -1246,6 +1258,19 @@ async def test_inject_pty_reuses_background_session_without_second_consumer():
             99,
             session,
         ) is True
+        # The native Session exposes the follow-up process while its pump is
+        # still draining.  It must not be mistaken for a separate foreground
+        # turn and steered a second time.
+        assert await manager.inject_pty_message(
+            session.session_id,
+            "must wait for the first follow-up",
+            task_id=99,
+            task_retry_count=2,
+            task_turn_generation=3,
+            expected_instance_id=7,
+            followup_operation_id="followup-99-second",
+        ) is False
+        session.steer_active_turn.assert_not_awaited()
 
         release_followup.set()
         await asyncio.wait_for(
@@ -1255,8 +1280,8 @@ async def test_inject_pty_reuses_background_session_without_second_consumer():
             ),
             timeout=1,
         )
-        assert observed_records == [record]
-        assert observed_contexts == [{
+        assert observed_records == [record, record]
+        expected_context = {
             "task_id": 99,
             "loop_iteration": None,
             "background_followup": True,
@@ -1264,9 +1289,24 @@ async def test_inject_pty_reuses_background_session_without_second_consumer():
             "expected_background_generation": "background-generation",
             "expected_task_retry_count": 2,
             "expected_task_turn_generation": 3,
-        }]
+        }
+        assert observed_contexts == [expected_context, expected_context]
+        assert observed_events[0]["event_type"] == "message"
+        assert observed_events[1]["event_type"] == (
+            "pty_background_followup_boundary"
+        )
+        assert observed_events[1]["followup_operation_id"] == "followup-99"
+        assert observed_events[1]["pty_followup_state"] == "completed"
+        assert json.loads(observed_events[1]["raw_json"]) == {
+            "background_generation": "background-generation",
+            "followup_operation_id": "followup-99",
+            "state": "completed",
+            "type": "pty.background_followup_boundary",
+            "version": 1,
+        }
         assert background_state.pending_followups == 0
         assert 7 not in manager._pty_followup_tasks
+        broadcaster.broadcast.assert_not_awaited()
     finally:
         release_followup.set()
         for task in tuple(manager._pty_followup_tasks.get(7, ())):
@@ -1309,7 +1349,8 @@ async def test_inject_pty_background_followup_reports_immediate_failure():
         _launch_params={8: {"task_id": 100}},
         on_event=AsyncMock(),
     )
-    manager = InstanceManager(MagicMock(), MagicMock())
+    broadcaster = types.SimpleNamespace(broadcast=AsyncMock())
+    manager = InstanceManager(MagicMock(), broadcaster)
     manager._pty_backend = backend
     manager.processes[8] = proxy
     manager._tasks[8] = consumer
@@ -1338,6 +1379,7 @@ async def test_inject_pty_background_followup_reports_immediate_failure():
         assert background_state.pending_followups == 0
         assert 8 not in manager._pty_followup_tasks
         backend.on_event.assert_not_awaited()
+        broadcaster.broadcast.assert_not_awaited()
     finally:
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)
@@ -1369,7 +1411,8 @@ def _retained_pty_followup_manager(
         _launch_params={instance_id: {"task_id": task_id}},
         on_event=AsyncMock(),
     )
-    manager = InstanceManager(MagicMock(), MagicMock())
+    broadcaster = types.SimpleNamespace(broadcast=AsyncMock())
+    manager = InstanceManager(MagicMock(), broadcaster)
     manager._pty_backend = backend
     manager.processes[instance_id] = proxy
     manager._tasks[instance_id] = consumer
@@ -1434,6 +1477,7 @@ async def test_inject_pty_background_followup_slow_echo_is_admitted_once():
                 task_retry_count=2,
                 task_turn_generation=7,
                 expected_instance_id=81,
+                followup_operation_id="followup-181",
             ),
             timeout=0.5,
         )
@@ -1453,12 +1497,155 @@ async def test_inject_pty_background_followup_slow_echo_is_admitted_once():
             ),
             timeout=1,
         )
-        backend.on_event.assert_awaited_once()
+        assert backend.on_event.await_count == 2
+        boundary = backend.on_event.await_args_list[-1].args[1]
+        assert boundary["followup_operation_id"] == "followup-181"
+        assert boundary["pty_followup_state"] == "completed"
         assert sent == ["continue exactly once"]
         assert background_state.pending_followups == 0
     finally:
         release_first_event.set()
         await manager._cancel_pty_followup_tasks({81})
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_inject_pty_background_followup_publishes_uncertain_boundary():
+    """A pump that fails after local admission cannot wake queued retries."""
+
+    class Event:
+        def to_dict(self):
+            return {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "partial follow-up output",
+            }
+
+    published = asyncio.Event()
+    session = types.SimpleNamespace(
+        session_id="claude-session-uncertain-boundary",
+        is_alive=True,
+        active_turn_process=None,
+    )
+
+    async def send_prompt(_text: str):
+        yield Event()
+        raise RuntimeError("follow-up stream ended unexpectedly")
+
+    session.send_prompt = send_prompt
+    manager, backend, consumer, background_state = (
+        _retained_pty_followup_manager(
+            session,
+            instance_id=84,
+            task_id=184,
+            retry_count=5,
+            turn_generation=10,
+        )
+    )
+
+    async def record_boundary(_key, payload, **context):
+        if payload["event_type"] != "pty_background_followup_boundary":
+            return
+        assert payload["followup_operation_id"] == "followup-184"
+        assert payload["pty_followup_state"] == "uncertain"
+        assert context["expected_background_generation"] == (
+            "background-generation-184"
+        )
+        published.set()
+
+    backend.on_event.side_effect = record_boundary
+    try:
+        assert await manager.inject_pty_message(
+            session.session_id,
+            "continue once",
+            task_id=184,
+            task_retry_count=5,
+            task_turn_generation=10,
+            expected_instance_id=84,
+            followup_operation_id="followup-184",
+        ) is True
+        await asyncio.wait_for(published.wait(), timeout=1)
+        assert background_state.pending_followups == 0
+        assert backend.on_event.await_count == 2
+    finally:
+        await manager._cancel_pty_followup_tasks({84})
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_pty_followup_keeps_admission_slot_until_boundary_publication():
+    """A delayed receipt cannot overlap the next retained follow-up."""
+
+    boundary_started = asyncio.Event()
+    release_boundary = asyncio.Event()
+    session = types.SimpleNamespace(
+        session_id="claude-session-boundary-slot",
+        is_alive=True,
+        active_turn_process=None,
+    )
+
+    async def send_prompt(_text: str):
+        yield types.SimpleNamespace(
+            to_dict=lambda: {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "done",
+            },
+        )
+
+    session.send_prompt = send_prompt
+    manager, backend, consumer, background_state = (
+        _retained_pty_followup_manager(
+            session,
+            instance_id=85,
+            task_id=185,
+            retry_count=1,
+            turn_generation=2,
+        )
+    )
+
+    async def hold_boundary(_key, event, **_context):
+        if event["event_type"] == "pty_background_followup_boundary":
+            boundary_started.set()
+            await release_boundary.wait()
+
+    backend.on_event.side_effect = hold_boundary
+    try:
+        first = asyncio.create_task(manager.inject_pty_message(
+            session.session_id,
+            "first",
+            task_id=185,
+            task_retry_count=1,
+            task_turn_generation=2,
+            expected_instance_id=85,
+            followup_operation_id="followup-slot-1",
+        ))
+        assert await asyncio.wait_for(first, timeout=1) is True
+        await asyncio.wait_for(boundary_started.wait(), timeout=1)
+        assert await manager.inject_pty_message(
+            session.session_id,
+            "second",
+            task_id=185,
+            task_retry_count=1,
+            task_turn_generation=2,
+            expected_instance_id=85,
+            followup_operation_id="followup-slot-2",
+        ) is False
+        pending = tuple(manager._pty_followup_tasks.get(85, set()))
+        release_boundary.set()
+        await asyncio.wait_for(
+            asyncio.gather(
+                *pending,
+                return_exceptions=False,
+            ),
+            timeout=1,
+        )
+        assert background_state.pending_followups == 0
+    finally:
+        release_boundary.set()
+        await manager._cancel_pty_followup_tasks({85})
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)
 
@@ -1510,6 +1697,7 @@ async def test_inject_pty_background_followup_finishes_receipt_after_cancellatio
             task_retry_count=3,
             task_turn_generation=8,
             expected_instance_id=82,
+            followup_operation_id="followup-182",
         ))
         injection_holder["task"] = injection
 
@@ -1529,7 +1717,7 @@ async def test_inject_pty_background_followup_finishes_receipt_after_cancellatio
             ),
             timeout=1,
         )
-        backend.on_event.assert_awaited_once()
+        assert backend.on_event.await_count == 2
         assert sent == ["audit this once"]
         assert background_state.pending_followups == 0
     finally:

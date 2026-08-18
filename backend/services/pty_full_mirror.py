@@ -303,8 +303,38 @@ class FullMirrorCCMBackend(CCMBackend):
         )
         return sid
 
-    async def on_event(self, key: Any, event_dict: dict, **context) -> None:
+    async def on_event(
+        self,
+        key: Any,
+        event_dict: dict,
+        **context,
+    ) -> bool | None:
         """Forward a foreground event with its immutable PTY turn identity."""
+
+        # Follow-up boundaries are audit receipts, not ordinary provider
+        # output. Route them through the strict idempotent writer before the
+        # compatibility callback below, which intentionally swallows ordinary
+        # autonomous-mirror failures.
+        if event_dict.get("pty_followup_boundary"):
+            return await self._im.persist_pty_followup_boundary(
+                instance_id=int(key),
+                task_id=int(context["task_id"]),
+                task_retry_count=int(context["expected_task_retry_count"]),
+                task_turn_generation=int(
+                    context["expected_task_turn_generation"]
+                ),
+                session_id=str(context["expected_session_id"]),
+                background_generation=str(
+                    context["expected_background_generation"]
+                ),
+                followup_operation_id=str(
+                    event_dict["followup_operation_id"]
+                ),
+                state=str(
+                    event_dict.get("pty_followup_state")
+                    or event_dict.get("state")
+                ),
+            )
 
         await self._im.wait_for_pty_launch_metadata(key)
         background_followup = bool(context.get("background_followup"))

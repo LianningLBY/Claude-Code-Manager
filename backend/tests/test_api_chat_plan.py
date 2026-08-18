@@ -162,6 +162,64 @@ async def test_chat_history_exposes_durable_turn_scope(client, session_factory):
 
 
 @pytest.mark.asyncio
+async def test_chat_history_replays_pty_followup_boundary_receipt(
+    client,
+    session_factory,
+):
+    create_resp = await client.post("/api/tasks", json={
+        "title": "PTY receipt",
+        "description": "retained follow-up",
+        "target_repo": "/tmp",
+    })
+    task_id = create_resp.json()["id"]
+    operation_id = "history-followup-operation"
+    async with session_factory() as db:
+        db.add(LogEntry(
+            task_id=task_id,
+            task_retry_count=0,
+            task_turn_generation=0,
+            event_type="pty_background_followup_boundary",
+            role="system",
+            raw_json=json.dumps({
+                "type": "pty.background_followup_boundary",
+                "version": 1,
+                "followup_operation_id": operation_id,
+                "state": "completed",
+                "background_generation": "history-background",
+            }),
+        ))
+        db.add(LogEntry(
+            task_id=task_id,
+            task_retry_count=0,
+            task_turn_generation=0,
+            event_type="user_message",
+            role="user",
+            content="follow up",
+            raw_json=json.dumps({
+                "followup_operation_id": operation_id,
+                "raw_content": "follow up",
+            }),
+        ))
+        await db.commit()
+
+    response = await client.get(f"/api/tasks/{task_id}/chat/history")
+    assert response.status_code == 200
+    messages = response.json()
+    boundary = next(
+        message for message in messages
+        if message["event_type"] == "pty_background_followup_boundary"
+    )
+    user_message = next(
+        message for message in messages
+        if message["event_type"] == "user_message"
+    )
+    assert boundary["followup_operation_id"] == operation_id
+    assert boundary["pty_followup_state"] == "completed"
+    assert boundary["pty_background_generation"] == "history-background"
+    assert user_message["followup_operation_id"] == operation_id
+
+
+@pytest.mark.asyncio
 async def test_codex_fork_starts_before_selected_user_message(
     client, session_factory,
 ):
@@ -4145,7 +4203,34 @@ async def test_inject_allows_exact_retained_pty_background_tail(
 
     assert response.status_code == 200, response.text
     mock_im.inject_pty_message.assert_awaited_once()
-    assert response.json()["injected"] is True
+    payload = response.json()
+    assert payload["injected"] is True
+    assert isinstance(payload["operation_id"], str)
+    assert len(payload["operation_id"]) == 32
+    assert mock_im.inject_pty_message.await_args.kwargs[
+        "followup_operation_id"
+    ] == payload["operation_id"]
+    injected_events = [
+        call.args[1]
+        for call in broadcaster.broadcast.call_args_list
+        if call.args[1].get("source") == "inject"
+    ]
+    assert injected_events[0]["followup_operation_id"] == (
+        payload["operation_id"]
+    )
+
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "user_message",
+                )
+            )
+        ).scalar_one()
+    assert json.loads(stored.raw_json)["followup_operation_id"] == (
+        payload["operation_id"]
+    )
 
 
 @pytest.mark.parametrize("terminal_status", ["failed", "cancelled"])
@@ -4280,6 +4365,63 @@ async def test_inject_delivers_to_pty_session(client, session_factory):
     assert stored.task_retry_count == 0
     assert stored.task_turn_generation == 0
     assert stored.turn_scope == "foreground"
+
+
+@pytest.mark.asyncio
+async def test_inject_retained_marker_foreground_route_omits_boundary_operation(
+    client,
+    session_factory,
+):
+    """A retained DB marker must not make a foreground steer wait for a boundary."""
+    task_id = await _create_task_with_session(
+        client,
+        session_factory,
+        provider="claude",
+        status="executing",
+        pty_background_generation="still-draining",
+    )
+    class RouteAwareInstanceManager:
+        pty_mode_enabled = True
+
+        def __init__(self):
+            self.has_pty_session = MagicMock(return_value=True)
+            self.inject_pty_message = AsyncMock(return_value=True)
+            self.consume_calls: list[str] = []
+
+        def consume_pty_followup_operation_route(self, operation_id):
+            self.consume_calls.append(operation_id)
+            return True, None
+
+    mock_im = RouteAwareInstanceManager()
+    broadcaster = MagicMock(broadcast=AsyncMock())
+
+    with patch("backend.main.instance_manager", mock_im), patch(
+        "backend.main.broadcaster",
+        broadcaster,
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={"message": "steer the active turn"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["operation_id"] is None
+    provisional = mock_im.inject_pty_message.await_args.kwargs[
+        "followup_operation_id"
+    ]
+    assert isinstance(provisional, str) and len(provisional) == 32
+    assert mock_im.consume_calls == [provisional]
+
+    async with session_factory() as db:
+        stored = (
+            await db.execute(
+                select(LogEntry).where(
+                    LogEntry.task_id == task_id,
+                    LogEntry.event_type == "user_message",
+                )
+            )
+        ).scalar_one()
+    assert "followup_operation_id" not in json.loads(stored.raw_json)
 
 
 @pytest.mark.asyncio

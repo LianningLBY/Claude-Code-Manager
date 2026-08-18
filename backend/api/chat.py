@@ -4128,7 +4128,11 @@ async def get_chat_history(
         task.last_accessed_at = _dt.utcnow()
         await db.commit()
 
-    allowed = ["user_message", "message", "result", "tool_use", "tool_result", "system_init", "system_event", "thinking", "process_exit", "background_lifecycle"]
+    allowed = [
+        "user_message", "message", "result", "tool_use", "tool_result",
+        "system_init", "system_event", "thinking", "process_exit",
+        "background_lifecycle", "pty_background_followup_boundary",
+    ]
     # Noisy telemetry must be excluded in SQL, before LIMIT applies. Filtering
     # after the query made pages come back short (< limit), which the client
     # reads as "history exhausted" — older messages became unreachable.
@@ -4259,6 +4263,9 @@ async def get_chat_history(
         native_item_type = None
         native_item_status = None
         background_lifecycle = None
+        followup_operation_id = None
+        pty_followup_state = None
+        pty_background_generation = None
         if row.raw_json:
             try:
                 raw = json.loads(row.raw_json)
@@ -4301,6 +4308,16 @@ async def get_chat_history(
                         raw_content = raw["raw_content"]
                     if isinstance(raw.get("applied_plans"), list):
                         applied_plans = raw["applied_plans"]
+                    if isinstance(raw.get("followup_operation_id"), str):
+                        followup_operation_id = raw[
+                            "followup_operation_id"
+                        ]
+                    if raw.get("state") in {"completed", "uncertain"}:
+                        pty_followup_state = raw["state"]
+                    if isinstance(raw.get("background_generation"), str):
+                        pty_background_generation = raw[
+                            "background_generation"
+                        ]
                     if raw.get("type") == "background.lifecycle":
                         background_lifecycle = {
                             "state": raw.get("state"),
@@ -4353,6 +4370,9 @@ async def get_chat_history(
             "native_item_type": native_item_type,
             "native_item_status": native_item_status,
             "background_lifecycle": background_lifecycle,
+            "followup_operation_id": followup_operation_id,
+            "pty_followup_state": pty_followup_state,
+            "pty_background_generation": pty_background_generation,
         })
 
     # Trim back to requested limit (we over-fetched to compensate for
@@ -4493,6 +4513,7 @@ async def _store_injected_message(
     instance_id: int | None,
     generation_audit_matched: bool,
     execution_principal: dict[str, object],
+    followup_operation_id: str | None,
 ) -> None:
     attachments = [upload.public_dict() for upload in uploads]
     file_paths = [upload.path for upload in uploads]
@@ -4514,6 +4535,8 @@ async def _store_injected_message(
             "kind": execution_principal["execution_principal_kind"],
         },
     }
+    if followup_operation_id:
+        raw_metadata["followup_operation_id"] = followup_operation_id
     if attachments:
         raw_metadata.update({
             "attachments": attachments,
@@ -4550,6 +4573,8 @@ async def _store_injected_message(
             if attachment["is_image"]
         ],
     })
+    if followup_operation_id:
+        event["followup_operation_id"] = followup_operation_id
     if sender_display_name:
         event["sender_name"] = sender_display_name
     await broadcaster.broadcast(f"task:{task_id}", event)
@@ -4569,6 +4594,7 @@ async def _audit_and_store_injected_message(
     execution_principal: dict[str, object],
     raw_content: str,
     uploads: list[ValidatedUploadAttachment],
+    followup_operation_id: str | None,
 ) -> None:
     """Durably audit a transport side effect against its admitted generation.
 
@@ -4640,6 +4666,7 @@ async def _audit_and_store_injected_message(
         instance_id=task_instance_id,
         generation_audit_matched=generation_audit_matched,
         execution_principal=execution_principal,
+        followup_operation_id=followup_operation_id,
     )
 
 
@@ -4789,7 +4816,8 @@ async def inject_message(
             )
         _require_no_pending_worker_routing(task)
         retained_background_tail = (
-            task.status == "completed"
+            (task.provider or "claude").lower() == "claude"
+            and task.status in {"in_progress", "executing", "completed"}
             and task.pty_background_generation is not None
         )
         if (
@@ -4833,6 +4861,16 @@ async def inject_message(
         admitted_provider_db_value = task.provider
         admitted_provider = (task.provider or "claude").lower()
         admitted_execution_principal = dict(request_principal)
+        admitted_followup_operation_id = (
+            uuid.uuid4().hex
+            if admitted_provider == "claude" and retained_background_tail
+            else None
+        )
+        followup_transport_kwargs = (
+            {"followup_operation_id": admitted_followup_operation_id}
+            if admitted_followup_operation_id is not None
+            else {}
+        )
 
         # Take a short exact-generation admission gate, then COMMIT it before
         # awaiting the provider.  The PTY consumer may need to persist an
@@ -4960,6 +4998,7 @@ async def inject_message(
                         task_retry_count=admitted_retry_count,
                         task_turn_generation=admitted_turn_generation,
                         expected_instance_id=admitted_instance_id,
+                        **followup_transport_kwargs,
                     )
                 else:
                     ok = await instance_manager.inject_pty_message(
@@ -4969,6 +5008,7 @@ async def inject_message(
                         task_retry_count=admitted_retry_count,
                         task_turn_generation=admitted_turn_generation,
                         expected_instance_id=admitted_instance_id,
+                        **followup_transport_kwargs,
                     )
             except Exception as exc:
                 from backend.services.instance_manager import (
@@ -4998,6 +5038,48 @@ async def inject_message(
         if not ok:
             raise HTTPException(409, unavailable_detail)
 
+        # The durable Task marker is only a routing hint.  Between the short
+        # admission transaction and the PTY lifecycle lock, a new native
+        # foreground turn may have started.  InstanceManager records the
+        # route it actually selected: retained pumps return the operation id;
+        # ordinary foreground steering returns ``None`` because it emits no
+        # retained-boundary receipt.  Keep the provisional id as a compatibility
+        # fallback for older test doubles/managers that do not expose this
+        # handoff method.
+        if admitted_followup_operation_id:
+            consume_route = getattr(
+                instance_manager,
+                "consume_pty_followup_operation_route",
+                None,
+            )
+            manager_owns_route_handoff = (
+                inspect.getattr_static(
+                    type(instance_manager),
+                    "consume_pty_followup_operation_route",
+                    None,
+                )
+                is not None
+            )
+            route_result = (
+                consume_route(admitted_followup_operation_id)
+                if manager_owns_route_handoff and callable(consume_route)
+                else None
+            )
+            if manager_owns_route_handoff:
+                if (
+                    isinstance(route_result, tuple)
+                    and len(route_result) == 2
+                    and route_result[0] is True
+                    and isinstance(route_result[1], str)
+                    and route_result[1]
+                ):
+                    admitted_followup_operation_id = route_result[1]
+                else:
+                    # A live manager that cannot prove the route must fail
+                    # closed: returning the provisional id would recreate the
+                    # exact spinner-without-boundary bug this handoff avoids.
+                    admitted_followup_operation_id = None
+
         # The model has accepted the input.  From this point on, cancellation
         # must not leave an invisible side effect that a client will retry.
         # Re-audit the exact generation and persist its user-message record in
@@ -5016,12 +5098,14 @@ async def inject_message(
                 execution_principal=admitted_execution_principal,
                 raw_content=body.message,
                 uploads=uploads,
+                followup_operation_id=admitted_followup_operation_id,
             )
         )
         return {
             "ok": True,
             "injected": True,
             "attachment_count": len(uploads),
+            "operation_id": admitted_followup_operation_id,
         }
 
 

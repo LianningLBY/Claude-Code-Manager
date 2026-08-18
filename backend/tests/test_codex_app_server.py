@@ -9949,6 +9949,423 @@ async def test_parent_completed_waits_for_active_child_and_preserves_late_output
     assert server._contexts_by_descendant == {}
 
 
+@pytest.mark.parametrize("terminal_path", ["turn", "status"])
+def test_nested_descendant_terminal_waits_for_grandchild(terminal_path):
+    """A child turn terminal is not a terminal lineage proof."""
+
+    server = CodexAppServer("codex")
+    process = SimpleNamespace(returncode=None, feed=MagicMock())
+    context = _TurnContext(
+        thread_id="thread-root-nested",
+        process=process,
+        launch_started=0.0,
+        task_id=401,
+    )
+    server._contexts_by_thread[context.thread_id] = context
+    server._record_child_relation("thread-root-nested", "thread-child")
+    server._record_child_relation("thread-child", "thread-grandchild")
+
+    server._attach_descendant(context, "thread-child", active=True)
+    server._attach_descendant(context, "thread-grandchild", active=True)
+    assert context.active_descendant_thread_ids == {
+        "thread-child",
+        "thread-grandchild",
+    }
+
+    child_runtime = server._runtime_state_for("thread-child")
+    child_runtime.active_turn_ids.add("turn-child")
+    if terminal_path == "turn":
+        server._record_thread_turn_lifecycle(
+            "turn/completed",
+            "thread-child",
+            "turn-child",
+            "completed",
+        )
+    else:
+        server._record_thread_status(
+            "thread-child",
+            {"type": "idle"},
+        )
+
+    # The child is still a public blocker and must not emit a terminal edge
+    # while its grandchild remains active.
+    assert context.active_descendant_thread_ids == {
+        "thread-child",
+        "thread-grandchild",
+    }
+    assert context.descendant_pending_terminal_status == {
+        "thread-child": "completed",
+    }
+    child_done = [
+        call.args[0]
+        for call in process.feed.call_args_list
+        if call.args[0].get("type") == "native.subagent.lifecycle"
+        and call.args[0].get("native_agent_id") == "thread-child"
+        and call.args[0].get("lifecycle_event") == "done"
+    ]
+    assert child_done == []
+
+    grandchild_runtime = server._runtime_state_for("thread-grandchild")
+    grandchild_runtime.active_turn_ids.add("turn-grandchild")
+    server._record_thread_status(
+        "thread-grandchild",
+        {"type": "idle"},
+    )
+
+    # Once the last nested edge settles, the deferred child terminal is
+    # emitted exactly once and the root no longer has blockers.
+    assert context.active_descendant_thread_ids == set()
+    assert context.descendant_pending_terminal_status == {}
+    done_ids = [
+        call.args[0]["native_agent_id"]
+        for call in process.feed.call_args_list
+        if call.args[0].get("type") == "native.subagent.lifecycle"
+        and call.args[0].get("lifecycle_event") == "done"
+    ]
+    assert done_ids == ["thread-grandchild", "thread-child"]
+
+
+@pytest.mark.asyncio
+async def test_late_grandchild_relation_does_not_flash_parent_done():
+    """A late child relation is coalesced before lifecycle terminal output."""
+
+    server = CodexAppServer("codex")
+    process = SimpleNamespace(returncode=None, feed=MagicMock())
+    context = _TurnContext(
+        thread_id="thread-root-late-nested",
+        process=process,
+        launch_started=0.0,
+        task_id=402,
+    )
+    server._contexts_by_thread[context.thread_id] = context
+    server._record_child_relation("thread-root-late-nested", "thread-child")
+    server._attach_descendant(context, "thread-child", active=True)
+    # The root may already be retained while the child terminal arrives. The
+    # root guard must not disable the relation-discovery grace window.
+    context.deferred_terminal_notification = {
+        "threadId": context.thread_id,
+        "turn": {"id": "turn-root-late-nested", "status": "completed"},
+    }
+
+    # The child terminal arrives before the relation event for its own child.
+    server._record_thread_status(
+        "thread-child",
+        {"type": "idle"},
+    )
+    # The terminal proof is held briefly while a nested relation can still
+    # arrive from the app-server's other native thread.
+    assert context.active_descendant_thread_ids == {"thread-child"}
+    assert context.descendant_lifecycle_states["thread-child"] == "running"
+    assert context.descendant_pending_terminal_status == {
+        "thread-child": "completed",
+    }
+    assert [
+        call.args[0]
+        for call in process.feed.call_args_list
+        if call.args[0].get("type") == "native.subagent.lifecycle"
+        and call.args[0].get("lifecycle_event") == "done"
+    ] == []
+
+    # Relation discovery then reveals a still-running grandchild.  Attach it
+    # from the authoritative runtime snapshot, as the normal notification
+    # path does when thread/started races item/completed.
+    server._record_child_relation("thread-child", "thread-grandchild")
+    context.descendant_parent_thread_ids["thread-grandchild"] = "thread-child"
+    server._runtime_state_for("thread-grandchild").status_type = "active"
+    server._attach_descendant(context, "thread-grandchild", active=None)
+
+    assert context.active_descendant_thread_ids == {
+        "thread-child",
+        "thread-grandchild",
+    }
+    assert context.descendant_pending_terminal_status == {
+        "thread-child": "completed",
+    }
+    lifecycle = [
+        call.args[0]
+        for call in process.feed.call_args_list
+        if call.args[0].get("type") == "native.subagent.lifecycle"
+    ]
+    assert [
+        (row["native_agent_id"], row["lifecycle_event"])
+        for row in lifecycle
+    ] == [
+        ("thread-child", "spawn"),
+        ("thread-grandchild", "spawn"),
+    ]
+
+    server._record_thread_status(
+        "thread-grandchild",
+        {"type": "idle"},
+    )
+    await asyncio.sleep(0.15)
+    assert context.active_descendant_thread_ids == set()
+    assert context.descendant_pending_terminal_status == {}
+    lifecycle = [
+        call.args[0]
+        for call in process.feed.call_args_list
+        if call.args[0].get("type") == "native.subagent.lifecycle"
+    ]
+    assert [
+        row["native_agent_id"]
+        for row in lifecycle
+        if row["lifecycle_event"] == "done"
+    ] == ["thread-grandchild", "thread-child"]
+
+
+@pytest.mark.asyncio
+async def test_claimed_stop_flushes_descendant_terminal_without_grace_delay():
+    """An explicit stop fence may close an already-proven child immediately."""
+
+    server = CodexAppServer("codex")
+    process = SimpleNamespace(returncode=None, feed=MagicMock())
+    context = _TurnContext(
+        thread_id="thread-root-stop-terminal",
+        process=process,
+        launch_started=0.0,
+        task_id=407,
+    )
+    server._contexts_by_thread[context.thread_id] = context
+    server._record_child_relation("thread-root-stop-terminal", "thread-child")
+    server._attach_descendant(context, "thread-child", active=True)
+    context.deferred_terminal_notification = {
+        "threadId": context.thread_id,
+        "turn": {"id": "turn-root-stop-terminal", "status": "failed"},
+    }
+    context.claimed_stop_token = object()
+
+    server._record_thread_status("thread-child", {"type": "idle"})
+
+    assert context.active_descendant_thread_ids == set()
+    assert context.descendant_pending_terminal_status == {}
+    assert context.descendant_terminal_debounce_handles == {}
+    assert [
+        row["lifecycle_event"]
+        for call in process.feed.call_args_list
+        if (row := call.args[0]).get("type") == "native.subagent.lifecycle"
+    ] == ["spawn", "done"]
+
+
+def test_recursive_attach_registers_nested_active_child_before_parent_terminal():
+    """A terminal parent cannot win before a nested active child is attached."""
+
+    server = CodexAppServer("codex")
+    process = SimpleNamespace(returncode=None, feed=MagicMock())
+    context = _TurnContext(
+        thread_id="thread-root-two-phase",
+        process=process,
+        launch_started=0.0,
+        task_id=403,
+    )
+    server._contexts_by_thread[context.thread_id] = context
+    server._record_child_relation("thread-root-two-phase", "thread-child")
+    server._record_child_relation("thread-child", "thread-grandchild")
+    server._runtime_state_for("thread-grandchild").status_type = "active"
+
+    # The child's own turn is already idle, but its nested child is active.
+    server._attach_descendant(
+        context,
+        "thread-child",
+        active=False,
+        terminal_status="completed",
+    )
+
+    assert context.active_descendant_thread_ids == {
+        "thread-child",
+        "thread-grandchild",
+    }
+    assert context.descendant_pending_terminal_status == {
+        "thread-child": "completed",
+    }
+    lifecycle = [
+        call.args[0]
+        for call in process.feed.call_args_list
+        if call.args[0].get("type") == "native.subagent.lifecycle"
+    ]
+    # The parent is represented as running and no premature done edge exists.
+    assert [
+        (row["native_agent_id"], row["lifecycle_event"])
+        for row in lifecycle
+    ] == [
+        ("thread-grandchild", "spawn"),
+        ("thread-child", "spawn"),
+    ]
+
+    server._record_thread_status(
+        "thread-grandchild",
+        {"type": "idle"},
+    )
+    assert context.active_descendant_thread_ids == set()
+    assert [
+        row["native_agent_id"]
+        for call in process.feed.call_args_list
+        if (row := call.args[0]).get("type")
+        == "native.subagent.lifecycle"
+        and row.get("lifecycle_event") == "done"
+    ] == ["thread-grandchild", "thread-child"]
+
+
+def test_first_descendant_terminal_status_survives_later_idle():
+    """A later idle event must not erase an earlier failure proof."""
+
+    server = CodexAppServer("codex")
+    process = SimpleNamespace(returncode=None, feed=MagicMock())
+    context = _TurnContext(
+        thread_id="thread-root-first-terminal",
+        process=process,
+        launch_started=0.0,
+        task_id=404,
+    )
+    server._contexts_by_thread[context.thread_id] = context
+    server._record_child_relation("thread-root-first-terminal", "thread-child")
+    server._record_child_relation("thread-child", "thread-grandchild")
+    server._attach_descendant(context, "thread-child", active=True)
+    server._attach_descendant(context, "thread-grandchild", active=True)
+
+    server._record_thread_status(
+        "thread-child",
+        {"type": "systemError"},
+    )
+    server._record_thread_status(
+        "thread-child",
+        {"type": "idle"},
+    )
+    assert context.descendant_pending_terminal_status == {
+        "thread-child": "failed",
+    }
+
+    server._record_thread_status(
+        "thread-grandchild",
+        {"type": "idle"},
+    )
+    done = [
+        row
+        for call in process.feed.call_args_list
+        if (row := call.args[0]).get("type")
+        == "native.subagent.lifecycle"
+        and row.get("lifecycle_event") == "done"
+    ]
+    assert [(row["native_agent_id"], row["status"]) for row in done] == [
+        ("thread-grandchild", "completed"),
+        ("thread-child", "failed"),
+    ]
+
+
+def test_late_descendant_message_does_not_clear_pending_terminal():
+    """Late child output is progress, not proof of a fresh child turn."""
+
+    server = CodexAppServer("codex")
+    process = SimpleNamespace(returncode=None, feed=MagicMock())
+    context = _TurnContext(
+        thread_id="thread-root-late-message",
+        process=process,
+        launch_started=0.0,
+        task_id=405,
+    )
+    server._contexts_by_thread[context.thread_id] = context
+    server._record_child_relation("thread-root-late-message", "thread-child")
+    server._record_child_relation("thread-child", "thread-grandchild")
+    server._attach_descendant(context, "thread-child", active=True)
+    server._attach_descendant(context, "thread-grandchild", active=True)
+    server._record_thread_status("thread-child", {"type": "idle"})
+    assert context.descendant_pending_terminal_status == {
+        "thread-child": "completed",
+    }
+
+    server._publish_descendant_message_summary(
+        context,
+        "thread-child",
+        {"type": "agentMessage", "text": "late answer"},
+    )
+    assert context.descendant_pending_terminal_status == {
+        "thread-child": "completed",
+    }
+
+    server._record_thread_status("thread-grandchild", {"type": "idle"})
+    assert context.active_descendant_thread_ids == set()
+    assert [
+        row["native_agent_id"]
+        for call in process.feed.call_args_list
+        if (row := call.args[0]).get("type")
+        == "native.subagent.lifecycle"
+        and row.get("lifecycle_event") == "done"
+    ] == ["thread-grandchild", "thread-child"]
+
+
+def test_child_relation_rejects_cycles():
+    server = CodexAppServer("codex")
+    assert server._record_child_relation("thread-a", "thread-b") is True
+    assert server._record_child_relation("thread-b", "thread-c") is True
+    assert server._record_child_relation("thread-c", "thread-a") is False
+    assert "thread-a" not in server._children_by_thread.get("thread-c", set())
+
+
+def test_rejected_child_relation_cannot_overwrite_valid_parent_projection():
+    """Invalid cycle edges must not poison the live parent/detail mirror."""
+
+    server = CodexAppServer("codex")
+    process = SimpleNamespace(returncode=None, feed=MagicMock())
+    context = _TurnContext(
+        thread_id="thread-root-relation-fence",
+        process=process,
+        launch_started=0.0,
+        task_id=406,
+    )
+    server._contexts_by_thread[context.thread_id] = context
+
+    assert server._record_child_relation(
+        "thread-root-relation-fence",
+        "thread-a",
+    ) is True
+    assert server._record_child_relation("thread-a", "thread-b") is True
+    assert server._record_child_relation("thread-b", "thread-c") is True
+    server._remember_descendant_lifecycle_details(
+        context,
+        "thread-b",
+        parent_thread_id="thread-a",
+        item={"prompt": "valid parent"},
+    )
+    server._attach_descendant(context, "thread-a", active=True)
+    assert context.descendant_parent_thread_ids["thread-b"] == "thread-a"
+
+    # c -> b closes the existing b -> c path.  Both protocol paths must
+    # reject it before mutating the parent/detail projection.
+    server._track_collaboration_item(
+        context,
+        "thread-c",
+        {
+            "type": "collabAgentToolCall",
+            "senderThreadId": "thread-c",
+            "receiverThreadIds": ["thread-b"],
+            "agentsStates": {
+                "thread-b": {
+                    "status": "running",
+                    "message": "invalid cycle",
+                },
+            },
+            "tool": "sendInput",
+            "status": "completed",
+            "prompt": "invalid cycle",
+        },
+    )
+    server._handle_notification(
+        "thread/started",
+        {
+            "thread": {
+                "id": "thread-b",
+                "parentThreadId": "thread-c",
+                "status": {"type": "active"},
+            },
+        },
+    )
+
+    assert context.descendant_parent_thread_ids["thread-b"] == "thread-a"
+    assert context.descendant_lifecycle_details["thread-b"]["description"] == (
+        "valid parent"
+    )
+    assert "thread-b" not in server._children_by_thread.get("thread-c", set())
+
+
 async def _retained_followup_context(
     *,
     thread_id: str,

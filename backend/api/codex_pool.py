@@ -1622,13 +1622,19 @@ async def codex_pool_usage(force: bool = False):
     app-server; rollout snapshots remain the background/failure fallback.
     """
     pool = _get_pool()
-    status = pool.status()
     quota_list = await pool.fetch_quota(force=force, live=force)
+    # Build status after the refresh so a newly observed native terminal quota
+    # is reflected in ``available`` immediately, rather than one request later.
+    status = pool.status()
     quota_by_id = {q["id"]: q for q in quota_list}
     for account in status["accounts"]:
         q = quota_by_id.get(account["id"], {})
         account["plan_type"] = q.get("plan_type")
-        account["quota"] = q.get("quota")
+        # A live RPC can briefly return an older 0% window after the native
+        # rollout has recorded a structured terminal usage-limit event. Use the
+        # pool's effective evidence for the UI as well as for routing.
+        effective_quota = pool.cached_quota_for_home(account["codex_home"])
+        account["quota"] = effective_quota or q.get("quota")
         account["quota_error"] = q.get("error")
         account["api_quota"] = q.get("api_quota")
     return status

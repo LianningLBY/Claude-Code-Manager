@@ -255,6 +255,8 @@ def is_transient_overload(text: str) -> bool:
 
 _CODEX_USAGE_LIMIT_RE = re.compile(
     r"hit your usage limit"          # UsageLimitReached
+    r"|usage_limit_exceeded"          # structured Codex error code
+    r"|usage limit exceeded"          # structured/human error wording
     r"|quota exceeded"               # QuotaExceeded
     r"|out of credits"               # workspace credits depleted
     r"|spend cap"                    # workspace spend cap

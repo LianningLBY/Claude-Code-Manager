@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -201,6 +202,31 @@ def _quota_rollout(
     return path
 
 
+def _usage_limit_rollout(
+    home: Path,
+    session_id: str,
+    *,
+    event_timestamp: str = "2026-08-18T19:40:04.821Z",
+    reset_text: str = "Aug 20th, 2026 7:15 AM",
+) -> Path:
+    path = _rollout(home, session_id, timestamp="2026-08-18T19-40-04")
+    path.write_text(json.dumps({
+        "timestamp": event_timestamp,
+        "type": "event_msg",
+        "payload": {
+            "type": "task_complete",
+            "error": {
+                "message": (
+                    "You've hit your usage limit. Visit the usage page or try "
+                    f"again at {reset_text}."
+                ),
+                "codex_error_info": "usage_limit_exceeded",
+            },
+        },
+    }) + "\n", encoding="utf-8")
+    return path
+
+
 class TestSharedDetectors:
     def test_imports_the_canonical_codex_detectors(self):
         assert (
@@ -217,6 +243,10 @@ class TestSharedDetectors:
         assert is_pool_rotatable("You have hit your usage limit")
         assert is_pool_rotatable("The refresh token was revoked")
         assert not is_pool_rotatable("request timed out")
+
+    def test_structured_usage_limit_code_is_detected(self):
+        assert is_rate_limited("usage_limit_exceeded")
+        assert is_rate_limited("Usage limit exceeded")
 
 
 class TestSelection:
@@ -787,6 +817,90 @@ async def test_rollout_scan_skips_newer_snapshot_without_usage_data(
     assert result["codex-1"]["quota"]["primary_used_percent"] == 64
 
 
+def test_zero_addon_credit_wallet_is_not_native_quota_exhaustion():
+    quota = codex_pool_module._normalize_rate_limits({
+        "primary": {
+            "used_percent": 0.0,
+            "window_minutes": 300,
+            "resets_at": 1_800_000_000,
+        },
+        "secondary": None,
+        "credits": {
+            "has_credits": False,
+            "unlimited": False,
+            "balance": "0",
+        },
+    })
+
+    assert quota is not None
+    assert quota["primary_used_percent"] == 0.0
+    assert quota["is_rate_limited"] is False
+    assert "usage_limit_exceeded" not in quota
+    assert "credits_exhausted" not in quota
+
+
+def test_structured_terminal_beats_older_zero_percent_rollout(tmp_path: Path):
+    home = tmp_path / "codex-1"
+    _quota_rollout(
+        home,
+        "old-healthy",
+        0,
+        event_timestamp="2026-08-18T19:39:00Z",
+        mtime=2_000_000_000,
+    )
+    _usage_limit_rollout(home, "terminal")
+
+    quota = codex_pool_module._read_quota_from_rollout(str(home))
+
+    assert quota is not None
+    assert quota["usage_limit_exceeded"] is True
+    assert quota["is_rate_limited"] is True
+    expected_reset = time.mktime((2026, 8, 20, 7, 15, 0, 0, 0, -1))
+    assert quota["usage_limit_resets_at"] == expected_reset
+
+
+def test_terminal_before_account_quota_cutoff_is_ignored(tmp_path: Path):
+    home = tmp_path / "codex-1"
+    _usage_limit_rollout(home, "migrated-old-terminal")
+
+    quota = codex_pool_module._read_quota_from_rollout(
+        str(home),
+        min_event_timestamp=datetime.fromisoformat(
+            "2026-08-19T00:00:00+00:00"
+        ).timestamp(),
+    )
+
+    assert quota is None
+
+
+def test_rollout_tail_stops_after_first_quota_candidate(monkeypatch, tmp_path: Path):
+    event = json.dumps({
+        "timestamp": "2026-08-18T19:40:04.821Z",
+        "payload": {
+            "type": "task_complete",
+            "error": {"codex_error_info": "usage_limit_exceeded"},
+        },
+    }).encode()
+
+    def bounded_tail(_path):
+        yield event
+        raise AssertionError("quota parser read past the latest candidate")
+
+    monkeypatch.setattr(
+        codex_pool_module,
+        "_iter_rollout_lines_reverse",
+        bounded_tail,
+    )
+
+    candidate = codex_pool_module._latest_quota_event_in_rollout(
+        tmp_path / "large-rollout.jsonl",
+        0,
+    )
+
+    assert candidate is not None
+    assert candidate[1]["usage_limit_exceeded"] is True
+
+
 @pytest.mark.asyncio
 async def test_live_quota_refresh_prefers_account_rpc_and_maps_camel_case(
     pool_config: Path, tmp_path: Path,
@@ -1100,6 +1214,39 @@ async def test_usage_api_only_requests_live_quota_for_explicit_force(
     fake_pool.fetch_quota.assert_awaited_once_with(force=force, live=force)
 
 
+@pytest.mark.asyncio
+async def test_usage_api_projects_effective_terminal_over_stale_live_snapshot(
+    monkeypatch,
+):
+    from backend.api import codex_pool as codex_pool_api
+
+    terminal = {
+        "usage_limit_exceeded": True,
+        "is_rate_limited": True,
+        "usage_limit_resets_at": time.time() + 600,
+    }
+    fake_pool = type("FakePool", (), {})()
+    fake_pool.status = lambda: {
+        "accounts": [{
+            "id": "codex-1",
+            "codex_home": "/codex/one",
+            "available": False,
+        }],
+    }
+    fake_pool.fetch_quota = AsyncMock(return_value=[{
+        "id": "codex-1",
+        "quota": {"primary_used_percent": 0},
+        "plan_type": "pro",
+        "error": None,
+    }])
+    fake_pool.cached_quota_for_home = lambda _home: terminal
+    monkeypatch.setattr(codex_pool_api, "_get_pool", lambda: fake_pool)
+
+    result = await codex_pool_api.codex_pool_usage(force=True)
+
+    assert result["accounts"][0]["quota"] == terminal
+
+
 class TestQuotaAwareSelection:
     def test_threshold_checks_primary_or_secondary(self):
         assert quota_at_or_above({"primary_used_percent": 90})
@@ -1108,6 +1255,122 @@ class TestQuotaAwareSelection:
             "primary_used_percent": 89.9,
             "secondary_used_percent": 40,
         })
+
+    def test_expired_window_no_longer_blocks_selection(self):
+        now = 1_700_000_000
+        assert not quota_at_or_above({
+            "primary_used_percent": 100,
+            "primary_resets_at": now - 1,
+            "is_rate_limited": True,
+        }, now=now)
+
+    def test_known_healthy_native_precedes_unknown_native(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        pool._selection_quota_cache = {
+            "codex-1": {"id": "codex-1", "quota": None},
+            "codex-2": {
+                "id": "codex-2",
+                "quota": {"primary_used_percent": 20},
+            },
+        }
+        pool._selection_quota_cache_at = time.time()
+
+        assert pool.select() == str((tmp_path / "codex-2").resolve())
+
+    def test_active_terminal_beats_later_stale_live_zero(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        now = time.time()
+        pool._selection_quota_cache = {
+            "codex-1": {
+                "id": "codex-1",
+                "quota": {
+                    "usage_limit_exceeded": True,
+                    "is_rate_limited": True,
+                    "usage_limit_resets_at": now + 600,
+                },
+            },
+            "codex-2": {
+                "id": "codex-2",
+                "quota": {"primary_used_percent": 10},
+            },
+        }
+        pool._selection_quota_cache_at = now
+        pool._quota_cache = {
+            "codex-1": {
+                "id": "codex-1",
+                "quota": {"primary_used_percent": 0},
+            },
+        }
+        pool._quota_cache_at = now + 1
+
+        assert pool.select() == str((tmp_path / "codex-2").resolve())
+        assert pool.account_status("codex-1")["available"] is False
+
+    def test_expired_terminal_can_be_reopened_by_known_healthy_live(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        now = time.time()
+        pool._selection_quota_cache = {
+            "codex-1": {
+                "id": "codex-1",
+                "quota": {
+                    "usage_limit_exceeded": True,
+                    "is_rate_limited": True,
+                    "usage_limit_resets_at": now - 1,
+                },
+            },
+        }
+        pool._selection_quota_cache_at = now
+        pool._quota_cache = {
+            "codex-1": {
+                "id": "codex-1",
+                "quota": {"primary_used_percent": 0},
+            },
+            "codex-2": {"id": "codex-2", "quota": None},
+        }
+        pool._quota_cache_at = now + 1
+
+        assert pool.select() == str((tmp_path / "codex-1").resolve())
+        assert pool.account_status("codex-1")["available"] is True
+
+    def test_all_known_high_native_accounts_defer_but_remain_retryable(
+        self, pool: CodexPool,
+    ):
+        now = time.time()
+        pool._selection_quota_cache = {
+            account_id: {
+                "id": account_id,
+                "quota": {
+                    "primary_used_percent": 100,
+                    "primary_resets_at": now + 300,
+                    "is_rate_limited": True,
+                },
+            }
+            for account_id in ("codex-1", "codex-2")
+        }
+        pool._selection_quota_cache_at = now
+
+        assert pool.select() is None
+        assert pool.has_retryable_compatible_account(None)
+        assert 1 <= pool.quota_retry_after() <= 300
+
+    @pytest.mark.asyncio
+    async def test_cold_cache_refresh_skips_structured_terminal_account(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        _usage_limit_rollout(tmp_path / "codex-1", "terminal")
+        _quota_rollout(
+            tmp_path / "codex-2",
+            "healthy",
+            10,
+            event_timestamp="2026-08-18T19:41:00Z",
+        )
+
+        await pool.refresh_selection_quota()
+
+        assert pool.select() == str((tmp_path / "codex-2").resolve())
 
     def test_api_unlimited_window_does_not_trigger_threshold(self):
         assert not codex_pool_module.api_quota_at_or_above({

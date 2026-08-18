@@ -7563,7 +7563,9 @@ async def test_failed_sequential_mode_turn_never_receives_rotation_replay(db_fac
     d._automatic_relaunch_is_blocked_by_turn_source = AsyncMock(
         return_value=False
     )
-    d._collect_failure_output = AsyncMock(return_value="rate limited")
+    d._collect_failure_output = AsyncMock(
+        return_value="You've hit your usage limit"
+    )
     d._check_rate_limit_and_rotate = AsyncMock(
         return_value={
             "config_dir": "/tmp/codex-b",
@@ -7590,6 +7592,12 @@ async def test_failed_sequential_mode_turn_never_receives_rotation_replay(db_fac
     token = object()
     sequence = _ModeTurnSequence(next_token=token)
 
+    codex_pool = MagicMock()
+    codex_pool.enabled = True
+    codex_pool.canonical_home.side_effect = lambda home: home
+    d.codex_pool = codex_pool
+    manager.is_cloudrouter_auth_failure.return_value = False
+
     exit_code, home = await d._launch_mode_turn_with_rotation(
         7,
         task,
@@ -7610,8 +7618,9 @@ async def test_failed_sequential_mode_turn_never_receives_rotation_replay(db_fac
     assert manager.launch.await_count == 1
     assert manager.launch.await_args.kwargs["sequential_turn_token"] is token
     d._automatic_relaunch_is_blocked_by_turn_source.assert_not_awaited()
-    d._collect_failure_output.assert_not_awaited()
+    d._collect_failure_output.assert_awaited_once_with(7, 45)
     d._check_rate_limit_and_rotate.assert_not_awaited()
+    codex_pool.mark_rate_limited.assert_called_once_with("/tmp/codex-a")
     assert sequence.next_token is None
 
 

@@ -152,18 +152,56 @@ def _models_cache_supports_service_tier(
 
 
 def quota_at_or_above(
-    quota: dict | None, *, threshold: float = QUOTA_SWITCH_THRESHOLD_PERCENT
+    quota: dict | None,
+    *,
+    threshold: float = QUOTA_SWITCH_THRESHOLD_PERCENT,
+    now: float | None = None,
 ) -> bool:
     """Whether Codex's 5-hour or weekly window reached ``threshold`` percent."""
 
     if not isinstance(quota, dict):
         return False
-    for key in ("primary_used_percent", "secondary_used_percent"):
+    current = time.time() if now is None else now
+    if quota.get("usage_limit_exceeded") is True:
         try:
-            if float(quota.get(key)) >= threshold:
-                return True
+            reset_at = float(quota.get("usage_limit_resets_at"))
+        except (TypeError, ValueError):
+            return True
+        return reset_at > current
+
+    high_window_seen = False
+    for used_key, reset_key in (
+        ("primary_used_percent", "primary_resets_at"),
+        ("secondary_used_percent", "secondary_resets_at"),
+    ):
+        try:
+            if float(quota.get(used_key)) < threshold:
+                continue
         except (TypeError, ValueError):
             continue
+        high_window_seen = True
+        try:
+            reset_at = float(quota.get(reset_key))
+            if reset_at > 10_000_000_000:
+                reset_at /= 1000
+        except (TypeError, ValueError):
+            return True
+        if reset_at > current:
+            return True
+    if high_window_seen:
+        return False
+
+    if quota.get("is_rate_limited") is True:
+        resets = []
+        for key in ("primary_resets_at", "secondary_resets_at"):
+            try:
+                reset_at = float(quota.get(key))
+                if reset_at > 10_000_000_000:
+                    reset_at /= 1000
+                resets.append(reset_at)
+            except (TypeError, ValueError):
+                continue
+        return not resets or any(reset_at > current for reset_at in resets)
     return False
 
 
@@ -227,6 +265,21 @@ def quota_cooldown_seconds(
     if not isinstance(quota, dict):
         return max(1, int(fallback))
 
+    current = time.time() if now is None else now
+    if quota.get("usage_limit_exceeded") is True:
+        try:
+            reset_at = float(quota.get("usage_limit_resets_at"))
+            if reset_at > 10_000_000_000:
+                reset_at /= 1000
+        except (TypeError, ValueError):
+            return max(1, int(fallback))
+        if reset_at <= current:
+            return max(1, int(fallback))
+        return min(
+            max(1, int(reset_at - current)),
+            max(1, int(maximum)),
+        )
+
     reset_timestamps: list[float] = []
     for used_key, reset_key in (
         ("primary_used_percent", "primary_resets_at"),
@@ -242,7 +295,6 @@ def quota_cooldown_seconds(
         except (TypeError, ValueError):
             continue
 
-    current = time.time() if now is None else now
     future_resets = [
         reset_at for reset_at in reset_timestamps if reset_at > current
     ]
@@ -449,6 +501,8 @@ class CodexPool:
         self._quota_cache_at: float = 0.0
         self._quota_cache_live_until: float = 0.0
         self._selection_quota_cache: dict[str, dict] | None = None
+        self._selection_quota_cache_at: float = 0.0
+        self._selection_quota_refresh_lock = asyncio.Lock()
         self._quota_reader = quota_reader
         self._cloudrouter_store = cloudrouter_store
         self._bootstrap_native = bool(bootstrap_default)
@@ -621,6 +675,7 @@ class CodexPool:
         self._quota_cache_at = 0.0
         self._quota_cache_live_until = 0.0
         self._selection_quota_cache = None
+        self._selection_quota_cache_at = 0.0
 
     def account(self, account_id: str) -> CodexPoolAccount | None:
         return next((a for a in self._accounts if a.id == account_id), None)
@@ -663,6 +718,10 @@ class CodexPool:
         available = (
             account.enabled
             and now >= cooldown_until
+            and (
+                _is_api_auth_kind(account.auth_kind)
+                or not self._cached_native_quota_is_unavailable(account.id)
+            )
             and not (
                 bool(quota_decision.get("known"))
                 and quota_decision.get("available") is False
@@ -723,6 +782,140 @@ class CodexPool:
             if isinstance(snapshot, dict):
                 return snapshot
         return None
+
+    def _cached_native_quota_state(
+        self,
+        account_id: str,
+        *,
+        now: float | None = None,
+    ) -> tuple[str, dict | None]:
+        """Return ``available``, ``unavailable``, or ``unknown`` quota state.
+
+        A structured usage-limit terminal is stronger than the app-server's
+        sometimes stale 0% snapshot until the terminal's stated reset. Ordinary
+        percentage snapshots, however, follow cache recency so a later healthy
+        live read can reopen an account before an older rollout cache expires.
+        Unknown reads never erase the last known terminal evidence.
+        """
+
+        current = time.time() if now is None else now
+        evidence: list[tuple[float, dict]] = []
+        for cache, observed_at in (
+            (self._selection_quota_cache, self._selection_quota_cache_at),
+            (self._quota_cache, self._quota_cache_at),
+        ):
+            if not isinstance(cache, dict):
+                continue
+            row = cache.get(account_id)
+            quota = row.get("quota") if isinstance(row, dict) else None
+            if isinstance(quota, dict):
+                evidence.append((observed_at, quota))
+        if not evidence:
+            return "unknown", None
+
+        active_terminals = [
+            quota
+            for _, quota in evidence
+            if quota.get("usage_limit_exceeded") is True
+            and quota_at_or_above(
+                quota,
+                threshold=self._quota_switch_threshold_percent,
+                now=current,
+            )
+        ]
+        if active_terminals:
+            return "unavailable", active_terminals[0]
+
+        newest_at = max(float(observed_at or 0) for observed_at, _ in evidence)
+        newest = [quota for observed_at, quota in evidence if observed_at == newest_at]
+        unavailable = next(
+            (
+                quota
+                for quota in newest
+                if quota_at_or_above(
+                    quota,
+                    threshold=self._quota_switch_threshold_percent,
+                    now=current,
+                )
+            ),
+            None,
+        )
+        if unavailable is not None:
+            return "unavailable", unavailable
+        return "available", newest[-1]
+
+    def _cached_native_quota_is_unavailable(self, account_id: str) -> bool:
+        state, _ = self._cached_native_quota_state(account_id)
+        return state == "unavailable"
+
+    async def refresh_selection_quota(self, *, force: bool = False) -> None:
+        """Refresh native rollout evidence before assigning a fresh turn.
+
+        This intentionally stays rollout-only: admission must not start every
+        account's app-server, and filesystem scanning runs off the event loop.
+        A single-flight lock prevents concurrent fresh tasks from duplicating a
+        potentially large account-history scan.
+        """
+
+        now = time.time()
+        if (
+            not force
+            and self._selection_quota_cache is not None
+            and now - self._selection_quota_cache_at < QUOTA_CACHE_TTL
+        ):
+            return
+        async with self._selection_quota_refresh_lock:
+            now = time.time()
+            if (
+                not force
+                and self._selection_quota_cache is not None
+                and now - self._selection_quota_cache_at < QUOTA_CACHE_TTL
+            ):
+                return
+            while True:
+                generation = self._config_generation
+                accounts = [
+                    account
+                    for account in self._accounts
+                    if account.enabled
+                    and not account.retired
+                    and not _is_api_auth_kind(account.auth_kind)
+                ]
+                quotas = await asyncio.gather(
+                    *(
+                        asyncio.to_thread(
+                            _read_quota_from_rollout,
+                            account.codex_home,
+                            min_event_timestamp=(
+                                account.quota_valid_after or None
+                            ),
+                        )
+                        if not account.quota_cutoff_invalid
+                        else asyncio.sleep(0, result=None)
+                        for account in accounts
+                    )
+                )
+                if generation == self._config_generation:
+                    break
+                logger.info(
+                    "Discarding Codex selection quota read across pool reload "
+                    "(%s -> %s)",
+                    generation,
+                    self._config_generation,
+                )
+            self._selection_quota_cache = {
+                account.id: {
+                    "id": account.id,
+                    "quota": quota,
+                    "error": (
+                        "invalid_quota_cutoff"
+                        if account.quota_cutoff_invalid
+                        else None if quota else "no_rollout_data"
+                    ),
+                }
+                for account, quota in zip(accounts, quotas)
+            }
+            self._selection_quota_cache_at = time.time()
 
     def home_status(self, codex_home: str | os.PathLike[str]) -> dict | None:
         account = self.account_for_home(codex_home)
@@ -896,6 +1089,10 @@ class CodexPool:
                 and account.id not in excluded
                 and now >= self._cooldowns.get(account.id, 0)
                 and account.supports_service_tier(model, requested_tier)
+                and (
+                    _is_api_auth_kind(account.auth_kind)
+                    or not self._cached_native_quota_is_unavailable(account.id)
+                )
                 and not (
                     bool(decision.get("known"))
                     and decision.get("available") is False
@@ -942,15 +1139,32 @@ class CodexPool:
             for account in api_candidates
             if account.id not in verified_api_ids
         ]
-        native_candidates = [
+        known_native_candidates = [
             account
             for account in candidates
             if not _is_api_auth_kind(account.auth_kind)
+            and self._cached_native_quota_state(account.id)[0] == "available"
+        ]
+        unknown_native_candidates = [
+            account
+            for account in candidates
+            if not _is_api_auth_kind(account.auth_kind)
+            and self._cached_native_quota_state(account.id)[0] == "unknown"
         ]
         groups = (
-            (native_candidates, verified_api_candidates, unknown_api_candidates)
+            (
+                known_native_candidates,
+                unknown_native_candidates,
+                verified_api_candidates,
+                unknown_api_candidates,
+            )
             if self._routing_policy == "native_first"
-            else (verified_api_candidates, native_candidates, unknown_api_candidates)
+            else (
+                verified_api_candidates,
+                known_native_candidates,
+                unknown_native_candidates,
+                unknown_api_candidates,
+            )
         )
         for group in groups:
             chosen = self._round_robin_candidate(group)
@@ -1027,6 +1241,33 @@ class CodexPool:
             self._terminal_failures.discard(acc.id)
             self._cooldowns[acc.id] = time.time() + d
             logger.info("Codex pool: marked %s rate-limited for %ds", acc.id, d)
+
+    def quota_retry_after(self) -> float | None:
+        """Return the earliest bounded recovery delay for cached native quota."""
+
+        delays: list[float] = []
+        now = time.time()
+        for account in self._accounts:
+            if (
+                not account.enabled
+                or account.retired
+                or _is_api_auth_kind(account.auth_kind)
+            ):
+                continue
+            state, quota = self._cached_native_quota_state(account.id, now=now)
+            if state != "unavailable" or quota is None:
+                continue
+            delays.append(
+                float(
+                    quota_cooldown_seconds(
+                        quota,
+                        threshold=self._quota_switch_threshold_percent,
+                        now=now,
+                        fallback=self._cooldown_seconds,
+                    )
+                )
+            )
+        return max(1.0, min(delays)) if delays else None
 
     def mark_auth_failure(self, codex_home: str):
         acc = self._find_by_home(codex_home)
@@ -1252,6 +1493,7 @@ class CodexPool:
             # Quota-aware rotation needs the exact rollout snapshot it just
             # selected on, even while a live UI result is protected by TTL.
             self._selection_quota_cache = results
+            self._selection_quota_cache_at = completed_at
             if completed_at >= self._quota_cache_live_until:
                 # A background rollout scan may overlap a manual live refresh.
                 # Return its fresh data to quota-aware switching, but do not let
@@ -1426,14 +1668,8 @@ class CodexPool:
         account_id = self.account_id_for_home(codex_home)
         if not account_id:
             return None
-        for cache in (self._selection_quota_cache, self._quota_cache):
-            if not isinstance(cache, dict):
-                continue
-            row = cache.get(account_id)
-            quota = row.get("quota") if isinstance(row, dict) else None
-            if isinstance(quota, dict):
-                return quota
-        return None
+        _, quota = self._cached_native_quota_state(account_id)
+        return quota if isinstance(quota, dict) else None
 
 
 # ---------------------------------------------------------------------------
@@ -1496,10 +1732,24 @@ def _latest_quota_event_in_rollout(
     *,
     min_event_timestamp: float | None = None,
 ) -> tuple[float, dict] | None:
-    """Read one rollout from its tail and return its last usable snapshot."""
+    """Read one rollout tail and return its latest usable quota evidence.
+
+    A native ``task_complete`` usage-limit error is durable account evidence
+    even when the preceding ``token_count`` has null percentage windows. Treat
+    that terminal event as a quota candidate so an older 0% rollout cannot win
+    the account-wide timestamp comparison.
+    """
 
     for raw_line in _iter_rollout_lines_reverse(path):
-        if not raw_line or b'"rate_limits"' not in raw_line:
+        if not raw_line:
+            continue
+        if (
+            b'"rate_limits"' not in raw_line
+            and b'"usage_limit_exceeded"' not in raw_line
+            and b'"usageLimitExceeded"' not in raw_line
+            and b'"codex_error_info"' not in raw_line
+            and b'"codexErrorInfo"' not in raw_line
+        ):
             continue
         try:
             event = json.loads(raw_line)
@@ -1507,25 +1757,111 @@ def _latest_quota_event_in_rollout(
             continue
         if not isinstance(event, dict):
             continue
-        payload = event.get("payload") or {}
-        if not isinstance(payload, dict):
-            continue
-        if payload.get("type") != "token_count":
-            continue
-        quota = _normalize_rate_limits(payload.get("rate_limits"))
-        if quota is None:
-            continue
         event_timestamp = _rollout_event_timestamp(event)
         if min_event_timestamp is not None and (
             event_timestamp is None
             or event_timestamp <= min_event_timestamp
         ):
             continue
+        candidate_quota: dict | None = None
+        if _rollout_usage_limit_evidence(event):
+            candidate_quota = _terminal_usage_limit_quota(
+                event,
+                observed_at=(
+                    fallback_mtime if event_timestamp is None else event_timestamp
+                ),
+            )
+        else:
+            payload = event.get("payload") or {}
+            if isinstance(payload, dict) and payload.get("type") == "token_count":
+                candidate_quota = _normalize_rate_limits(payload.get("rate_limits"))
+        if candidate_quota is None:
+            continue
         return (
             fallback_mtime if event_timestamp is None else event_timestamp,
-            quota,
+            candidate_quota,
         )
     return None
+
+
+_USAGE_LIMIT_RESET_RE = re.compile(
+    r"\b(?:try\s+again|retry|available)\s+(?:at|after)\s+"
+    r"([A-Za-z]{3,9}\s+\d{1,2}(?:st|nd|rd|th)?,\s+\d{4}\s+"
+    r"\d{1,2}:\d{2}\s+[AP]M)\b",
+    re.IGNORECASE,
+)
+
+
+def _usage_limit_reset_at(event: dict) -> float | None:
+    """Parse the local-time reset printed in a structured Codex terminal."""
+
+    payload = event.get("payload")
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        error = event.get("error")
+    if not isinstance(error, dict):
+        return None
+    for key in ("resets_at", "resetsAt", "reset_at", "resetAt"):
+        value = error.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            reset_at = float(value)
+            return reset_at / 1000 if reset_at > 10_000_000_000 else reset_at
+    message = error.get("message")
+    if not isinstance(message, str):
+        return None
+    match = _USAGE_LIMIT_RESET_RE.search(message)
+    if not match:
+        return None
+    normalized = re.sub(r"(?<=\d)(?:st|nd|rd|th)\b", "", match.group(1), flags=re.I)
+    for date_format in ("%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p"):
+        try:
+            # Codex renders this timestamp in the CLI's local timezone. Calling
+            # ``astimezone`` on a naive datetime applies the host timezone (and
+            # its DST rules) for that date before converting to Unix seconds.
+            return datetime.strptime(normalized, date_format).astimezone().timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def _terminal_usage_limit_quota(event: dict, *, observed_at: float) -> dict:
+    """Build a normalized quota snapshot for a structured terminal error."""
+
+    reset_at = _usage_limit_reset_at(event)
+    if reset_at is None or reset_at <= observed_at:
+        reset_at = observed_at + DEFAULT_COOLDOWN_SECONDS
+    return {
+        "primary_used_percent": None,
+        "primary_window_minutes": None,
+        "primary_resets_at": None,
+        "secondary_used_percent": None,
+        "secondary_window_minutes": None,
+        "secondary_resets_at": None,
+        "plan_type": None,
+        "is_rate_limited": True,
+        "has_credits": None,
+        "usage_limit_exceeded": True,
+        "usage_limit_observed_at": observed_at,
+        "usage_limit_resets_at": reset_at,
+    }
+
+
+def _rollout_usage_limit_evidence(event: dict) -> bool:
+    """Recognize the exact structured Codex usage-limit terminal code."""
+
+    payload = event.get("payload")
+    if not isinstance(payload, dict) or payload.get("type") != "task_complete":
+        return False
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return False
+    code = error.get("codex_error_info")
+    if not isinstance(code, str):
+        code = error.get("codexErrorInfo")
+    if not isinstance(code, str):
+        return False
+    normalized = re.sub(r"[^a-z]", "", code.lower())
+    return normalized == "usagelimitexceeded"
 
 
 def _iter_rollout_lines_reverse(
@@ -1589,12 +1925,18 @@ def _normalize_rate_limits(snapshot: dict | None) -> dict | None:
     reached_type = _value(
         snapshot, "rateLimitReachedType", "rate_limit_reached_type"
     )
+    spend_control_reached = _value(
+        snapshot,
+        "spendControlReached",
+        "spend_control_reached",
+    ) is True
     primary_used = _value(primary, "usedPercent", "used_percent")
     secondary_used = _value(secondary, "usedPercent", "used_percent")
     if (
         primary_used is None
         and secondary_used is None
         and reached_type is None
+        and not spend_control_reached
     ):
         return None
     return {
@@ -1609,7 +1951,7 @@ def _normalize_rate_limits(snapshot: dict | None) -> dict | None:
         ),
         "secondary_resets_at": _value(secondary, "resetsAt", "resets_at"),
         "plan_type": plan_type,
-        "is_rate_limited": reached_type is not None,
+        "is_rate_limited": reached_type is not None or spend_control_reached,
         "has_credits": bool(_value(credits, "hasCredits", "has_credits")),
     }
 

@@ -8107,6 +8107,9 @@ class GlobalDispatcher:
             for account in pool.list_accounts()
             if account.get("enabled") and account.get("cooldown_remaining")
         ]
+        quota_retry_after = pool.quota_retry_after()
+        if quota_retry_after is not None:
+            remaining.append(float(quota_retry_after))
         return max(1.0, min(remaining)) if remaining else None
 
     async def _resolve_codex_home(
@@ -8161,6 +8164,10 @@ class GlobalDispatcher:
         if session_id:
             matches = pool.locate_session_homes(session_id)
 
+        # Resolve the preferred account's identity before session-copy
+        # disambiguation.  Its availability is evaluated below, after any
+        # required quota refresh, but ownership is needed to choose among
+        # multiple physical copies safely.
         preferred_owner_home: str | None = None
         preferred_home: str | None = None
         preferred_id = pool.preferred_account_id
@@ -8168,17 +8175,6 @@ class GlobalDispatcher:
             candidate_home = pool.home_for_account(preferred_id)
             if candidate_home:
                 preferred_owner_home = pool.canonical_home(candidate_home)
-            if (
-                preferred_owner_home
-                and pool.is_home_available(preferred_owner_home)
-                and preferred_owner_home not in busy_homes
-                and pool.supports_model_for_home(
-                    preferred_owner_home,
-                    model,
-                    service_tier=codex_service_tier,
-                )
-            ):
-                preferred_home = preferred_owner_home
 
         resident: str | None = None
         if bound_home:
@@ -8233,6 +8229,37 @@ class GlobalDispatcher:
                     "homes but the task has no codex_account_id binding",
                     permanent=True,
                 )
+
+        # Native rollout evidence is needed only when this call may choose a
+        # new route. Resident turns with a known-healthy home avoid a full
+        # account-history scan; fresh launches and unavailable residents refresh
+        # off-loop before the synchronous selector runs.
+        resident_known_available = bool(
+            resident
+            and pool.is_home_available(resident)
+            and resident not in busy_homes
+            and pool.supports_model_for_home(
+                resident,
+                model,
+                service_tier=codex_service_tier,
+            )
+        )
+        if not resident_known_available:
+            await pool.refresh_selection_quota()
+            await self._require_task_lifecycle_active(expected_generation)
+
+        if preferred_owner_home:
+            if (
+                preferred_owner_home
+                and pool.is_home_available(preferred_owner_home)
+                and preferred_owner_home not in busy_homes
+                and pool.supports_model_for_home(
+                    preferred_owner_home,
+                    model,
+                    service_tier=codex_service_tier,
+                )
+            ):
+                preferred_home = preferred_owner_home
 
         resident_available = bool(
             resident
@@ -8387,6 +8414,56 @@ class GlobalDispatcher:
             task_id, limit=10
         )
         return collect_process_output_for_detection(stderr, log_contents)
+
+    def _mark_codex_terminal_failure(
+        self,
+        instance_id: int,
+        task: Task,
+        combined: str,
+    ) -> bool:
+        """Quarantine a failed Codex account without authorizing a replay."""
+
+        pool = self.codex_pool
+        if not pool or (task.provider or "claude").lower() != "codex":
+            return False
+        from backend.services.codex_pool import is_auth_failure, is_rate_limited
+
+        cloudrouter_auth_failed = (
+            self.instance_manager.is_cloudrouter_auth_failure(
+                instance_id,
+                "codex",
+                combined,
+            )
+            is True
+        )
+        auth_failed = is_auth_failure(combined) or cloudrouter_auth_failed
+        rate_limited = is_rate_limited(combined)
+        if not (auth_failed or rate_limited):
+            return False
+
+        old_home = self.instance_manager.get_config_dir(instance_id)
+        metadata = task.metadata_ if isinstance(task.metadata_, dict) else {}
+        bound_id = metadata.get("codex_account_id")
+        if not old_home and isinstance(bound_id, str):
+            old_home = pool.home_for_account(bound_id)
+        old_home = pool.canonical_home(
+            old_home
+            or os.environ.get("CODEX_HOME")
+            or str(Path.home() / ".codex")
+        )
+        if auth_failed:
+            pool.mark_auth_failure(old_home)
+            logger.warning(
+                "Codex pool account %s auth failed; quarantined without replay",
+                old_home,
+            )
+        else:
+            pool.mark_rate_limited(old_home)
+            logger.info(
+                "Codex pool account %s hit its usage limit; quarantined without replay",
+                old_home,
+            )
+        return True
 
     async def _check_rate_limit_and_rotate(
         self,
@@ -8648,6 +8725,8 @@ class GlobalDispatcher:
 
         old_account_id = pool.account_id_for_home(old_home)
         excluded = {old_account_id} if old_account_id else set()
+        await pool.refresh_selection_quota()
+        await self._require_task_lifecycle_active(expected_generation)
         new_home = pool.select(
             exclude=excluded,
             model=task_model,
@@ -9107,6 +9186,13 @@ class GlobalDispatcher:
                     label,
                     task.id,
                 )
+                if (task.provider or "claude").lower() == "codex":
+                    combined = await self._collect_failure_output(
+                        instance_id, task.id
+                    )
+                    self._mark_codex_terminal_failure(
+                        instance_id, task, combined
+                    )
                 return exit_code, current_home
             if await self._automatic_relaunch_is_blocked_by_turn_source(
                 generation
@@ -9117,8 +9203,22 @@ class GlobalDispatcher:
                     label,
                     task.id,
                 )
+                if (task.provider or "claude").lower() == "codex":
+                    combined = await self._collect_failure_output(
+                        instance_id, task.id
+                    )
+                    self._mark_codex_terminal_failure(
+                        instance_id, task, combined
+                    )
                 return exit_code, current_home
             if rotation_attempt >= max_rotations:
+                if (task.provider or "claude").lower() == "codex":
+                    combined = await self._collect_failure_output(
+                        instance_id, task.id
+                    )
+                    self._mark_codex_terminal_failure(
+                        instance_id, task, combined
+                    )
                 return exit_code, current_home
 
             combined = await self._collect_failure_output(instance_id, task.id)
@@ -11239,6 +11339,14 @@ class GlobalDispatcher:
         # Still failing — keep backing off while it's transient and budget
         # remains (flag covers PTY's exit_code-0 repeat; text covers stderr).
         combined = await self._collect_failure_output(instance_id, task.id)
+        if await self._automatic_relaunch_is_blocked_by_turn_source(generation):
+            self._mark_codex_terminal_failure(instance_id, task, combined)
+            await self._retry_or_fail_mode_task(
+                generation,
+                "Provider retry failed after the exact turn crossed its "
+                "external-effect boundary",
+            )
+            return
         if (
             settings.transient_retry_enabled
             and attempt < settings.transient_retry_max
@@ -11748,6 +11856,11 @@ class GlobalDispatcher:
                     )
                     and context_preflight_permit is None
                 ):
+                    self._mark_codex_terminal_failure(
+                        instance_id,
+                        task,
+                        combined,
+                    )
                     await self._retry_or_fail_mode_task(
                         lifecycle_generation,
                         f"Exit code: {exit_code}; provider turn failed after "
@@ -12929,11 +13042,21 @@ class GlobalDispatcher:
             return
 
         # Failed again — try another rotation if budget remains
+        combined = await self._collect_failure_output(instance_id, task.id)
+        if await self._automatic_relaunch_is_blocked_by_turn_source(generation):
+            self._mark_codex_terminal_failure(instance_id, task, combined)
+            await self._retry_or_fail_mode_task(
+                generation,
+                "Pool retry failed after the exact turn crossed its "
+                "external-effect boundary",
+            )
+            return
         if _rotation_count < max_rotations:
             rotation = await self._check_rate_limit_and_rotate(
                 instance_id,
                 task.id,
                 exit_code,
+                combined=combined,
                 expected_generation=generation,
             )
             if rotation:
@@ -12953,6 +13076,8 @@ class GlobalDispatcher:
                     _rotation_count=_rotation_count + 1,
                 )
                 return
+        else:
+            self._mark_codex_terminal_failure(instance_id, task, combined)
 
         # Non-rotatable failure or exhausted rotations — normal retry/fail
         await self._retry_or_fail_mode_task(

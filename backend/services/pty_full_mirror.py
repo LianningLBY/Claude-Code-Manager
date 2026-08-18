@@ -702,6 +702,25 @@ class FullMirrorCCMBackend(CCMBackend):
                 final_status, background_generation, background_state = (
                     await _commit_terminal(allow_background=True)
                 )
+                if (
+                    chat_initiated
+                    and background_generation is not None
+                    and background_state is not None
+                    and record is not None
+                    and session is not None
+                    and session_id is not None
+                ):
+                    # Keep the exact chat generation injectable before
+                    # releasing the transition lock.  on_exit waits below for
+                    # native children, so retaining only after that wait leaves
+                    # the whole background tail without a routable Session.
+                    self._im.retain_pty_post_exit_generation(
+                        key,
+                        task_id,
+                        session_id,
+                        session,
+                        record,
+                    )
         else:
             (
                 final_status,
@@ -806,6 +825,8 @@ class FullMirrorCCMBackend(CCMBackend):
             and session is not None
             and session_id is not None
         ):
+            # Idempotent while the early proof is current; if background-state
+            # cleanup retired it, this restores the ordinary post-exit grace.
             self._im.retain_pty_post_exit_generation(
                 key,
                 task_id,

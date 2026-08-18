@@ -19239,7 +19239,13 @@ class InstanceManager:
         if not await fresh_stop_effect_authority():
             return False
 
-        if post_exit_proof is not None:
+        post_exit_proof_is_attached = bool(
+            post_exit_proof is not None
+            and self._pty_backend is not None
+            and getattr(self._pty_backend, "_sessions", {}).get(instance_id)
+            is post_exit_proof.session
+        )
+        if post_exit_proof is not None and not post_exit_proof_is_attached:
             if not await fresh_stop_effect_authority():
                 return False
             if not await self._stop_exact_post_exit_pty_session(

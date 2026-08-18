@@ -1219,6 +1219,202 @@ class TestFullMirrorBackend:
             for event in status_events
         )
 
+    async def test_chat_tail_is_injectable_while_on_exit_waits_for_child(
+        self, db_factory
+    ):
+        """Retain the exact Session before the background wait can block."""
+
+        im, _ = _make_im(db_factory)
+        backend = self._bare_backend(im)
+        im._pty_backend = backend
+        instance_id, task_id = await _make_inst_task(db_factory)
+        started_at = datetime.utcnow()
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            task.status = "executing"
+            task.retry_count = 4
+            task.instance_id = instance_id
+            task.session_id = "injectable-background-session"
+            inst = await db.get(Instance, instance_id)
+            inst.status = "running"
+            inst.pid = 4322
+            inst.current_task_id = task_id
+            inst.started_at = started_at
+            await db.commit()
+
+        class Proxy:
+            pid = 4322
+            returncode = None
+
+            def __init__(self, session):
+                self.session = session
+
+            def complete(self, code=0):
+                self.returncode = code
+
+        class Session:
+            session_id = "injectable-background-session"
+            has_pending_subagents = True
+            is_alive = True
+            active_turn_process = None
+
+            def __init__(self):
+                self._reader = MagicMock()
+                self._reader._tracker.has_pending = True
+                self._reader.tracker = self._reader._tracker
+                self.followup_started = asyncio.Event()
+                self.release_followup = asyncio.Event()
+                self.followup_content = None
+
+                async def _on_autonomous(event):
+                    raise AssertionError("base callback must be replaced")
+
+                self.on_autonomous_event = _on_autonomous
+
+            def send_prompt(self, content):
+                self.followup_content = content
+
+                async def stream():
+                    self.followup_started.set()
+                    await self.release_followup.wait()
+                    event = MagicMock()
+                    event.to_dict.return_value = {
+                        "event_type": "message",
+                        "role": "assistant",
+                        "content": "follow-up accepted",
+                    }
+                    yield event
+
+                return stream()
+
+        session = Session()
+        proxy = Proxy(session)
+        backend._sessions[instance_id] = session
+        backend._proxies[instance_id] = proxy
+
+        async def exit_turn():
+            consumer = asyncio.current_task()
+            backend._consumers[instance_id] = consumer
+            im.processes[instance_id] = proxy
+            im._track_output_consumer(
+                instance_id,
+                proxy,
+                consumer,
+                chat_initiated=True,
+                provider="claude",
+                task_id=task_id,
+                task_retry_count=4,
+                task_turn_generation=0,
+                instance_started_at=started_at,
+            )
+            await backend.on_exit(
+                instance_id,
+                0,
+                session=session,
+                task_id=task_id,
+                chat_initiated=True,
+            )
+
+        exit_task = asyncio.create_task(exit_turn())
+        state = await _wait_for_pty_background_state(
+            im,
+            task_id=task_id,
+            session_id=session.session_id,
+            owner_task=exit_task,
+        )
+
+        proof = im._pty_post_exit_generations.get(
+            (task_id, session.session_id)
+        )
+        assert proof is not None
+        assert proof.session is session
+        assert proof.process is proxy
+        assert im._pty_post_exit_generation_is_current(
+            proof,
+            instance_id=instance_id,
+            task_id=task_id,
+            session_id=session.session_id,
+            task_retry_count=4,
+            task_turn_generation=0,
+            background_generation=state.generation,
+            require_background_state=True,
+        )
+        assert exit_task.done() is False
+
+        injected = await asyncio.wait_for(
+            im.inject_pty_message(
+                session.session_id,
+                "follow up while child runs",
+                task_id=task_id,
+                task_retry_count=4,
+                task_turn_generation=0,
+                expected_instance_id=instance_id,
+                followup_operation_id="retained-tail-operation",
+            ),
+            1,
+        )
+
+        assert injected is True
+        assert session.followup_started.is_set()
+        assert session.followup_content == "follow up while child runs"
+        assert state.pending_followups == 1
+        assert exit_task.done() is False
+        assert proxy.returncode is None
+
+        session.release_followup.set()
+
+        async def wait_for_followup():
+            while im._pty_followup_tasks.get(instance_id):
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_for_followup(), 1)
+        assert state.pending_followups == 0
+
+        session.has_pending_subagents = False
+        session._reader._tracker.has_pending = False
+
+        def pty_event(payload):
+            event = MagicMock()
+            event.to_dict.return_value = payload
+            return event
+
+        await session.on_autonomous_event(
+            pty_event(
+                {
+                    "event_type": "message",
+                    "role": "assistant",
+                    "content": "native child completed",
+                }
+            )
+        )
+        await session.on_autonomous_event(
+            pty_event(
+                {
+                    "event_type": "system_event",
+                    "content": "turn_duration",
+                }
+            )
+        )
+        await asyncio.wait_for(exit_task, 1)
+
+        async with db_factory() as db:
+            task = await db.get(Task, task_id)
+            inst = await db.get(Instance, instance_id)
+            assert task.status == "completed"
+            assert task.background_active is False
+            assert inst.status == "idle"
+            assert inst.current_task_id is None
+            assert inst.pid is None
+        assert proxy.returncode == 0
+        final_proof = im._pty_post_exit_generations.get(
+            (task_id, session.session_id)
+        )
+        if final_proof is not None:
+            im._discard_pty_post_exit_generation(
+                (task_id, session.session_id), final_proof
+            )
+
     async def test_pending_native_agent_keeps_chat_task_executing_until_tail(
         self, db_factory
     ):

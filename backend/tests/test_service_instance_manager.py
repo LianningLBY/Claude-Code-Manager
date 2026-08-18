@@ -1161,12 +1161,11 @@ async def test_inject_pty_reuses_background_session_without_second_consumer():
     """A detached PTY epoch accepts input on its hot Session/consumer slot."""
 
     class Event:
+        def __init__(self, payload):
+            self.payload = payload
+
         def to_dict(self):
-            return {
-                "event_type": "message",
-                "role": "assistant",
-                "content": "follow-up output",
-            }
+            return dict(self.payload)
 
     consumer = asyncio.create_task(asyncio.Event().wait())
     release_followup = asyncio.Event()
@@ -1185,8 +1184,16 @@ async def test_inject_pty_reuses_background_session_without_second_consumer():
         session.active_turn_process = followup_process
         followup_started.set()
         try:
-            yield Event()
+            yield Event({
+                "event_type": "message",
+                "role": "assistant",
+                "content": "follow-up output",
+            })
             await release_followup.wait()
+            yield Event({
+                "event_type": "system_event",
+                "content": "turn_duration",
+            })
         finally:
             session.active_turn_process = None
 
@@ -1280,7 +1287,7 @@ async def test_inject_pty_reuses_background_session_without_second_consumer():
             ),
             timeout=1,
         )
-        assert observed_records == [record, record]
+        assert observed_records == [record, record, record]
         expected_context = {
             "task_id": 99,
             "loop_iteration": None,
@@ -1290,14 +1297,20 @@ async def test_inject_pty_reuses_background_session_without_second_consumer():
             "expected_task_retry_count": 2,
             "expected_task_turn_generation": 3,
         }
-        assert observed_contexts == [expected_context, expected_context]
+        assert observed_contexts == [
+            expected_context,
+            expected_context,
+            expected_context,
+        ]
         assert observed_events[0]["event_type"] == "message"
-        assert observed_events[1]["event_type"] == (
+        assert observed_events[1]["event_type"] == "system_event"
+        assert observed_events[1]["content"] == "turn_duration"
+        assert observed_events[2]["event_type"] == (
             "pty_background_followup_boundary"
         )
-        assert observed_events[1]["followup_operation_id"] == "followup-99"
-        assert observed_events[1]["pty_followup_state"] == "completed"
-        assert json.loads(observed_events[1]["raw_json"]) == {
+        assert observed_events[2]["followup_operation_id"] == "followup-99"
+        assert observed_events[2]["pty_followup_state"] == "completed"
+        assert json.loads(observed_events[2]["raw_json"]) == {
             "background_generation": "background-generation",
             "followup_operation_id": "followup-99",
             "state": "completed",

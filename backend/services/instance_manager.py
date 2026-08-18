@@ -1201,6 +1201,7 @@ class InstanceManager:
         session_id: str | None = None,
         task_retry_count: int | None = None,
         task_turn_generation: int | None = None,
+        allow_task_generation_drift: bool = False,
         background_generation: str | None = None,
         require_background_state: bool = False,
     ) -> bool:
@@ -1221,16 +1222,17 @@ class InstanceManager:
             return False
         if session_id is not None and proof.session_id != session_id:
             return False
-        if (
-            task_retry_count is not None
-            and proof.record.task_retry_count != task_retry_count
-        ):
-            return False
-        if (
-            task_turn_generation is not None
-            and proof.record.task_turn_generation != task_turn_generation
-        ):
-            return False
+        if not allow_task_generation_drift:
+            if (
+                task_retry_count is not None
+                and proof.record.task_retry_count != task_retry_count
+            ):
+                return False
+            if (
+                task_turn_generation is not None
+                and proof.record.task_turn_generation != task_turn_generation
+            ):
+                return False
         if (
             proof.record.provider != "claude"
             or proof.record.task_id != proof.task_id
@@ -2665,6 +2667,87 @@ class InstanceManager:
             self._release_task_runtime_scope_pty_owner(session)
         return released
 
+    def _task_pty_runtime_session_candidates(
+        self,
+        task_id: int,
+        session_id: str,
+        *,
+        instance_id: int | None = None,
+    ) -> list[tuple[int | None, Any]]:
+        """Find PTY Sessions still owned by one exact Task/session pair.
+
+        The post-exit proof is intentionally short-lived after a hot follow-up
+        settles, while the task runtime-scope owner remains until the native
+        Session is actually stopped. Deletion must consult both records so a
+        terminal Task cannot leave a live Session behind after its proof watcher
+        has retired.
+        """
+
+        candidates: list[tuple[int | None, Any]] = []
+
+        def add_candidate(candidate_instance_id: int | None, session: Any) -> None:
+            if session is None or getattr(session, "session_id", None) != session_id:
+                return
+            if (
+                instance_id is not None
+                and candidate_instance_id is not None
+                and candidate_instance_id != instance_id
+            ):
+                return
+            for index, (existing_instance_id, existing_session) in enumerate(
+                candidates
+            ):
+                if existing_session is not session:
+                    continue
+                if existing_instance_id is None and candidate_instance_id is not None:
+                    candidates[index] = (candidate_instance_id, session)
+                return
+            candidates.append((candidate_instance_id, session))
+
+        for session, owner_task_id in tuple(
+            self._task_runtime_scope_pty_owners.items()
+        ):
+            if owner_task_id == task_id:
+                add_candidate(None, session)
+
+        state = self._pty_background_states.get((task_id, session_id))
+        if state is not None:
+            add_candidate(getattr(state, "instance_id", None), state.session)
+
+        backend_sessions = getattr(self._pty_backend, "_sessions", {})
+        for candidate_instance_id, session in tuple(backend_sessions.items()):
+            if getattr(session, "session_id", None) != session_id:
+                continue
+            if instance_id is not None and candidate_instance_id != instance_id:
+                continue
+            record = self._consumer_records.get(candidate_instance_id)
+            if record is not None and record.task_id != task_id:
+                # A reusable slot now owned by another Task is never a
+                # destructive-stop target for this delete.
+                continue
+            add_candidate(candidate_instance_id, session)
+
+        # Resolve owner-only candidates to their attached slot when there is
+        # exactly one. Multiple attachments remain represented as separate
+        # candidates and are rejected by the caller as an ABA ambiguity.
+        for candidate_instance_id, session in tuple(candidates):
+            if candidate_instance_id is not None:
+                continue
+            attached_ids = [
+                key
+                for key, attached in tuple(backend_sessions.items())
+                if attached is session
+                and (instance_id is None or key == instance_id)
+            ]
+            if len(attached_ids) == 1:
+                index = candidates.index((candidate_instance_id, session))
+                candidates[index] = (attached_ids[0], session)
+            elif len(attached_ids) > 1:
+                for attached_id in attached_ids[1:]:
+                    candidates.append((attached_id, session))
+
+        return candidates
+
     def has_live_task_pty_post_exit(
         self,
         task_id: int,
@@ -2695,12 +2778,25 @@ class InstanceManager:
                 proof,
                 task_id=task_id,
                 session_id=session_id,
+                allow_task_generation_drift=True,
                 task_retry_count=task_retry_count,
                 task_turn_generation=task_turn_generation,
             ):
                 continue
-            return True
-        return False
+            if getattr(proof.session, "is_alive", True) is not False:
+                return True
+        return any(
+            getattr(session, "is_alive", True) is not False
+            for _candidate_instance_id, session in (
+                self._task_pty_runtime_session_candidates(
+                    task_id,
+                    session_id,
+                    instance_id=instance_id,
+                )
+                if session_id
+                else ()
+            )
+        )
 
     async def cleanup_task_pty_for_delete(
         self,
@@ -2734,7 +2830,7 @@ class InstanceManager:
                 task_turn_generation=task_turn_generation,
             )
 
-        candidates = [
+        proof_candidates = [
             proof
             for proof in tuple(self._pty_post_exit_generations.values())
             if (
@@ -2745,79 +2841,100 @@ class InstanceManager:
                     proof,
                     task_id=task_id,
                     session_id=session_id,
+                    allow_task_generation_drift=True,
                     task_retry_count=task_retry_count,
                     task_turn_generation=task_turn_generation,
                 )
             )
         ]
-        if not candidates:
-            return not self.has_live_task_pty_post_exit(
-                task_id,
-                session_id=session_id,
-                instance_id=instance_id,
-                task_retry_count=task_retry_count,
-                task_turn_generation=task_turn_generation,
-            )
-        # There should be one proof per (Task, native Session). Multiple
-        # current proofs for the same frozen session are an ABA ambiguity;
-        # refusing deletion preserves the exact runtime evidence.
-        if len(candidates) != 1:
+        runtime_candidates = self._task_pty_runtime_session_candidates(
+            task_id,
+            session_id,
+            instance_id=instance_id,
+        )
+        session_candidates: list[tuple[int | None, Any]] = list(
+            runtime_candidates
+        )
+        for proof in proof_candidates:
+            if not any(session is proof.session for _slot, session in session_candidates):
+                session_candidates.append((proof.instance_id, proof.session))
+        distinct_sessions = []
+        for candidate_instance_id, session in session_candidates:
+            if not any(existing is session for _slot, existing in distinct_sessions):
+                distinct_sessions.append((candidate_instance_id, session))
+            elif candidate_instance_id is not None:
+                for index, (existing_slot, existing) in enumerate(distinct_sessions):
+                    if existing is session and existing_slot is None:
+                        distinct_sessions[index] = (candidate_instance_id, existing)
+        # There should be one exact Session per (Task, native session id).
+        # Multiple Session objects or attached reusable slots are an ABA
+        # ambiguity; refusing deletion preserves the runtime evidence.
+        if len(distinct_sessions) != 1:
+            if not distinct_sessions:
+                return True
             return False
 
-        proof = candidates[0]
-        lifecycle_lock = self._instance_lifecycle_lock(proof.instance_id)
+        candidate_instance_id, session = distinct_sessions[0]
+        if candidate_instance_id is not None:
+            lifecycle_lock = self._instance_lifecycle_lock(candidate_instance_id)
+        else:
+            lifecycle_lock = asyncio.Lock()
         async with lifecycle_lock:
-            current = self._pty_post_exit_generations.get(
-                (proof.task_id, proof.session_id)
-            )
-            if current is not proof or not self._pty_post_exit_generation_is_current(
-                proof,
-                instance_id=proof.instance_id,
-                task_id=task_id,
-                session_id=session_id,
-                task_retry_count=task_retry_count,
-                task_turn_generation=task_turn_generation,
-            ):
-                return False
+            if candidate_instance_id is not None:
+                attached = getattr(self._pty_backend, "_sessions", {}).get(
+                    candidate_instance_id
+                )
+                if attached is not None and attached is not session:
+                    return False
+                record = self._consumer_records.get(candidate_instance_id)
+                if record is not None and record.task_id != task_id:
+                    return False
 
-            self._begin_stopping(proof.instance_id)
+            if candidate_instance_id is not None:
+                self._begin_stopping(candidate_instance_id)
             try:
                 # Invalidate queued follow-ups before stopping the native
                 # process. Their cancellation receipts must not race a Task
                 # DELETE that is holding the task operation fence.
-                key = (proof.task_id, proof.session_id)
+                key = (task_id, session_id)
                 self._pty_autonomous_activity_handoffs.pop(key, None)
-                backend_session = getattr(self._pty_backend, "_sessions", {}).get(
-                    proof.instance_id
+                backend_session = (
+                    getattr(self._pty_backend, "_sessions", {}).get(
+                        candidate_instance_id
+                    )
+                    if candidate_instance_id is not None
+                    else None
                 )
-                if backend_session is proof.session:
+                if backend_session is session:
                     # The proof normally reaches this path after FullMirror
                     # released the slot maps, but handle an attached session
                     # conservatively by checking the pool identity first.
                     pool = getattr(self._pty_backend, "_pool", None)
-                    pool_session = (
-                        await pool.get(proof.session_id) if pool is not None else None
-                    )
-                    if pool_session is not proof.session:
+                    pool_session = await pool.get(session_id) if pool is not None else None
+                    if pool_session is not session:
                         return False
-                    released = await self.release_pty_session(proof.session_id)
+                    released = await self.release_pty_session(session_id)
                 else:
-                    released = await self._stop_exact_post_exit_pty_session(proof)
+                    released = await self._stop_exact_unattached_pty_session(
+                        session,
+                        session_id,
+                        task_id,
+                    )
                 if not released:
                     return False
-                self._discard_pty_post_exit_generation(key, proof)
+                for proof in tuple(proof_candidates):
+                    self._discard_pty_post_exit_generation(
+                        (proof.task_id, proof.session_id),
+                        proof,
+                    )
+                self._pty_autonomous_activity_handoffs.pop(key, None)
                 state = self._pty_background_states.get(key)
                 if state is not None:
                     self._discard_pty_background_state(key, state.generation)
-                return not self.has_live_task_pty_post_exit(
-                    task_id,
-                    session_id=session_id,
-                    instance_id=instance_id,
-                    task_retry_count=task_retry_count,
-                    task_turn_generation=task_turn_generation,
-                )
+                return getattr(session, "is_alive", True) is False
             finally:
-                self._end_stopping(proof.instance_id)
+                if candidate_instance_id is not None:
+                    self._end_stopping(candidate_instance_id)
 
     async def drain_idle_pty_sessions(self) -> int:
         """Stop idle PTY sessions (called after PTY mode is switched off).

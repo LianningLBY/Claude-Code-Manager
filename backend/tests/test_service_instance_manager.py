@@ -19273,6 +19273,60 @@ async def test_pty_launch_commit_persists_actual_instance_provider(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_delete_cleanup_stops_runtime_owned_session_after_proof_generation_drift(
+    monkeypatch,
+):
+    """Task deletion must find a hot Session after its old proof has retired."""
+
+    task_id = 901
+    session_id = "runtime-owned-delete-session"
+    stop_calls = 0
+
+    class Session:
+        def __init__(self):
+            self.session_id = session_id
+            self.is_alive = True
+
+        async def stop(self):
+            nonlocal stop_calls
+            stop_calls += 1
+            self.is_alive = False
+
+    session = Session()
+
+    class Pool:
+        def __init__(self):
+            self._sessions = {session_id: session}
+            self._lock = asyncio.Lock()
+
+        async def get(self, requested_session_id):
+            return self._sessions.get(requested_session_id)
+
+    backend = types.SimpleNamespace(
+        _sessions={},
+        _pool=Pool(),
+    )
+    manager = InstanceManager(MagicMock(), types.SimpleNamespace())
+    manager._pty_backend = backend
+    manager._task_runtime_scope_pty_owners[session] = task_id
+    monkeypatch.setattr(
+        "backend.services.mcp_config.cleanup_mcp_config",
+        MagicMock(),
+    )
+
+    assert await manager.cleanup_task_pty_for_delete(
+        task_id,
+        session_id=session_id,
+        instance_id=36,
+        task_retry_count=0,
+        task_turn_generation=2,
+    ) is True
+    assert stop_calls == 1
+    assert session_id not in backend._pool._sessions
+    assert session not in manager._task_runtime_scope_pty_owners
+
+
+@pytest.mark.asyncio
 async def test_pty_launch_callback_runs_immediately_before_backend_launch():
     im = InstanceManager(_FakeDBFactory(), MagicMock())
     instance_id = 17

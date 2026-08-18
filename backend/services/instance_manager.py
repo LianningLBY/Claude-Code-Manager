@@ -1840,7 +1840,46 @@ class InstanceManager:
         delayed_cancellation: asyncio.CancelledError | None = None
         admitted_locally = False
         stream_completed = False
+        followup_terminal_seen = False
         ownership_lost = False
+
+        async def publish_event(event: Any) -> dict[str, Any]:
+            """Route pre-prompt child output back through its lifecycle owner."""
+
+            event_dict = event.to_dict()
+            if event_dict.get("orphan"):
+                callback = getattr(session, "on_autonomous_event", None)
+                callback_matches = bool(
+                    callable(callback)
+                    and getattr(callback, "__name__", "")
+                    == "_full_autonomous_mirror"
+                    and getattr(callback, "_ccm_task_id", None)
+                    == record.task_id
+                    and getattr(callback, "_ccm_session_id", None)
+                    == background_state.session_id
+                    and self._pty_background_states.get(
+                        (record.task_id, background_state.session_id)
+                    )
+                    is background_state
+                    and getattr(background_state, "accepting_events", True)
+                )
+                if callback_matches:
+                    # Session.send_prompt marks every record before its own
+                    # prompt echo as orphan. During a retained follow-up those
+                    # records can be the still-running child's autonomous
+                    # notification/result/sentinel. The idle watcher yields to
+                    # send_prompt, so this pump must hand them to the exact
+                    # autonomous callback instead of persisting them as
+                    # follow-up output and losing the child terminal edge.
+                    await callback(event)
+                    return event_dict
+            await backend.on_event(
+                key,
+                event_dict,
+                **launch_params,
+            )
+            return event_dict
+
         try:
             if backend is None:
                 admission.set_result(False)
@@ -1903,11 +1942,12 @@ class InstanceManager:
             ):
                 ownership_lost = True
             if not ownership_lost:
-                await backend.on_event(
-                    key,
-                    event.to_dict(),
-                    **launch_params,
-                )
+                event_dict = await publish_event(event)
+                if (
+                    not event_dict.get("orphan")
+                    and self._is_pty_autonomous_terminal(event_dict)
+                ):
+                    followup_terminal_seen = True
                 if not self._pty_followup_proof_is_current(
                     key,
                     session,
@@ -1927,11 +1967,12 @@ class InstanceManager:
                     ):
                         ownership_lost = True
                         break
-                    await backend.on_event(
-                        key,
-                        event.to_dict(),
-                        **launch_params,
-                    )
+                    event_dict = await publish_event(event)
+                    if (
+                        not event_dict.get("orphan")
+                        and self._is_pty_autonomous_terminal(event_dict)
+                    ):
+                        followup_terminal_seen = True
                     if not self._pty_followup_proof_is_current(
                         key,
                         session,
@@ -1941,7 +1982,9 @@ class InstanceManager:
                     ):
                         ownership_lost = True
                         break
-                stream_completed = not ownership_lost
+                stream_completed = bool(
+                    not ownership_lost and followup_terminal_seen
+                )
         except asyncio.CancelledError as exc:
             delayed_cancellation = exc
             if not admission.done():

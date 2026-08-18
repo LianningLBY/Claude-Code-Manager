@@ -2032,12 +2032,11 @@ async def test_inject_pty_background_followup_slow_echo_is_admitted_once():
     """Local pump ownership, not active_turn_process/JSONL echo, is the receipt."""
 
     class Event:
+        def __init__(self, payload):
+            self.payload = payload
+
         def to_dict(self):
-            return {
-                "event_type": "message",
-                "role": "assistant",
-                "content": "event after slow echo",
-            }
+            return dict(self.payload)
 
     delivery_started = asyncio.Event()
     release_first_event = asyncio.Event()
@@ -2052,7 +2051,15 @@ async def test_inject_pty_background_followup_slow_echo_is_admitted_once():
         sent.append(text)
         delivery_started.set()
         await release_first_event.wait()
-        yield Event()
+        yield Event({
+            "event_type": "message",
+            "role": "assistant",
+            "content": "event after slow echo",
+        })
+        yield Event({
+            "event_type": "system_event",
+            "content": "turn_duration",
+        })
 
     session.send_prompt = send_prompt
     manager, backend, consumer, background_state = (
@@ -2093,7 +2100,7 @@ async def test_inject_pty_background_followup_slow_echo_is_admitted_once():
             ),
             timeout=1,
         )
-        assert backend.on_event.await_count == 2
+        assert backend.on_event.await_count == 3
         boundary = backend.on_event.await_args_list[-1].args[1]
         assert boundary["followup_operation_id"] == "followup-181"
         assert boundary["pty_followup_state"] == "completed"
@@ -2102,6 +2109,166 @@ async def test_inject_pty_background_followup_slow_echo_is_admitted_once():
     finally:
         release_first_event.set()
         await manager._cancel_pty_followup_tasks({81})
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_pty_background_followup_returns_orphans_to_autonomous_mirror():
+    """Child terminal records consumed before prompt echo keep their owner."""
+
+    class Event:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def to_dict(self):
+            return dict(self.payload)
+
+    session = types.SimpleNamespace(
+        session_id="claude-session-followup-orphan-handoff",
+        is_alive=True,
+        active_turn_process=None,
+    )
+    child_events: list[dict] = []
+
+    async def autonomous_mirror(event):
+        payload = event.to_dict()
+        child_events.append(payload)
+        if (
+            payload.get("event_type") == "system_event"
+            and payload.get("content") == "turn_duration"
+        ):
+            background_state.terminal_seen = True
+
+    autonomous_mirror._ccm_task_id = 186
+    autonomous_mirror._ccm_session_id = session.session_id
+    autonomous_mirror.__name__ = "_full_autonomous_mirror"
+    session.on_autonomous_event = autonomous_mirror
+
+    async def send_prompt(_text: str):
+        yield Event({
+            "event_type": "message",
+            "role": "user",
+            "content": "<task-notification>child done</task-notification>",
+            "orphan": True,
+        })
+        yield Event({
+            "event_type": "system_event",
+            "content": "turn_duration",
+            "orphan": True,
+        })
+        yield Event({
+            "event_type": "message",
+            "role": "assistant",
+            "content": "follow-up reply",
+        })
+        yield Event({
+            "event_type": "system_event",
+            "content": "turn_duration",
+        })
+
+    session.send_prompt = send_prompt
+    manager, backend, consumer, background_state = (
+        _retained_pty_followup_manager(
+            session,
+            instance_id=86,
+            task_id=186,
+            retry_count=3,
+            turn_generation=12,
+        )
+    )
+    background_state.accepting_events = True
+    background_state.terminal_seen = False
+    try:
+        assert await manager.inject_pty_message(
+            session.session_id,
+            "continue after child",
+            task_id=186,
+            task_retry_count=3,
+            task_turn_generation=12,
+            expected_instance_id=86,
+            followup_operation_id="followup-orphan-handoff",
+        ) is True
+        followups = tuple(manager._pty_followup_tasks.get(86, ()))
+        assert followups
+        await asyncio.wait_for(
+            asyncio.gather(*followups, return_exceptions=False),
+            timeout=1,
+        )
+
+        assert [event["content"] for event in child_events] == [
+            "<task-notification>child done</task-notification>",
+            "turn_duration",
+        ]
+        assert background_state.terminal_seen is True
+        forwarded = [call.args[1] for call in backend.on_event.await_args_list]
+        assert all(not payload.get("orphan") for payload in forwarded)
+        assert [payload["event_type"] for payload in forwarded] == [
+            "message",
+            "system_event",
+            "pty_background_followup_boundary",
+        ]
+        assert forwarded[-1]["pty_followup_state"] == "completed"
+        assert background_state.pending_followups == 0
+    finally:
+        await manager._cancel_pty_followup_tasks({86})
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_pty_background_followup_clean_eof_without_terminal_is_uncertain():
+    """A provider stream EOF is not completion without its exact sentinel."""
+
+    class Event:
+        def to_dict(self):
+            return {
+                "event_type": "message",
+                "role": "assistant",
+                "content": "partial follow-up output",
+            }
+
+    session = types.SimpleNamespace(
+        session_id="claude-session-followup-clean-eof",
+        is_alive=True,
+        active_turn_process=None,
+    )
+
+    async def send_prompt(_text: str):
+        yield Event()
+
+    session.send_prompt = send_prompt
+    manager, backend, consumer, background_state = (
+        _retained_pty_followup_manager(
+            session,
+            instance_id=87,
+            task_id=187,
+            retry_count=4,
+            turn_generation=13,
+        )
+    )
+    try:
+        assert await manager.inject_pty_message(
+            session.session_id,
+            "continue once",
+            task_id=187,
+            task_retry_count=4,
+            task_turn_generation=13,
+            expected_instance_id=87,
+            followup_operation_id="followup-clean-eof",
+        ) is True
+        followups = tuple(manager._pty_followup_tasks.get(87, ()))
+        assert followups
+        await asyncio.wait_for(
+            asyncio.gather(*followups, return_exceptions=False),
+            timeout=1,
+        )
+
+        boundary = backend.on_event.await_args_list[-1].args[1]
+        assert boundary["pty_followup_state"] == "uncertain"
+        assert background_state.pending_followups == 0
+    finally:
+        await manager._cancel_pty_followup_tasks({87})
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)
 

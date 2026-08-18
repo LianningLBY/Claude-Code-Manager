@@ -991,6 +991,12 @@ class FullMirrorCCMBackend(CCMBackend):
             generation = None
             completion_state = None
             event_data = event.to_dict()
+            # A retained follow-up may hand pre-echo child records back to
+            # this callback. They were marked ``orphan`` by Session only
+            # because the follow-up prompt had not echoed yet; once routed
+            # through the autonomous mirror they are authoritative child
+            # lifecycle events, not stale foreground backlog.
+            event_data.pop("orphan", None)
             event_data["autonomous"] = True
             background_tracker = _background_work_tracker(
                 session, create=True

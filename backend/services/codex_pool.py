@@ -20,7 +20,7 @@ import stat
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable, Iterator
+from typing import Awaitable, BinaryIO, Callable, Iterator
 
 from backend.config import settings
 from backend.services.claude_pool import (
@@ -30,6 +30,10 @@ from backend.services.claude_pool import (
 )
 from backend.services.cloudrouter_accounts import (
     is_api_auth_kind as _is_api_auth_kind,
+)
+from backend.services.codex_session_migration import (
+    CodexRolloutMigrationMetadataError,
+    read_rollout_migration_marker,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,15 +97,20 @@ def _service_tier_model(model: str | None) -> str:
     return value
 
 
-def _models_cache_supports_service_tier(
+def _models_cache_model_state(
     codex_home: str,
     model: str | None,
-    service_tier: str,
-) -> bool:
-    """Read one native account's bounded catalog without guessing support."""
+) -> tuple[bool | None, dict | None]:
+    """Return native model-catalog evidence.
 
-    if service_tier == "default":
-        return True
+    ``True`` means a valid catalog contains the requested model, ``False``
+    means a valid catalog was read and does not contain it, and ``None`` means
+    the catalog cannot be trusted (missing, malformed, or unreadable).  The
+    distinction is important for standard turns: an unknown catalog remains
+    a usable compatibility fallback, while a verified model mismatch must not
+    be routed and allowed to fail after the provider boundary.
+    """
+
     requested_model = _service_tier_model(model)
     path = Path(codex_home) / "models_cache.json"
     descriptor = -1
@@ -117,7 +126,7 @@ def _models_cache_supports_service_tier(
             not stat.S_ISREG(metadata.st_mode)
             or metadata.st_size > _MODELS_CACHE_MAX_BYTES
         ):
-            return False
+            return None, None
         chunks: list[bytes] = []
         remaining = _MODELS_CACHE_MAX_BYTES + 1
         while remaining:
@@ -128,27 +137,52 @@ def _models_cache_supports_service_tier(
             remaining -= len(chunk)
         raw = b"".join(chunks)
         if len(raw) > _MODELS_CACHE_MAX_BYTES:
-            return False
+            return None, None
         payload = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
-        return False
+        return None, None
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
     models = payload.get("models") if isinstance(payload, dict) else None
     if not isinstance(models, list) or len(models) > _MODELS_CACHE_MAX_MODELS:
-        return False
+        return None, None
     for item in models:
-        if not isinstance(item, dict) or item.get("slug") != requested_model:
-            continue
-        tiers = item.get("service_tiers")
-        if not isinstance(tiers, list):
-            return False
-        return any(
-            isinstance(tier, dict) and tier.get("id") == service_tier
-            for tier in tiers
-        )
-    return False
+        if not isinstance(item, dict):
+            return None, None
+        slug = item.get("slug")
+        if not isinstance(slug, str) or not slug:
+            return None, None
+        if slug == requested_model:
+            return True, item
+    return False, None
+
+
+def _models_cache_supports_service_tier(
+    codex_home: str,
+    model: str | None,
+    service_tier: str,
+) -> bool:
+    """Read one native account's bounded catalog without guessing support.
+
+    Priority turns remain fail-closed when catalog evidence is unavailable.
+    Standard turns retain the historical unknown-catalog fallback, but reject
+    a model mismatch once a valid catalog proves it.
+    """
+
+    state, item = _models_cache_model_state(codex_home, model)
+    if service_tier == "default":
+        return state is not False
+    if state is not True or item is None:
+        return False
+    tiers = item.get("service_tiers")
+    if not isinstance(tiers, list):
+        return False
+    return any(
+        isinstance(tier, dict) and tier.get("id") == service_tier
+        for tier in tiers
+    )
 
 
 def quota_at_or_above(
@@ -419,10 +453,21 @@ class CodexPoolAccount:
         })
 
     def supports_model(self, model: str | None) -> bool:
+        requested_model = _service_tier_model(model)
         if not _is_api_auth_kind(self.auth_kind):
-            return True
+            state, _ = _models_cache_model_state(
+                self.codex_home,
+                requested_model,
+            )
+            # A missing/unreadable catalog is an unknown capability and keeps
+            # native accounts eligible as a compatibility fallback.  A valid
+            # catalog that omits the model is authoritative evidence that the
+            # account cannot serve this turn.
+            return state is not False
         try:
-            return bool(self._api_account.supports_model("codex", model))
+            return bool(
+                self._api_account.supports_model("codex", requested_model)
+            )
         except Exception:
             logger.exception(
                 "Could not evaluate API account model support for %s", self.id
@@ -435,35 +480,31 @@ class CodexPoolAccount:
         service_tier: str | None,
     ) -> bool:
         requested_tier = _normalize_service_tier(service_tier)
-        requested_model = (
-            _service_tier_model(model)
-            if requested_tier == "priority"
-            else model
-        )
+        requested_model = _service_tier_model(model)
+        if not _is_api_auth_kind(self.auth_kind):
+            return _models_cache_supports_service_tier(
+                self.codex_home,
+                requested_model,
+                requested_tier,
+            )
         if not self.supports_model(requested_model):
             return False
         if requested_tier == "default":
             return True
-        if _is_api_auth_kind(self.auth_kind):
-            try:
-                return bool(
-                    self._api_account.supports_service_tier(
-                        "codex",
-                        requested_model,
-                        requested_tier,
-                    )
+        try:
+            return bool(
+                self._api_account.supports_service_tier(
+                    "codex",
+                    requested_model,
+                    requested_tier,
                 )
-            except Exception:
-                logger.exception(
-                    "Could not evaluate API account service-tier support for %s",
-                    self.id,
-                )
-                return False
-        return _models_cache_supports_service_tier(
-            self.codex_home,
-            requested_model,
-            requested_tier,
-        )
+            )
+        except Exception:
+            logger.exception(
+                "Could not evaluate API account service-tier support for %s",
+                self.id,
+            )
+            return False
 
 
 class CodexPool:
@@ -939,8 +980,6 @@ class CodexPool:
         account = self.account_for_home(codex_home)
         requested_tier = _normalize_service_tier(service_tier)
         if account is None:
-            if requested_tier == "default":
-                return True
             return _models_cache_supports_service_tier(
                 canonical_codex_home(codex_home),
                 model,
@@ -1151,18 +1190,46 @@ class CodexPool:
             if not _is_api_auth_kind(account.auth_kind)
             and self._cached_native_quota_state(account.id)[0] == "unknown"
         ]
+
+        # A valid native catalog is stronger than an unknown one for an
+        # explicit (or configured-default) model.  Keep unknown catalogs as a
+        # final compatibility fallback, but do not let them win round-robin
+        # selection over an account whose model support was verified.
+        def split_model_catalog_candidates(
+            native_candidates: list[CodexPoolAccount],
+        ) -> tuple[list[CodexPoolAccount], list[CodexPoolAccount]]:
+            known: list[CodexPoolAccount] = []
+            unknown: list[CodexPoolAccount] = []
+            for account in native_candidates:
+                state, _ = _models_cache_model_state(account.codex_home, model)
+                if state is True:
+                    known.append(account)
+                elif state is None:
+                    unknown.append(account)
+            return known, unknown
+
+        known_quota_known_model, known_quota_unknown_model = (
+            split_model_catalog_candidates(known_native_candidates)
+        )
+        unknown_quota_known_model, unknown_quota_unknown_model = (
+            split_model_catalog_candidates(unknown_native_candidates)
+        )
         groups = (
             (
-                known_native_candidates,
-                unknown_native_candidates,
+                known_quota_known_model,
+                known_quota_unknown_model,
+                unknown_quota_known_model,
+                unknown_quota_unknown_model,
                 verified_api_candidates,
                 unknown_api_candidates,
             )
             if self._routing_policy == "native_first"
             else (
                 verified_api_candidates,
-                known_native_candidates,
-                unknown_native_candidates,
+                known_quota_known_model,
+                known_quota_unknown_model,
+                unknown_quota_known_model,
+                unknown_quota_unknown_model,
                 unknown_api_candidates,
             )
         )
@@ -1705,16 +1772,33 @@ def _read_quota_from_rollout(
     latest_quota: dict | None = None
     for path in sessions_dir.glob("*/*/*/rollout-*.jsonl"):
         try:
-            fallback_mtime = path.stat().st_mtime
-        except OSError:
-            continue
-        try:
-            candidate = _latest_quota_event_in_rollout(
-                path,
-                fallback_mtime,
-                min_event_timestamp=min_event_timestamp,
-            )
-        except OSError:
+            with path.open("rb") as stream:
+                rollout_stat = os.fstat(stream.fileno())
+                if not stat.S_ISREG(rollout_stat.st_mode):
+                    continue
+                foreign_prefix_bytes = read_rollout_migration_marker(
+                    path,
+                    rollout_stat=rollout_stat,
+                )
+                candidate = _latest_quota_event_in_rollout(
+                    path,
+                    rollout_stat.st_mtime,
+                    min_event_timestamp=min_event_timestamp,
+                    foreign_prefix_bytes=foreign_prefix_bytes,
+                    stream=stream,
+                )
+                if read_rollout_migration_marker(
+                    path,
+                    rollout_stat=rollout_stat,
+                ) != foreign_prefix_bytes:
+                    continue
+        except (CodexRolloutMigrationMetadataError, OSError) as exc:
+            if isinstance(exc, CodexRolloutMigrationMetadataError):
+                logger.warning(
+                    "Ignoring Codex rollout with invalid migration metadata %s: %s",
+                    path,
+                    exc,
+                )
             continue
         if candidate is None:
             continue
@@ -1731,6 +1815,8 @@ def _latest_quota_event_in_rollout(
     fallback_mtime: float,
     *,
     min_event_timestamp: float | None = None,
+    foreign_prefix_bytes: int | None = None,
+    stream: BinaryIO | None = None,
 ) -> tuple[float, dict] | None:
     """Read one rollout tail and return its latest usable quota evidence.
 
@@ -1740,7 +1826,18 @@ def _latest_quota_event_in_rollout(
     the account-wide timestamp comparison.
     """
 
-    for raw_line in _iter_rollout_lines_reverse(path):
+    if stream is not None:
+        lines = _iter_rollout_lines_reverse_stream(
+            stream,
+            minimum_offset=foreign_prefix_bytes or 0,
+        )
+    else:
+        lines = (
+            _iter_rollout_lines_reverse_after(path, foreign_prefix_bytes)
+            if foreign_prefix_bytes
+            else _iter_rollout_lines_reverse(path)
+        )
+    for raw_line in lines:
         if not raw_line:
             continue
         if (
@@ -1870,18 +1967,84 @@ def _iter_rollout_lines_reverse(
     """Yield JSONL lines newest-first without loading a rollout into memory."""
 
     with path.open("rb") as stream:
-        stream.seek(0, os.SEEK_END)
-        position = stream.tell()
-        remainder = b""
-        while position > 0:
-            read_size = min(chunk_size, position)
-            position -= read_size
-            stream.seek(position)
-            parts = (stream.read(read_size) + remainder).split(b"\n")
-            remainder = parts[0]
-            yield from reversed(parts[1:])
-        if remainder:
-            yield remainder
+        yield from _iter_rollout_lines_reverse_stream(
+            stream,
+            chunk_size=chunk_size,
+        )
+
+
+def _iter_rollout_lines_reverse_after(
+    path: Path,
+    minimum_offset: int,
+    *,
+    chunk_size: int = 64 * 1024,
+) -> Iterator[bytes]:
+    """Yield complete JSONL lines newest-first after a byte offset.
+
+    Migration markers describe a foreign byte prefix. A destination account
+    may append native events to that same rollout, so only complete lines that
+    begin at or after the marker are eligible quota evidence. If the boundary
+    cuts through a line, that mixed line is discarded.
+    """
+
+    if (
+        not isinstance(minimum_offset, int)
+        or isinstance(minimum_offset, bool)
+        or minimum_offset < 0
+    ):
+        raise ValueError("minimum_offset must be a non-negative integer")
+    with path.open("rb") as stream:
+        yield from _iter_rollout_lines_reverse_stream(
+            stream,
+            minimum_offset=minimum_offset,
+            chunk_size=chunk_size,
+        )
+
+
+def _iter_rollout_lines_reverse_stream(
+    stream: BinaryIO,
+    *,
+    minimum_offset: int = 0,
+    chunk_size: int = 64 * 1024,
+) -> Iterator[bytes]:
+    """Yield reverse JSONL lines from an already-open rollout identity."""
+
+    if (
+        not isinstance(minimum_offset, int)
+        or isinstance(minimum_offset, bool)
+        or minimum_offset < 0
+    ):
+        raise ValueError("minimum_offset must be a non-negative integer")
+    stream.seek(0, os.SEEK_END)
+    end = stream.tell()
+    if minimum_offset >= end:
+        return
+
+    scan_start = minimum_offset
+    if minimum_offset > 0:
+        stream.seek(minimum_offset - 1)
+        if stream.read(1) != b"\n":
+            stream.seek(minimum_offset)
+            while True:
+                chunk = stream.read(chunk_size)
+                if not chunk:
+                    return
+                newline = chunk.find(b"\n")
+                if newline >= 0:
+                    scan_start = stream.tell() - len(chunk) + newline + 1
+                    break
+
+    position = end
+    remainder = b""
+    while position > scan_start:
+        read_size = min(chunk_size, position - scan_start)
+        position -= read_size
+        stream.seek(position)
+        parts = (stream.read(read_size) + remainder).split(b"\n")
+        remainder = parts[0]
+        yield from reversed(parts[1:])
+    if remainder:
+        yield remainder
 
 
 def _rollout_event_timestamp(event: dict) -> float | None:

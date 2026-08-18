@@ -1387,6 +1387,30 @@ class TaskQueue:
             # The foreground status is terminal, but the persistent Claude
             # session still owns detached output for this Task.
             return False
+        # A completed Claude turn may have released the ordinary Instance
+        # maps while retaining a hot PTY Session for a short follow-up window.
+        # That proof is runtime-owned even when the durable background marker
+        # is already clear. Queue deletion is also used by internal callers,
+        # so keep this guard here in addition to the HTTP cleanup path.
+        if not (remote_worker_deleted or worker_delete_preparing) and (
+            observed_worker_id is None
+        ):
+            from backend.main import instance_manager
+
+            has_live_post_exit = getattr(
+                instance_manager,
+                "has_live_task_pty_post_exit",
+                None,
+            )
+            if callable(has_live_post_exit) and has_live_post_exit(
+                task_id,
+                session_id=getattr(task, "session_id", None),
+                instance_id=observed_instance_id,
+                task_retry_count=observed_retry_count,
+                task_turn_generation=observed_turn_generation,
+            ):
+                await self.db.rollback()
+                return False
         # A Worker task is authoritative on the remote CCM.  Directly deleting
         # its Manager mirror would lose the only management handle while the
         # remote task/process can still exist.  The API opts in only after a

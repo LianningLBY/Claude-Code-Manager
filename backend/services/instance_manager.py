@@ -2665,6 +2665,160 @@ class InstanceManager:
             self._release_task_runtime_scope_pty_owner(session)
         return released
 
+    def has_live_task_pty_post_exit(
+        self,
+        task_id: int,
+        *,
+        session_id: str | None = None,
+        instance_id: int | None = None,
+        task_retry_count: int | None = None,
+        task_turn_generation: int | None = None,
+    ) -> bool:
+        """Return whether a retained PTY proof still owns this Task.
+
+        ``FullMirrorCCMBackend`` deliberately removes the ordinary
+        instance-keyed process maps before retaining a hot Session for a
+        follow-up. Callers that only inspect ``is_running()`` therefore miss
+        that native process. Keep this check generation/session-aware so a
+        stale proof from a deleted/reused Task id cannot be mistaken for the
+        current Task's Session.
+        """
+
+        for proof in tuple(self._pty_post_exit_generations.values()):
+            if proof.task_id != task_id:
+                continue
+            if session_id is not None and proof.session_id != session_id:
+                continue
+            if instance_id is not None and proof.instance_id != instance_id:
+                continue
+            if not self._pty_post_exit_generation_is_current(
+                proof,
+                task_id=task_id,
+                session_id=session_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+            ):
+                continue
+            return True
+        return False
+
+    async def cleanup_task_pty_for_delete(
+        self,
+        task_id: int,
+        *,
+        session_id: str | None,
+        instance_id: int | None = None,
+        task_retry_count: int | None = None,
+        task_turn_generation: int | None = None,
+    ) -> bool:
+        """Stop the exact retained PTY Session before deleting its Task.
+
+        A terminal Claude chat intentionally retains its native Session for a
+        short follow-up window. Task deletion is a stronger lifecycle edge:
+        it must invalidate that handoff and prove the native process stopped
+        before the durable Task row disappears. This method acquires the
+        reusable-slot lock itself, so callers may invoke it before taking the
+        normal deletion lock set.
+        """
+
+        if self._pty_backend is None:
+            return True
+        if not session_id:
+            # Without the frozen native session id there is no safe target for
+            # a destructive stop. Let the caller's durable delete guard fail
+            # closed instead of guessing from a reusable instance slot.
+            return not self.has_live_task_pty_post_exit(
+                task_id,
+                instance_id=instance_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+            )
+
+        candidates = [
+            proof
+            for proof in tuple(self._pty_post_exit_generations.values())
+            if (
+                proof.task_id == task_id
+                and proof.session_id == session_id
+                and (instance_id is None or proof.instance_id == instance_id)
+                and self._pty_post_exit_generation_is_current(
+                    proof,
+                    task_id=task_id,
+                    session_id=session_id,
+                    task_retry_count=task_retry_count,
+                    task_turn_generation=task_turn_generation,
+                )
+            )
+        ]
+        if not candidates:
+            return not self.has_live_task_pty_post_exit(
+                task_id,
+                session_id=session_id,
+                instance_id=instance_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+            )
+        # There should be one proof per (Task, native Session). Multiple
+        # current proofs for the same frozen session are an ABA ambiguity;
+        # refusing deletion preserves the exact runtime evidence.
+        if len(candidates) != 1:
+            return False
+
+        proof = candidates[0]
+        lifecycle_lock = self._instance_lifecycle_lock(proof.instance_id)
+        async with lifecycle_lock:
+            current = self._pty_post_exit_generations.get(
+                (proof.task_id, proof.session_id)
+            )
+            if current is not proof or not self._pty_post_exit_generation_is_current(
+                proof,
+                instance_id=proof.instance_id,
+                task_id=task_id,
+                session_id=session_id,
+                task_retry_count=task_retry_count,
+                task_turn_generation=task_turn_generation,
+            ):
+                return False
+
+            self._begin_stopping(proof.instance_id)
+            try:
+                # Invalidate queued follow-ups before stopping the native
+                # process. Their cancellation receipts must not race a Task
+                # DELETE that is holding the task operation fence.
+                key = (proof.task_id, proof.session_id)
+                self._pty_autonomous_activity_handoffs.pop(key, None)
+                backend_session = getattr(self._pty_backend, "_sessions", {}).get(
+                    proof.instance_id
+                )
+                if backend_session is proof.session:
+                    # The proof normally reaches this path after FullMirror
+                    # released the slot maps, but handle an attached session
+                    # conservatively by checking the pool identity first.
+                    pool = getattr(self._pty_backend, "_pool", None)
+                    pool_session = (
+                        await pool.get(proof.session_id) if pool is not None else None
+                    )
+                    if pool_session is not proof.session:
+                        return False
+                    released = await self.release_pty_session(proof.session_id)
+                else:
+                    released = await self._stop_exact_post_exit_pty_session(proof)
+                if not released:
+                    return False
+                self._discard_pty_post_exit_generation(key, proof)
+                state = self._pty_background_states.get(key)
+                if state is not None:
+                    self._discard_pty_background_state(key, state.generation)
+                return not self.has_live_task_pty_post_exit(
+                    task_id,
+                    session_id=session_id,
+                    instance_id=instance_id,
+                    task_retry_count=task_retry_count,
+                    task_turn_generation=task_turn_generation,
+                )
+            finally:
+                self._end_stopping(proof.instance_id)
+
     async def drain_idle_pty_sessions(self) -> int:
         """Stop idle PTY sessions (called after PTY mode is switched off).
         In-flight turns are untouched and finish on the PTY path."""

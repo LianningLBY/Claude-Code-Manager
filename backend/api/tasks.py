@@ -5666,9 +5666,39 @@ async def delete_task(
                     and task_side_instance.current_task_id in (None, task_id)
                 ):
                     lifecycle_ids.add(fenced_task.instance_id)
+            # FullMirror may have released the normal Instance maps while
+            # retaining the exact native Claude Session for a follow-up.
+            # Stop that post-exit proof before taking the regular lifecycle
+            # locks and before allowing TaskQueue to remove the durable Task
+            # identity. Capture all generation fields before rollback because
+            # the cleanup itself must run outside the DB read transaction.
+            retained_session_id = fenced_task.session_id
+            retained_instance_id = fenced_task.instance_id
+            retained_retry_count = fenced_task.retry_count
+            retained_turn_generation = fenced_task.turn_generation
             # Do not wait on a lifecycle lock while retaining a read transaction:
             # launch holds that lock while committing Task/Instance metadata.
             await db.rollback()
+
+            cleanup_pty = getattr(
+                instance_manager,
+                "cleanup_task_pty_for_delete",
+                None,
+            )
+            if callable(cleanup_pty):
+                cleaned = await cleanup_pty(
+                    task_id,
+                    session_id=retained_session_id,
+                    instance_id=retained_instance_id,
+                    task_retry_count=retained_retry_count,
+                    task_turn_generation=retained_turn_generation,
+                )
+                if not cleaned:
+                    raise HTTPException(
+                        409,
+                        "Task still has an active Claude PTY session; "
+                        "retry deletion after it is stopped",
+                    )
 
             # Serialize deletion with the complete launch/spawn/persist window. A
             # terminal Task can otherwise disappear just before a child is registered;

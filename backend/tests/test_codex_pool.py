@@ -398,6 +398,112 @@ class TestSelection:
             service_tier="priority",
         )
 
+    def test_default_selection_excludes_known_incompatible_native_catalog(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        (tmp_path / "codex-1" / "models_cache.json").write_text(
+            json.dumps({"models": [{"slug": "gpt-5.5", "service_tiers": []}]}),
+            encoding="utf-8",
+        )
+        (tmp_path / "codex-2" / "models_cache.json").write_text(
+            json.dumps({
+                "models": [{
+                    "slug": "gpt-5.6-sol",
+                    "service_tiers": [{"id": "priority"}],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        assert pool.select(
+            model="gpt-5.6-sol",
+            service_tier="default",
+        ) == str((tmp_path / "codex-2").resolve())
+        assert not pool.supports_model_for_home(
+            tmp_path / "codex-1",
+            "gpt-5.6-sol",
+            service_tier="default",
+        )
+
+    def test_known_native_catalog_outranks_missing_catalog_for_default_tier(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        (tmp_path / "codex-2" / "models_cache.json").write_text(
+            json.dumps({
+                "models": [{
+                    "slug": "gpt-5.6-sol",
+                    "service_tiers": [],
+                }],
+            }),
+            encoding="utf-8",
+        )
+
+        # codex-1 has no catalog, so it remains a compatibility fallback;
+        # the verified model-compatible account should be selected first.
+        assert pool.select(
+            model="gpt-5.6-sol",
+            service_tier="default",
+        ) == str((tmp_path / "codex-2").resolve())
+
+    def test_missing_native_catalog_remains_default_tier_fallback(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        (tmp_path / "codex-1" / "models_cache.json").write_text(
+            json.dumps({"models": [{"slug": "gpt-5.5", "service_tiers": []}]}),
+            encoding="utf-8",
+        )
+
+        assert pool.select(
+            model="gpt-5.6-sol",
+            service_tier="default",
+        ) == str((tmp_path / "codex-2").resolve())
+        assert pool.supports_model_for_home(
+            tmp_path / "codex-2",
+            "gpt-5.6-sol",
+            service_tier="default",
+        )
+
+    def test_malformed_native_catalog_remains_default_tier_fallback(
+        self, pool: CodexPool, tmp_path: Path,
+    ):
+        (tmp_path / "codex-1" / "models_cache.json").write_text(
+            json.dumps({"models": [{"slug": "gpt-5.5", "service_tiers": []}]}),
+            encoding="utf-8",
+        )
+        (tmp_path / "codex-2" / "models_cache.json").write_text(
+            "not-json\n",
+            encoding="utf-8",
+        )
+
+        assert pool.select(
+            model="gpt-5.6-sol",
+            service_tier="default",
+        ) == str((tmp_path / "codex-2").resolve())
+
+    def test_null_and_default_model_resolve_configured_default_for_native_routing(
+        self, pool: CodexPool, tmp_path: Path, monkeypatch,
+    ):
+        monkeypatch.setattr(
+            codex_pool_module.settings,
+            "default_codex_model",
+            "gpt-5.6-sol",
+        )
+        (tmp_path / "codex-1" / "models_cache.json").write_text(
+            json.dumps({"models": [{"slug": "gpt-5.5", "service_tiers": []}]}),
+            encoding="utf-8",
+        )
+        (tmp_path / "codex-2" / "models_cache.json").write_text(
+            json.dumps({"models": [{"slug": "gpt-5.6-sol", "service_tiers": []}]}),
+            encoding="utf-8",
+        )
+
+        expected = str((tmp_path / "codex-2").resolve())
+        assert pool.select(model=None) == expected
+        pool._selection_cursor_id = None
+        assert pool.select(model="default") == expected
+        assert pool.account("codex-2").supports_model(None)
+        assert pool.account("codex-2").supports_model("default")
+
 
 class TestAccountHomeHelpers:
     def test_canonical_home_resolves_alias_and_drives_lookup(
@@ -1600,11 +1706,61 @@ class TestCloudRouterCodexProjection:
             Path(account.codex_home).resolve()
         )
 
+    def test_api_only_pool_resolves_null_model_to_configured_default(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(
+            codex_pool_module.settings,
+            "default_codex_model",
+            "gpt-5.5",
+        )
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        pool = CodexPool(
+            config_path=tmp_path / "missing-codex-pool.json",
+            cloudrouter_store=_FakeCloudRouterCodexStore(account),
+            bootstrap_default=False,
+        )
+
+        expected = str(Path(account.codex_home).resolve())
+        assert pool.select(model=None) == expected
+        assert pool.select(model="default") == expected
+
     def test_unsupported_api_model_preserves_native_fallback(self, tmp_path):
         account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
         pool, native_home = self._mixed_pool(tmp_path, account)
 
         assert pool.select(model="gpt-5.6-sol") == str(native_home.resolve())
+
+    def test_supported_api_model_fallback_wins_over_known_incompatible_native(
+        self, tmp_path
+    ):
+        account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")
+        native_home = tmp_path / "native-codex"
+        native_home.mkdir()
+        (native_home / "models_cache.json").write_text(
+            json.dumps({
+                "models": [{"slug": "gpt-5.4", "service_tiers": []}],
+            }),
+            encoding="utf-8",
+        )
+        native_path = tmp_path / "native-codex-accounts.json"
+        native_path.write_text(json.dumps({
+            "pool_settings": {"routing_policy": "native_first"},
+            "accounts": [{
+                "id": "native-1",
+                "codex_home": str(native_home),
+                "enabled": True,
+            }],
+        }))
+        pool = CodexPool(
+            config_path=native_path,
+            cloudrouter_store=_FakeCloudRouterCodexStore(account),
+            bootstrap_default=False,
+        )
+
+        assert pool.select(model="gpt-5.5") == str(
+            Path(account.codex_home).resolve()
+        )
 
     def test_exhausted_api_preserves_native_fallback(self, tmp_path):
         account = _FakeCloudRouterCodexAccount(tmp_path / "cloudrouter-1")

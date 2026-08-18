@@ -9871,19 +9871,19 @@ async def test_codex_child_thread_reactivation_emits_newer_spawn_sequence():
     lifecycle = [
         row for row in rows if row["type"] == "native.subagent.lifecycle"
     ]
+    # The relation grace window suppresses an intermediate done flash, while
+    # the newer start still receives its own monotonic spawn sequence.
     assert [row["lifecycle_event"] for row in lifecycle] == [
         "spawn",
-        "done",
         "spawn",
         "done",
     ]
     assert [row["status"] for row in lifecycle] == [
         "running",
-        "completed",
         "running",
         "completed",
     ]
-    assert [row["sequence"] for row in lifecycle] == [1, 2, 3, 4]
+    assert [row["sequence"] for row in lifecycle] == [1, 2, 3]
 
 
 @pytest.mark.asyncio

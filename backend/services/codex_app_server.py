@@ -3364,8 +3364,15 @@ class CodexAppServer:
             return
         # A fresh active proof supersedes a previously deferred terminal edge
         # for this exact native thread (for example a retained Goal turn).
+        reactivated = thread_id in context.descendant_pending_terminal_status
         self._cancel_descendant_terminal_debounce(context, thread_id)
         context.descendant_pending_terminal_status.pop(thread_id, None)
+        if reactivated:
+            # The deferred terminal intentionally kept the public state at
+            # ``running`` during the relation grace window.  A new explicit
+            # active/start proof is a real child turn, so reset only the
+            # lifecycle state and let the publisher emit a fresh spawn edge.
+            context.descendant_lifecycle_states.pop(thread_id, None)
         if context.claimed_stop_token is not None:
             # A newly active child invalidates an earlier quiescence snapshot.
             context.claimed_stop_interrupt_confirmed = False
@@ -3813,6 +3820,15 @@ class CodexAppServer:
         if item.get("type") not in {"agentMessage", "agent_message"}:
             return
         if context.descendant_lifecycle_states.get(thread_id) != "running":
+            return
+        if (
+            thread_id in context.descendant_pending_terminal_status
+            and not self._descendant_has_active_children(context, thread_id)
+        ):
+            # The child has already supplied a terminal proof.  Until its
+            # short relation grace period expires, only a fresh lifecycle
+            # notification can reopen it; a late item replay must not change
+            # the public progress summary.
             return
         summary = self._bounded_descendant_text(item.get("text"), 2000)
         if summary is None:

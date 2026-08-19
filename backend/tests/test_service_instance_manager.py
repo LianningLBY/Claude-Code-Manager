@@ -7040,6 +7040,7 @@ async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
 
     assert pid == 54_321
     kwargs = im._launch_pty.await_args.kwargs
+    assert kwargs["claude_binary_override"] == settings.claude_binary
     assert kwargs["git_env"]["CCM_TASK_SSH_GUARD"] == "1"
     assert kwargs["git_env"]["SSH_AUTH_SOCK"] == ""
     assert {

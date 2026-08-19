@@ -1445,6 +1445,7 @@ Worker、Shared、Delivery、Plan、Loop、Goal 与迁移导入继续 fail close
 | `backend/services/worktree_manager.py` | `backend/tests/test_service_worktree_manager.py` |
 | `backend/services/instance_manager.py` | `backend/tests/test_service_instance_manager.py` |
 | Claude PTY chat post-exit retained proof | `test_inject_pty_message_uses_chat_post_exit_proof_after_maps_clear` + `test_process_event_accepts_exact_chat_proof_after_maps_clear` + `test_inject_pty_message_rejects_same_slot_replacement_proof` + `test_autonomous_mirror.py::TestFullMirrorBackend::test_exact_pty_generation_finalizes_task_and_instance` |
+| Claude PTY CLI 路由 | `test_claude_pty_receives_task_ssh_guard_env_and_policy` 同时确认 PTY wrapper 使用配置的 `CLAUDE_BINARY`，不回落到 ambient `claude` |
 | `backend/services/context_compaction.py` | `backend/tests/test_context_compaction.py` |
 | `backend/services/ralph_loop.py` | `backend/tests/test_service_ralph_loop.py` |
 | `backend/services/ws_broadcaster.py` | `backend/tests/test_service_ws_broadcaster.py` |

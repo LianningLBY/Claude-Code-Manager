@@ -6111,7 +6111,10 @@ class InstanceManager:
                 enable_workflows=enable_workflows,
                 enabled_skills=enabled_skills,
                 mcp_config_path=str(mcp_config_path) if mcp_config_path else None,
-                claude_binary_override=None,
+                # claude-pty's default config resolves ambient ``claude``.
+                # Carry CCM's configured binary through the wrapper so PTY
+                # and direct launches use the same pinned CLI.
+                claude_binary_override=settings.claude_binary,
                 container_exec_spec=None,
                 task_retry_count=task_retry_count,
                 task_turn_generation=task_turn_generation,

@@ -576,16 +576,12 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   // Keep request-scoped tombstones for this mounted task so such a snapshot
   // cannot turn an answered/timed-out card back into an actionable one.
   const resolvedAskRequestIdsRef = useRef(new Set<string>());
-  const markAskUserResolved = useCallback((
-    requestId: string,
-    status: 'answered' | 'timed_out' | 'expired',
-  ) => {
+  const retireAskUserRequest = useCallback((requestId: string) => {
     resolvedAskRequestIdsRef.current.add(requestId);
-    setMessages((prev) => prev.map((message) =>
-      message.event_type === 'ask_user_question' && message.request_id === requestId
-        ? { ...message, ask_status: status }
-        : message
-    ));
+    setMessages((previous) => previous.filter((message) => !(
+      message.event_type === 'ask_user_question'
+      && message.request_id === requestId
+    )));
   }, []);
   // WS 驱动的实时状态覆盖。task.status prop（5s 轮询）才是最终一致的事实源：
   // prop 变化时清掉覆盖（见下方 effect），否则错过一次 WS 事件就永久陈旧。
@@ -2002,8 +1998,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
     }
     if (eventType === 'ask_user_resolved') {
       const rid = msg.data.request_id as string;
-      const timedOut = !!msg.data.timed_out;
-      if (rid) markAskUserResolved(rid, timedOut ? 'timed_out' : 'answered');
+      if (rid) retireAskUserRequest(rid);
       return;
     }
 
@@ -2459,7 +2454,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       syncLiveStreamCache(activeTaskTurnRef.current, next);
       return next;
     });
-  }, [hasControlAccess, markAskUserResolved, observeTaskTurn, onTaskUpdated, refreshVersionedPlans, rememberPtyFollowupBoundary, task.goal_max_turns, task.id, task.worker_id]);
+  }, [hasControlAccess, observeTaskTurn, onTaskUpdated, refreshVersionedPlans, rememberPtyFollowupBoundary, retireAskUserRequest, task.goal_max_turns, task.id, task.worker_id]);
 
   const fetchHistory = useCallback(() => {
     const requestEpoch = ++historyRequestEpochRef.current;
@@ -4102,7 +4097,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
               message={group.message}
               taskId={task.id}
               canResolvePermission={hasControlAccess}
-              onAskUserResolved={markAskUserResolved}
+              onAskUserResolved={retireAskUserRequest}
             />
           )
         )}
@@ -5132,11 +5127,12 @@ function AskUserCard({
 }: {
   message: ChatMessage;
   taskId?: number;
-  onResolved?: (requestId: string, status: 'answered' | 'expired') => void;
+  onResolved?: (requestId: string) => void;
 }) {
   const questions = message.ask_questions || [];
   const [submitting, setSubmitting] = useState(false);
   const [localStatus, setLocalStatus] = useState<string | null>(null);
+  const [submitError, setSubmitError] = useState<string | null>(null);
   // 每个问题的选中 label 集合 + 自定义文本
   const [selected, setSelected] = useState<Record<number, Set<string>>>({});
   const [custom, setCustom] = useState<Record<number, string>>({});
@@ -5167,13 +5163,18 @@ function AskUserCard({
     // 至少一个问题要有答案（label 或自定义文本）
     if (!answers.some((a) => a.labels.length || a.text)) return;
     setSubmitting(true);
+    setSubmitError(null);
     try {
       await api.submitAskUser(taskId!, message.request_id!, answers);
       setLocalStatus('answered');
-      onResolved?.(message.request_id!, 'answered');
-    } catch {
-      setLocalStatus('expired');
-      onResolved?.(message.request_id!, 'expired');
+      onResolved?.(message.request_id!);
+    } catch (error) {
+      if (isApiRequestError(error) && error.status === 410) {
+        setLocalStatus('expired');
+        onResolved?.(message.request_id!);
+      } else {
+        setSubmitError('回答提交结果未确认，卡片已保留，请重试。');
+      }
     } finally {
       setSubmitting(false);
     }
@@ -5251,6 +5252,9 @@ function AskUserCard({
             </span>
           )}
         </div>
+        {submitError && (
+          <p className="mt-1.5 text-xs text-red-400" role="alert">{submitError}</p>
+        )}
       </div>
     </div>
   );
@@ -5265,7 +5269,7 @@ const MessageBubble = memo(function MessageBubble({
   message: ChatMessage;
   taskId: number;
   canResolvePermission: boolean;
-  onAskUserResolved?: (requestId: string, status: 'answered' | 'expired') => void;
+  onAskUserResolved?: (requestId: string) => void;
 }) {
   const isUser = message.role === 'user';
 

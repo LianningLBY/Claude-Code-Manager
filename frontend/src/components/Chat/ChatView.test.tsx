@@ -3734,7 +3734,7 @@ describe('ChatView', () => {
       await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalledTimes(2));
     });
 
-    it('does not revive an answered ask-user card from a stale pending snapshot', async () => {
+    it('removes a resolved ask-user card and does not revive it from stale events', async () => {
       let resolvePending!: (value: {
         pending: { request_id: string; questions: {
           question: string;
@@ -3777,7 +3777,22 @@ describe('ChatView', () => {
           },
         });
       });
-      expect(screen.getByText('✓ 已回答')).toBeInTheDocument();
+      expect(screen.queryByText('Proceed?')).not.toBeInTheDocument();
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:14',
+          data: {
+            event_type: 'ask_user_question',
+            request_id: 'ask-1',
+            questions: [{
+              question: 'Proceed?',
+              options: [{ label: 'Yes' }, { label: 'No' }],
+            }],
+          },
+        });
+      });
+      expect(screen.queryByText('Proceed?')).not.toBeInTheDocument();
 
       await act(async () => {
         resolvePending({
@@ -3791,12 +3806,11 @@ describe('ChatView', () => {
         });
       });
 
-      expect(screen.getAllByText('Proceed?')).toHaveLength(1);
-      expect(screen.getByText('✓ 已回答')).toBeInTheDocument();
+      expect(screen.queryByText('Proceed?')).not.toBeInTheDocument();
       expect(screen.queryByPlaceholderText('或自定义回答…')).not.toBeInTheDocument();
     });
 
-    it('tombstones a locally submitted answer before a stale pending snapshot returns', async () => {
+    it('removes a submitted ask-user card before a stale pending snapshot returns', async () => {
       let resolvePending!: (value: {
         pending: { request_id: string; questions: {
           question: string;
@@ -3830,7 +3844,7 @@ describe('ChatView', () => {
       await userEvent.click(screen.getByRole('button', { name: /Yes/ }));
       await userEvent.click(screen.getByRole('button', { name: '提交' }));
       await waitFor(() => expect(api.submitAskUser).toHaveBeenCalled());
-      expect(screen.getByText('✓ 已回答')).toBeInTheDocument();
+      await waitFor(() => expect(screen.queryByText('Ship it?')).not.toBeInTheDocument());
 
       await act(async () => {
         resolvePending({
@@ -3844,9 +3858,43 @@ describe('ChatView', () => {
         });
       });
 
-      expect(screen.getAllByText('Ship it?')).toHaveLength(1);
-      expect(screen.getByText('✓ 已回答')).toBeInTheDocument();
+      expect(screen.queryByText('Ship it?')).not.toBeInTheDocument();
       expect(screen.queryByPlaceholderText('或自定义回答…')).not.toBeInTheDocument();
+    });
+
+    it('keeps an ask-user card when answer delivery is uncertain', async () => {
+      (api.submitAskUser as ReturnType<typeof vi.fn>).mockRejectedValueOnce(
+        Object.assign(new Error('network failed'), { status: 503 }),
+      );
+      render(
+        <ChatView
+          task={makeTask({ id: 16, description: null })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:16',
+          data: {
+            event_type: 'ask_user_question',
+            request_id: 'ask-uncertain',
+            questions: [{
+              question: 'Deploy?',
+              options: [{ label: 'Yes' }, { label: 'No' }],
+            }],
+          },
+        });
+      });
+      await userEvent.click(screen.getByRole('button', { name: /Yes/ }));
+      await userEvent.click(screen.getByRole('button', { name: '提交' }));
+
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        '回答提交结果未确认，卡片已保留，请重试。',
+      );
+      expect(screen.getByText('Deploy?')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '提交' })).toBeEnabled();
     });
 
     it('copies a user message without its sender prefix', async () => {

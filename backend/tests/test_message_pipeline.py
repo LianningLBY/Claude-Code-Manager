@@ -494,6 +494,49 @@ async def test_consume_output_broadcasts_to_both_channels(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_consume_output_marks_legacy_tool_markup_as_inert_text(db_factory):
+    async with db_factory() as db:
+        inst = Instance(name="test")
+        task = Task(title="t", description="d")
+        db.add_all([inst, task])
+        await db.commit()
+        await db.refresh(inst)
+        await db.refresh(task)
+        inst_id, task_id = inst.id, task.id
+
+    leaked_text = (
+        'card\n<invoke name="Bash">\n'
+        '<parameter name="command">pwd</parameter>\n</invoke>'
+    )
+    mock_proc = _make_mock_process_with_output([
+        json.dumps({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": leaked_text}],
+                "stop_reason": "end_turn",
+            },
+        }) + "\n",
+    ])
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    im = InstanceManager(db_factory, broadcaster)
+
+    await im._consume_output(inst_id, task_id, mock_proc)
+
+    task_messages = [
+        call.args[1]
+        for call in broadcaster.broadcast.call_args_list
+        if call.args[0] == f"task:{task_id}"
+        and call.args[1].get("event_type") == "message"
+    ]
+    assert len(task_messages) == 1
+    assert task_messages[0]["content"] == leaked_text
+    assert task_messages[0]["protocol_anomaly"] == "legacy_tool_markup"
+    assert task_messages[0]["tool_name"] is None
+
+
+@pytest.mark.asyncio
 async def test_consume_output_continues_after_parse_error(db_factory):
     """_consume_output should skip bad lines and continue processing."""
     async with db_factory() as db:
@@ -622,6 +665,7 @@ async def test_chat_history_filters_heartbeats(client, session_factory):
     """Chat history should filter out system_event with content=task_progress."""
     create_resp = await client.post("/api/tasks", json={
         "title": "T", "description": "d", "target_repo": "/tmp",
+        "provider": "claude",
     })
     task_id = create_resp.json()["id"]
 
@@ -649,6 +693,138 @@ async def test_chat_history_filters_heartbeats(client, session_factory):
     assert msgs[0]["task_turn_generation"] == 11
     assert msgs[0]["native_turn_id"] == "native-turn-11"
     assert msgs[0]["turn_id"] == "native-turn-11"
+
+
+@pytest.mark.asyncio
+async def test_chat_history_marks_legacy_tool_markup_anomaly(
+    client,
+    session_factory,
+):
+    create_resp = await client.post("/api/tasks", json={
+        "title": "T", "description": "d", "target_repo": "/tmp",
+        "provider": "claude",
+    })
+    task_id = create_resp.json()["id"]
+    leaked_text = (
+        '<invoke name="Bash">'
+        '<parameter name="command">pwd</parameter>'
+        '</invoke>'
+    )
+
+    async with session_factory() as db:
+        db.add_all([
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="message",
+                role="assistant",
+                content=leaked_text,
+            ),
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="message",
+                role="assistant",
+                content="A normal reply",
+            ),
+        ])
+        await db.commit()
+
+    resp = await client.get(f"/api/tasks/{task_id}/chat/history")
+    assert resp.status_code == 200
+    messages = resp.json()
+    assert messages[0]["content"] == leaked_text
+    assert messages[0]["protocol_anomaly"] == "legacy_tool_markup"
+    assert messages[1]["protocol_anomaly"] is None
+
+
+@pytest.mark.asyncio
+async def test_chat_history_ignores_codex_xml_example(
+    client,
+    session_factory,
+):
+    create_resp = await client.post("/api/tasks", json={
+        "title": "T", "description": "d", "target_repo": "/tmp",
+        "provider": "codex",
+    })
+    task_id = create_resp.json()["id"]
+    xml_example = (
+        '<function_calls><invoke name="Bash">'
+        '<parameter name="command">pwd</parameter>'
+        '</invoke></function_calls>'
+    )
+
+    async with session_factory() as db:
+        db.add(
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="message",
+                role="assistant",
+                content=xml_example,
+            )
+        )
+        await db.commit()
+
+    resp = await client.get(f"/api/tasks/{task_id}/chat/history")
+    assert resp.status_code == 200
+    assert resp.json()[0]["protocol_anomaly"] is None
+
+
+@pytest.mark.asyncio
+async def test_shared_history_marks_legacy_tool_markup_anomaly(
+    session_factory,
+):
+    from backend.api.shared_access import shared_history
+    from backend.models.task_share import TaskShare
+
+    leaked_text = (
+        '<function_calls><invoke name="Read">'
+        '<parameter name="file_path">/tmp/a</parameter>'
+        '</invoke></function_calls>'
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            title="T",
+            description="d",
+            target_repo="/tmp",
+            provider="claude",
+        )
+        db.add(task)
+        await db.flush()
+        task_id = task.id
+        db.add(
+            TaskShare(
+                task_id=task_id,
+                shared_to_open_id="protocol-anomaly-recipient",
+                shared_to_name="Remote Reader",
+                shared_to_ccm_url="https://receiver.test",
+                share_token="protocol-anomaly-share-token",
+                status="active",
+            )
+        )
+        db.add(
+            LogEntry(
+                instance_id=1,
+                task_id=task_id,
+                event_type="message",
+                role="assistant",
+                content=leaked_text,
+            )
+        )
+        await db.commit()
+
+    async with session_factory() as db:
+        messages = await shared_history(
+            task_id,
+            token="protocol-anomaly-share-token",
+            limit=0,
+            before_id=0,
+            compact=True,
+            db=db,
+        )
+    assert messages[0]["protocol_anomaly"] == "legacy_tool_markup"
 
 
 @pytest.mark.asyncio

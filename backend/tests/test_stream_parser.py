@@ -2,7 +2,11 @@
 import json
 import pytest
 
-from backend.services.stream_parser import StreamParser
+from backend.services.stream_parser import (
+    LEGACY_TOOL_MARKUP_ANOMALY,
+    StreamParser,
+    detect_assistant_protocol_anomaly,
+)
 
 
 @pytest.fixture
@@ -216,6 +220,146 @@ def test_assistant_tool_use_block(parser):
     assert result["tool_name"] == "Bash"
     assert '"command"' in result["tool_input"]
     assert result["role"] == "assistant"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        (
+            '<invoke name="Bash">\n'
+            '<parameter name="command">pwd</parameter>\n</invoke>'
+        ),
+        (
+            'card\n<invoke name="Bash">\n'
+            '<parameter name="command">pwd</parameter>\n</invoke>'
+        ),
+        (
+            '<function_calls>\n<invoke name="Read">\n'
+            '<parameter name="file_path">/tmp/a</parameter>\n'
+            '</invoke>\n</function_calls>'
+        ),
+        (
+            '<antml:function_calls>\n<antml:invoke name="Bash">\n'
+            '<antml:parameter name="command">true</antml:parameter>\n'
+            '</antml:invoke>\n</antml:function_calls>'
+        ),
+    ],
+)
+def test_assistant_legacy_tool_markup_remains_inert_text(parser, text):
+    line = json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+        },
+    })
+
+    results = parser.parse_line(line)
+
+    assert len(results) == 1
+    assert results[0]["event_type"] == "message"
+    assert results[0]["content"] == text
+    assert results[0]["tool_name"] is None
+    assert results[0]["tool_input"] is None
+    assert results[0]["is_error"] is False
+    assert results[0]["protocol_anomaly"] == LEGACY_TOOL_MARKUP_ANOMALY
+
+
+@pytest.mark.parametrize(
+    ("event_type", "role", "text"),
+    [
+        ("message", "assistant", "Use <invoke> as a placeholder."),
+        ("message", "assistant", '<invoke name="Bash"></invoke>'),
+        ("message", "assistant", '<parameter name="command">pwd</parameter>'),
+        (
+            "message",
+            "assistant",
+            '<invoke><parameter>documentation</parameter></invoke>',
+        ),
+        (
+            "message",
+            "assistant",
+            '<invoke name="Bash"><parameter>documentation</parameter>'
+            '</invoke>',
+        ),
+        (
+            "message",
+            "assistant",
+            '<invoke name="Bash"><parameter name="command">pwd</invoke>',
+        ),
+        (
+            "message",
+            "assistant",
+            '<function_calls><invoke name="Bash"></invoke>',
+        ),
+        (
+            "message",
+            "assistant",
+            '<function_calls>docs</function_calls>',
+        ),
+        (
+            "message",
+            "assistant",
+            '<function_calls>documentation example</function_calls>',
+        ),
+        ("assistant", "assistant", "<function_calls>docs</function_calls>"),
+        (
+            "tool_use",
+            "assistant",
+            '<invoke name="Bash"><parameter name="command">pwd</parameter>'
+            '</invoke>',
+        ),
+        ("message", "user", '<invoke name="Bash"></invoke>'),
+        ("tool_result", "tool", '<function_calls></function_calls>'),
+        ("message", "assistant", "Normal response without tool markup."),
+    ],
+)
+def test_protocol_anomaly_classifier_ignores_non_tool_text(
+    event_type,
+    role,
+    text,
+):
+    assert detect_assistant_protocol_anomaly(event_type, role, text) is None
+
+
+def test_protocol_anomaly_classifier_ignores_codex_assistant_text():
+    text = (
+        '<function_calls><invoke name="Bash">'
+        '<parameter name="command">pwd</parameter>'
+        '</invoke></function_calls>'
+    )
+
+    assert detect_assistant_protocol_anomaly(
+        "message",
+        "assistant",
+        text,
+        provider="codex",
+    ) is None
+
+
+def test_protocol_anomaly_classifier_handles_many_incomplete_tags():
+    incomplete = '<invoke name="Bash">x' * 20_000
+
+    assert detect_assistant_protocol_anomaly(
+        "message",
+        "assistant",
+        incomplete,
+    ) is None
+
+
+def test_result_legacy_tool_markup_is_marked(parser):
+    result = parser.parse_line(json.dumps({
+        "type": "result",
+        "result": (
+            '<invoke name="Bash">'
+            '<parameter name="command">pwd</parameter>'
+            '</invoke>'
+        ),
+    }))[0]
+
+    assert result["event_type"] == "result"
+    assert result["protocol_anomaly"] == LEGACY_TOOL_MARKUP_ANOMALY
 
 
 def test_assistant_thinking_block(parser):

@@ -22,6 +22,7 @@ from backend.services.pr_review_runtime import is_pr_sandbox_task
 from backend.services.process_identity import (
     persisted_process_is_definitively_dead,
 )
+from backend.services.stream_parser import detect_assistant_protocol_anomaly
 
 router = APIRouter(
     prefix="/api/instances",
@@ -559,7 +560,8 @@ async def get_logs(
     event_type: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    if await db.get(Instance, instance_id) is None:
+    instance = await db.get(Instance, instance_id)
+    if instance is None:
         raise HTTPException(404, "Instance not found")
     if after_id is not None and offset:
         raise HTTPException(
@@ -567,7 +569,14 @@ async def get_logs(
             detail="after_id and offset cannot be used together",
         )
 
-    stmt = select(LogEntry).where(LogEntry.instance_id == instance_id)
+    # An Instance is reused across providers, so its current provider is not
+    # authoritative for historical rows. Prefer the Task that owns each log
+    # and retain the Instance only as the legacy/orphan fallback.
+    stmt = (
+        select(LogEntry, Task.provider)
+        .outerjoin(Task, Task.id == LogEntry.task_id)
+        .where(LogEntry.instance_id == instance_id)
+    )
     if event_type:
         stmt = stmt.where(LogEntry.event_type == event_type)
     if after_id is not None:
@@ -583,7 +592,18 @@ async def get_logs(
         # loads and existing callers.
         stmt = stmt.order_by(LogEntry.id.desc()).limit(limit).offset(offset)
     result = await db.execute(stmt)
-    return list(result.scalars().all())
+    entries = list(result.all())
+    responses = []
+    for entry, task_provider in entries:
+        response = LogEntryResponse.model_validate(entry)
+        response.protocol_anomaly = detect_assistant_protocol_anomaly(
+            entry.event_type,
+            entry.role,
+            entry.content,
+            provider=task_provider or instance.provider,
+        )
+        responses.append(response)
+    return responses
 
 
 @router.post("/{instance_id}/ralph/start")

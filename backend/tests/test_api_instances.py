@@ -1218,6 +1218,113 @@ async def test_get_logs_exposes_item_id_without_raw_json(client, session_factory
 
 
 @pytest.mark.asyncio
+async def test_get_logs_exposes_legacy_tool_markup_anomaly(
+    client,
+    session_factory,
+):
+    created = await client.post("/api/instances", json={"name": "log-anomaly"})
+    inst_id = created.json()["id"]
+
+    async with session_factory() as db:
+        db.add(
+            LogEntry(
+                instance_id=inst_id,
+                event_type="message",
+                role="assistant",
+                content=(
+                    '<invoke name="Bash">'
+                    '<parameter name="command">pwd</parameter>'
+                    '</invoke>'
+                ),
+                raw_json=json.dumps({
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": []},
+                }),
+            )
+        )
+        await db.commit()
+
+    response = await client.get(f"/api/instances/{inst_id}/logs")
+    assert response.status_code == 200
+    assert response.json()[0]["protocol_anomaly"] == "legacy_tool_markup"
+
+
+@pytest.mark.asyncio
+async def test_get_logs_ignores_codex_xml_example(client, session_factory):
+    created = await client.post("/api/instances", json={
+        "name": "log-codex-xml",
+        "provider": "codex",
+    })
+    inst_id = created.json()["id"]
+    xml_example = (
+        '<function_calls><invoke name="Bash">'
+        '<parameter name="command">pwd</parameter>'
+        '</invoke></function_calls>'
+    )
+
+    async with session_factory() as db:
+        instance = await db.get(Instance, inst_id)
+        instance.provider = "codex"
+        db.add(
+            LogEntry(
+                instance_id=inst_id,
+                event_type="message",
+                role="assistant",
+                content=xml_example,
+                raw_json=json.dumps({
+                    "type": "item.completed",
+                    "item": {"type": "agent_message"},
+                }),
+            )
+        )
+        await db.commit()
+
+    response = await client.get(f"/api/instances/{inst_id}/logs")
+    assert response.status_code == 200
+    assert response.json()[0]["protocol_anomaly"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_logs_uses_historical_task_provider_before_reused_instance(
+    client,
+    session_factory,
+):
+    created = await client.post("/api/instances", json={
+        "name": "reused-log-instance",
+        "provider": "codex",
+    })
+    inst_id = created.json()["id"]
+    leaked_text = (
+        '<invoke name="Bash"><parameter name="command">pwd</parameter>'
+        '</invoke>'
+    )
+
+    async with session_factory() as db:
+        task = Task(
+            title="historical claude task",
+            description="d",
+            target_repo="/tmp",
+            provider="claude",
+        )
+        db.add(task)
+        await db.flush()
+        db.add(
+            LogEntry(
+                instance_id=inst_id,
+                task_id=task.id,
+                event_type="message",
+                role="assistant",
+                content=leaked_text,
+            )
+        )
+        await db.commit()
+
+    response = await client.get(f"/api/instances/{inst_id}/logs")
+    assert response.status_code == 200
+    assert response.json()[0]["protocol_anomaly"] == "legacy_tool_markup"
+
+
+@pytest.mark.asyncio
 async def test_get_logs_returns_404_for_unknown_instance(client):
     response = await client.get("/api/instances/9999/logs")
     assert response.status_code == 404

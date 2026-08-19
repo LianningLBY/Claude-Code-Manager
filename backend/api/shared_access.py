@@ -17,6 +17,7 @@ from backend.models.task import Task
 from backend.models.task_share import TaskShare
 from backend.models.log_entry import LogEntry
 from backend.services.chat_event_identity import persisted_chat_event
+from backend.services.stream_parser import detect_assistant_protocol_anomaly
 from backend.services.worker_proxy import get_task_operation_lock
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,12 @@ async def shared_history(
             "loop_iteration": row.loop_iteration,
             "task_retry_count": row.task_retry_count,
             "timestamp": row.timestamp.isoformat() if row.timestamp else None,
+            "protocol_anomaly": detect_assistant_protocol_anomaly(
+                row.event_type,
+                row.role,
+                row.content,
+                provider=task.provider,
+            ),
         }
         if row.raw_json:
             try:

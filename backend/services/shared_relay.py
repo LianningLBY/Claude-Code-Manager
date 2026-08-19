@@ -300,6 +300,7 @@ class SharedRelay:
                         for key, value in data.items()
                         if key != "raw_json"
                     },
+                    provider=shadow.provider,
                 )
 
         # Broadcast to local frontend (mirror the event on local task channel)

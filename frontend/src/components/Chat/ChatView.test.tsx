@@ -3594,6 +3594,69 @@ describe('ChatView', () => {
       });
     });
 
+    it('renders persisted legacy tool markup as an unexecuted protocol warning', async () => {
+      const leakedMarkup = 'card\n<invoke name="Bash">\n<parameter name="command">touch /tmp/never-ran</parameter>\n</invoke>';
+      vi.mocked(api.getTaskChatHistory).mockResolvedValueOnce([{
+        id: 133,
+        role: 'assistant',
+        event_type: 'message',
+        content: leakedMarkup,
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: '2026-08-19T10:25:00Z',
+        image_urls: null,
+        attachments: null,
+        protocol_anomaly: 'legacy_tool_markup',
+      }]);
+
+      render(
+        <ChatView
+          task={makeTask({ id: 133, description: null })}
+          projects={projects}
+          onBack={onBack}
+        />,
+      );
+
+      expect(await screen.findByText('工具协议异常')).toBeInTheDocument();
+      expect(screen.getByText('以下内容是模型输出的未解析工具标记，未作为工具调用执行。')).toBeInTheDocument();
+      const rawDetails = screen.getByText('查看未执行原文').parentElement;
+      expect(rawDetails?.tagName).toBe('DETAILS');
+      expect(rawDetails).toBeInTheDocument();
+      expect(rawDetails).not.toHaveAttribute('open');
+      expect(screen.getByLabelText('未执行的工具标记原文').textContent).toBe(leakedMarkup);
+    });
+
+    it('preserves the protocol anomaly marker on live assistant messages', async () => {
+      const leakedMarkup = '<invoke name="Bash"><parameter name="command">false</parameter></invoke>';
+      const task = makeTask({ id: 134, description: null });
+      render(<ChatView task={task} projects={projects} onBack={onBack} />);
+      await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:134',
+          data: {
+            event_type: 'message',
+            role: 'assistant',
+            content: leakedMarkup,
+            protocol_anomaly: 'legacy_tool_markup',
+          },
+        });
+      });
+
+      expect(screen.getByText('工具协议异常')).toBeInTheDocument();
+      const rawDetails = screen.getByText('查看未执行原文').parentElement;
+      expect(rawDetails?.tagName).toBe('DETAILS');
+      expect(rawDetails).toBeInTheDocument();
+      expect(rawDetails).not.toHaveAttribute('open');
+      const original = screen.getByLabelText('未执行的工具标记原文');
+      expect(original.textContent).toBe(leakedMarkup);
+      expect(original.closest('.markdown-body')).toBeNull();
+    });
+
     it('re-fetches chat history on WebSocket reconnect', async () => {
       const msgs: ChatMessage[] = [
         { id: 1, role: 'assistant', event_type: 'message', content: 'Hello', tool_name: null, tool_input: null, tool_output: null, is_error: false, loop_iteration: null, timestamp: '2024-01-01T00:00:00Z' },

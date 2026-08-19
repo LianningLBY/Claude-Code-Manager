@@ -868,6 +868,55 @@ async def test_stale_relay_cannot_write_to_unowned_local_task(
 
 
 @pytest.mark.asyncio
+async def test_shared_relay_uses_local_codex_provider_to_clear_remote_marker(
+    session_factory,
+):
+    xml_example = (
+        '<function_calls><invoke name="Bash">'
+        '<parameter name="command">pwd</parameter>'
+        '</invoke></function_calls>'
+    )
+    async with session_factory() as db:
+        shared = SharedTaskReceived(
+            owner_ccm_url="https://owner.example.test",
+            remote_task_id=43,
+            share_token="codex-relay-token",
+            status="active",
+        )
+        db.add(shared)
+        await db.flush()
+        shadow = Task(
+            title="Codex shadow",
+            description="d",
+            status="pending",
+            provider="codex",
+            shared_from_id=shared.id,
+        )
+        db.add(shadow)
+        await db.flush()
+        shared.local_task_id = shadow.id
+        await db.commit()
+
+    broadcaster = SimpleNamespace(broadcast=AsyncMock())
+    relay = SharedRelay(session_factory, broadcaster)
+    await relay._handle(
+        {
+            "data": {
+                "event_type": "message",
+                "role": "assistant",
+                "content": xml_example,
+                "protocol_anomaly": "legacy_tool_markup",
+            }
+        },
+        shared,
+    )
+
+    event = broadcaster.broadcast.await_args.args[1]
+    assert event["content"] == xml_example
+    assert "protocol_anomaly" not in event
+
+
+@pytest.mark.asyncio
 async def test_shared_cleanup_does_not_cancel_unowned_local_task(
     session_factory,
 ):

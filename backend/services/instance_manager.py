@@ -44,7 +44,10 @@ from backend.services.process_identity import (
     persisted_process_is_definitively_dead,
 )
 from backend.services.process_safety import require_safe_process_group_id
-from backend.services.stream_parser import StreamParser
+from backend.services.stream_parser import (
+    StreamParser,
+    detect_assistant_protocol_anomaly,
+)
 from backend.services.task_queue import task_retry_not_superseded_predicate
 from backend.services.trusted_runtime import prime_trusted_runtime
 from backend.services.worker_routing_config import (
@@ -16867,6 +16870,26 @@ class InstanceManager:
             event_record,
             provider,
         )
+        protocol_anomaly = detect_assistant_protocol_anomaly(
+            event.get("event_type"),
+            event.get("role"),
+            event.get("content"),
+            provider=provider,
+        )
+        if protocol_anomaly:
+            event["protocol_anomaly"] = protocol_anomaly
+            logger.warning(
+                "Assistant protocol anomaly %s on instance %s task %s "
+                "(provider=%s); preserving it as inert text",
+                protocol_anomaly,
+                instance_id,
+                task_id,
+                provider,
+            )
+        else:
+            # Adapter or relay metadata cannot assert a protocol anomaly that
+            # is supported only by a now-suppressed or non-canonical payload.
+            event.pop("protocol_anomaly", None)
         context_preflight_relay_proof: dict[str, object] | None = None
 
         # Store the event and related heartbeat/session/unread updates in one

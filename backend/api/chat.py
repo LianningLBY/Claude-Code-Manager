@@ -43,6 +43,7 @@ from backend.schemas.task import TaskResponse, TaskRoutingExpectation
 from backend.services.task_creation import stage_task_record
 from backend.services.cancellation import await_task_completion
 from backend.services.chat_event_identity import persisted_chat_event
+from backend.services.stream_parser import detect_assistant_protocol_anomaly
 from backend.services.task_queue import TaskQueue, task_is_pr_review_superseded
 from backend.services.pr_review_runtime import (
     PR_REVIEW_TERMINAL_CHAT_HEADER,
@@ -4373,6 +4374,12 @@ async def get_chat_history(
             "followup_operation_id": followup_operation_id,
             "pty_followup_state": pty_followup_state,
             "pty_background_generation": pty_background_generation,
+            "protocol_anomaly": detect_assistant_protocol_anomaly(
+                row.event_type,
+                row.role,
+                row.content,
+                provider=task.provider,
+            ),
         })
 
     # Trim back to requested limit (we over-fetched to compensate for

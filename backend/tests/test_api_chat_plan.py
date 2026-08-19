@@ -3025,6 +3025,71 @@ async def test_shared_relay_replaces_remote_chat_identity_with_local_log_entry(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "supplied_marker", "expected_marker"),
+    [
+        ("claude", None, "legacy_tool_markup"),
+        ("codex", "legacy_tool_markup", None),
+    ],
+)
+async def test_shared_relay_derives_protocol_anomaly_from_local_provider(
+    client,
+    session_factory,
+    provider,
+    supplied_marker,
+    expected_marker,
+):
+    """A relay must not trust a remote marker or lose the local diagnostic."""
+    from backend.models.task_share import SharedTaskReceived
+    from backend.services.shared_relay import SharedRelay
+
+    leaked_text = (
+        '<invoke name="Bash"><parameter name="command">pwd</parameter>'
+        '</invoke>'
+    )
+    created = await client.post("/api/tasks", json={
+        "title": f"{provider} shadow",
+        "description": "shared relay protocol marker",
+        "target_repo": "/tmp",
+        "provider": provider,
+    })
+    task_id = created.json()["id"]
+    async with session_factory() as db:
+        shared = SharedTaskReceived(
+            owner_ccm_url="https://owner.example.test",
+            remote_task_id=45,
+            share_token="relay-anomaly-token",
+            local_task_id=task_id,
+            status="active",
+        )
+        db.add(shared)
+        await db.flush()
+        shadow = await db.get(Task, task_id)
+        shadow.shared_from_id = shared.id
+        await db.commit()
+
+    broadcaster = MagicMock()
+    broadcaster.broadcast = AsyncMock()
+    relay = SharedRelay(session_factory, broadcaster)
+    remote_data = {
+        "task_id": 45,
+        "event_type": "message",
+        "role": "assistant",
+        "content": leaked_text,
+    }
+    if supplied_marker is not None:
+        remote_data["protocol_anomaly"] = supplied_marker
+    await relay._handle(
+        {"data": remote_data},
+        shared,
+    )
+
+    event = broadcaster.broadcast.call_args.args[1]
+    assert event.get("protocol_anomaly") == expected_marker
+    assert event["content"] == leaked_text
+
+
+@pytest.mark.asyncio
 async def test_chat_send_queues_even_when_task_busy(client, session_factory):
     """Busy/no-idle-instance states no longer 4xx at the endpoint — the
     message is queued and the dispatcher serializes processing."""

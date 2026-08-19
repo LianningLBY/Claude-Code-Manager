@@ -2424,6 +2424,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       turn_id: nativeTurnId,
       native_item_type: (msg.data.native_item_type as string) || null,
       native_item_status: (msg.data.native_item_status as string) || null,
+      protocol_anomaly: msg.data.protocol_anomaly === 'legacy_tool_markup'
+        ? 'legacy_tool_markup'
+        : null,
       pty_cold_start: Boolean(msg.data.pty_cold_start),
       persisted: isPersisted,
     };
@@ -5260,6 +5263,44 @@ function AskUserCard({
   );
 }
 
+function ProtocolAnomalyCard({ message }: { message: ChatMessage }) {
+  const originalText = message.content || '';
+  return (
+    <div className="mx-4" role="alert" data-protocol-anomaly="legacy_tool_markup">
+      <div className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2.5 text-sm">
+        <div className="flex items-start gap-2 text-amber-300">
+          <AlertCircle size={16} className="mt-0.5 shrink-0" />
+          <div className="min-w-0 flex-1">
+            <div className="font-medium">工具协议异常</div>
+            <div className="mt-0.5 text-xs leading-5 text-amber-200/80">
+              以下内容是模型输出的未解析工具标记，未作为工具调用执行。
+            </div>
+          </div>
+          {message.timestamp && (
+            <MessageTimestamp timestamp={message.timestamp} className="shrink-0" />
+          )}
+        </div>
+        {originalText && (
+          <details className="mt-2 rounded-md border border-amber-500/20 bg-gray-950/40">
+            <summary className="cursor-pointer select-none px-3 py-2 text-xs text-amber-200/80 marker:text-amber-400">
+              查看未执行原文
+            </summary>
+            <div className="group relative border-t border-amber-500/20">
+              <CopyButton text={originalText} />
+              <pre
+                aria-label="未执行的工具标记原文"
+                className="max-h-80 overflow-auto whitespace-pre-wrap break-words px-3 py-2 pr-9 text-xs leading-5 text-gray-300 [overflow-wrap:anywhere]"
+              >
+                {originalText}
+              </pre>
+            </div>
+          </details>
+        )}
+      </div>
+    </div>
+  );
+}
+
 const MessageBubble = memo(function MessageBubble({
   message,
   taskId,
@@ -5296,6 +5337,13 @@ const MessageBubble = memo(function MessageBubble({
         onResolved={onAskUserResolved}
       />
     );
+  }
+
+  if (
+    message.role === 'assistant'
+    && message.protocol_anomaly === 'legacy_tool_markup'
+  ) {
+    return <ProtocolAnomalyCard message={message} />;
   }
 
   if (message.event_type === 'thinking') {

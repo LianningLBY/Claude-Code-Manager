@@ -21,7 +21,7 @@ import json
 import logging
 import uuid
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 import httpx
@@ -342,6 +342,10 @@ class WorkerTaskGeneration:
     termination_uncertainty: object | None = None
     legacy_carrier_conflict_present: bool = False
     legacy_carrier_conflict: object | None = None
+    # Provider is needed when canonicalizing relayed chat payloads.  It is
+    # intentionally not part of the generation marker: provider routing is
+    # already fenced by the Task row and is not an event identity field.
+    provider: str = field(default="claude", compare=False)
 
 
 def has_worker_termination_uncertainty(metadata: object) -> bool:
@@ -489,6 +493,7 @@ def worker_task_generation(
         worker_turn_handoff_acknowledged=(
             task.worker_turn_handoff_acknowledged
         ),
+        provider=(task.provider or "claude").lower(),
         termination_uncertainty_present=(
             WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY in metadata
         ),
@@ -720,6 +725,7 @@ async def read_worker_task_generation(
                 Task.worker_turn_handoff_from_generation,
                 Task.worker_turn_handoff_source_log_id,
                 Task.worker_turn_handoff_acknowledged,
+                Task.provider,
                 Task.metadata_,
             ).where(
                 Task.id == task_id,
@@ -757,6 +763,7 @@ async def read_worker_task_generation(
         worker_turn_handoff_acknowledged=(
             row.worker_turn_handoff_acknowledged
         ),
+        provider=(row.provider or "claude").lower(),
         termination_uncertainty_present=(
             isinstance(row.metadata_, dict)
             and WORKER_TERMINATION_UNCERTAINTY_METADATA_KEY in row.metadata_
@@ -5899,6 +5906,7 @@ class WorkerRelay:
                             WORKER_CONTEXT_PREFLIGHT_PROOF_KEY,
                         )
                     },
+                    provider=observed.provider,
                 )
                 persisted_forward["task_retry_count"] = event_retry_count
                 persisted_forward["task_turn_generation"] = event_turn_generation

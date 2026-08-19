@@ -3131,6 +3131,45 @@ async def test_relay_chat_event_stored_and_forwarded(relay, broadcaster, session
     assert event["timestamp"].endswith("Z")
 
 
+@pytest.mark.asyncio
+async def test_relay_uses_local_codex_provider_to_clear_remote_anomaly_marker(
+    relay,
+    broadcaster,
+    session_factory,
+):
+    worker = await _mk_worker(session_factory)
+    task = await _mk_task(
+        session_factory,
+        worker_id=worker.id,
+        provider="codex",
+    )
+    relay._tasks[worker.id] = {task.id}
+    xml_example = (
+        '<function_calls><invoke name="Bash">'
+        '<parameter name="command">pwd</parameter>'
+        '</invoke></function_calls>'
+    )
+
+    await relay._handle(
+        {
+            "channel": f"task:{task.id}",
+            "data": {
+                "event_type": "message",
+                "role": "assistant",
+                "content": xml_example,
+                "protocol_anomaly": "legacy_tool_markup",
+                **_relay_generation(task),
+            },
+        },
+        worker,
+    )
+
+    assert len(broadcaster.sent) == 1
+    _channel, event = broadcaster.sent[0]
+    assert event["content"] == xml_example
+    assert "protocol_anomaly" not in event
+
+
 async def test_relay_rejects_non_string_native_turn_identity(
     relay,
     broadcaster,

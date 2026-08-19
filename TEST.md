@@ -112,6 +112,7 @@ inode 不可替换；exact 80% 取得独占锁且证明容器空闲后清空，�
 | `test_user_event_tool_result_error` | type=user 事件含 is_error → 正确设置错误标记 |
 | `test_system_non_init` | system 非 init 子类型 → 映射为 system_event |
 | `test_assistant_empty_content_blocks` | assistant 空 content 块 → 默认为 message 事件 |
+| `test_assistant_legacy_tool_markup_remains_inert_text` / `test_protocol_anomaly_classifier_*` | Claude 将旧式 `<invoke>`/`<function_calls>` 作为文本输出时只标记协议异常、保持原文且绝不执行；Codex 和残缺/文档片段不误报 |
 
 #### `test_models.py` — ORM 模型
 

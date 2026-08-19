@@ -949,6 +949,8 @@ export interface ChatMessage {
   native_item_type?: string | null;
   native_item_status?: string | null;
   background_lifecycle?: BackgroundLifecycle | null;
+  /** Provider emitted literal legacy tool markup instead of a structured tool call. */
+  protocol_anomaly?: 'legacy_tool_markup' | null;
   /** Exact retained Claude follow-up correlated with its durable boundary. */
   followup_operation_id?: string | null;
   pty_followup_state?: 'completed' | 'uncertain' | null;

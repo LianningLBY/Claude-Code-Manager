@@ -24424,6 +24424,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         broadcast_data = persisted_chat_event(
                             monitor_log,
                             broadcast_data,
+                            provider=task_provider,
                         )
                         broadcast, broadcast_cancellation = (
                             await _settle_despite_cancellation(
@@ -24465,6 +24466,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     broadcast_data = persisted_chat_event(
                         monitor_log,
                         broadcast_data,
+                        provider=task_provider,
                     )
             if broadcast_data is not None:
                 await self.broadcaster.broadcast(f"task:{task_id}", broadcast_data)

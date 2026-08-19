@@ -5008,6 +5008,52 @@ async def test_codex_inject_uncertain_admission_returns_503(
 
 
 @pytest.mark.asyncio
+async def test_claude_channel_inject_uncertain_keeps_message_uncommitted(
+    client, session_factory
+):
+    from backend.services.instance_manager import (
+        ClaudeInjectionAdmissionUncertainError,
+    )
+
+    task_id = await _create_task_with_session(
+        client, session_factory, provider="claude", status="executing"
+    )
+    mock_im = MagicMock()
+    mock_im.pty_mode_enabled = True
+    mock_im.has_pty_session = MagicMock(return_value=True)
+    mock_im.inject_pty_message = AsyncMock(
+        side_effect=ClaudeInjectionAdmissionUncertainError(
+            "channel response was lost"
+        )
+    )
+    broadcaster = MagicMock(broadcast=AsyncMock())
+
+    with patch("backend.main.instance_manager", mock_im), patch(
+        "backend.main.broadcaster", broadcaster
+    ):
+        response = await client.post(
+            f"/api/tasks/{task_id}/inject",
+            json={"message": "possibly admitted once"},
+        )
+
+    assert response.status_code == 503
+    assert "结果不确定" in response.json()["detail"]
+    assert "任务会继续运行" in response.json()["detail"]
+    assert "不会自动重试" in response.json()["detail"]
+    broadcaster.broadcast.assert_not_awaited()
+    async with session_factory() as db:
+        stored = await db.scalar(
+            select(func.count())
+            .select_from(LogEntry)
+            .where(
+                LogEntry.task_id == task_id,
+                LogEntry.event_type == "user_message",
+            )
+        )
+    assert stored == 0
+
+
+@pytest.mark.asyncio
 async def test_codex_inject_requires_app_server_enabled(
     client, session_factory, monkeypatch
 ):

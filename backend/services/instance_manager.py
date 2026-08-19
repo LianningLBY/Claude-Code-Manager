@@ -416,6 +416,10 @@ class LiveAttachmentInjectionUnsupportedError(RuntimeError):
     """The active transport cannot safely access Manager upload paths."""
 
 
+class ClaudeInjectionAdmissionUncertainError(RuntimeError):
+    """A Claude channel write may have been accepted without a usable ACK."""
+
+
 class SharedProjectAgentLaunchDisabledError(RuntimeError):
     """Agent execution is disabled for Projects visible to other users."""
 
@@ -2169,13 +2173,21 @@ class InstanceManager:
         require_host_file_access: bool = False,
         followup_operation_id: str | None = None,
     ) -> bool:
-        """Steer one exact live Claude PTY foreground turn via stdin.
+        """Inject into one exact live Claude PTY foreground turn.
 
-        Experimental Claude Channels are not a delivery acknowledgement: the
-        channel server may be absent (CloudRouter/API sessions) or return 200
-        before Claude consumes the notification.  The pinned ``claude-pty``
-        API instead owns the active-turn boundary and serializes the complete
-        bracketed-paste write with process stop/interrupt.
+        Prefer Claude's native channel notification while the exact foreground
+        process advertises channel support.  A successful response proves the
+        local channel server wrote the notification to Claude's MCP stream; it
+        deliberately does not wait for the optional ``queue-operation`` JSONL
+        record.  That record can be absent while Claude is busy in a tool call,
+        and the legacy stdin steering implementation fail-closes such a timeout
+        by terminating an otherwise healthy process.
+
+        Once a channel request starts, a missing response is delivery-uncertain
+        and must never fall back to stdin: the notification may already be in
+        Claude's stream, so a second transport could execute the input twice.
+        Sessions without channel support retain the fenced stdin compatibility
+        path owned by ``claude-pty``.
 
         ``Task.instance_id`` can be absent for chat-launched turns, so the
         native session id resolves the candidate slot.  The immutable
@@ -2535,6 +2547,51 @@ class InstanceManager:
                     session_id,
                 )
                 return False
+            channel_inject = getattr(session, "inject", None)
+            if (
+                bool(getattr(native_process, "channels_enabled", False))
+                and callable(channel_inject)
+            ):
+                try:
+                    # BridgeHub returns only after the session-scoped channel
+                    # server has written the notification to its MCP stdout.
+                    # Settle that exact request across caller cancellation and
+                    # never issue a second transport after it has started.
+                    channel_delivery = asyncio.create_task(
+                        channel_inject(content)
+                    )
+                    caller_cancellation = await await_task_completion(
+                        channel_delivery
+                    )
+                    channel_admitted = bool(channel_delivery.result())
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    raise ClaudeInjectionAdmissionUncertainError(
+                        "Claude channel injection returned no authoritative "
+                        "local admission result"
+                    ) from exc
+                if not channel_admitted:
+                    logger.warning(
+                        "Claude channel injection for session %s returned "
+                        "without a local admission acknowledgement",
+                        session_id,
+                    )
+                    raise ClaudeInjectionAdmissionUncertainError(
+                        "Claude channel injection returned no authoritative "
+                        "local admission result"
+                    )
+                if caller_cancellation is not None:
+                    logger.info(
+                        "Finished Claude channel injection for session %s "
+                        "after caller cancellation",
+                        session_id,
+                    )
+                self._record_pty_followup_operation_route(
+                    followup_operation_id,
+                    None,
+                )
+                return True
             try:
                 # Once the exact provider side effect is admitted, finish its
                 # acknowledgement even if the HTTP caller disconnects.  Do

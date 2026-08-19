@@ -5012,9 +5012,21 @@ async def inject_message(
                     )
             except Exception as exc:
                 from backend.services.instance_manager import (
+                    ClaudeInjectionAdmissionUncertainError,
                     LiveAttachmentInjectionUnsupportedError,
                 )
 
+                if isinstance(
+                    exc,
+                    ClaudeInjectionAdmissionUncertainError,
+                ):
+                    raise HTTPException(
+                        503,
+                        "注入结果不确定：Claude channel 可能已接收消息，但本地 "
+                        "transport 未能确认。当前 Claude 任务会继续运行，系统不"
+                        "会自动重试；请先查看聊天记录或运行日志，再决定是否手动"
+                        "重试",
+                    ) from exc
                 if isinstance(
                     exc,
                     LiveAttachmentInjectionUnsupportedError,
@@ -5080,8 +5092,9 @@ async def inject_message(
                     # exact spinner-without-boundary bug this handoff avoids.
                     admitted_followup_operation_id = None
 
-        # The model has accepted the input.  From this point on, cancellation
-        # must not leave an invisible side effect that a client will retry.
+        # The provider transport has accepted the input. From this point on,
+        # cancellation must not leave an invisible side effect that a client
+        # will retry.
         # Re-audit the exact generation and persist its user-message record in
         # one short transaction, even when that generation changed meanwhile.
         await _settle_injected_message_audit(

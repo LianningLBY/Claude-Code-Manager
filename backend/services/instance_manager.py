@@ -417,7 +417,7 @@ class LiveAttachmentInjectionUnsupportedError(RuntimeError):
 
 
 class ClaudeInjectionAdmissionUncertainError(RuntimeError):
-    """A Claude channel write may have been accepted without a usable ACK."""
+    """A Claude live-injection write may have been accepted without a usable ACK."""
 
 
 class SharedProjectAgentLaunchDisabledError(RuntimeError):
@@ -2619,7 +2619,24 @@ class InstanceManager:
                         None,
                     )
                 return result
-            except Exception:
+            except Exception as exc:
+                # A complete legacy stdin steer has an at-most-once side
+                # effect even when Claude's optional queue receipt is absent.
+                # The pinned PTY dependency exposes that case explicitly so
+                # callers can preserve the process and refuse an automatic
+                # duplicate rather than misclassifying it as an unavailable
+                # turn.
+                try:
+                    from claude_pty import SteerDeliveryUncertainError
+                except ImportError:  # pragma: no cover - PTY mode is absent
+                    steer_uncertain_types: tuple[type[BaseException], ...] = ()
+                else:
+                    steer_uncertain_types = (SteerDeliveryUncertainError,)
+                if isinstance(exc, steer_uncertain_types):
+                    raise ClaudeInjectionAdmissionUncertainError(
+                        "Claude stdin steering completed without an "
+                        "authoritative delivery acknowledgement"
+                    ) from exc
                 logger.exception("PTY steer failed for session %s", session_id)
                 return False
 

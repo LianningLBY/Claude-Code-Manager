@@ -1189,6 +1189,43 @@ async def test_inject_pty_channel_failure_is_uncertain_without_stdin_retry():
 
 
 @pytest.mark.asyncio
+async def test_inject_pty_maps_dependency_stdin_uncertainty():
+    from claude_pty import SteerDeliveryUncertainError
+
+    native_process = types.SimpleNamespace(channels_enabled=False)
+    session = types.SimpleNamespace(
+        session_id="claude-session-stdin-uncertain",
+        is_alive=True,
+        active_turn_process=native_process,
+        steer_active_turn=AsyncMock(
+            side_effect=SteerDeliveryUncertainError(
+                "complete write has no queue acknowledgement"
+            )
+        ),
+    )
+    manager, consumer = _foreground_pty_manager(session)
+
+    try:
+        with pytest.raises(ClaudeInjectionAdmissionUncertainError):
+            await manager.inject_pty_message(
+                session.session_id,
+                "do not send this a second time",
+                task_id=99,
+                task_retry_count=2,
+                task_turn_generation=3,
+                expected_instance_id=7,
+            )
+    finally:
+        consumer.cancel()
+        await asyncio.gather(consumer, return_exceptions=True)
+
+    session.steer_active_turn.assert_awaited_once_with(
+        "do not send this a second time",
+        expected_process=native_process,
+    )
+
+
+@pytest.mark.asyncio
 async def test_inject_pty_channel_settles_after_caller_cancellation():
     native_process = types.SimpleNamespace(channels_enabled=True)
     release_channel = asyncio.Event()

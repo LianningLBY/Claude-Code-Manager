@@ -348,6 +348,20 @@ def test_protocol_anomaly_classifier_handles_many_incomplete_tags():
     ) is None
 
 
+def test_protocol_anomaly_classifier_treats_parameter_text_as_opaque():
+    text = (
+        '<invoke name="Bash"><parameter name="command">'
+        "printf '</invoke>'"
+        '</parameter></invoke>'
+    )
+
+    assert detect_assistant_protocol_anomaly(
+        "message",
+        "assistant",
+        text,
+    ) == LEGACY_TOOL_MARKUP_ANOMALY
+
+
 def test_result_legacy_tool_markup_is_marked(parser):
     result = parser.parse_line(json.dumps({
         "type": "result",

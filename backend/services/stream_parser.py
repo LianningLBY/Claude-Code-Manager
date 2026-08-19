@@ -26,6 +26,11 @@ def _contains_complete_legacy_tool_call(content: str) -> bool:
     for match in _LEGACY_TOOL_TAG.finditer(content):
         tag = match.group("tag").lower()
         if not match.group("closing"):
+            # Parameter text is opaque. A shell command or file body may
+            # contain literal target-looking tags; the first real closing
+            # parameter tag still determines the legacy call boundary.
+            if stack and stack[-1][0] == "parameter":
+                continue
             if len(stack) >= _MAX_LEGACY_TOOL_TAG_DEPTH:
                 stack.clear()
             stack.append([
@@ -36,6 +41,10 @@ def _contains_complete_legacy_tool_call(content: str) -> bool:
             continue
 
         if not stack or stack[-1][0] != tag:
+            if stack and stack[-1][0] == "parameter":
+                # See the opaque-parameter rule above: an invoke-looking
+                # closing string inside a command is not structural.
+                continue
             # A malformed target-tag nesting cannot prove a complete call.
             # Reset so a later independent, well-formed call can still match.
             stack.clear()

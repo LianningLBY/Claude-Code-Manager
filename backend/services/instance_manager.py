@@ -2178,19 +2178,20 @@ class InstanceManager:
     ) -> bool:
         """Inject into one exact live Claude PTY foreground turn.
 
-        Prefer Claude's native channel notification while the exact foreground
-        process advertises channel support.  A successful response proves the
-        local channel server wrote the notification to Claude's MCP stream; it
-        deliberately does not wait for the optional ``queue-operation`` JSONL
-        record.  That record can be absent while Claude is busy in a tool call,
-        and the legacy stdin steering implementation fail-closes such a timeout
-        by terminating an otherwise healthy process.
+        Active-turn user input uses Claude-PTY's fenced
+        ``steer_active_turn`` API.  The separate channel ``inject`` API is a
+        notification-only transport: it may be accepted by the local MCP
+        server without becoming a user message in the current turn and is only
+        guaranteed to appear at a later tool boundary.  Treating its HTTP 200
+        as a successful steer can report a message that the model never
+        consumed.
 
-        Once a channel request starts, a missing response is delivery-uncertain
-        and must never fall back to stdin: the notification may already be in
-        Claude's stream, so a second transport could execute the input twice.
-        Sessions without channel support retain the fenced stdin compatibility
-        path owned by ``claude-pty``.
+        ``steer_active_turn`` proves the complete stdin write and matching
+        queue acknowledgement.  If the write completed but the acknowledgement
+        is unavailable, the pinned PTY dependency raises its uncertain-
+        delivery error; this method maps it to
+        ``ClaudeInjectionAdmissionUncertainError`` so callers preserve the
+        process and refuse an automatic duplicate.
 
         ``Task.instance_id`` can be absent for chat-launched turns, so the
         native session id resolves the candidate slot.  The immutable
@@ -2544,57 +2545,14 @@ class InstanceManager:
                         resolved_followup_operation_id,
                     )
                 return admitted
-            if native_process is None or not callable(steer):
+            if not callable(steer):
                 logger.info(
                     "PTY steer rejected for session %s: turn is not steerable",
                     session_id,
                 )
                 return False
-            channel_inject = getattr(session, "inject", None)
-            if (
-                bool(getattr(native_process, "channels_enabled", False))
-                and callable(channel_inject)
-            ):
-                try:
-                    # BridgeHub returns only after the session-scoped channel
-                    # server has written the notification to its MCP stdout.
-                    # Settle that exact request across caller cancellation and
-                    # never issue a second transport after it has started.
-                    channel_delivery = asyncio.create_task(
-                        channel_inject(content)
-                    )
-                    caller_cancellation = await await_task_completion(
-                        channel_delivery
-                    )
-                    channel_admitted = bool(channel_delivery.result())
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    raise ClaudeInjectionAdmissionUncertainError(
-                        "Claude channel injection returned no authoritative "
-                        "local admission result"
-                    ) from exc
-                if not channel_admitted:
-                    logger.warning(
-                        "Claude channel injection for session %s returned "
-                        "without a local admission acknowledgement",
-                        session_id,
-                    )
-                    raise ClaudeInjectionAdmissionUncertainError(
-                        "Claude channel injection returned no authoritative "
-                        "local admission result"
-                    )
-                if caller_cancellation is not None:
-                    logger.info(
-                        "Finished Claude channel injection for session %s "
-                        "after caller cancellation",
-                        session_id,
-                    )
-                self._record_pty_followup_operation_route(
-                    followup_operation_id,
-                    None,
-                )
-                return True
+            # Active-turn input intentionally bypasses the notification-only
+            # channel transport and uses the fenced stdin steer below.
             try:
                 # Once the exact provider side effect is admitted, finish its
                 # acknowledgement even if the HTTP caller disconnects.  Do

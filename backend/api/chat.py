@@ -5029,10 +5029,10 @@ async def inject_message(
                 ):
                     raise HTTPException(
                         503,
-                        "注入结果不确定：Claude channel 可能已接收消息，但本地 "
-                        "transport 未能确认。当前 Claude 任务会继续运行，系统不"
-                        "会自动重试；请先查看聊天记录或运行日志，再决定是否手动"
-                        "重试",
+                        "注入结果不确定：Claude 输入可能已完整写入，但本地 "
+                        "transport 未能确认模型是否接收。当前 Claude 任务会继续"
+                        "运行，系统不会自动重试；请先查看聊天记录或运行日志，再"
+                        "决定是否手动重试",
                     ) from exc
                 if isinstance(
                     exc,

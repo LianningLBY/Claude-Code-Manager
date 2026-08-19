@@ -1126,7 +1126,7 @@ def _foreground_pty_manager(session):
 
 
 @pytest.mark.asyncio
-async def test_inject_pty_prefers_channel_for_exact_foreground_turn():
+async def test_inject_pty_prefers_fenced_stdin_for_exact_foreground_turn():
     native_process = types.SimpleNamespace(channels_enabled=True)
     session = types.SimpleNamespace(
         session_id="claude-session-1",
@@ -1151,48 +1151,53 @@ async def test_inject_pty_prefers_channel_for_exact_foreground_turn():
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)
 
-    session.inject.assert_awaited_once_with("change direction")
-    session.steer_active_turn.assert_not_awaited()
+    session.steer_active_turn.assert_awaited_once_with(
+        "change direction",
+        expected_process=native_process,
+    )
+    session.inject.assert_not_awaited()
     assert manager.consume_pty_followup_operation_route(
         "provisional-foreground"
     ) == (True, None)
 
 
 @pytest.mark.asyncio
-async def test_inject_pty_channel_failure_is_uncertain_without_stdin_retry():
+async def test_inject_pty_does_not_fallback_to_channel_after_steer_rejection():
     native_process = types.SimpleNamespace(channels_enabled=True)
     session = types.SimpleNamespace(
         session_id="claude-session-channel-uncertain",
         is_alive=True,
         active_turn_process=native_process,
-        steer_active_turn=AsyncMock(return_value=True),
-        inject=AsyncMock(return_value=False),
+        steer_active_turn=AsyncMock(return_value=False),
+        inject=AsyncMock(return_value=True),
     )
     manager, consumer = _foreground_pty_manager(session)
 
     try:
-        with pytest.raises(ClaudeInjectionAdmissionUncertainError):
-            await manager.inject_pty_message(
-                session.session_id,
-                "do not deliver twice",
-                task_id=99,
-                task_retry_count=2,
-                task_turn_generation=3,
-                expected_instance_id=7,
-            )
+        assert await manager.inject_pty_message(
+            session.session_id,
+            "do not deliver twice",
+            task_id=99,
+            task_retry_count=2,
+            task_turn_generation=3,
+            expected_instance_id=7,
+        ) is False
     finally:
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)
 
-    session.inject.assert_awaited_once_with("do not deliver twice")
-    session.steer_active_turn.assert_not_awaited()
+    session.steer_active_turn.assert_awaited_once_with(
+        "do not deliver twice",
+        expected_process=native_process,
+    )
+    session.inject.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_inject_pty_maps_dependency_stdin_uncertainty():
     from claude_pty import SteerDeliveryUncertainError
 
-    native_process = types.SimpleNamespace(channels_enabled=False)
+    native_process = types.SimpleNamespace(channels_enabled=True)
     session = types.SimpleNamespace(
         session_id="claude-session-stdin-uncertain",
         is_alive=True,
@@ -1202,6 +1207,7 @@ async def test_inject_pty_maps_dependency_stdin_uncertainty():
                 "complete write has no queue acknowledgement"
             )
         ),
+        inject=AsyncMock(return_value=True),
     )
     manager, consumer = _foreground_pty_manager(session)
 
@@ -1223,26 +1229,28 @@ async def test_inject_pty_maps_dependency_stdin_uncertainty():
         "do not send this a second time",
         expected_process=native_process,
     )
+    session.inject.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_inject_pty_channel_settles_after_caller_cancellation():
+async def test_inject_pty_steer_settles_after_caller_cancellation():
     native_process = types.SimpleNamespace(channels_enabled=True)
-    release_channel = asyncio.Event()
+    release_steer = asyncio.Event()
     injection_holder: dict[str, asyncio.Task] = {}
 
-    async def inject_once(content: str) -> bool:
+    async def steer_once(content: str, *, expected_process=None) -> bool:
         assert content == "admit despite disconnect"
+        assert expected_process is native_process
         injection_holder["task"].cancel()
-        await release_channel.wait()
+        await release_steer.wait()
         return True
 
     session = types.SimpleNamespace(
         session_id="claude-session-channel-cancelled",
         is_alive=True,
         active_turn_process=native_process,
-        steer_active_turn=AsyncMock(return_value=True),
-        inject=AsyncMock(side_effect=inject_once),
+        steer_active_turn=AsyncMock(side_effect=steer_once),
+        inject=AsyncMock(return_value=True),
     )
     manager, consumer = _foreground_pty_manager(session)
 
@@ -1258,16 +1266,19 @@ async def test_inject_pty_channel_settles_after_caller_cancellation():
         injection_holder["task"] = injection
         await asyncio.sleep(0)
         assert injection.done() is False
-        release_channel.set()
+        release_steer.set()
         assert await asyncio.wait_for(injection, timeout=0.5) is True
         assert injection.cancelled() is False
     finally:
-        release_channel.set()
+        release_steer.set()
         consumer.cancel()
         await asyncio.gather(consumer, return_exceptions=True)
 
-    session.inject.assert_awaited_once_with("admit despite disconnect")
-    session.steer_active_turn.assert_not_awaited()
+    session.steer_active_turn.assert_awaited_once_with(
+        "admit despite disconnect",
+        expected_process=native_process,
+    )
+    session.inject.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -2687,6 +2698,7 @@ async def test_inject_pty_uses_pinned_session_active_turn_api(tmp_path):
         is_alive = True
         exit_code = None
         rate_limited = False
+        channels_enabled = True
 
         def __init__(self):
             self.jsonl_path = str(jsonl_path)

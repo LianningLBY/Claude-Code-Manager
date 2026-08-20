@@ -790,7 +790,17 @@ class UpdateService:
             # A tokened v2 worker commits its result to the durable lease after
             # health verification. The /tmp mirror can be one write ahead and
             # therefore must never announce success while the lease is active.
-            data = lease
+            data = dict(lease)
+            # Releases before update-channel metadata was added to the lease
+            # already wrote it to the exact owner-token status/journal record.
+            # Enrich display-only metadata without allowing that mirror to
+            # override the lease's status, commit, migration, or fencing data.
+            for record in reversed(records[1:]):
+                if record.get("owner_token") != owner_token:
+                    continue
+                for key in ("update_id", "update_channel", "target_version"):
+                    if not data.get(key) and record.get(key):
+                        data[key] = record[key]
         else:
             records.sort(
                 key=lambda item: str(

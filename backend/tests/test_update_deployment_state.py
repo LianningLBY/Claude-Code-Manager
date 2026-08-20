@@ -926,6 +926,44 @@ def test_terminal_handoff_restores_release_metadata_and_completed_steps(
     assert all(step.message is None for step in service._current.steps)
 
 
+def test_recovery_enriches_legacy_lease_from_same_owner_status_metadata(
+    tmp_path,
+):
+    old_commit = "a" * 40
+    new_commit = "b" * 40
+    service = _service(tmp_path, running_commit=new_commit)
+    lease = {
+        "port": service.port,
+        "owner_token": "legacy-owner",
+        "status": "completed",
+        "old_commit": old_commit,
+        "new_commit": new_commit,
+        "expected_commit": new_commit,
+        "operation": "update",
+        "deployment_incomplete": False,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json(service._lease_file, lease)
+    _write_json(
+        service._status_file,
+        {
+            **lease,
+            "update_id": "upd_legacy",
+            "update_channel": "stable",
+            "target_version": "v1.0.2",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+    service.recover_from_status_file()
+
+    assert service._current is not None
+    assert service._current.status == "completed"
+    assert service._current.update_channel == "stable"
+    assert service._current.target_version == "v1.0.2"
+    assert all(step.status == "completed" for step in service._current.steps)
+
+
 @pytest.mark.asyncio
 async def test_repair_rejects_unsafe_modes_before_any_work(tmp_path):
     service = _service(tmp_path)

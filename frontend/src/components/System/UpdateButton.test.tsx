@@ -126,7 +126,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -140,7 +140,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       const { container } = render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -153,7 +153,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -168,7 +168,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -193,7 +193,7 @@ describe('UpdateButton', () => {
 
       render(<UpdateButton />, { container: innerDiv });
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -210,7 +210,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -230,7 +230,7 @@ describe('UpdateButton', () => {
 
       expect(findModalOverlay()).toBeNull();
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -241,7 +241,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(findModalOverlay()).toBeTruthy();
@@ -258,7 +258,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         const portals = document.body.querySelectorAll('[class*="z-[70]"]');
@@ -282,7 +282,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText('已是最新版本，无需更新。')).toBeInTheDocument();
@@ -293,12 +293,13 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(api.startUpdate).toHaveBeenCalledWith({
           dry_run: true,
           force: true,
+          channel: 'stable',
           branch: undefined,
         });
       });
@@ -316,7 +317,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText(/磁盘代码尚未完整部署/)).toBeInTheDocument();
@@ -332,7 +333,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText('3')).toBeInTheDocument();
@@ -343,7 +344,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText(/abc1234/)).toBeInTheDocument();
@@ -355,7 +356,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText('fix: bug')).toBeInTheDocument();
@@ -367,7 +368,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText('前端变更')).toBeInTheDocument();
@@ -384,7 +385,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText(/当前有 1 个任务正在执行/)).toBeInTheDocument();
@@ -408,7 +409,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await user.click(await screen.findByRole('button', { name: '重新核对运行状态' }));
 
       await waitFor(() => {
@@ -418,6 +419,7 @@ describe('UpdateButton', () => {
       expect(api.startUpdate).toHaveBeenLastCalledWith({
         dry_run: true,
         force: true,
+        channel: 'stable',
         branch: undefined,
       });
       expect(vi.mocked(api.reconcileUpdateState).mock.invocationCallOrder[0])
@@ -451,7 +453,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await user.click(await screen.findByRole('button', { name: '重新核对运行状态' }));
 
       expect(await screen.findByText(/#77 真实运行任务/)).toBeInTheDocument();
@@ -477,7 +479,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       expect(await screen.findByText(/当前有 1 个运行阻断项/)).toBeInTheDocument();
       expect(screen.getByText(/实例 worker-13（仍有未解除运行证据）/)).toBeInTheDocument();
@@ -499,7 +501,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       expect(await screen.findByText(/当前有 1 个运行阻断项/)).toBeInTheDocument();
       expect(screen.getByText(/监控子 Agent #7（running_auxiliary）/)).toBeInTheDocument();
@@ -519,7 +521,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await user.click(await screen.findByRole('button', { name: '重新核对运行状态' }));
 
       expect(await screen.findByText(
@@ -542,7 +544,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await user.click(await screen.findByRole('button', { name: '重新核对运行状态' }));
 
       expect(await screen.findByText('重新核对运行状态失败：维护锁正忙')).toBeInTheDocument();
@@ -566,7 +568,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await waitFor(() => {
         expect(screen.getByText('运行版本')).toBeInTheDocument();
@@ -587,7 +589,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       const repairButton = await screen.findByRole('button', { name: '修复并重新部署' });
       await user.click(repairButton);
@@ -610,7 +612,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       await user.click(await screen.findByRole('button', { name: '重启服务' }));
 
@@ -631,7 +633,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       const restartButton = await screen.findByRole('button', { name: '手动重启' });
       await user.click(restartButton);
@@ -655,7 +657,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       expect(await screen.findByText('数据库版本落后于代码')).toBeInTheDocument();
       expect(screen.getByText('待迁移')).toBeInTheDocument();
@@ -809,7 +811,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
 
       expect(await screen.findByText('无法拉取 origin/main')).toBeInTheDocument();
       expect(screen.getByText('更新失败')).toBeInTheDocument();
@@ -967,7 +969,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await waitFor(() => expect(findModalOverlay()).toBeTruthy());
 
       const confirmBtn = screen.getAllByText('确认更新').find(el => el.tagName === 'BUTTON');
@@ -1003,7 +1005,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await waitFor(() => expect(findModalOverlay()).toBeTruthy());
 
       simulateVisibilityChange('hidden');
@@ -1027,7 +1029,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await waitFor(() => expect(findModalOverlay()).toBeTruthy());
 
       const confirmBtn = screen.getAllByText('确认更新').find(el => el.tagName === 'BUTTON');
@@ -1057,7 +1059,7 @@ describe('UpdateButton', () => {
 
       const user = userEvent.setup();
       render(<UpdateButton />);
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await waitFor(() => expect(findModalOverlay()).toBeTruthy());
       const confirmBtn = screen.getAllByText('确认更新').find(el => el.tagName === 'BUTTON');
       await user.click(confirmBtn!);
@@ -1080,7 +1082,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await waitFor(() => expect(findModalOverlay()).toBeTruthy());
 
       const confirmBtn = screen.getAllByText('确认更新').find(el => el.tagName === 'BUTTON');
@@ -1104,7 +1106,7 @@ describe('UpdateButton', () => {
       const user = userEvent.setup();
       render(<UpdateButton />);
 
-      await user.click(screen.getByTitle('更新并重启'));
+      await openAndCheck(user);
       await waitFor(() => expect(findModalOverlay()).toBeTruthy());
 
       const confirmBtn = screen.getAllByText('确认更新').find(el => el.tagName === 'BUTTON');

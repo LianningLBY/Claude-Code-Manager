@@ -40,6 +40,11 @@ function findModalOverlay(): HTMLElement | null {
   return document.body.querySelector('[class*="fixed"][class*="z-[70]"]');
 }
 
+async function openAndCheck(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByTitle('更新并重启'));
+  await user.click(screen.getByRole('button', { name: '检查所选渠道' }));
+}
+
 describe('UpdateButton', () => {
   beforeEach(() => {
     sessionStorage.clear();
@@ -73,6 +78,47 @@ describe('UpdateButton', () => {
   it('renders the update trigger button', () => {
     render(<UpdateButton />);
     expect(screen.getByTitle('更新并重启')).toBeInTheDocument();
+  });
+
+  it('shows both update channels before checking and does not auto-fallback', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.startUpdate).mockRejectedValue(new Error('仓库没有可用的正式版本 tag'));
+    render(<UpdateButton />);
+
+    await user.click(screen.getByTitle('更新并重启'));
+
+    expect(screen.getByRole('radio', { name: /Stable 正式版/ })).toBeChecked();
+    expect(screen.getByRole('radio', { name: /Main 测试版/ })).not.toBeChecked();
+    expect(api.startUpdate).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: '检查所选渠道' }));
+
+    expect(await screen.findByText('仓库没有可用的正式版本 tag')).toBeInTheDocument();
+    expect(api.startUpdate).toHaveBeenCalledWith({
+      dry_run: true,
+      force: true,
+      channel: 'stable',
+      branch: undefined,
+    });
+    expect(api.startUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it('checks Main only after the user explicitly selects it', async () => {
+    const user = userEvent.setup();
+    render(<UpdateButton />);
+
+    await user.click(screen.getByTitle('更新并重启'));
+    await user.click(screen.getByRole('radio', { name: /Main 测试版/ }));
+    await user.click(screen.getByRole('button', { name: '检查所选渠道' }));
+
+    await waitFor(() => {
+      expect(api.startUpdate).toHaveBeenCalledWith({
+        dry_run: true,
+        force: true,
+        channel: 'main',
+        branch: undefined,
+      });
+    });
   });
 
   describe('modal portal rendering', () => {

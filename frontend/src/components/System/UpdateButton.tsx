@@ -67,7 +67,7 @@ interface ActiveTaskSummary {
   instance_claim_count?: number;
 }
 
-type Phase = 'idle' | 'checking' | 'confirming' | 'running' | 'restarting' | 'completed' | 'failed';
+type Phase = 'idle' | 'selecting' | 'checking' | 'confirming' | 'running' | 'restarting' | 'completed' | 'failed';
 type DeploymentAction = 'update' | 'repair' | 'restart' | 'none';
 
 const ACTIVE_UPDATE_KEY = 'ccm-update-active';
@@ -423,6 +423,27 @@ export function UpdateButton() {
     }
   };
 
+  const handleOpen = () => {
+    setDryRunResult(null);
+    setError('');
+    setPhase('selecting');
+  };
+
+  const handleChannelChange = async (next: 'stable' | 'main') => {
+    setChannel(next);
+    setDryRunResult(null);
+    setError('');
+    if (next === 'stable') setBranch('');
+    if (typeof api.updateUpdateChannel === 'function') {
+      try {
+        await api.updateUpdateChannel(next);
+      } catch {
+        // The visible selection remains usable for this check even if the
+        // preference could not be persisted.
+      }
+    }
+  };
+
   const handleReconcile = async () => {
     setReconciling(true);
     setReconcileError('');
@@ -602,7 +623,7 @@ export function UpdateButton() {
   return (
     <>
       <button
-        onClick={handleCheck}
+        onClick={handleOpen}
         className="relative p-2 rounded text-gray-400 hover:text-foreground hover:bg-gray-800 transition-colors"
         title="更新并重启"
       >
@@ -615,6 +636,7 @@ export function UpdateButton() {
             {/* Header */}
             <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700">
               <h3 className="text-sm font-semibold text-foreground">
+                {phase === 'selecting' && '选择更新渠道'}
                 {phase === 'checking' && '检查更新...'}
                 {phase === 'confirming' && '确认更新'}
                 {phase === 'running' && '更新中...'}
@@ -622,13 +644,64 @@ export function UpdateButton() {
                 {phase === 'completed' && '更新完成'}
                 {phase === 'failed' && '更新失败'}
               </h3>
-              {(phase === 'completed' || phase === 'failed' || phase === 'confirming') && (
+              {(phase === 'selecting' || phase === 'completed' || phase === 'failed' || phase === 'confirming') && (
                 <button onClick={handleClose} className="text-gray-400 hover:text-foreground text-lg">✕</button>
               )}
             </div>
 
             {/* Body */}
             <div className="flex-1 overflow-y-auto p-4 space-y-3">
+              {/* Channel selection always precedes a remote update check. */}
+              {phase === 'selecting' && (
+                <div className="space-y-3">
+                  <p className="text-sm text-gray-300">请选择本次要检查的更新渠道。</p>
+                  <div className="grid gap-2">
+                    <label className={`cursor-pointer rounded-lg border p-3 transition-colors ${channel === 'stable' ? 'border-indigo-500 bg-indigo-950/30' : 'border-gray-700 bg-gray-800/40 hover:border-gray-600'}`}>
+                      <span className="flex items-center gap-3">
+                        <input
+                          type="radio"
+                          name="update-channel"
+                          value="stable"
+                          checked={channel === 'stable'}
+                          onChange={() => void handleChannelChange('stable')}
+                        />
+                        <span>
+                          <span className="block text-sm font-medium text-foreground">Stable 正式版</span>
+                          <span className="block text-xs text-gray-500">只接收已发布的正式版本 tag</span>
+                        </span>
+                      </span>
+                    </label>
+                    <label className={`cursor-pointer rounded-lg border p-3 transition-colors ${channel === 'main' ? 'border-amber-500 bg-amber-950/20' : 'border-gray-700 bg-gray-800/40 hover:border-gray-600'}`}>
+                      <span className="flex items-center gap-3">
+                        <input
+                          type="radio"
+                          name="update-channel"
+                          value="main"
+                          checked={channel === 'main'}
+                          onChange={() => void handleChannelChange('main')}
+                        />
+                        <span>
+                          <span className="block text-sm font-medium text-foreground">Main 测试版</span>
+                          <span className="block text-xs text-amber-400">跟随 main 最新代码，可能包含未验证变更</span>
+                        </span>
+                      </span>
+                    </label>
+                  </div>
+                  {channel === 'main' && (
+                    <div className="flex items-center gap-2">
+                      <label htmlFor="update-branch" className="text-xs text-gray-400 shrink-0">分支:</label>
+                      <input
+                        id="update-branch"
+                        value={branch}
+                        onChange={e => setBranch(e.target.value)}
+                        placeholder="main"
+                        className="flex-1 bg-gray-800 text-foreground text-xs rounded px-2 py-1.5 border border-gray-700 focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Checking phase */}
               {phase === 'checking' && (
                 <div className="flex items-center gap-2 text-gray-400 text-sm">
@@ -646,14 +719,7 @@ export function UpdateButton() {
                     <select
                       id="update-channel"
                       value={channel}
-                      onChange={async e => {
-                        const next = e.target.value as 'stable' | 'main';
-                        setChannel(next);
-                        setBranch(next === 'main' ? branch : '');
-                        if (typeof api.updateUpdateChannel === 'function') {
-                          try { await api.updateUpdateChannel(next); } catch { /* keep local selection */ }
-                        }
-                      }}
+                      onChange={e => void handleChannelChange(e.target.value as 'stable' | 'main')}
                       className="bg-gray-800 text-foreground text-xs rounded px-2 py-1 border border-gray-700 focus:outline-none focus:border-indigo-500"
                     >
                       <option value="stable">Stable 正式版</option>
@@ -915,6 +981,14 @@ export function UpdateButton() {
 
             {/* Footer */}
             <div className="flex justify-end gap-2 px-4 py-3 border-t border-gray-700">
+              {phase === 'selecting' && (
+                <>
+                  <button onClick={handleClose} className="px-3 py-1.5 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700">取消</button>
+                  <button onClick={handleCheck} className="px-3 py-1.5 text-xs rounded bg-indigo-600 text-white hover:bg-indigo-500">
+                    检查所选渠道
+                  </button>
+                </>
+              )}
               {phase === 'confirming' && dryRunResult && action === 'update' && (
                 <>
                   <button onClick={handleClose} className="px-3 py-1.5 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700">取消</button>

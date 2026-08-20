@@ -3455,7 +3455,12 @@ export const api = {
     request<{ ok: boolean }>(`/api/user-skills/${id}`, { method: 'DELETE' }),
 
   // System Update
-  startUpdate: (data: { skip_frontend_build?: boolean; dry_run?: boolean; force?: boolean; branch?: string | null } = {}) =>
+  getUpdateChannel: () => request<{ update_channel: 'stable' | 'main' }>('/api/settings/update-channel'),
+  updateUpdateChannel: (update_channel: 'stable' | 'main') =>
+    request<{ update_channel: 'stable' | 'main' }>('/api/settings/update-channel', {
+      method: 'PUT', body: JSON.stringify({ update_channel }),
+    }),
+  startUpdate: (data: { skip_frontend_build?: boolean; dry_run?: boolean; force?: boolean; branch?: string | null; channel?: 'stable' | 'main' | null } = {}) =>
     request<any>('/api/system/update', { method: 'POST', body: JSON.stringify(data) }),
   getUpdateStatus: () =>
     request<any>('/api/system/update/status'),

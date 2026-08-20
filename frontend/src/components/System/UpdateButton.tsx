@@ -52,6 +52,9 @@ interface DeploymentCheck {
   update_blocked?: boolean;
   remote?: string;
   branch?: string;
+  channel?: 'stable' | 'main';
+  latest_version?: string;
+  version?: string;
   [key: string]: unknown;
 }
 
@@ -152,6 +155,7 @@ export function UpdateButton() {
   const [dryRunResult, setDryRunResult] = useState<DeploymentCheck | null>(null);
   const [skipFrontend, setSkipFrontend] = useState(false);
   const [branch, setBranch] = useState('');
+  const [channel, setChannel] = useState<'stable' | 'main'>('stable');
   const [error, setError] = useState('');
   const [oldCommit, setOldCommit] = useState('');
   const [newCommit, setNewCommit] = useState('');
@@ -221,6 +225,17 @@ export function UpdateButton() {
     return () => {
       if (reconnectTimer.current) clearInterval(reconnectTimer.current);
     };
+  }, []);
+
+  useEffect(() => {
+    if (typeof api.getUpdateChannel !== 'function') return;
+    void api.getUpdateChannel().then(result => {
+      if (result?.update_channel === 'stable' || result?.update_channel === 'main') {
+        setChannel(result.update_channel);
+      }
+    }).catch(() => {
+      // Older Managers do not expose channel settings; keep the safe default.
+    });
   }, []);
 
   useEffect(() => {
@@ -391,7 +406,12 @@ export function UpdateButton() {
     setReconcileError('');
     setReconcileNotice('');
     try {
-      const result = await api.startUpdate({ dry_run: true, force: true, branch: branch || undefined }) as DeploymentCheck;
+      const result = await api.startUpdate({
+        dry_run: true,
+        force: true,
+        channel,
+        branch: channel === 'main' ? (branch || undefined) : undefined,
+      }) as DeploymentCheck;
       if (result.error && !result.needs_restart && !result.repair_required) {
         throw new Error(result.error);
       }
@@ -419,7 +439,8 @@ export function UpdateButton() {
       const result = await api.startUpdate({
         dry_run: true,
         force: true,
-        branch: branch || undefined,
+        channel,
+        branch: channel === 'main' ? (branch || undefined) : undefined,
       }) as DeploymentCheck;
       if (result.error && !result.needs_restart && !result.repair_required) {
         throw new Error(result.error);
@@ -472,7 +493,11 @@ export function UpdateButton() {
   const handleConfirm = async () => {
     prepareRunning();
     try {
-      const result = await api.startUpdate({ skip_frontend_build: skipFrontend, branch: branch || undefined });
+      const result = await api.startUpdate({
+        skip_frontend_build: skipFrontend,
+        channel,
+        branch: channel === 'main' ? (branch || undefined) : undefined,
+      });
       if (result.update_id) {
         setOldCommit(result.old_commit || '');
       }
@@ -615,15 +640,25 @@ export function UpdateButton() {
               {/* Confirm phase */}
               {phase === 'confirming' && dryRunResult && (
                 <div className="space-y-3">
-                  {/* Branch selector */}
+                  {/* Update channel selector */}
                   <div className="flex items-center gap-2">
-                    <label className="text-xs text-gray-400 shrink-0">分支:</label>
-                    <input
-                      value={branch}
-                      onChange={e => setBranch(e.target.value)}
-                      placeholder="main"
-                      className="flex-1 bg-gray-800 text-foreground text-xs rounded px-2 py-1 border border-gray-700 focus:outline-none focus:border-indigo-500"
-                    />
+                    <label htmlFor="update-channel" className="text-xs text-gray-400 shrink-0">更新渠道:</label>
+                    <select
+                      id="update-channel"
+                      value={channel}
+                      onChange={async e => {
+                        const next = e.target.value as 'stable' | 'main';
+                        setChannel(next);
+                        setBranch(next === 'main' ? branch : '');
+                        if (typeof api.updateUpdateChannel === 'function') {
+                          try { await api.updateUpdateChannel(next); } catch { /* keep local selection */ }
+                        }
+                      }}
+                      className="bg-gray-800 text-foreground text-xs rounded px-2 py-1 border border-gray-700 focus:outline-none focus:border-indigo-500"
+                    >
+                      <option value="stable">Stable 正式版</option>
+                      <option value="main">Main 测试版</option>
+                    </select>
                     <button
                       onClick={handleCheck}
                       className="px-2 py-1 text-xs rounded bg-gray-800 text-gray-300 hover:bg-gray-700 shrink-0"
@@ -631,6 +666,20 @@ export function UpdateButton() {
                       重新检查
                     </button>
                   </div>
+                  {channel === 'main' && (
+                    <div className="flex items-center gap-2">
+                      <label className="text-xs text-gray-400 shrink-0">分支:</label>
+                      <input
+                        value={branch}
+                        onChange={e => setBranch(e.target.value)}
+                        placeholder="main"
+                        className="flex-1 bg-gray-800 text-foreground text-xs rounded px-2 py-1 border border-gray-700 focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                  )}
+                  {channel === 'main' && (
+                    <p className="text-xs text-amber-400">测试渠道会跟随 main 最新代码，可能包含未验证变更。</p>
+                  )}
                   {branch && branch !== 'main' && (
                     <p className="text-xs text-amber-400">⚠️ 将从分支 <span className="font-mono">{branch}</span> 更新（非 main）</p>
                   )}
@@ -693,6 +742,12 @@ export function UpdateButton() {
                         {dbInSync === false ? '待迁移' : dbInSync === true ? '已同步' : '无法确认'}
                       </span>
                     </div>
+                  )}
+
+                  {(dryRunResult.latest_version || dryRunResult.version) && (
+                    <p className="text-xs text-gray-400">
+                      正式版本：<span className="font-mono text-indigo-300">{dryRunResult.latest_version || dryRunResult.version}</span>
+                    </p>
                   )}
 
                   {action === 'none' ? (

@@ -104,6 +104,19 @@ def _make_gate_dispatcher(db_factory):
 # ---- update safety and version detection ----
 
 
+@pytest.mark.parametrize(
+    ("tag", "expected"),
+    [
+        ("v1.2.3", (1, 2, 3)),
+        ("v10.0.0+build.4", (10, 0, 0)),
+        ("v1.2.3-rc.1", None),
+        ("v1.2", None),
+    ],
+)
+def test_stable_tag_parser_accepts_only_semver_releases(tag, expected):
+    assert UpdateService._stable_tag_key(tag) == expected
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
 @pytest.mark.asyncio
 async def test_run_cmd_timeout_kills_grandchild_process_group(tmp_path):

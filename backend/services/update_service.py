@@ -25,6 +25,7 @@ from typing import Any
 
 from sqlalchemy import or_, select
 
+from backend.models.global_settings import GlobalSettings
 from backend.models.instance import Instance
 from backend.models.task import Task
 from backend.services.cancellation import finish_awaitable, settle_awaitable
@@ -103,6 +104,8 @@ class UpdateState:
     started_at: str = ""
     completed_at: str = ""
     error: str = ""
+    update_channel: str = "main"
+    target_version: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -135,6 +138,8 @@ class UpdateState:
             "started_at": self.started_at,
             "completed_at": self.completed_at,
             "error": self.error,
+            "update_channel": self.update_channel,
+            "target_version": self.target_version,
         }
 
 
@@ -1684,10 +1689,15 @@ class UpdateService:
         branch: str | None = None,
         *,
         force: bool = False,
+        channel: str | None = None,
     ) -> dict[str, Any]:
         """Check for available updates without applying them."""
-        target_branch = branch or "main"
-        version_result = await self._cached_version_check(target_branch, force=force)
+        selected_channel = channel or await self._configured_update_channel()
+        if selected_channel == "stable":
+            version_result = await self._cached_stable_version_check(force=force)
+        else:
+            target_branch = branch or "main"
+            version_result = await self._cached_version_check(target_branch, force=force)
         environment = await self._inspect_environment()
         active_tasks = await self._get_blocking_tasks()
         return {
@@ -1695,6 +1705,94 @@ class UpdateService:
             **environment,
             **self._blocker_payload(active_tasks),
         }
+
+    async def _configured_update_channel(self) -> str:
+        """Read this independent CCM instance's persisted update channel."""
+        if self.db_factory is None:
+            # Service unit tests without a DB retain the historical behavior.
+            return "main"
+        try:
+            async with self.db_factory() as db:
+                row = await db.get(GlobalSettings, 1)
+                return row.update_channel if row and row.update_channel in {"stable", "main"} else "stable"
+        except Exception:
+            logger.exception("Unable to read update channel; refusing stable ambiguity")
+            return "stable"
+
+    @staticmethod
+    def _stable_tag_key(tag: str) -> tuple[int, int, int] | None:
+        match = re.fullmatch(
+            r"v?(\d+)\.(\d+)\.(\d+)(?:\+[0-9A-Za-z.-]+)?", tag
+        )
+        if not match:
+            return None
+        return tuple(int(part) for part in match.groups())
+
+    async def _check_stable_updates(self) -> dict[str, Any]:
+        fetch = await self._run_cmd(["git", "fetch", "--tags"], timeout=60)
+        head = await self._disk_commit()
+        if fetch["returncode"] != 0:
+            return {
+                "has_updates": False,
+                "channel": "stable",
+                "current_commit": head,
+                "running_commit": self._running_commit,
+                "error": fetch["stderr"],
+            }
+        tags_result = await self._run_cmd(["git", "tag", "--list", "v*"])
+        candidates = []
+        for raw_tag in tags_result["stdout"].splitlines():
+            tag = raw_tag.strip()
+            version = self._stable_tag_key(tag)
+            if version is None:
+                continue
+            commit_result = await self._run_cmd(["git", "rev-list", "-n", "1", tag])
+            commit = commit_result["stdout"].strip()
+            if commit_result["returncode"] == 0 and re.fullmatch(r"[0-9a-fA-F]{40,64}", commit):
+                candidates.append((version, tag, commit))
+        if not candidates:
+            return {
+                "has_updates": False,
+                "channel": "stable",
+                "current_commit": head,
+                "running_commit": self._running_commit,
+                "error": "仓库没有可用的正式版本 tag",
+            }
+        _, version_tag, release_commit = max(candidates, key=lambda item: item[0])
+        commits_output = await self._run_cmd(["git", "log", "--oneline", f"{head}..{release_commit}"])
+        commits = [line for line in commits_output["stdout"].splitlines() if line.strip()]
+        diff_output = await self._run_cmd(["git", "diff", "--name-only", f"{head}..{release_commit}"])
+        files = [line for line in diff_output["stdout"].splitlines() if line.strip()]
+        return {
+            "has_updates": bool(commits) and head != release_commit,
+            "channel": "stable",
+            "version": version_tag,
+            "latest_version": version_tag,
+            "current_commit": head,
+            "running_commit": self._running_commit,
+            "latest_commit": release_commit,
+            "commits_behind": len(commits),
+            "commit_messages": [line.split(" ", 1)[-1] for line in commits[:20]],
+            "has_new_migrations": any(path.startswith("alembic/versions/") for path in files),
+            "migration_count": sum(path.startswith("alembic/versions/") for path in files),
+            "has_frontend_changes": any(path.startswith("frontend/") for path in files),
+            "has_package_changes": "frontend/package.json" in files,
+        }
+
+    async def _cached_stable_version_check(self, *, force: bool = False) -> dict[str, Any]:
+        key = "stable"
+        now = time.monotonic()
+        cached = self._dry_run_cache.get(key)
+        if not force and cached and cached[0] > now:
+            return dict(cached[1])
+        async with self._dry_run_lock:
+            cached = self._dry_run_cache.get(key)
+            if not force and cached and cached[0] > time.monotonic():
+                return dict(cached[1])
+            result = await self._check_stable_updates()
+            ttl = DRY_RUN_ERROR_CACHE_SECONDS if result.get("error") else DRY_RUN_CACHE_SECONDS
+            self._dry_run_cache[key] = (time.monotonic() + ttl, dict(result))
+            return result
 
     async def _check_remote_updates(self, target_branch: str) -> dict[str, Any]:
         """Fetch and compare versions; caller handles caching and task blockers."""
@@ -1766,6 +1864,7 @@ class UpdateService:
         skip_frontend_build: bool = False,
         force: bool = False,
         branch: str | None = None,
+        channel: str | None = None,
     ) -> dict[str, Any]:
         async with self._operation_lock:
             self._reconcile_external_terminal_status()
@@ -1798,6 +1897,10 @@ class UpdateService:
                     ),
                     "dirty_files": dirty_files,
                 }
+
+            selected_channel = channel or await self._configured_update_channel()
+            if selected_channel not in {"stable", "main"}:
+                return {"error": "无效的更新渠道"}
 
             # Freeze new claims before checking the DB.  Existing tasks are
             # never cancelled; callers retry after they finish.
@@ -1841,6 +1944,7 @@ class UpdateService:
                     operation="update",
                     started_at=datetime.now(timezone.utc).isoformat(),
                     steps=[StepInfo(name=n) for n in STEP_NAMES],
+                    update_channel=selected_channel,
                 )
                 self._current = state
                 self._inspection_cache = None
@@ -1851,7 +1955,7 @@ class UpdateService:
                 )
 
                 asyncio.create_task(
-                    self._run_pipeline(state, skip_frontend_build=skip_frontend_build, force=force, branch=branch)
+                    self._run_pipeline(state, skip_frontend_build=skip_frontend_build, force=force, branch=branch, channel=selected_channel)
                 )
                 return {"update_id": update_id, "status": "started"}
             except asyncio.CancelledError:
@@ -2245,10 +2349,11 @@ class UpdateService:
         skip_frontend_build: bool = False,
         force: bool = False,
         branch: str | None = None,
+        channel: str = "main",
     ):
         async with self._lock:
             try:
-                await self._pipeline_inner(state, skip_frontend_build, force, branch=branch)
+                await self._pipeline_inner(state, skip_frontend_build, force, branch=branch, channel=channel)
             except Exception as e:
                 state.status = "failed"
                 state.error = str(e)
@@ -2397,6 +2502,7 @@ class UpdateService:
         skip_frontend_build: bool,
         force: bool,
         branch: str | None = None,
+        channel: str = "main",
     ):
         target_branch = branch or "main"
         remote = await self._resolve_remote(target_branch)
@@ -2428,13 +2534,26 @@ class UpdateService:
             )
             return
 
-        (
-            protocol_ok,
-            protocol_error,
-            target_commit,
-        ) = await self._fetch_and_validate_target_protocol(
-            remote, target_branch, step
-        )
+        if channel == "stable":
+            stable_check = await self._check_stable_updates()
+            protocol_ok = False
+            protocol_error = stable_check.get("error", "无法解析正式版本")
+            target_commit = stable_check.get("latest_commit", "")
+            state.target_version = stable_check.get("latest_version", "")
+            if target_commit:
+                show = await self._run_cmd(["git", "show", f"{target_commit}:scripts/update_migrate.sh"], timeout=30)
+                protocol = self._parse_update_script_protocol(show["stdout"])
+                protocol_ok = show["returncode"] == 0 and protocol == UPDATE_SCRIPT_PROTOCOL_VERSION
+                if not protocol_ok:
+                    protocol_error = "正式版本的部署协议不兼容，拒绝更新"
+        else:
+            (
+                protocol_ok,
+                protocol_error,
+                target_commit,
+            ) = await self._fetch_and_validate_target_protocol(
+                remote, target_branch, step
+            )
         if not protocol_ok:
             await self._fail_step(step, state, protocol_error)
             return
@@ -2442,7 +2561,12 @@ class UpdateService:
         # Checkout target branch before pulling (keeps main clean when
         # updating to a feature branch for testing)
         current_branch = (await self._run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"]))["stdout"].strip()
-        if current_branch != target_branch:
+        if channel == "stable":
+            checkout_result = await self._run_cmd(["git", "checkout", "--detach", target_commit], step=step)
+            if checkout_result["returncode"] != 0:
+                await self._fail_step(step, state, f"正式版本 checkout 失败: {checkout_result['stderr']}")
+                return
+        elif current_branch != target_branch:
             # Create or reset local branch to match remote
             checkout_result = await self._run_cmd(
                 ["git", "checkout", "-B", target_branch, target_commit],
@@ -3432,6 +3556,10 @@ class UpdateService:
             "port": self.port,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+        if self._current:
+            data.setdefault("update_id", self._current.update_id)
+            data.setdefault("update_channel", self._current.update_channel)
+            data.setdefault("target_version", self._current.target_version)
         data.update(extra)
         try:
             self._atomic_write_json(self._status_file, data)

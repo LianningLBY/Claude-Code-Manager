@@ -18,14 +18,16 @@ from backend.schemas.global_settings import (
     GlobalSettingsUpdate,
     RuntimeSettingsResponse,
     RuntimeSettingsUpdate,
+    UpdateChannelResponse,
+    UpdateChannelUpdate,
 )
 from backend.schemas.plan import PlanPipelineConfig
+from backend.services.cancellation import finish_awaitable
 from backend.services.instance_capacity import (
     active_capacity_predicate,
     occupied_slot_predicate,
 )
 from backend.services.plan_pipeline_settings import effective_plan_pipeline_config
-from backend.services.cancellation import finish_awaitable
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
@@ -69,6 +71,30 @@ async def update_git_settings(
     await db.commit()
     await db.refresh(row)
     return row
+
+
+@router.get("/update-channel", response_model=UpdateChannelResponse)
+async def get_update_channel(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    require_admin(request)
+    row = await _get_or_create(db)
+    return UpdateChannelResponse(update_channel=row.update_channel or "stable")
+
+
+@router.put("/update-channel", response_model=UpdateChannelResponse)
+async def update_update_channel(
+    request: Request,
+    body: UpdateChannelUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    require_admin(request)
+    row = await _get_or_create(db)
+    row.update_channel = body.update_channel
+    await db.commit()
+    await db.refresh(row)
+    return UpdateChannelResponse(update_channel=row.update_channel)
 
 
 @router.get("/plan-pipeline", response_model=PlanPipelineConfig)
@@ -224,8 +250,7 @@ async def update_runtime_settings(
     db: AsyncSession = Depends(get_db),
 ):
     require_admin(request)
-    from backend.main import instance_manager
-    from backend.main import broadcaster
+    from backend.main import broadcaster, instance_manager
 
     async def persist_apply_and_respond() -> RuntimeSettingsResponse:
         async with _runtime_settings_lock:

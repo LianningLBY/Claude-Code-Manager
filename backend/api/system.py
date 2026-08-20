@@ -2,24 +2,23 @@ import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select, func
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import require_admin
 from backend.config import settings
 from backend.database import get_db
-from backend.models.task import Task
 from backend.models.instance import Instance
-
+from backend.models.task import Task
+from backend.services.claude_models import (
+    CLAUDE_CONTEXT_WINDOWS,
+    CLAUDE_MODEL_EFFORTS,
+)
 from backend.services.codex_models import (
     CODEX_MODEL_EFFORTS,
     CODEX_MODEL_SERVICE_TIERS,
     CODEX_SERVICE_TIERS,
     DEFAULT_CODEX_SERVICE_TIER,
-)
-from backend.services.claude_models import (
-    CLAUDE_CONTEXT_WINDOWS,
-    CLAUDE_MODEL_EFFORTS,
 )
 from backend.services.git_info import git_head_commit
 from backend.services.legacy_plan_execution import (
@@ -32,19 +31,19 @@ from backend.services.pr_review_runtime import (
 from backend.services.task_artifact_contract import (
     TASK_ARTIFACT_SCOPE_VERSION,
 )
-from backend.services.task_queue import ordinary_task_visibility_predicate
 from backend.services.task_id_namespace import (
     TASK_ID_NAMESPACE_PROTOCOL,
     TASK_ID_WORKER_NAMESPACE_START,
 )
-from backend.services.worker_launch_admission import (
-    WORKER_DELEGATED_LAUNCH_ADMISSION_PROTOCOL,
-)
+from backend.services.task_queue import ordinary_task_visibility_predicate
 from backend.services.worker_drain_proof import (
     WORKER_NODE_DRAIN_PROOF_PROTOCOL,
     build_worker_node_drain_proof,
     seal_worker_node_runtime,
     worker_node_drain_proof_signature,
+)
+from backend.services.worker_launch_admission import (
+    WORKER_DELEGATED_LAUNCH_ADMISSION_PROTOCOL,
 )
 from backend.services.worker_node_control import begin_worker_node_drain
 from backend.services.worker_routing_config import (
@@ -359,6 +358,7 @@ class UpdateRequest(BaseModel):
     dry_run: bool = False
     force: bool = False
     branch: str | None = None
+    channel: str | None = None
 
 
 class RollbackRequest(BaseModel):
@@ -376,13 +376,16 @@ def _get_update_service():
 async def start_update(req: UpdateRequest):
     if req.branch and not _BRANCH_RE.match(req.branch):
         raise HTTPException(status_code=400, detail="Invalid branch name")
+    if req.channel and req.channel not in {"stable", "main"}:
+        raise HTTPException(status_code=400, detail="Invalid update channel")
     svc = _get_update_service()
     if req.dry_run:
-        return await svc.dry_run(branch=req.branch, force=req.force)
+        return await svc.dry_run(branch=req.branch, force=req.force, channel=req.channel)
     result = await svc.start_update(
         skip_frontend_build=req.skip_frontend_build,
         force=req.force,
         branch=req.branch,
+        channel=req.channel,
     )
     if "error" in result:
         raise HTTPException(status_code=409, detail=result["error"])

@@ -25,6 +25,24 @@ async def test_get_runtime_settings(client):
 
 
 @pytest.mark.asyncio
+async def test_update_channel_defaults_to_stable_and_round_trips(client):
+    response = await client.get("/api/settings/update-channel")
+    assert response.status_code == 200
+    assert response.json() == {"update_channel": "stable"}
+
+    response = await client.put(
+        "/api/settings/update-channel", json={"update_channel": "main"}
+    )
+    assert response.status_code == 200
+    assert response.json() == {"update_channel": "main"}
+
+    response = await client.put(
+        "/api/settings/update-channel", json={"update_channel": "invalid"}
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("enabled", [True, False])
 async def test_runtime_settings_reports_effective_codex_main_mcp_capability(
     client, monkeypatch, enabled,
@@ -143,6 +161,7 @@ async def test_toggle_pty_mode_roundtrip(client):
 async def test_toggle_off_drains_idle_sessions(client):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
+
     from backend.main import instance_manager
 
     class FakeBackend:

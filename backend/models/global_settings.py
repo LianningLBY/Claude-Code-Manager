@@ -1,4 +1,4 @@
-from sqlalchemy import Boolean, Float, Integer, JSON, String, Text
+from sqlalchemy import JSON, Boolean, Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from backend.database import Base
@@ -35,3 +35,9 @@ class GlobalSettings(Base):
     plan_pipeline_config: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # CC settings template (JSON string) synced to all pool account config dirs
     cc_settings_template: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Which repository channel this independent CCM instance follows.
+    # Existing installations are migrated to stable; tests without a DB row
+    # retain the historical main behavior in UpdateService.
+    update_channel: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="stable", server_default="stable"
+    )

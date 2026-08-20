@@ -55,3 +55,11 @@ class CapacitySettingsResponse(BaseModel):
 class CapacitySettingsUpdate(BaseModel):
     # ``None`` deliberately clears the DB override and restores the env default.
     max_concurrent_instances: int | None = Field(default=None, ge=1, le=64)
+
+
+class UpdateChannelResponse(BaseModel):
+    update_channel: str
+
+
+class UpdateChannelUpdate(BaseModel):
+    update_channel: str = Field(pattern="^(stable|main)$")

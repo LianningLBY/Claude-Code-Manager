@@ -117,6 +117,85 @@ def test_stable_tag_parser_accepts_only_semver_releases(tag, expected):
     assert UpdateService._stable_tag_key(tag) == expected
 
 
+@pytest.mark.asyncio
+async def test_stable_check_treats_main_ahead_as_explicit_channel_switch(
+    tmp_path,
+):
+    service = _make_service(tmp_path, running_commit="b" * 40)
+    current = "b" * 40
+    release = "a" * 40
+
+    async def run_cmd(args, **_kwargs):
+        command = tuple(args)
+        if command == ("git", "fetch", "--tags"):
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if command == ("git", "rev-parse", "HEAD"):
+            return {"returncode": 0, "stdout": current, "stderr": ""}
+        if command == ("git", "tag", "--list", "v*"):
+            return {"returncode": 0, "stdout": "v1.0.0\n", "stderr": ""}
+        if command == ("git", "rev-list", "-n", "1", "v1.0.0"):
+            return {"returncode": 0, "stdout": release, "stderr": ""}
+        if command == ("git", "merge-base", "--is-ancestor", release, current):
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if command == ("git", "log", "--oneline", f"{current}..{release}"):
+            return {"returncode": 0, "stdout": "", "stderr": ""}
+        if command == ("git", "diff", "--name-only", f"{current}..{release}"):
+            return {
+                "returncode": 0,
+                "stdout": "frontend/src/App.tsx\n",
+                "stderr": "",
+            }
+        raise AssertionError(command)
+
+    service._run_cmd = AsyncMock(side_effect=run_cmd)
+
+    result = await service._check_stable_updates()
+
+    assert result["has_updates"] is True
+    assert result["update_kind"] == "stable_switch"
+    assert result["is_stable_downgrade"] is True
+    assert result["stable_switch_blocked"] is False
+    assert result["latest_version"] == "v1.0.0"
+    assert result["latest_commit"] == release
+
+
+@pytest.mark.asyncio
+async def test_stable_check_blocks_test_to_release_database_downgrade(
+    tmp_path,
+):
+    service = _make_service(tmp_path, running_commit="b" * 40)
+    current = "b" * 40
+    release = "a" * 40
+
+    async def run_cmd(args, **_kwargs):
+        command = tuple(args)
+        responses = {
+            ("git", "fetch", "--tags"): (0, ""),
+            ("git", "rev-parse", "HEAD"): (0, current),
+            ("git", "tag", "--list", "v*"): (0, "v1.0.0\n"),
+            ("git", "rev-list", "-n", "1", "v1.0.0"): (0, release),
+            ("git", "merge-base", "--is-ancestor", release, current): (0, ""),
+            ("git", "log", "--oneline", f"{current}..{release}"): (0, ""),
+            ("git", "diff", "--name-only", f"{current}..{release}"): (
+                0,
+                "alembic/versions/new_test_schema.py\n",
+            ),
+        }
+        if command not in responses:
+            raise AssertionError(command)
+        returncode, stdout = responses[command]
+        return {"returncode": returncode, "stdout": stdout, "stderr": ""}
+
+    service._run_cmd = AsyncMock(side_effect=run_cmd)
+
+    result = await service._check_stable_updates()
+
+    assert result["has_updates"] is False
+    assert result["stable_switch_blocked"] is True
+    assert result["migration_count"] == 1
+    assert "不能自动切回 Stable" in result["error"]
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process groups required")
 @pytest.mark.asyncio
 async def test_run_cmd_timeout_kills_grandchild_process_group(tmp_path):

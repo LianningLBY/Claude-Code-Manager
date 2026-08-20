@@ -55,6 +55,9 @@ interface DeploymentCheck {
   channel?: 'stable' | 'main';
   latest_version?: string;
   version?: string;
+  update_kind?: 'stable_upgrade' | 'stable_switch';
+  is_stable_downgrade?: boolean;
+  stable_switch_blocked?: boolean;
   [key: string]: unknown;
 }
 
@@ -817,7 +820,16 @@ export function UpdateButton() {
                   )}
 
                   {action === 'none' ? (
-                    <p className="text-sm text-gray-300">已是最新版本，无需更新。</p>
+                    <div className="space-y-1">
+                      <p className="text-sm text-gray-300">
+                        {dryRunResult.channel === 'stable' && dryRunResult.error
+                          ? 'Stable 当前不可切换。'
+                          : '已是最新版本，无需更新。'}
+                      </p>
+                      {dryRunResult.error && (
+                        <p className="text-xs text-red-300">{dryRunResult.error}</p>
+                      )}
+                    </div>
                   ) : action === 'restart' ? (
                     <div className="space-y-1 text-sm text-yellow-300">
                       <p>代码已是最新，但服务正在运行旧版本，需要重启。</p>
@@ -851,7 +863,11 @@ export function UpdateButton() {
                   ) : (
                     <>
                       <div className="text-sm text-gray-300 space-y-1">
-                        <p>发现 <span className="text-indigo-400 font-medium">{dryRunResult.commits_behind}</span> 个新提交</p>
+                        <p>
+                          {dryRunResult.is_stable_downgrade
+                            ? <>将从测试版切换回正式版 <span className="text-indigo-400 font-medium">{dryRunResult.latest_version || 'Stable'}</span></>
+                            : <>发现 <span className="text-indigo-400 font-medium">{dryRunResult.commits_behind}</span> 个新提交</>}
+                        </p>
                         <p className="text-xs text-gray-500">{dryRunResult.current_commit} → {dryRunResult.latest_commit}</p>
                         {dryRunResult.remote && (
                           <p className="text-xs text-gray-600">来源：{dryRunResult.remote}/{dryRunResult.branch || 'main'}</p>
@@ -997,7 +1013,9 @@ export function UpdateButton() {
                     disabled={actionDisabled}
                     className="px-3 py-1.5 text-xs rounded bg-indigo-600 text-white hover:bg-indigo-500 disabled:cursor-not-allowed disabled:opacity-50"
                   >
-                    {updateBlocked ? '等待任务完成' : '确认更新'}
+                    {updateBlocked
+                      ? '等待任务完成'
+                      : dryRunResult.is_stable_downgrade ? '切换到正式版' : '确认更新'}
                   </button>
                 </>
               )}

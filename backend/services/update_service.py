@@ -1759,12 +1759,25 @@ class UpdateService:
                 "error": "仓库没有可用的正式版本 tag",
             }
         _, version_tag, release_commit = max(candidates, key=lambda item: item[0])
+        # Stable is also an explicit escape hatch from a Main/test build.  A
+        # release tag behind the current checkout is a channel switch (and
+        # potentially a rollback), not "already up to date".
+        ancestry = await self._run_cmd(
+            ["git", "merge-base", "--is-ancestor", release_commit, head],
+            timeout=30,
+        )
+        is_downgrade = bool(head != release_commit and ancestry["returncode"] == 0)
         commits_output = await self._run_cmd(["git", "log", "--oneline", f"{head}..{release_commit}"])
         commits = [line for line in commits_output["stdout"].splitlines() if line.strip()]
         diff_output = await self._run_cmd(["git", "diff", "--name-only", f"{head}..{release_commit}"])
         files = [line for line in diff_output["stdout"].splitlines() if line.strip()]
-        return {
-            "has_updates": bool(commits) and head != release_commit,
+        migration_files = [path for path in files if path.startswith("alembic/versions/")]
+        downgrade_blocked = bool(is_downgrade and migration_files)
+        result = {
+            "has_updates": head != release_commit,
+            "update_kind": "stable_switch" if is_downgrade else "stable_upgrade",
+            "is_stable_downgrade": is_downgrade,
+            "stable_switch_blocked": downgrade_blocked,
             "channel": "stable",
             "version": version_tag,
             "latest_version": version_tag,
@@ -1773,11 +1786,18 @@ class UpdateService:
             "latest_commit": release_commit,
             "commits_behind": len(commits),
             "commit_messages": [line.split(" ", 1)[-1] for line in commits[:20]],
-            "has_new_migrations": any(path.startswith("alembic/versions/") for path in files),
-            "migration_count": sum(path.startswith("alembic/versions/") for path in files),
+            "has_new_migrations": bool(migration_files),
+            "migration_count": len(migration_files),
             "has_frontend_changes": any(path.startswith("frontend/") for path in files),
             "has_package_changes": "frontend/package.json" in files,
         }
+        if downgrade_blocked:
+            result["has_updates"] = False
+            result["error"] = (
+                "当前测试版与正式版之间包含数据库迁移，不能自动切回 Stable；"
+                "请先备份并制定数据库降级方案"
+            )
+        return result
 
     async def _cached_stable_version_check(self, *, force: bool = False) -> dict[str, Any]:
         key = "stable"
@@ -2509,6 +2529,7 @@ class UpdateService:
         has_new_migrations = False
         has_frontend_changes = False
         has_package_changes = False
+        is_stable_downgrade = False
 
         # Step 1: check clean → git pull
         step = state.steps[0]
@@ -2539,7 +2560,16 @@ class UpdateService:
             protocol_ok = False
             protocol_error = stable_check.get("error", "无法解析正式版本")
             target_commit = stable_check.get("latest_commit", "")
+            is_stable_downgrade = bool(stable_check.get("is_stable_downgrade"))
             state.target_version = stable_check.get("latest_version", "")
+            if stable_check.get("stable_switch_blocked"):
+                await self._fail_step(
+                    step,
+                    state,
+                    stable_check.get("error")
+                    or "当前数据库状态不允许自动切回 Stable",
+                )
+                return
             if target_commit:
                 show = await self._run_cmd(["git", "show", f"{target_commit}:scripts/update_migrate.sh"], timeout=30)
                 protocol = self._parse_update_script_protocol(show["stdout"])
@@ -2601,6 +2631,25 @@ class UpdateService:
             )
             return
         self._update_deployment_lease(expected_commit=state.new_commit)
+
+        # Never attempt an Alembic upgrade against a release whose schema is
+        # older than the currently-running Main build.  Alembic's normal
+        # ``upgrade head`` cannot downgrade safely; leave the checkout exactly
+        # as we found it and fail closed with an actionable message.
+        if channel == "stable" and is_stable_downgrade:
+            target_database = await self._database_revision_status()
+            if target_database["database_up_to_date"] is not True:
+                await self._run_cmd(
+                    ["git", "checkout", "--detach", disk_commit],
+                    timeout=60,
+                )
+                await self._fail_step(
+                    step,
+                    state,
+                    "当前测试版数据库包含正式版没有的迁移，不能自动切回 Stable；"
+                    "请先备份并按降级方案处理数据库",
+                )
+                return
 
         same_commit = state.old_commit == state.new_commit
         if same_commit and not force:

@@ -329,6 +329,24 @@ describe('UpdateButton', () => {
   });
 
   describe('modal content rendering', () => {
+    it('labels a Main-to-Stable change as a channel switch', async () => {
+      vi.mocked(api.startUpdate).mockResolvedValue({
+        ...mockDryRun,
+        channel: 'stable',
+        latest_version: 'v1.0.0',
+        update_kind: 'stable_switch',
+        is_stable_downgrade: true,
+        commits_behind: 0,
+      } as never);
+
+      const user = userEvent.setup();
+      render(<UpdateButton />);
+      await openAndCheck(user);
+
+      expect(await screen.findByText(/将从测试版切换回正式版/)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: '切换到正式版' })).toBeEnabled();
+    });
+
     it('displays commit count when updates available', async () => {
       const user = userEvent.setup();
       render(<UpdateButton />);

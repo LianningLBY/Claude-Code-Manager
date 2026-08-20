@@ -691,16 +691,24 @@ export function UpdateButton() {
                     </label>
                   </div>
                   {channel === 'main' && (
-                    <div className="flex items-center gap-2">
-                      <label htmlFor="update-branch" className="text-xs text-gray-400 shrink-0">分支:</label>
-                      <input
-                        id="update-branch"
-                        value={branch}
-                        onChange={e => setBranch(e.target.value)}
-                        placeholder="main"
-                        className="flex-1 bg-gray-800 text-foreground text-xs rounded px-2 py-1.5 border border-gray-700 focus:outline-none focus:border-indigo-500"
-                      />
-                    </div>
+                    <>
+                      <div className="rounded-lg border border-amber-700/60 bg-amber-950/30 p-3 text-xs text-amber-200" role="alert">
+                        <p className="font-medium">切换到测试版前请注意</p>
+                        <p className="mt-1 text-amber-300/90">
+                          如果 Main 包含正式版没有的数据库迁移，更新后将无法一键切回 Stable，需先备份并制定数据库降级方案。
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <label htmlFor="update-branch" className="text-xs text-gray-400 shrink-0">分支:</label>
+                        <input
+                          id="update-branch"
+                          value={branch}
+                          onChange={e => setBranch(e.target.value)}
+                          placeholder="main"
+                          className="flex-1 bg-gray-800 text-foreground text-xs rounded px-2 py-1.5 border border-gray-700 focus:outline-none focus:border-indigo-500"
+                        />
+                      </div>
+                    </>
                   )}
                 </div>
               )}
@@ -900,10 +908,15 @@ export function UpdateButton() {
                         )}
                       </div>
 
-                      {dryRunResult.has_new_migrations && (
-                        <p className="text-xs text-yellow-400">
-                          ⚠️ 包含数据库迁移，更新时会短暂停服。数据库将自动备份。
-                        </p>
+                  {dryRunResult.has_new_migrations && (
+                        <div className="rounded border border-yellow-700/60 bg-yellow-950/30 p-2 text-xs text-yellow-300" role="alert">
+                          <p>⚠️ 包含数据库迁移，更新时会短暂停服并自动备份数据库。</p>
+                          {channel === 'main' && (
+                            <p className="mt-1 font-medium text-amber-300">
+                              更新后可能无法一键切回 Stable；切回前需要数据库降级方案。
+                            </p>
+                          )}
+                        </div>
                       )}
                     </>
                   )}

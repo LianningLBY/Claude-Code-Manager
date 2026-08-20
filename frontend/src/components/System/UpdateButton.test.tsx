@@ -109,6 +109,10 @@ describe('UpdateButton', () => {
 
     await user.click(screen.getByTitle('更新并重启'));
     await user.click(screen.getByRole('radio', { name: /Main 测试版/ }));
+
+    expect(screen.getByText('切换到测试版前请注意')).toBeInTheDocument();
+    expect(screen.getByText(/如果 Main 包含正式版没有的数据库迁移/)).toBeInTheDocument();
+
     await user.click(screen.getByRole('button', { name: '检查所选渠道' }));
 
     await waitFor(() => {
@@ -329,6 +333,23 @@ describe('UpdateButton', () => {
   });
 
   describe('modal content rendering', () => {
+    it('repeats the Stable rollback warning when Main contains migrations', async () => {
+      vi.mocked(api.startUpdate).mockResolvedValue({
+        ...mockDryRun,
+        channel: 'main',
+        has_new_migrations: true,
+        migration_count: 1,
+      } as never);
+
+      const user = userEvent.setup();
+      render(<UpdateButton />);
+      await user.click(screen.getByTitle('更新并重启'));
+      await user.click(screen.getByRole('radio', { name: /Main 测试版/ }));
+      await user.click(screen.getByRole('button', { name: '检查所选渠道' }));
+
+      expect(await screen.findByText(/更新后可能无法一键切回 Stable/)).toBeInTheDocument();
+    });
+
     it('labels a Main-to-Stable change as a channel switch', async () => {
       vi.mocked(api.startUpdate).mockResolvedValue({
         ...mockDryRun,

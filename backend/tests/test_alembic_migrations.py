@@ -117,6 +117,7 @@ DELIVERY_PR_MONITOR_MERGE_REVISION = "f4c7a9d2e610"
 INSTANCE_PROCESS_IDENTITY_REVISION = "a56a13b7f287"
 PR_REVIEW_RESULT_EVIDENCE_REVISION = "b1d7e4a9c302"
 PR_MONITOR_DISPLAY_TASK_REVISION = "f5d7b9e1c3a4"
+UPDATE_CHANNEL_REVISION = "fa1c2e3d4b5f"
 CAPABILITY_CORE_REVISION = "6a4c2e9f1b73"
 CODE_REVIEW_REVISION = "8d4e1f7a9c20"
 DELIVERY_LOOP_REVISION = "9e5b2a7c4d10"
@@ -127,7 +128,7 @@ PLAN_RUNTIME_RECEIPT_REVISION = "8d2f5b7a1c90"
 WORKER_PLAN_DISPATCH_RECEIPT_REVISION = "a6e4c2d9f810"
 WORKER_TASK_DELETE_RECEIPT_REVISION = "b7f3d1a8c920"
 WORKER_PLAN_IMPORT_RECEIPT_REVISION = "d3c8a7f1e620"
-CURRENT_HEAD_REVISION = PR_MONITOR_DISPLAY_TASK_REVISION
+CURRENT_HEAD_REVISION = UPDATE_CHANNEL_REVISION
 
 
 def _alembic_cfg(db_path: str) -> Config:
@@ -10550,7 +10551,13 @@ class TestPublishedMigrationHistory:
         cfg = _alembic_cfg(str(tmp_path / "graph.db"))
         script = ScriptDirectory.from_config(cfg)
 
-        assert set(script.get_heads()) == {PR_MONITOR_DISPLAY_TASK_REVISION}
+        assert set(script.get_heads()) == {UPDATE_CHANNEL_REVISION}
+        assert set(
+            script.get_revision(UPDATE_CHANNEL_REVISION).down_revision
+        ) == {
+            MAIN_SSH_MERGE_REVISION,
+            PR_MONITOR_DISPLAY_TASK_REVISION,
+        }
         assert (
             script.get_revision(PR_MONITOR_DISPLAY_TASK_REVISION).down_revision
             == PR_REVIEW_RESULT_EVIDENCE_REVISION

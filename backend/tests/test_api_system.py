@@ -212,7 +212,30 @@ async def test_update_dry_run_forwards_force_and_branch(client, monkeypatch):
 
     assert resp.status_code == 200
     assert resp.json() == {"has_updates": False}
-    service.dry_run.assert_awaited_once_with(branch="release/test", force=True)
+    service.dry_run.assert_awaited_once_with(
+        branch="release/test",
+        force=True,
+        channel=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_dry_run_forwards_explicit_channel(client, monkeypatch):
+    service = MagicMock()
+    service.dry_run = AsyncMock(return_value={"has_updates": False})
+    monkeypatch.setattr("backend.main.update_service", service)
+
+    resp = await client.post(
+        "/api/system/update",
+        json={"dry_run": True, "force": True, "channel": "stable"},
+    )
+
+    assert resp.status_code == 200
+    service.dry_run.assert_awaited_once_with(
+        branch=None,
+        force=True,
+        channel="stable",
+    )
 
 
 @pytest.mark.asyncio
@@ -235,6 +258,7 @@ async def test_update_returns_conflict_when_active_tasks_block_start(client, mon
         skip_frontend_build=False,
         force=True,
         branch="main",
+        channel=None,
     )
 
 

@@ -882,6 +882,19 @@ async def test_concurrent_dry_runs_share_one_remote_check(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_main_dry_run_identifies_its_update_channel(tmp_path):
+    svc = _make_service(tmp_path)
+    svc._check_remote_updates = AsyncMock(return_value={
+        "has_updates": False,
+        "branch": "main",
+    })
+
+    result = await svc.dry_run(channel="main", force=True)
+
+    assert result["channel"] == "main"
+
+
+@pytest.mark.asyncio
 async def test_dry_run_cache_keeps_blockers_fresh_and_force_bypasses_cache(tmp_path):
     svc = _make_service(tmp_path)
     svc._check_remote_updates = AsyncMock(return_value={

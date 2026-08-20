@@ -1698,6 +1698,7 @@ class UpdateService:
         else:
             target_branch = branch or "main"
             version_result = await self._cached_version_check(target_branch, force=force)
+        version_result.setdefault("channel", selected_channel)
         environment = await self._inspect_environment()
         active_tasks = await self._get_blocking_tasks()
         return {

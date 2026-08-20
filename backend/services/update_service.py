@@ -713,6 +713,13 @@ class UpdateService:
             database_migration_applied=(
                 self._current.database_migration_applied if self._current else False
             ),
+            update_id=self._current.update_id if self._current else "",
+            update_channel=(
+                self._current.update_channel if self._current else "main"
+            ),
+            target_version=(
+                self._current.target_version if self._current else ""
+            ),
         ):
             raise RuntimeError("部署租约已被其他进程替换，拒绝停服")
 
@@ -872,6 +879,13 @@ class UpdateService:
                 if normalized in {"failed", "rolled_back"}
                 else ""
             ),
+            update_channel=(
+                str(data.get("update_channel") or "main")
+                if str(data.get("update_channel") or "main")
+                in {"stable", "main"}
+                else "main"
+            ),
+            target_version=str(data.get("target_version") or ""),
             steps=[StepInfo(name=name) for name in STEP_NAMES],
         )
         step_name = str(data.get("step") or "")
@@ -1023,6 +1037,19 @@ class UpdateService:
             or terminal_record.get("updated_at")
             or datetime.now(timezone.utc).isoformat()
         )
+        recovered_channel = str(
+            terminal_record.get("update_channel") or ""
+        )
+        if recovered_channel in {"stable", "main"}:
+            self._current.update_channel = recovered_channel
+        self._current.target_version = str(
+            terminal_record.get("target_version")
+            or self._current.target_version
+        )
+        if status in {"completed", "rolled_back"}:
+            for step in self._current.steps:
+                step.status = "completed"
+                step.message = None
         if status in {"completed", "rolled_back"}:
             self._running_commit = (
                 self._current.new_commit
@@ -1973,6 +2000,8 @@ class UpdateService:
                     status="running",
                     old_commit=self._running_commit,
                     deployment_incomplete=False,
+                    update_id=update_id,
+                    update_channel=selected_channel,
                 )
 
                 asyncio.create_task(
@@ -2563,6 +2592,9 @@ class UpdateService:
             target_commit = stable_check.get("latest_commit", "")
             is_stable_downgrade = bool(stable_check.get("is_stable_downgrade"))
             state.target_version = stable_check.get("latest_version", "")
+            self._update_deployment_lease(
+                target_version=state.target_version,
+            )
             if stable_check.get("stable_switch_blocked"):
                 await self._fail_step(
                     step,

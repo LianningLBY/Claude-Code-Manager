@@ -889,6 +889,43 @@ def test_fresh_tokenless_legacy_starting_waits_for_exact_terminal(tmp_path):
     assert service._legacy_handoff is False
 
 
+def test_terminal_handoff_restores_release_metadata_and_completed_steps(
+    tmp_path,
+):
+    old_commit = "a" * 40
+    new_commit = "b" * 40
+    service = _service(tmp_path, running_commit=new_commit)
+    service._current = _state(
+        status="restarting",
+        operation="update",
+        old_commit=old_commit,
+        new_commit=new_commit,
+    )
+    service._current.steps[-1].status = "failed"
+    token = service._claim_deployment_lease("update")
+    assert token
+    lease = service._read_deployment_lease()
+    lease.update(
+        {
+            "status": "completed",
+            "handoff": False,
+            "expected_commit": new_commit,
+            "update_channel": "stable",
+            "target_version": "v1.0.0",
+            "deployment_incomplete": False,
+        }
+    )
+    _write_json(service._lease_file, lease)
+
+    service._reconcile_external_terminal_status()
+
+    assert service._current.status == "completed"
+    assert service._current.update_channel == "stable"
+    assert service._current.target_version == "v1.0.0"
+    assert all(step.status == "completed" for step in service._current.steps)
+    assert all(step.message is None for step in service._current.steps)
+
+
 @pytest.mark.asyncio
 async def test_repair_rejects_unsafe_modes_before_any_work(tmp_path):
     service = _service(tmp_path)

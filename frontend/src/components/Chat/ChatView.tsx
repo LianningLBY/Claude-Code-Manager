@@ -1001,9 +1001,6 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
   const previousBrowserReviewActive = useRef(false);
   const handleBrowserReviewAvailable = useCallback((available: boolean) => {
     setBrowserReviewAvailable(available);
-    if (available && !previousBrowserReviewAvailable.current) {
-      setShowBrowserReviewPanel(true);
-    }
     previousBrowserReviewAvailable.current = available;
   }, []);
   const handleBrowserReviewActive = useCallback((active: boolean) => {

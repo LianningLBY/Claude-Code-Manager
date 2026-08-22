@@ -738,6 +738,50 @@ async def test_cleanup_preserves_manager_owned_live_generation(db_factory):
 
 
 @pytest.mark.asyncio
+async def test_cleanup_preserves_terminal_consumer_recovery_evidence(db_factory):
+    """A reaped generation awaiting DB retry remains manager-owned."""
+    d = _make_dispatcher(db_factory)
+    d.instance_manager.is_running = MagicMock(return_value=True)
+
+    async with db_factory() as db:
+        task = Task(
+            title="terminal-recovery-task",
+            description="test",
+            status="executing",
+        )
+        db.add(task)
+        await db.flush()
+        inst = Instance(
+            name="terminal-recovery-worker",
+            status="running",
+            pid=43211,
+            current_task_id=task.id,
+        )
+        db.add(inst)
+        await db.flush()
+        task.instance_id = inst.id
+        await db.commit()
+        inst_id = inst.id
+        task_id = task.id
+
+    process = MagicMock(returncode=130, pid=43211)
+    d.instance_manager._consumer_recovery_pending = {
+        (inst_id, process): MagicMock(tracked_generation=True),
+    }
+
+    await d._cleanup_stale_state()
+
+    async with db_factory() as db:
+        inst = await db.get(Instance, inst_id)
+        task = await db.get(Task, task_id)
+        assert inst.status == "running"
+        assert inst.pid == 43211
+        assert inst.current_task_id == task_id
+        assert task.status == "executing"
+        assert task.instance_id == inst_id
+
+
+@pytest.mark.asyncio
 async def test_cleanup_preserves_live_codex_registry_task_generation(db_factory):
     """A live native Codex turn owns its shared-transport Instance row."""
     d = _make_dispatcher(db_factory)

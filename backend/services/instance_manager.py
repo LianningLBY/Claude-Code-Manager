@@ -847,7 +847,10 @@ class _ConsumerRecoveryEvidence:
     task_id: int | None
     task_retry_count: int | None
     task_turn_generation: int | None
+    instance_pid: int | None
     instance_started_at: datetime | None
+    consumer: asyncio.Task | None = None
+    record: _OutputConsumerRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -7337,7 +7340,10 @@ class InstanceManager:
         task_id: int | None,
         task_retry_count: int | None,
         task_turn_generation: int | None,
+        instance_pid: int | None,
         instance_started_at: datetime | None,
+        consumer: asyncio.Task | None = None,
+        record: _OutputConsumerRecord | None = None,
     ) -> _ConsumerRecoveryEvidence:
         """Retain one exact terminal generation whose DB recovery is unknown."""
 
@@ -7347,7 +7353,10 @@ class InstanceManager:
             task_id=task_id,
             task_retry_count=task_retry_count,
             task_turn_generation=task_turn_generation,
+            instance_pid=instance_pid,
             instance_started_at=instance_started_at,
+            consumer=consumer,
+            record=record,
         )
         key = (instance_id, process)
         self._consumer_recovery_pending[key] = evidence
@@ -7366,6 +7375,97 @@ class InstanceManager:
         key = (instance_id, process)
         self._consumer_recovery_pending.pop(key, None)
         self._consumer_errors.pop(key, None)
+
+    def _terminal_stop_recovery_match(
+        self,
+        instance_id: int,
+        *,
+        process: Any | None = None,
+        expected_task_id: int | None | object = _EXPECTED_GENERATION_UNSET,
+        expected_task_retry_count: int | object = _EXPECTED_GENERATION_UNSET,
+        expected_task_turn_generation: int | object = (
+            _EXPECTED_GENERATION_UNSET
+        ),
+        expected_pid: int | None | object = _EXPECTED_GENERATION_UNSET,
+        expected_started_at: datetime | None | object = (
+            _EXPECTED_GENERATION_UNSET
+        ),
+    ) -> tuple[Any, _ConsumerRecoveryEvidence] | None:
+        """Return one exact reaped generation awaiting only durable settlement."""
+
+        matches: list[tuple[Any, _ConsumerRecoveryEvidence]] = []
+        mapped_process = self.processes.get(instance_id)
+        mapped_process_group = self._process_groups.get(instance_id)
+        mapped_container_process = self._container_exec_processes.get(
+            instance_id
+        )
+        mapped_task = self._tasks.get(instance_id)
+        mapped_record = self._consumer_records.get(instance_id)
+        for (
+            recovery_instance_id,
+            recovery_process,
+        ), evidence in self._consumer_recovery_pending.items():
+            if (
+                recovery_instance_id != instance_id
+                or not evidence.tracked_generation
+                or (process is not None and recovery_process is not process)
+                or (
+                    expected_task_id is not _EXPECTED_GENERATION_UNSET
+                    and evidence.task_id != expected_task_id
+                )
+                or (
+                    expected_task_retry_count
+                    is not _EXPECTED_GENERATION_UNSET
+                    and evidence.task_retry_count
+                    != expected_task_retry_count
+                )
+                or (
+                    expected_task_turn_generation
+                    is not _EXPECTED_GENERATION_UNSET
+                    and evidence.task_turn_generation
+                    != expected_task_turn_generation
+                )
+                or (
+                    expected_pid is not _EXPECTED_GENERATION_UNSET
+                    and evidence.instance_pid != expected_pid
+                )
+                or (
+                    expected_started_at is not _EXPECTED_GENERATION_UNSET
+                    and evidence.instance_started_at != expected_started_at
+                )
+                or getattr(recovery_process, "pid", None)
+                != evidence.instance_pid
+                or not self._generation_reap_confirmed(
+                    instance_id,
+                    recovery_process,
+                )
+                or evidence.consumer is None
+                or evidence.record is None
+                or evidence.record.process is not recovery_process
+                or evidence.record.task is not evidence.consumer
+                or not evidence.consumer.done()
+                or (
+                    mapped_process is not None
+                    and mapped_process is not recovery_process
+                )
+                or (
+                    mapped_process_group is not None
+                    and mapped_process_group is not recovery_process
+                )
+                or (
+                    mapped_container_process is not None
+                    and mapped_container_process is not recovery_process
+                )
+            ):
+                continue
+            if mapped_record is not None and mapped_record is not evidence.record:
+                continue
+            if mapped_task is not None and mapped_task is not evidence.consumer:
+                continue
+            matches.append((recovery_process, evidence))
+            if len(matches) > 1:
+                return None
+        return matches[0] if matches else None
 
     async def shutdown_codex_app_server(self) -> None:
         """Stop every persistent Codex account transport at app shutdown."""
@@ -12635,7 +12735,10 @@ class InstanceManager:
                     task_id=task_id,
                     task_retry_count=None,
                     task_turn_generation=None,
+                    instance_pid=None,
                     instance_started_at=None,
+                    consumer=consumer,
+                    record=record,
                 )
                 raise unsettled from exc
             # A failed post-process hook must not leave the DB advertising a
@@ -12983,7 +13086,10 @@ class InstanceManager:
                     task_id=task_id,
                     task_retry_count=expected_retry_count,
                     task_turn_generation=expected_turn_generation,
+                    instance_pid=getattr(process, "pid", None),
                     instance_started_at=expected_started_at,
+                    consumer=consumer,
+                    record=record,
                 )
             if task_publication_generation is not None:
                 try:
@@ -18791,9 +18897,106 @@ class InstanceManager:
         force_cancel_consumer = False
         expected_owner_verified = False
         stop_fence_registered = False
+        # A terminal consumer can remove every instance-keyed map from its
+        # done callback while this stop is awaiting it.  Keep the exact
+        # handles captured before the await so a later DB failure can still
+        # leave a generation-bound recovery receipt.  These are never put
+        # back into the live maps.
+        terminal_process: Any | None = None
+        terminal_record: _OutputConsumerRecord | None = None
+        terminal_task: asyncio.Task | None = None
+        terminal_launch_params: dict | None = None
+        runtime_mismatch = object()
+
+        def snapshot_runtime():
+            mapped_process = (
+                self.processes.get(instance_id)
+                or self._process_groups.get(instance_id)
+                or self._container_exec_processes.get(instance_id)
+            )
+            mapped_record = self._consumer_records.get(instance_id)
+            mapped_task = self._tasks.get(instance_id)
+            if mapped_process is None and mapped_record is not None:
+                mapped_process = mapped_record.process
+            if terminal_process is None:
+                process = mapped_process
+                record = mapped_record
+                task = (
+                    record.task
+                    if record is not None
+                    else mapped_task
+                )
+                if (
+                    record is not None
+                    and process is not None
+                    and record.process is not process
+                ):
+                    return runtime_mismatch
+                return process, record, task
+
+            # Once a terminal generation has been captured, a non-empty map
+            # pointing elsewhere is an ABA/replacement race.  Do not let the
+            # old stop touch the new generation.
+            for mapped in (
+                mapped_process,
+                self.processes.get(instance_id),
+                self._process_groups.get(instance_id),
+                self._container_exec_processes.get(instance_id),
+            ):
+                if mapped is not None and mapped is not terminal_process:
+                    return runtime_mismatch
+            if (
+                mapped_record is not None
+                and terminal_record is not None
+                and mapped_record is not terminal_record
+            ):
+                return runtime_mismatch
+            if (
+                mapped_task is not None
+                and terminal_task is not None
+                and mapped_task is not terminal_task
+            ):
+                return runtime_mismatch
+            record = terminal_record or mapped_record
+            task = terminal_task or (
+                record.task if record is not None else mapped_task
+            )
+            if (
+                record is not None
+                and record.process is not terminal_process
+            ):
+                return runtime_mismatch
+            if record is not None and task is not None and record.task is not task:
+                return runtime_mismatch
+            return terminal_process, record, task
+
         try:
             while True:
                 async with lifecycle_lock:
+                    initial_runtime = snapshot_runtime()
+                    if initial_runtime is runtime_mismatch:
+                        return False
+                    initial_process, initial_record, initial_task = (
+                        initial_runtime
+                    )
+                    if (
+                        terminal_process is None
+                        and initial_process is not None
+                        and initial_record is not None
+                        and initial_task is not None
+                        and self._generation_reap_confirmed(
+                            instance_id, initial_process
+                        )
+                    ):
+                        # Capture before the first owner/guard query.  The
+                        # consumer callback can finish during that await and
+                        # remove all instance-keyed maps.
+                        terminal_process = initial_process
+                        terminal_record = initial_record
+                        terminal_task = initial_task
+                        terminal_launch_params = self._launch_params.get(
+                            instance_id
+                        )
                     has_expected_owner = (
                         expected_task_id is not None
                         or expected_task_turn_generation
@@ -18860,12 +19063,10 @@ class InstanceManager:
                         # touched until the guard below succeeds.
                         self._begin_stopping(instance_id)
                         stop_fence_registered = True
-                    pre_guard_record = self._consumer_records.get(instance_id)
-                    pre_guard_process = (
-                        pre_guard_record.process
-                        if pre_guard_record is not None
-                        else self.processes.get(instance_id)
-                    )
+                    runtime = snapshot_runtime()
+                    if runtime is runtime_mismatch:
+                        return False
+                    pre_guard_process, pre_guard_record, _pre_guard_task = runtime
                     protected_task_id = expected_task_id
                     if protected_task_id is None:
                         guard_owner = (
@@ -18914,23 +19115,35 @@ class InstanceManager:
                         # its exact maps during that await; preserve the same
                         # settled-cleanup proof the pre-guard loop observed.
                         settled_terminal_consumer = True
-                    process = (
-                        self.processes.get(instance_id)
-                        or self._process_groups.get(instance_id)
-                        or self._container_exec_processes.get(instance_id)
-                    )
-                    record = self._consumer_records.get(instance_id)
-                    task = (
-                        record.task
-                        if record is not None
-                        else self._tasks.get(instance_id)
-                    )
+                        if terminal_process is None:
+                            terminal_process = pre_guard_process
+                            terminal_record = pre_guard_record
+                            terminal_task = pre_guard_record.task
+                            terminal_launch_params = self._launch_params.get(
+                                instance_id
+                            )
+                    runtime = snapshot_runtime()
+                    if runtime is runtime_mismatch:
+                        return False
+                    process, record, task = runtime
                     record_process = record.process if record is not None else process
+                    recovery_match = self._terminal_stop_recovery_match(
+                        instance_id,
+                        process=process,
+                        expected_task_id=(
+                            expected_task_id
+                            if expected_task_id is not None
+                            else _EXPECTED_GENERATION_UNSET
+                        ),
+                        expected_task_turn_generation=(
+                            expected_task_turn_generation
+                        ),
+                        expected_pid=expected_pid,
+                        expected_started_at=expected_started_at,
+                    )
                     recovery_pending = (
-                        self._consumer_recovery_pending.get(
-                            (instance_id, record_process)
-                        )
-                        if record_process is not None
+                        recovery_match[1]
+                        if recovery_match is not None
                         else None
                     )
                     if (
@@ -18998,6 +19211,12 @@ class InstanceManager:
                         # we await its terminal bookkeeping.
                         expected_process = record_process
                         provider = record.provider if record is not None else "claude"
+                        terminal_process = record_process
+                        terminal_record = record
+                        terminal_task = task
+                        terminal_launch_params = self._launch_params.get(
+                            instance_id
+                        )
                     else:
                         stopped = await self._stop_locked(
                             instance_id,
@@ -19058,6 +19277,26 @@ class InstanceManager:
                             ),
                             worker_termination_state_version=(
                                 worker_termination_state_version
+                            ),
+                            exact_process=(
+                                terminal_process
+                                if terminal_process is not None
+                                else _EXPECTED_GENERATION_UNSET
+                            ),
+                            exact_record=(
+                                terminal_record
+                                if terminal_process is not None
+                                else _EXPECTED_GENERATION_UNSET
+                            ),
+                            exact_task=(
+                                terminal_task
+                                if terminal_process is not None
+                                else _EXPECTED_GENERATION_UNSET
+                            ),
+                            exact_launch_params=(
+                                terminal_launch_params
+                                if terminal_process is not None
+                                else _EXPECTED_GENERATION_UNSET
                             ),
                         )
                         return stopped or (
@@ -19218,15 +19457,67 @@ class InstanceManager:
         worker_termination_operation: str | None = None,
         worker_termination_execution_token: str | None = None,
         worker_termination_state_version: int | None = None,
+        exact_process: Any | object = _EXPECTED_GENERATION_UNSET,
+        exact_record: _OutputConsumerRecord | object = (
+            _EXPECTED_GENERATION_UNSET
+        ),
+        exact_task: asyncio.Task | object = _EXPECTED_GENERATION_UNSET,
+        exact_launch_params: dict | object = _EXPECTED_GENERATION_UNSET,
     ) -> bool:
         """Serialize an active PTY background epoch against its exact stop."""
 
-        process = (
+        mapped_process = (
             self.processes.get(instance_id)
             or self._process_groups.get(instance_id)
             or self._container_exec_processes.get(instance_id)
         )
-        record = self._consumer_records.get(instance_id)
+        mapped_record = self._consumer_records.get(instance_id)
+        mapped_task = self._tasks.get(instance_id)
+        if exact_process is _EXPECTED_GENERATION_UNSET:
+            process = mapped_process
+        else:
+            process = exact_process
+            if (
+                mapped_process is not None
+                and mapped_process is not process
+            ):
+                return False
+            for mapped in (
+                self.processes.get(instance_id),
+                self._process_groups.get(instance_id),
+                self._container_exec_processes.get(instance_id),
+            ):
+                if mapped is not None and mapped is not process:
+                    return False
+        if exact_record is _EXPECTED_GENERATION_UNSET:
+            record = mapped_record
+        else:
+            record = exact_record
+            if (
+                mapped_record is not None
+                and mapped_record is not record
+            ):
+                return False
+        if record is not None and process is None:
+            process = record.process
+        if (
+            record is not None
+            and process is not None
+            and record.process is not process
+        ):
+            return False
+        if exact_task is _EXPECTED_GENERATION_UNSET:
+            task = (
+                record.task
+                if record is not None
+                else mapped_task
+            )
+        else:
+            task = exact_task
+            if mapped_task is not None and mapped_task is not task:
+                return False
+        if record is not None and task is not None and record.task is not task:
+            return False
         session = getattr(process, "session", None)
         session_id = getattr(session, "session_id", None)
         state = (
@@ -19279,6 +19570,10 @@ class InstanceManager:
                 worker_termination_state_version=(
                     worker_termination_state_version
                 ),
+                exact_process=process,
+                exact_record=record,
+                exact_task=task,
+                exact_launch_params=exact_launch_params,
             )
 
         if state is None and post_exit_proof is None:
@@ -19341,6 +19636,16 @@ class InstanceManager:
 
         if not isinstance(process, CodexTurnProcess):
             return
+        if (
+            self._terminal_stop_recovery_match(
+                instance_id,
+                process=process,
+            )
+            is not None
+        ):
+            # The registry has already detached this terminal adapter. Its
+            # exact recovery receipt authorizes DB-only settlement below.
+            return
         registry = self._codex_app_server
         codex_home = self._config_dirs.get(instance_id)
         if registry is None or not codex_home:
@@ -19352,6 +19657,306 @@ class InstanceManager:
             codex_home,
             process,
         )
+
+    def _retain_terminal_stop_recovery(
+        self,
+        instance_id: int,
+        *,
+        process: Any | None,
+        task: asyncio.Task | None,
+        record: _OutputConsumerRecord | None,
+        task_id: int | None,
+        expected_task_turn_generation: int | object,
+        expected_pid: int | None | object,
+        expected_started_at: datetime | None | object,
+        error: BaseException,
+    ) -> None:
+        """Keep exact reaped runtime evidence after final stop persistence fails."""
+
+        if (
+            process is None
+            or task is None
+            or record is None
+            or record.process is not process
+            or record.task is not task
+            or record.task_id != task_id
+            or record.task_retry_count is None
+            or record.task_turn_generation is None
+            or not task.done()
+            or not self._generation_reap_confirmed(instance_id, process)
+            or (
+                expected_task_turn_generation is not _EXPECTED_GENERATION_UNSET
+                and record.task_turn_generation
+                != expected_task_turn_generation
+            )
+            or (
+                expected_pid is not _EXPECTED_GENERATION_UNSET
+                and getattr(process, "pid", None) != expected_pid
+            )
+            or (
+                expected_started_at is not _EXPECTED_GENERATION_UNSET
+                and record.instance_started_at != expected_started_at
+            )
+        ):
+            return
+
+        recovery_key = (instance_id, process)
+        if recovery_key not in self._consumer_recovery_pending:
+            unsettled = ConsumerRecoveryUnsettledError(
+                "Could not confirm stopped generation settlement for instance "
+                f"{instance_id}: {error}"
+            )
+            self._mark_consumer_recovery_pending(
+                instance_id,
+                process,
+                error=unsettled,
+                tracked_generation=True,
+                task_id=task_id,
+                task_retry_count=record.task_retry_count,
+                task_turn_generation=record.task_turn_generation,
+                instance_pid=getattr(process, "pid", None),
+                instance_started_at=record.instance_started_at,
+                consumer=task,
+                record=record,
+            )
+
+    def _discard_terminal_stop_runtime(
+        self,
+        instance_id: int,
+        *,
+        process: Any | None,
+        task: asyncio.Task | None,
+        record: _OutputConsumerRecord | None,
+        launch_params: dict | None = None,
+    ) -> None:
+        """Drop only the exact runtime whose durable stop is confirmed."""
+
+        if process is not None and self.processes.get(instance_id) is process:
+            self.processes.pop(instance_id, None)
+            self._codex_exec_homes.pop(instance_id, None)
+        if (
+            process is not None
+            and self._process_groups.get(instance_id) is process
+        ):
+            self._process_groups.pop(instance_id, None)
+        if task is not None and self._tasks.get(instance_id) is task:
+            self._tasks.pop(instance_id, None)
+        current_record = self._consumer_records.get(instance_id)
+        if record is not None and current_record is record:
+            self._consumer_records.pop(instance_id, None)
+        if (
+            launch_params is not None
+            and self._launch_params.get(instance_id) is launch_params
+        ):
+            self._launch_params.pop(instance_id, None)
+        if process is not None:
+            native_session = getattr(process, "session", None)
+            if (
+                native_session is not None
+                and getattr(native_session, "is_alive", True) is False
+            ):
+                self._release_task_runtime_scope_pty_owner(native_session)
+            if self._generation_reap_confirmed(instance_id, process):
+                self._release_task_runtime_scope_direct_owner(
+                    instance_id,
+                    process,
+                )
+        self._clear_consumer_recovery_pending(instance_id, process)
+        self._transient_attempts.pop(instance_id, None)
+        self._pty_rate_limit_seen.discard(instance_id)
+        self._pty_rate_limit_info.pop(instance_id, None)
+
+    async def _stop_finalization_is_durable(
+        self,
+        instance_id: int,
+        *,
+        process: Any | None,
+        task_id: int | None,
+        expected_task_retry_count: int | None,
+        expected_task_turn_generation: int | object,
+        expected_pid: int | None | object,
+        expected_started_at: datetime | None | object,
+        task_status: str,
+    ) -> bool:
+        """Resolve an ambiguous commit ACK from exact durable end state."""
+
+        if process is None and (
+            (
+                expected_pid is not _EXPECTED_GENERATION_UNSET
+                and expected_pid is not None
+            )
+            or (
+                expected_started_at is not _EXPECTED_GENERATION_UNSET
+                and expected_started_at is not None
+            )
+        ):
+            # A durable terminal row is not proof that an unknown runtime
+            # generation was reaped.  Require the exact process handle when
+            # the caller supplied generation fences.
+            return False
+        if process is not None and not self._generation_reap_confirmed(
+            instance_id, process
+        ):
+            return False
+        if (
+            expected_pid is not _EXPECTED_GENERATION_UNSET
+            and (
+                (
+                    process is None
+                    and expected_pid is not None
+                )
+                or (
+                    process is not None
+                    and getattr(process, "pid", None) != expected_pid
+                )
+            )
+        ):
+            return False
+        if (
+            task_id is not None
+            and (
+                expected_task_retry_count is None
+                or expected_task_turn_generation
+                is _EXPECTED_GENERATION_UNSET
+            )
+        ):
+            return False
+        try:
+            async with self.db_factory() as db:
+                instance_row = (
+                    await db.execute(
+                        select(
+                            Instance.status,
+                            Instance.pid,
+                            Instance.process_identity,
+                            Instance.started_at,
+                            Instance.current_task_id,
+                        ).where(Instance.id == instance_id)
+                    )
+                ).one_or_none()
+                task_row = (
+                    (
+                        await db.execute(
+                            select(
+                                Task.status,
+                                Task.retry_count,
+                                Task.turn_generation,
+                                Task.started_at,
+                                Task.instance_id,
+                                Task.pty_background_generation,
+                            ).where(Task.id == task_id)
+                        )
+                    ).one_or_none()
+                    if task_id is not None
+                    else None
+                )
+                await db.rollback()
+        except Exception:
+            return False
+
+        if (
+            instance_row is None
+            or instance_row.current_task_id is not None
+            or instance_row.pid is not None
+            or instance_row.process_identity is not None
+            or instance_row.status
+            != ("error" if task_status == "failed" else "idle")
+            or (
+                expected_started_at is not _EXPECTED_GENERATION_UNSET
+                and instance_row.started_at != expected_started_at
+            )
+        ):
+            return False
+        if task_id is None:
+            return True
+        assert task_row is not None or task_id is not None
+        if task_row is None:
+            return False
+        task_status_is_settled = (
+            task_row.status == task_status
+            or task_row.status not in {"executing", "in_progress", "merging"}
+        )
+        expected_task_instance_id = (
+            None if task_row.status == "pending" else instance_id
+        )
+        expected_task_started_at = (
+            None
+            if task_status == "pending"
+            else expected_started_at
+        )
+        return bool(
+            task_status_is_settled
+            and task_row.retry_count == expected_task_retry_count
+            and task_row.turn_generation == expected_task_turn_generation
+            and (
+                expected_task_started_at is _EXPECTED_GENERATION_UNSET
+                or task_row.started_at == expected_task_started_at
+            )
+            and task_row.instance_id == expected_task_instance_id
+            and task_row.pty_background_generation is None
+        )
+
+    @asynccontextmanager
+    async def _stop_finalization_db(
+        self,
+        instance_id: int,
+        *,
+        process: Any | None,
+        task: asyncio.Task | None,
+        record: _OutputConsumerRecord | None,
+        task_id: int | None,
+        expected_task_retry_count: int | None,
+        expected_task_turn_generation: int | object,
+        expected_pid: int | None | object,
+        expected_started_at: datetime | None | object,
+        task_status: str,
+        launch_params: dict | None = None,
+        settlement_state: dict[str, bool] | None = None,
+    ):
+        """Retain exact retry evidence if the final stop transaction fails."""
+
+        try:
+            async with self.db_factory() as db:
+                yield db
+        except BaseException as exc:
+            if not isinstance(exc, asyncio.CancelledError) and await (
+                self._stop_finalization_is_durable(
+                    instance_id,
+                    process=process,
+                    task_id=task_id,
+                    expected_task_retry_count=expected_task_retry_count,
+                    expected_task_turn_generation=(
+                        expected_task_turn_generation
+                    ),
+                    expected_pid=expected_pid,
+                    expected_started_at=expected_started_at,
+                    task_status=task_status,
+                )
+            ):
+                if settlement_state is not None:
+                    settlement_state["durable"] = True
+                self._discard_terminal_stop_runtime(
+                    instance_id,
+                    process=process,
+                    task=task,
+                    record=record,
+                    launch_params=launch_params,
+                )
+                return
+            self._retain_terminal_stop_recovery(
+                instance_id,
+                process=process,
+                task=task,
+                record=record,
+                task_id=task_id,
+                expected_task_turn_generation=(
+                    expected_task_turn_generation
+                ),
+                expected_pid=expected_pid,
+                expected_started_at=expected_started_at,
+                error=exc,
+            )
+            raise
 
     async def _stop_locked_inner(
         self,
@@ -19375,6 +19980,12 @@ class InstanceManager:
         worker_termination_operation: str | None = None,
         worker_termination_execution_token: str | None = None,
         worker_termination_state_version: int | None = None,
+        exact_process: Any | object = _EXPECTED_GENERATION_UNSET,
+        exact_record: _OutputConsumerRecord | object = (
+            _EXPECTED_GENERATION_UNSET
+        ),
+        exact_task: asyncio.Task | object = _EXPECTED_GENERATION_UNSET,
+        exact_launch_params: dict | object = _EXPECTED_GENERATION_UNSET,
     ) -> bool:
         """Stop a running Claude Code instance via SIGINT (interrupt).
 
@@ -19386,24 +19997,124 @@ class InstanceManager:
             != (worker_termination_operation_id is None)
         ):
             return False
-        process = (
+        mapped_process = (
             self.processes.get(instance_id)
             or self._process_groups.get(instance_id)
             or self._container_exec_processes.get(instance_id)
         )
-        record = self._consumer_records.get(instance_id)
+        mapped_record = self._consumer_records.get(instance_id)
+        mapped_task = self._tasks.get(instance_id)
+        if exact_process is _EXPECTED_GENERATION_UNSET:
+            process = mapped_process
+        else:
+            process = exact_process
+            for mapped in (
+                mapped_process,
+                self.processes.get(instance_id),
+                self._process_groups.get(instance_id),
+                self._container_exec_processes.get(instance_id),
+            ):
+                if mapped is not None and mapped is not process:
+                    return False
+        if exact_record is _EXPECTED_GENERATION_UNSET:
+            record = mapped_record
+        else:
+            record = exact_record
+            if mapped_record is not None and mapped_record is not record:
+                return False
+        if process is None and record is not None:
+            process = record.process
+        if (
+            record is not None
+            and process is not None
+            and record.process is not process
+        ):
+            return False
+        if exact_task is _EXPECTED_GENERATION_UNSET:
+            task = (
+                record.task
+                if record is not None
+                else mapped_task
+            )
+        else:
+            task = exact_task
+            if mapped_task is not None and mapped_task is not task:
+                return False
+        if record is not None and task is not None and record.task is not task:
+            return False
+        launch_params = (
+            self._launch_params.get(instance_id)
+            if exact_launch_params is _EXPECTED_GENERATION_UNSET
+            else exact_launch_params
+        )
         post_exit_proof = self._pty_post_exit_generation_for_instance(
             instance_id,
             expected_task_id,
         )
-        if process is None and post_exit_proof is not None:
+        if (
+            exact_process is _EXPECTED_GENERATION_UNSET
+            and process is None
+            and post_exit_proof is not None
+        ):
             process = post_exit_proof.process
             record = post_exit_proof.record
-        task = record.task if record is not None else self._tasks.get(instance_id)
-        recovery_evidence = (
+            if exact_task is _EXPECTED_GENERATION_UNSET:
+                task = record.task
+        recovery_match = self._terminal_stop_recovery_match(
+            instance_id,
+            process=process,
+            expected_task_id=(
+                expected_task_id
+                if expected_task_id is not None
+                else _EXPECTED_GENERATION_UNSET
+            ),
+            expected_task_turn_generation=expected_task_turn_generation,
+            expected_pid=expected_pid,
+            expected_started_at=expected_started_at,
+        )
+        if recovery_match is None and any(
+            recovery_instance_id == instance_id
+            and evidence.tracked_generation
+            for (recovery_instance_id, _), evidence
+            in self._consumer_recovery_pending.items()
+        ):
+            # A retained terminal receipt owns an older exact generation.  A
+            # partial replacement (record/task installed before its process
+            # map, or a rapidly reaped replacement) must never be mistaken
+            # for that receipt and cancelled with the old Task id.
+            return False
+        if process is None and recovery_match is not None:
+            process = recovery_match[0]
+        if recovery_match is not None:
+            # The consumer done callback may have already removed the
+            # instance-keyed maps.  Recovery evidence owns the exact
+            # generation handles in that case; never reconstruct a terminal
+            # Codex adapter in the live registry/maps.
+            recovery_record = recovery_match[1].record
+            recovery_task = recovery_match[1].consumer
+            if record is None:
+                record = recovery_record
+            elif recovery_record is not None and record is not recovery_record:
+                return False
+            if recovery_task is not None:
+                if task is not None and task is not recovery_task:
+                    return False
+                task = recovery_task
+        direct_recovery_evidence = (
             self._consumer_recovery_pending.get((instance_id, process))
             if process is not None
             else None
+        )
+        recovery_evidence = (
+            recovery_match[1]
+            if recovery_match is not None
+            and recovery_match[0] is process
+            else (
+                direct_recovery_evidence
+                if direct_recovery_evidence is not None
+                and not direct_recovery_evidence.tracked_generation
+                else None
+            )
         )
         # A tracked recovery record supplies the durable per-turn token even
         # when the caller is a generic lifecycle cleanup.  An untracked record
@@ -19411,15 +20122,9 @@ class InstanceManager:
         # exact Instance fences.
         if recovery_evidence is not None:
             if recovery_evidence.tracked_generation:
-                effective_expected_pid = (
-                    getattr(process, "pid", None)
-                    if expected_pid is _EXPECTED_GENERATION_UNSET
-                    else expected_pid
-                )
+                effective_expected_pid = recovery_evidence.instance_pid
                 effective_expected_started_at = (
                     recovery_evidence.instance_started_at
-                    if expected_started_at is _EXPECTED_GENERATION_UNSET
-                    else expected_started_at
                 )
             else:
                 if (
@@ -19891,7 +20596,29 @@ class InstanceManager:
         cleared_background = False
         cleared_background_generation: str | None = None
         published_generation: dict | None = None
-        async with self.db_factory() as db:
+        finalization_state: dict[str, bool] = {}
+        async with self._stop_finalization_db(
+            instance_id,
+            process=process,
+            task=task,
+            record=record,
+            task_id=task_id,
+            expected_task_retry_count=(
+                recovery_evidence.task_retry_count
+                if recovery_evidence is not None
+                else (
+                    record.task_retry_count
+                    if record is not None
+                    else None
+                )
+            ),
+            expected_task_turn_generation=expected_task_turn_generation,
+            expected_pid=effective_expected_pid,
+            expected_started_at=effective_expected_started_at,
+            task_status=task_status,
+            launch_params=launch_params,
+            settlement_state=finalization_state,
+        ) as db:
             final_lease_valid_at: datetime | None = None
             if task_id is not None:
                 # Global ownership lock order is Task -> Instance.  A no-op
@@ -20201,11 +20928,44 @@ class InstanceManager:
                 stopping_background_state.generation,
             )
 
-        if task_id is not None and published_generation is not None:
+        if (
+            task_id is not None
+            and published_generation is not None
+            and not finalization_state.get("durable")
+        ):
             # Keep a row lock across publication. A rapid retry/replacement
             # must change one of these exact fields first and therefore
             # suppresses the old generation's status/process-exit events.
-            async with self.db_factory() as db:
+            @asynccontextmanager
+            async def terminal_publication_guard():
+                try:
+                    yield
+                except asyncio.CancelledError:
+                    # The terminal CAS is already durable. Do not let a
+                    # cancellation during this best-effort phase reach
+                    # _stop_locked, whose failure path would restore a PTY
+                    # background generation that has already been settled.
+                    logger.warning(
+                        "Terminal stop publication cancelled after durable "
+                        "settlement for instance %s/task %s",
+                        instance_id,
+                        task_id,
+                    )
+                except Exception:
+                    # Task/Instance settlement committed before this
+                    # best-effort publication phase. A lock or broadcaster
+                    # failure must not turn a durable stop into a retryable
+                    # runtime owner; the DB context rolls back its pending
+                    # publication work on exit and the exact runtime is
+                    # discarded below.
+                    logger.exception(
+                        "Terminal stop publication failed after durable "
+                        "settlement for instance %s/task %s",
+                        instance_id,
+                        task_id,
+                    )
+
+            async with terminal_publication_guard(), self.db_factory() as db:
                 generation_predicates = [
                     Task.id == task_id,
                     Task.status == published_generation["status"],
@@ -20406,32 +21166,18 @@ class InstanceManager:
                     if publication_live:
                         await db.commit()
 
-        if process is not None and self.processes.get(instance_id) is process:
-            self.processes.pop(instance_id, None)
-            self._codex_exec_homes.pop(instance_id, None)
-        if process is not None and self._process_groups.get(instance_id) is process:
-            self._process_groups.pop(instance_id, None)
-        if task is not None and self._tasks.get(instance_id) is task:
-            self._tasks.pop(instance_id, None)
-        record = self._consumer_records.get(instance_id)
-        if record is not None and record.task is task:
-            self._consumer_records.pop(instance_id, None)
-        if process is not None:
-            native_session = getattr(process, "session", None)
-            if (
-                native_session is not None
-                and getattr(native_session, "is_alive", True) is False
-            ):
-                self._release_task_runtime_scope_pty_owner(native_session)
-            if self._generation_reap_confirmed(instance_id, process):
-                self._release_task_runtime_scope_direct_owner(
-                    instance_id,
-                    process,
-                )
-        self._clear_consumer_recovery_pending(instance_id, process)
-        self._transient_attempts.pop(instance_id, None)
-        self._pty_rate_limit_seen.discard(instance_id)
-        self._pty_rate_limit_info.pop(instance_id, None)
+        if finalization_state.get("durable"):
+            # The primary transaction committed but its acknowledgement was
+            # lost.  Do not emit a second, potentially stale publication pass.
+            return True
+
+        self._discard_terminal_stop_runtime(
+            instance_id,
+            process=process,
+            task=task,
+            record=record,
+            launch_params=launch_params,
+        )
         return True
 
     async def wait_for_output_consumer(

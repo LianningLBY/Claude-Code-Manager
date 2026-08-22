@@ -2899,6 +2899,15 @@ class GlobalDispatcher:
                     {},
                 )
             )
+            | {
+                recovery_instance_id
+                for recovery_instance_id, _recovery_process in getattr(
+                    self.instance_manager,
+                    "_consumer_recovery_pending",
+                    {},
+                )
+                if isinstance(recovery_instance_id, int)
+            }
         ):
             if not isinstance(instance_id, int):
                 continue

@@ -13419,6 +13419,325 @@ async def test_stop_awaits_codex_consumer_after_process_already_exited(db_factor
 
 
 @pytest.mark.asyncio
+async def test_stop_retains_exact_handles_when_terminal_consumer_clears_maps_before_db_failure(
+    db_factory,
+):
+    """A post-exit DB failure remains retryable after the done callback cleanup."""
+
+    started_at = datetime(2026, 7, 23, 13, 55, 0)
+    async with db_factory() as db:
+        instance = Instance(
+            name="terminal-consumer-db-failure",
+            status="running",
+            pid=40_199,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="terminal consumer DB failure",
+            status="executing",
+            retry_count=0,
+            turn_generation=0,
+            instance_id=instance.id,
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    fail_primary_commit = True
+
+    @asynccontextmanager
+    async def failing_commit_factory():
+        nonlocal fail_primary_commit
+        async with db_factory() as db:
+            class SessionProxy:
+                def __getattr__(self, name):
+                    return getattr(db, name)
+
+                async def commit(self):
+                    nonlocal fail_primary_commit
+                    if fail_primary_commit:
+                        fail_primary_commit = False
+                        raise RuntimeError(
+                            "terminal stop database unavailable"
+                        )
+                    await db.commit()
+
+            yield SessionProxy()
+
+    process = _make_mock_process(pid=40_199, returncode=130)
+    release = asyncio.Event()
+
+    async def terminal_bookkeeping():
+        await release.wait()
+
+    consumer = asyncio.create_task(terminal_bookkeeping())
+    manager = InstanceManager(
+        failing_commit_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager.processes[instance_id] = process
+    record = manager._track_output_consumer(
+        instance_id,
+        process,
+        consumer,
+        provider="codex",
+        chat_initiated=True,
+        task_id=task_id,
+        task_retry_count=0,
+        task_turn_generation=0,
+        instance_started_at=started_at,
+    )
+    stopping = asyncio.create_task(
+        manager.stop(
+            instance_id,
+            expected_task_id=task_id,
+            expected_task_turn_generation=0,
+            expected_pid=process.pid,
+            expected_started_at=started_at,
+            task_status="cancelled",
+        )
+    )
+    for _ in range(20):
+        if instance_id in manager._stopping:
+            break
+        await asyncio.sleep(0)
+    assert not stopping.done()
+    release.set()
+
+    with pytest.raises(RuntimeError, match="terminal stop database unavailable"):
+        await stopping
+    recovery_key = (instance_id, process)
+    assert recovery_key in manager._consumer_recovery_pending
+    evidence = manager._consumer_recovery_pending[recovery_key]
+    assert evidence.consumer is consumer
+    assert evidence.record is record
+    assert evidence.record.process is process
+    assert evidence.record.task is consumer
+    assert consumer.done()
+    assert instance_id not in manager.processes
+    assert instance_id not in manager._tasks
+    assert instance_id not in manager._consumer_records
+
+    async with db_factory() as db:
+        task_row = await db.get(Task, task_id)
+        instance_row = await db.get(Instance, instance_id)
+    assert task_row.status == "executing"
+    assert instance_row.status == "running"
+    assert instance_row.pid == process.pid
+    assert instance_row.current_task_id == task_id
+
+    manager.db_factory = db_factory
+    assert await manager.stop(
+        instance_id,
+        expected_task_id=task_id,
+        expected_task_turn_generation=0,
+        expected_pid=process.pid,
+        expected_started_at=started_at,
+        task_status="cancelled",
+    )
+    assert recovery_key not in manager._consumer_recovery_pending
+    assert manager.is_running(instance_id) is False
+    async with db_factory() as db:
+        task_row = await db.get(Task, task_id)
+        instance_row = await db.get(Instance, instance_id)
+    assert task_row.status == "cancelled"
+    assert instance_row.status == "idle"
+    assert instance_row.pid is None
+    assert instance_row.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_stop_cleans_runtime_when_publication_commit_is_locked(db_factory):
+    """A post-CAS publication lock cannot leave a stale runtime owner."""
+
+    started_at = datetime(2026, 7, 23, 13, 57, 0)
+    async with db_factory() as db:
+        instance = Instance(
+            name="publication-commit-lock",
+            status="running",
+            pid=40_200,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="publication commit lock",
+            status="executing",
+            retry_count=0,
+            turn_generation=0,
+            instance_id=instance.id,
+            started_at=started_at,
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    commit_count = 0
+
+    @asynccontextmanager
+    async def publication_lock_factory():
+        nonlocal commit_count
+        async with db_factory() as db:
+            class SessionProxy:
+                def __getattr__(self, name):
+                    return getattr(db, name)
+
+                async def commit(self):
+                    nonlocal commit_count
+                    commit_count += 1
+                    if commit_count == 2:
+                        raise RuntimeError("publication database is locked")
+                    await db.commit()
+
+            yield SessionProxy()
+
+    process = _make_mock_process(pid=40_200, returncode=130)
+    consumer = asyncio.create_task(asyncio.sleep(0))
+    await consumer
+    manager = InstanceManager(
+        publication_lock_factory,
+        MagicMock(broadcast=AsyncMock()),
+    )
+    manager.processes[instance_id] = process
+    record = manager._track_output_consumer(
+        instance_id,
+        process,
+        consumer,
+        provider="codex",
+        chat_initiated=True,
+        task_id=task_id,
+        task_retry_count=0,
+        task_turn_generation=0,
+        instance_started_at=started_at,
+    )
+
+    assert await manager._stop_locked(
+        instance_id,
+        expected_task_id=task_id,
+        expected_task_turn_generation=0,
+        expected_pid=process.pid,
+        expected_started_at=started_at,
+        task_status="cancelled",
+        allow_settled_cleanup=True,
+    )
+    assert commit_count == 2
+    assert manager.is_running(instance_id) is False
+    assert instance_id not in manager.processes
+    assert instance_id not in manager._tasks
+    assert instance_id not in manager._consumer_records
+    assert (instance_id, process) not in manager._consumer_recovery_pending
+    assert record.process is process
+
+    async with db_factory() as db:
+        task_row = await db.get(Task, task_id)
+        instance_row = await db.get(Instance, instance_id)
+    assert task_row.status == "cancelled"
+    assert task_row.instance_id == instance_id
+    assert instance_row.status == "idle"
+    assert instance_row.pid is None
+    assert instance_row.current_task_id is None
+
+
+@pytest.mark.asyncio
+async def test_stop_accepts_ambiguous_pending_final_commit(db_factory):
+    """An ACK lost after a pending stop commit still settles exactly once."""
+
+    started_at = datetime(2026, 7, 23, 13, 58, 0)
+    async with db_factory() as db:
+        instance = Instance(
+            name="pending-ambiguous-stop",
+            status="running",
+            pid=40_204,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="pending ambiguous stop",
+            status="executing",
+            retry_count=3,
+            turn_generation=4,
+            instance_id=instance.id,
+            started_at=started_at,
+        )
+        db.add(task)
+        await db.flush()
+        instance.current_task_id = task.id
+        await db.commit()
+        instance_id, task_id = instance.id, task.id
+
+    commit_count = 0
+
+    @asynccontextmanager
+    async def ambiguous_commit_factory():
+        nonlocal commit_count
+        async with db_factory() as db:
+            class SessionProxy:
+                def __getattr__(self, name):
+                    return getattr(db, name)
+
+                async def commit(self):
+                    nonlocal commit_count
+                    commit_count += 1
+                    await db.commit()
+                    if commit_count == 1:
+                        raise RuntimeError("pending stop commit ACK lost")
+
+            yield SessionProxy()
+
+    process = _make_mock_process(pid=40_204, returncode=130)
+    consumer = asyncio.create_task(asyncio.sleep(0))
+    await consumer
+    broadcaster = MagicMock(broadcast=AsyncMock())
+    manager = InstanceManager(ambiguous_commit_factory, broadcaster)
+    manager.processes[instance_id] = process
+    manager._track_output_consumer(
+        instance_id,
+        process,
+        consumer,
+        provider="claude",
+        chat_initiated=True,
+        task_id=task_id,
+        task_retry_count=3,
+        task_turn_generation=4,
+        instance_started_at=started_at,
+    )
+
+    assert await manager._stop_locked(
+        instance_id,
+        expected_task_id=task_id,
+        expected_task_turn_generation=4,
+        expected_pid=process.pid,
+        expected_started_at=started_at,
+        task_status="pending",
+        allow_settled_cleanup=True,
+    )
+    assert commit_count == 1
+    assert broadcaster.broadcast.await_count == 0
+    assert manager.is_running(instance_id) is False
+    assert (instance_id, process) not in manager._consumer_recovery_pending
+
+    async with db_factory() as db:
+        task_row = await db.get(Task, task_id)
+        instance_row = await db.get(Instance, instance_id)
+    assert task_row.status == "pending"
+    assert task_row.instance_id is None
+    assert task_row.started_at is None
+    assert task_row.retry_count == 3
+    assert task_row.turn_generation == 4
+    assert instance_row.status == "idle"
+    assert instance_row.pid is None
+    assert instance_row.current_task_id is None
+    assert instance_row.started_at == started_at
+
+
+@pytest.mark.asyncio
 async def test_stop_bounds_terminal_codex_consumer_then_cancels_exact_record(
     db_factory,
 ):

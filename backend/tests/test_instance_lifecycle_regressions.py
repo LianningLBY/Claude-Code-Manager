@@ -198,6 +198,7 @@ async def test_stale_reset_honors_consumer_or_recovery_only_running_evidence(
             task_id=task_id,
             task_retry_count=task_retry_count,
             task_turn_generation=task_turn_generation,
+            instance_pid=920_001,
             instance_started_at=None,
         )
         recovery_evidence = manager._consumer_recovery_pending[

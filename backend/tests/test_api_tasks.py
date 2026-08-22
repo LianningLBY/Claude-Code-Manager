@@ -7880,18 +7880,25 @@ async def test_stop_session_shared_codex_preflight_preserves_queue(
 
 
 @pytest.mark.asyncio
-async def test_stop_session_codex_keeps_shared_delivery_peer_unchanged(
+async def test_stop_session_codex_retries_final_db_failure_without_stopping_peer(
     client,
     session_factory,
 ):
-    """API stop completes its Task without mutating a shared Delivery peer."""
+    """A DB failure after native stop retries without touching a shared peer."""
 
     import backend.main
+    import sqlite3
+
     from backend.models.delivery import DeliveryRun
     from backend.models.instance import Instance
     from backend.models.project import Project
     from backend.models.task import Task
-    from backend.services.codex_app_server import CodexTurnProcess
+    from backend.services import instance_manager as instance_manager_module
+    from backend.services.codex_app_server import (
+        CodexSharedTransportBusyError,
+        CodexTurnProcess,
+    )
+    from sqlalchemy.exc import OperationalError
 
     shared_pid = 54_321
     target_started_at = datetime(2026, 8, 17, 10, 0, 0)
@@ -7986,7 +7993,17 @@ async def test_stop_session_codex_keeps_shared_delivery_peer_unchanged(
     target_consumer = asyncio.create_task(target_release.wait())
     peer_consumer = asyncio.create_task(peer_release.wait())
     registry = MagicMock()
-    registry.require_claimed_turn_stop_isolated = AsyncMock()
+
+    async def require_claimed_turn_stop_isolated(_home, exact_process):
+        if registry.require_claimed_turn_stop_isolated.await_count > 1:
+            raise CodexSharedTransportBusyError(
+                "retry must use the retained terminal recovery receipt"
+            )
+        assert exact_process is target_process
+
+    registry.require_claimed_turn_stop_isolated = AsyncMock(
+        side_effect=require_claimed_turn_stop_isolated,
+    )
 
     async def stop_target(_home, exact_process, *, reason):
         assert exact_process is target_process
@@ -8028,14 +8045,75 @@ async def test_stop_session_codex_keeps_shared_delivery_peer_unchanged(
         instance_started_at=peer_started_at,
     )
 
+    real_lock_stop_authority = (
+        instance_manager_module._lock_worker_termination_stop_authority
+    )
+    failed_final_stop = False
+
+    async def fail_first_final_stop(*args, **kwargs):
+        nonlocal failed_final_stop
+        if (
+            not failed_final_stop
+            and kwargs.get("task_id") == target_task_id
+            and kwargs.get("instance_id") == target_instance_id
+            and target_process.returncode is not None
+            and target_consumer.done()
+        ):
+            failed_final_stop = True
+            raise OperationalError(
+                "UPDATE tasks SET status=tasks.status",
+                (target_task_id, target_instance_id, 0),
+                sqlite3.OperationalError("database is locked"),
+            )
+        return await real_lock_stop_authority(*args, **kwargs)
+
     try:
-        response = await client.post(
-            f"/api/tasks/{target_task_id}/stop-session"
-        )
+        with patch.object(
+            instance_manager_module,
+            "_lock_worker_termination_stop_authority",
+            side_effect=fail_first_final_stop,
+        ):
+            with pytest.raises(OperationalError, match="database is locked"):
+                await client.post(
+                    f"/api/tasks/{target_task_id}/stop-session"
+                )
+
+            recovery_key = (target_instance_id, target_process)
+            assert failed_final_stop is True
+            assert recovery_key in manager._consumer_recovery_pending
+            evidence = manager._consumer_recovery_pending[recovery_key]
+            assert evidence.consumer is target_consumer
+            assert evidence.record is not None
+            assert evidence.record.process is target_process
+            assert evidence.record.task is target_consumer
+            assert target_instance_id not in manager.processes
+            assert target_instance_id not in manager._tasks
+            assert target_instance_id not in manager._consumer_records
+            assert target_process.returncode == 130
+            assert peer_process.returncode is None
+            assert not peer_consumer.done()
+            assert manager.processes[peer_instance_id] is peer_process
+
+            async with session_factory() as db:
+                unsettled_target = await db.get(Task, target_task_id)
+                unsettled_instance = await db.get(
+                    Instance,
+                    target_instance_id,
+                )
+                assert unsettled_target.status == "executing"
+                assert unsettled_target.instance_id == target_instance_id
+                assert unsettled_instance.status == "running"
+                assert unsettled_instance.pid == shared_pid
+                assert unsettled_instance.current_task_id == target_task_id
+
+            response = await client.post(
+                f"/api/tasks/{target_task_id}/stop-session"
+            )
         assert response.status_code == 200, response.text
-        registry.require_claimed_turn_stop_isolated.assert_awaited_once_with(
-            "/tmp/api-stop-shared-home",
-            target_process,
+        assert registry.require_claimed_turn_stop_isolated.await_count == 1
+        assert (
+            registry.require_claimed_turn_stop_isolated.await_args_list[0].args
+            == ("/tmp/api-stop-shared-home", target_process)
         )
         registry.stop_claimed_turn.assert_awaited_once_with(
             "/tmp/api-stop-shared-home",
@@ -8046,6 +8124,11 @@ async def test_stop_session_codex_keeps_shared_delivery_peer_unchanged(
         assert peer_process.returncode is None
         assert not peer_consumer.done()
         assert manager.processes[peer_instance_id] is peer_process
+        assert recovery_key not in manager._consumer_recovery_pending
+        assert recovery_key not in manager._consumer_errors
+        assert target_instance_id not in manager.processes
+        assert target_instance_id not in manager._tasks
+        assert target_instance_id not in manager._consumer_records
 
         async with session_factory() as db:
             durable_target = await db.get(Task, target_task_id)
@@ -8084,6 +8167,14 @@ async def test_stop_session_codex_keeps_shared_delivery_peer_unchanged(
             manager._tasks.pop(instance_id, None)
             manager._consumer_records.pop(instance_id, None)
             manager._config_dirs.pop(instance_id, None)
+        manager._consumer_recovery_pending.pop(
+            (target_instance_id, target_process),
+            None,
+        )
+        manager._consumer_errors.pop(
+            (target_instance_id, target_process),
+            None,
+        )
 
 
 @pytest.mark.asyncio

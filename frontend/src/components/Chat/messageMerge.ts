@@ -40,6 +40,7 @@ function attachmentKey(message: ChatMessage): string {
 function messageFingerprint(message: ChatMessage): string {
   const nativeId = message.item_id || message.stream_item_id || null;
   return JSON.stringify([
+    message.client_message_id || null,
     nativeId,
     message.task_retry_count ?? null,
     message.task_turn_generation ?? null,
@@ -57,6 +58,9 @@ function messageFingerprint(message: ChatMessage): string {
 }
 
 function stableLiveKey(message: ChatMessage): string | null {
+  if (message.client_message_id) {
+    return `client-message:${message.client_message_id}`;
+  }
   const nativeId = message.item_id || message.stream_item_id;
   if (nativeId) {
     return JSON.stringify([

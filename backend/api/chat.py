@@ -138,8 +138,28 @@ async def _sender_display_name(
     return None
 
 
+def _client_message_id_field():
+    """Build the input-only optimistic-message correlation field."""
+
+    return Field(
+        default=None,
+        min_length=36,
+        max_length=36,
+        pattern=(
+            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+            r"[0-9a-f]{4}-[0-9a-f]{12}$"
+        ),
+        exclude=True,
+    )
+
+
 class ChatMessage(BaseModel):
     message: str
+    # UI-only correlation key for reconciling the optimistic user bubble with
+    # the committed LogEntry delivered by history or WebSocket.  Excluding it
+    # from model dumps keeps it out of Worker replay/handoff identities and all
+    # routing, authorization, and idempotency decisions.
+    client_message_id: str | None = _client_message_id_field()
     image_paths: list[str] | None = None  # kept for backwards compatibility
     file_paths: list[str] | None = None
     secret_ids: list[int] | None = None
@@ -328,6 +348,7 @@ class FrontendReviewGoalMessage(BaseModel):
     """Start a repeatable frontend review from an existing Task chat."""
 
     message: str = Field(min_length=1)
+    client_message_id: str | None = _client_message_id_field()
     image_paths: list[str] | None = None
     file_paths: list[str] | None = None
     secret_ids: list[int] | None = None
@@ -1509,6 +1530,8 @@ async def send_chat_message(
 
     # Store user message as a log entry (use instance_id=1 as placeholder)
     log_metadata: dict = {"raw_content": model_message}
+    if body.client_message_id is not None:
+        log_metadata["client_message_id"] = body.client_message_id
     log_metadata["execution_principal"] = {
         "user_id": initiating_user_id,
         "role": initiating_user_role,
@@ -1929,6 +1952,8 @@ async def send_chat_message(
     })
     if sender_display_name:
         broadcast_data["sender_name"] = sender_display_name
+    if body.client_message_id is not None:
+        broadcast_data["client_message_id"] = body.client_message_id
     await broadcaster.broadcast(f"task:{task_id}", broadcast_data)
 
     # Enqueue for serial processing (replaces direct launch)
@@ -2293,6 +2318,8 @@ async def start_frontend_review_goal(
                         "kind": task_updates["execution_principal_kind"],
                     },
                 }
+                if body.client_message_id is not None:
+                    log_metadata["client_message_id"] = body.client_message_id
                 if attachments:
                     log_metadata.update({
                         "attachments": attachments,
@@ -2342,6 +2369,8 @@ async def start_frontend_review_goal(
     })
     if sender_display_name:
         event["sender_name"] = sender_display_name
+    if body.client_message_id is not None:
+        event["client_message_id"] = body.client_message_id
     await broadcaster.broadcast(f"task:{task_id}", event)
     from backend.services.task_events import broadcast_status_change
 
@@ -3303,6 +3332,13 @@ async def _send_worker_chat(
                     metadata["applied_plans"] = versioned_plan_snapshots(
                         approved_versions
                     )
+                    if body.client_message_id is not None:
+                        # The retry owns a new optimistic bubble even though
+                        # it is recovering the same durable Plan application.
+                        # Retarget only this UI correlation key so the history
+                        # refresh can consume that bubble; the handoff/replay
+                        # identity remains frozen in the receipt.
+                        metadata["client_message_id"] = body.client_message_id
                     prior_log.raw_json = json.dumps(metadata)
                     try:
                         # Task -> Application -> Receipt is the shared deletion
@@ -3591,6 +3627,8 @@ async def _send_worker_chat(
                 "kind": manager_principal["execution_principal_kind"],
             },
         }
+        if body.client_message_id is not None:
+            log_metadata["client_message_id"] = body.client_message_id
         if (
             request_principal["execution_user_id"]
             != manager_principal["execution_user_id"]
@@ -3708,6 +3746,8 @@ async def _send_worker_chat(
         })
         if sender_display_name:
             broadcast_data["sender_name"] = sender_display_name
+        if body.client_message_id is not None:
+            broadcast_data["client_message_id"] = body.client_message_id
         await broadcaster.broadcast(f"task:{current.id}", broadcast_data)
 
         # The common operation lock is already held; asking WorkerProxy to
@@ -4267,6 +4307,7 @@ async def get_chat_history(
         followup_operation_id = None
         pty_followup_state = None
         pty_background_generation = None
+        client_message_id = None
         if row.raw_json:
             try:
                 raw = json.loads(row.raw_json)
@@ -4319,6 +4360,8 @@ async def get_chat_history(
                         pty_background_generation = raw[
                             "background_generation"
                         ]
+                    if isinstance(raw.get("client_message_id"), str):
+                        client_message_id = raw["client_message_id"]
                     if raw.get("type") == "background.lifecycle":
                         background_lifecycle = {
                             "state": raw.get("state"),
@@ -4374,6 +4417,7 @@ async def get_chat_history(
             "followup_operation_id": followup_operation_id,
             "pty_followup_state": pty_followup_state,
             "pty_background_generation": pty_background_generation,
+            "client_message_id": client_message_id,
             "protocol_anomaly": detect_assistant_protocol_anomaly(
                 row.event_type,
                 row.role,

@@ -938,6 +938,8 @@ export interface ChatMessage {
   source?: string | null;
   /** Original user text without the display-only sender prefix. */
   raw_content?: string | null;
+  /** Browser-generated identity used only to reconcile one optimistic send. */
+  client_message_id?: string | null;
   /** Exact approved Plan versions prepended to this user turn. */
   applied_plans?: AppliedPlanSnapshot[] | null;
   /** Live-only app-server item id used to merge streamed deltas into the final message. */
@@ -2819,6 +2821,7 @@ export const api = {
     confirmedStalePlanTaskIds?: number[],
     planVersionIds?: number[],
     confirmedStalePlanVersionIds?: number[],
+    clientMessageId?: string,
   ) =>
     request<{
       ok: boolean;
@@ -2845,6 +2848,7 @@ export const api = {
         ...(confirmedStalePlanVersionIds?.length
           ? { confirmed_stale_plan_version_ids: confirmedStalePlanVersionIds }
           : {}),
+        ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
       }),
     }),
   startFrontendReviewGoal: (
@@ -2856,6 +2860,7 @@ export const api = {
       profile?: 'standard' | 'exhaustive';
       max_iterations?: number;
       expected_routing?: TaskRoutingExpectation;
+      client_message_id?: string;
     },
   ) => request<Task>(`/api/tasks/${taskId}/frontend-review-goal`, {
     method: 'POST',

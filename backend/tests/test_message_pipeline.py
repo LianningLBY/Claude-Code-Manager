@@ -1185,6 +1185,81 @@ async def test_chat_history_correct_role_assignment(client, session_factory):
     assert msgs[3]["role"] == "system"  # fallback for system_init with no role
 
 
+def test_client_message_id_is_strict_and_handoff_neutral():
+    from backend.api.chat import (
+        ChatMessage,
+        FrontendReviewGoalMessage,
+        _worker_turn_handoff_request_identity,
+    )
+
+    client_message_id = "123e4567-e89b-12d3-a456-426614174000"
+    baseline = ChatMessage(message="same message")
+    correlated = ChatMessage(
+        message="same message",
+        client_message_id=client_message_id,
+    )
+
+    assert correlated.client_message_id == client_message_id
+    assert correlated.model_dump(mode="json") == baseline.model_dump(mode="json")
+    assert _worker_turn_handoff_request_identity(
+        correlated,
+        ("codex", "gpt-5.6-sol", "default"),
+    ) == _worker_turn_handoff_request_identity(
+        baseline,
+        ("codex", "gpt-5.6-sol", "default"),
+    )
+    goal = FrontendReviewGoalMessage(
+        message="review",
+        client_message_id=client_message_id,
+    )
+    assert goal.client_message_id == client_message_id
+    assert "client_message_id" not in goal.model_dump(mode="json")
+
+    for invalid in (
+        "123e4567-e89b-12d3-a456-42661417400",
+        "123e4567-e89b-12d3-a456-4266141740000",
+        "123E4567-E89B-12D3-A456-426614174000",
+        "123e4567e89b12d3a456426614174000",
+    ):
+        with pytest.raises(ValueError):
+            ChatMessage(message="invalid", client_message_id=invalid)
+        with pytest.raises(ValueError):
+            FrontendReviewGoalMessage(
+                message="invalid",
+                client_message_id=invalid,
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "endpoint",
+    ("chat", "frontend-review-goal"),
+)
+@pytest.mark.parametrize(
+    "invalid_client_message_id",
+    (
+        "123e4567-e89b-12d3-a456-42661417400",
+        "123e4567-e89b-12d3-a456-4266141740000",
+        "123E4567-E89B-12D3-A456-426614174000",
+        "123e4567e89b12d3a456426614174000",
+    ),
+)
+async def test_chat_endpoints_reject_invalid_client_message_id(
+    client,
+    endpoint,
+    invalid_client_message_id,
+):
+    response = await client.post(
+        f"/api/tasks/999999/{endpoint}",
+        json={
+            "message": "invalid correlation id",
+            "client_message_id": invalid_client_message_id,
+        },
+    )
+
+    assert response.status_code == 422
+
+
 @pytest.mark.asyncio
 async def test_chat_send_stores_user_message(client, session_factory):
     """Sending a chat message should store user_message in DB."""
@@ -1259,7 +1334,13 @@ async def test_chat_send_broadcasts_user_message(client, session_factory):
 
     with patch("backend.main.instance_manager", mock_im), \
          patch("backend.main.broadcaster", mock_broadcaster):
-        await client.post(f"/api/tasks/{task_id}/chat", json={"message": "hello"})
+        await client.post(
+            f"/api/tasks/{task_id}/chat",
+            json={
+                "message": "hello",
+                "client_message_id": "11111111-2222-4333-8444-555555555555",
+            },
+        )
 
     # Check broadcast was called with user_message on task channel
     broadcast_calls = mock_broadcaster.broadcast.call_args_list
@@ -1274,6 +1355,10 @@ async def test_chat_send_broadcasts_user_message(client, session_factory):
     assert isinstance(event["id"], int)
     assert event["id"] > 0
     assert event["timestamp"].endswith("Z")
+    assert (
+        event["client_message_id"]
+        == "11111111-2222-4333-8444-555555555555"
+    )
 
     async with session_factory() as db:
         stored = (
@@ -1285,6 +1370,9 @@ async def test_chat_send_broadcasts_user_message(client, session_factory):
             )
         ).scalar_one()
     assert event["id"] == stored.id
+    assert json.loads(stored.raw_json)["client_message_id"] == (
+        "11111111-2222-4333-8444-555555555555"
+    )
 
     history_response = await client.get(
         f"/api/tasks/{task_id}/chat/history?compact=true&limit=200"
@@ -1297,6 +1385,7 @@ async def test_chat_send_broadcasts_user_message(client, session_factory):
     )
     assert history_row["id"] == stored.id
     assert history_row["timestamp"] == event["timestamp"]
+    assert history_row["client_message_id"] == event["client_message_id"]
 
 
 @pytest.mark.asyncio

@@ -2120,6 +2120,7 @@ async def test_chat_can_start_frontend_review_goal_on_same_task(
         f"/api/tasks/{task_id}/frontend-review-goal",
         json={
             "message": "审查登录页桌面和移动端，修复后重新验证",
+            "client_message_id": "11111111-2222-4333-8444-666666666666",
             "file_paths": [f"/api/uploads/{reference.name}"],
             "profile": "standard",
             "max_iterations": 5,
@@ -2173,12 +2174,23 @@ async def test_chat_can_start_frontend_review_goal_on_same_task(
     assert rows[0].content == "审查登录页桌面和移动端，修复后重新验证"
     goal_log = json.loads(rows[0].raw_json)
     assert goal_log["source"] == "frontend-review-goal"
+    assert goal_log["client_message_id"] == (
+        "11111111-2222-4333-8444-666666666666"
+    )
     assert goal_log["execution_principal"] == {
         "user_id": None,
         "role": "super_admin",
         "mode": "unrestricted",
         "kind": "deployment_token",
     }
+    history = await client.get(f"/api/tasks/{task_id}/chat/history")
+    assert history.status_code == 200
+    goal_message = next(
+        row
+        for row in history.json()
+        if row["event_type"] == "user_message"
+    )
+    assert goal_message["client_message_id"] == goal_log["client_message_id"]
 
 
 @pytest.mark.asyncio

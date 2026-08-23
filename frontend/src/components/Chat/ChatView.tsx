@@ -100,6 +100,35 @@ const WORKSPACE_REVIEW_START_TOOLS = new Set([
 const BACKGROUND_STALLED_AFTER_MS = 30 * 60 * 1000;
 const BACKGROUND_LONG_STALLED_AFTER_MS = 2 * 60 * 60 * 1000;
 
+function createClientMessageId(): string {
+  try {
+    if (typeof globalThis.crypto?.randomUUID === 'function') {
+      return globalThis.crypto.randomUUID();
+    }
+  } catch {
+    // Fall through to the UUID v4 formatter below.
+  }
+  const bytes = new Uint8Array(16);
+  let usedCrypto = false;
+  try {
+    if (typeof globalThis.crypto?.getRandomValues === 'function') {
+      globalThis.crypto.getRandomValues(bytes);
+      usedCrypto = true;
+    }
+  } catch {
+    // Math.random is sufficient for this UI-only reconciliation identity.
+  }
+  if (!usedCrypto) {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((value) => value.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 function latestBackgroundLifecycle(
   messages: ChatMessage[],
   identity: TaskTurnIdentity,
@@ -2201,6 +2230,9 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
       const content = (msg.data.content as string) || '';
       const source = (msg.data.source as string) || null;
       const rawContent = typeof msg.data.raw_content === 'string' ? msg.data.raw_content : null;
+      const clientMessageId = typeof msg.data.client_message_id === 'string'
+        ? msg.data.client_message_id
+        : null;
       const imageUrls = (msg.data.image_urls as string[]) || null;
       const attachments = (msg.data.attachments as { url: string; name: string; is_image: boolean }[]) || null;
       const appliedPlans = (msg.data.applied_plans as AppliedPlanSnapshot[]) || null;
@@ -2226,6 +2258,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
         attachments,
         source,
         raw_content: rawContent,
+        client_message_id: clientMessageId,
         applied_plans: appliedPlans,
         followup_operation_id: followupOperationId,
         persisted: isPersisted,
@@ -2274,11 +2307,15 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             && candidate.role === 'user'
             && candidate.event_type === 'user_message'
             && (
-              candidate.content === content
-              || (
-                rawContent !== null
-                && candidate.raw_content === rawContent
-              )
+              clientMessageId !== null
+                ? candidate.client_message_id === clientMessageId
+                : (
+                  candidate.content === content
+                  || (
+                    rawContent !== null
+                    && candidate.raw_content === rawContent
+                  )
+                )
             )
           ) {
             optimisticIndex = index;
@@ -2296,6 +2333,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             content,
             source,
             raw_content: rawContent ?? optimistic.raw_content,
+            client_message_id: clientMessageId ?? optimistic.client_message_id,
             timestamp: eventTimestamp,
             image_urls: imageUrls?.length ? imageUrls : optimistic.image_urls,
             attachments: attachments?.length ? attachments : optimistic.attachments,
@@ -3147,6 +3185,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
 
     let optimisticMessageId: number | null = null;
     let frontendReviewGoalRequestId: number | null = null;
+    const clientMessageId = createClientMessageId();
     try {
       let uploadedPaths: string[] | undefined;
       const uploadedResults = uploadedResultsForTurn;
@@ -3186,6 +3225,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
           image_urls: optimisticAttachments?.filter((a) => a.is_image).map((a) => a.url) || null,
           attachments: optimisticAttachments,
           raw_content: text,
+          client_message_id: clientMessageId,
           applied_plans: optimisticAppliedPlans.length > 0
             ? optimisticAppliedPlans
             : null,
@@ -3221,6 +3261,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
             model: task.model,
             codex_service_tier: task.codex_service_tier,
           },
+          client_message_id: clientMessageId,
         });
         setFrontendReviewComposerMode(false);
         setLocalStatus(activatedTask.status || 'pending');
@@ -3254,6 +3295,14 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 task.id,
                 text || '(files attached)',
                 uploadedPaths,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                clientMessageId,
               );
             } else if (planVersionIdsForTurn.length > 0) {
               chatResponse = await api.sendTaskChat(
@@ -3267,6 +3316,7 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 undefined,
                 planVersionIdsForTurn,
                 confirmedStalePlanIds,
+                clientMessageId,
               );
             } else if (planIdsForTurn.length > 0) {
               chatResponse = await api.sendTaskChat(
@@ -3278,9 +3328,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 routing,
                 planIdsForTurn,
                 confirmedStalePlanIds,
+                undefined,
+                undefined,
+                clientMessageId,
               );
             } else {
-              // Keep the legacy six-argument call for ordinary messages.
               chatResponse = await api.sendTaskChat(
                 task.id,
                 text || '(files attached)',
@@ -3288,6 +3340,11 @@ export function ChatView({ task, projects, onBack, onTaskUpdated, onTaskForked, 
                 selectedSecretIds.length > 0 ? selectedSecretIds : undefined,
                 modelOverride,
                 routing,
+                undefined,
+                undefined,
+                undefined,
+                undefined,
+                clientMessageId,
               );
             }
             break;

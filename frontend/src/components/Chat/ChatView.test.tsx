@@ -544,6 +544,14 @@ describe('ChatView', () => {
       88,
       'Shared follow-up',
       undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      expect.any(String),
     ));
 
     act(() => {
@@ -720,6 +728,109 @@ describe('ChatView', () => {
   });
 
   describe('optimistic user-message reconciliation', () => {
+    it('reconciles an HTTP history row before the WS echo across thread.started', async () => {
+      let resolveSend!: (value: Record<string, unknown>) => void;
+      vi.mocked(api.sendTaskChat).mockReturnValueOnce(
+        new Promise((resolve) => { resolveSend = resolve; }),
+      );
+      localStorage.setItem('cc_user', JSON.stringify({ name: 'Admin' }));
+      const task = makeTask({
+        id: 18,
+        status: 'completed',
+        retry_count: 1,
+        turn_generation: 8,
+      });
+      render(
+        <ChatView
+          task={task}
+          projects={projects}
+          onBack={onBack}
+          onTaskUpdated={onTaskUpdated}
+        />,
+      );
+      await waitFor(() => expect(api.getTaskChatHistory).toHaveBeenCalled());
+
+      await userEvent.type(screen.getByRole('textbox'), 'same text');
+      await userEvent.click(screen.getByTitle('Send (Ctrl+Enter)'));
+      await waitFor(() => expect(api.sendTaskChat).toHaveBeenCalledTimes(1));
+      const clientMessageId = vi.mocked(api.sendTaskChat).mock.calls[0][10];
+      expect(clientMessageId).toEqual(expect.any(String));
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:18',
+          data: {
+            id: 502,
+            event_type: 'system_event',
+            content: 'thread.started',
+            timestamp: '2026-08-23T03:11:58Z',
+            task_retry_count: 1,
+            task_turn_generation: 8,
+          },
+        });
+      });
+
+      vi.mocked(api.getTaskChatHistory).mockResolvedValueOnce([{
+        id: 501,
+        role: 'user',
+        event_type: 'user_message',
+        content: '[Admin] same text',
+        raw_content: 'same text',
+        client_message_id: clientMessageId,
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: '2026-08-23T03:11:56Z',
+        image_urls: null,
+        attachments: null,
+        task_retry_count: 1,
+        task_turn_generation: 8,
+      }, {
+        id: 502,
+        role: 'system',
+        event_type: 'system_event',
+        content: 'thread.started',
+        tool_name: null,
+        tool_input: null,
+        tool_output: null,
+        is_error: false,
+        loop_iteration: null,
+        timestamp: '2026-08-23T03:11:58Z',
+        image_urls: null,
+        attachments: null,
+        task_retry_count: 1,
+        task_turn_generation: 8,
+      }]);
+      act(() => capturedOnSubscribed?.(['task:18']));
+
+      await waitFor(() => {
+        expect(screen.getAllByText('[Admin] same text')).toHaveLength(1);
+      });
+      expect(screen.getAllByText('— thread.started —')).toHaveLength(1);
+
+      act(() => {
+        capturedOnMessage?.({
+          channel: 'task:18',
+          data: {
+            id: 501,
+            event_type: 'user_message',
+            role: 'user',
+            content: '[Admin] same text',
+            raw_content: 'same text',
+            client_message_id: clientMessageId,
+            timestamp: '2026-08-23T03:11:56Z',
+            task_retry_count: 1,
+            task_turn_generation: 8,
+          },
+        });
+      });
+      expect(screen.getAllByText('[Admin] same text')).toHaveLength(1);
+
+      await act(async () => resolveSend({ ok: true, queued: true }));
+    });
+
     it('removes the optimistic bubble when an id-less WS echo precedes HTTP failure', async () => {
       let rejectSend!: (reason: Error) => void;
       vi.mocked(api.sendTaskChat).mockReturnValueOnce(
@@ -2178,6 +2289,7 @@ describe('ChatView', () => {
           undefined,
           [502],
           [],
+          expect.any(String),
         );
       }, { timeout: 1800 });
       expect(api.injectTaskMessage).not.toHaveBeenCalled();
@@ -2399,6 +2511,7 @@ describe('ChatView', () => {
             model: 'gpt-5.6-sol',
             codex_service_tier: 'default',
           },
+          client_message_id: expect.any(String),
         },
       ));
       expect(api.sendTaskChat).not.toHaveBeenCalled();
@@ -2714,6 +2827,11 @@ describe('ChatView', () => {
             model: null,
             codex_service_tier: 'default',
           },
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          expect.any(String),
         );
       });
     });
@@ -3376,6 +3494,11 @@ describe('ChatView', () => {
           model: null,
           codex_service_tier: 'default',
         },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        expect.any(String),
       ));
     });
 
@@ -3411,6 +3534,11 @@ describe('ChatView', () => {
           model: null,
           codex_service_tier: 'default',
         },
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        expect.any(String),
       ));
     });
   });
@@ -5640,6 +5768,7 @@ describe('independent Plan attachments', () => {
       undefined,
       [503, 504],
       [],
+      expect.any(String),
     ));
   }, 15_000);
 

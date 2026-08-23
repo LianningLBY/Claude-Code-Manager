@@ -14076,13 +14076,17 @@ async def test_worker_chat_sender_prefix_is_display_only(session_factory, monkey
         task = await db.get(Task, t.id)
         await _send_worker_chat(
             task,
-            ChatMessage(message="[FIX] preserve this tag"),
+            ChatMessage(
+                message="[FIX] preserve this tag",
+                client_message_id="11111111-2222-4333-8444-777777777777",
+            ),
             db,
             request,
         )
 
     forwarded = proxy.proxy_to_worker.call_args.kwargs["body"]
     assert forwarded["message"] == "[FIX] preserve this tag"
+    assert "client_message_id" not in forwarded
     async with session_factory() as db:
         stored = (await db.execute(
             select(LogEntry).where(
@@ -14091,12 +14095,17 @@ async def test_worker_chat_sender_prefix_is_display_only(session_factory, monkey
             )
         )).scalar_one()
     assert stored.content == "[Worker Alice] [FIX] preserve this tag"
-    assert json.loads(stored.raw_json)["raw_content"] == "[FIX] preserve this tag"
+    metadata = json.loads(stored.raw_json)
+    assert metadata["raw_content"] == "[FIX] preserve this tag"
+    assert metadata["client_message_id"] == (
+        "11111111-2222-4333-8444-777777777777"
+    )
     event = broadcaster.sent[0][1]
     assert event["content"] == stored.content
     assert event["id"] == stored.id
     assert event["task_id"] == t.id
     assert event["timestamp"].endswith("Z")
+    assert event["client_message_id"] == metadata["client_message_id"]
 
 
 async def test_worker_terminal_pr_chat_separates_actor_from_sandbox_principal(
@@ -15177,6 +15186,103 @@ async def test_worker_plan_application_recovers_lost_http_ack(
         )
         assert application is not None
         assert receipt.status == "committed"
+
+
+async def test_worker_plan_receipt_rebinds_ui_correlation_on_retry(
+    session_factory,
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    from backend.api.chat import ChatMessage, _send_worker_chat
+
+    worker, task, version_id = await _approved_worker_plan_version(session_factory)
+    old_client_message_id = "11111111-2222-4333-8444-111111111111"
+    new_client_message_id = "22222222-3333-4444-8555-222222222222"
+    async with session_factory() as db:
+        prior_log = LogEntry(
+            instance_id=None,
+            task_id=task.id,
+            event_type="user_message",
+            role="user",
+            content="Implement once",
+            raw_json=json.dumps({
+                "raw_content": "Implement once",
+                "client_message_id": old_client_message_id,
+            }),
+            is_error=False,
+        )
+        db.add(prior_log)
+        await db.flush()
+        db.add(PlanApplicationReceipt(
+            receipt_key="prepared-ui-correlation-retry",
+            target_task_id=task.id,
+            worker_id=worker.id,
+            manager_user_log_id=prior_log.id,
+            plan_version_ids=[version_id],
+            status="prepared",
+        ))
+        await db.commit()
+        prior_log_id = prior_log.id
+
+    proxy = AsyncMock()
+    proxy.require_ready_worker.return_value = worker
+    proxy.get_plan_repo_revision.return_value = {
+        "available": False,
+        "reason": "not_git",
+    }
+    proxy.relay = AsyncMock()
+    proxy.get_plan_application_receipt.return_value = {
+        "status": "committed",
+        "response": {
+            "ok": True,
+            "queued": True,
+            "session_id": task.session_id,
+            "applied_plan_version_ids": [912],
+        },
+    }
+
+    async def route_chat(_task, method, _path, *_args, **_kwargs):
+        if method == "GET":
+            return _routing_snapshot(task)
+        raise AssertionError("Prepared receipt recovery must not resend chat")
+
+    proxy.proxy_to_worker.side_effect = route_chat
+    monkeypatch.setattr(main_module, "worker_proxy", proxy)
+    monkeypatch.setattr(main_module, "broadcaster", FakeBroadcaster())
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            user_id=None,
+            user_role="super_admin",
+            auth_type="token",
+        )
+    )
+
+    async with session_factory() as db:
+        current = await db.get(Task, task.id)
+        result = await _send_worker_chat(
+            current,
+            ChatMessage(
+                message="Implement once",
+                plan_version_ids=[version_id],
+                confirmed_stale_plan_version_ids=[version_id],
+                client_message_id=new_client_message_id,
+            ),
+            db,
+            request,
+        )
+
+    assert result["applied_plan_version_ids"] == [version_id]
+    assert sum(
+        call.args[1] == "POST"
+        for call in proxy.proxy_to_worker.await_args_list
+    ) == 0
+    async with session_factory() as db:
+        recovered_log = await db.get(LogEntry, prior_log_id)
+        metadata = json.loads(recovered_log.raw_json)
+        assert metadata["client_message_id"] == new_client_message_id
+        assert metadata["client_message_id"] != old_client_message_id
+        assert metadata["applied_plans"][0]["version_id"] == version_id
 
 
 async def test_worker_uncertain_http_reconciliation_consumes_manager_version(

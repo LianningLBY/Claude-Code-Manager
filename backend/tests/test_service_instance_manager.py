@@ -235,6 +235,46 @@ def test_claude_no_progress_state_reads_pty_stop_reason_from_raw_json():
     assert state.similar_messages == 1
 
 
+def test_claude_no_progress_state_ignores_missing_stop_reason():
+    state = _ClaudeNoProgressState()
+    event = {
+        "event_type": "message",
+        "role": "assistant",
+        "content": "I will rewrite the document now.",
+        "raw_json": json.dumps({
+            "type": "assistant",
+            "message": {"role": "assistant"},
+        }),
+    }
+
+    for now in (0, 130, 260):
+        assert not state.observe(event, now=now)
+    assert state.similar_messages == 0
+    assert not state.triggered
+
+
+def test_claude_no_progress_state_sees_sibling_tool_before_text():
+    state = _ClaudeNoProgressState()
+    for now in (0, 60):
+        assert not state.observe(
+            _incomplete_claude_message("I will rewrite the document now."),
+            now=now,
+        )
+
+    assert not state.observe(
+        {
+            **_incomplete_claude_message(
+                "I will rewrite the document now."
+            ),
+            "assistant_envelope_has_tool_use": True,
+        },
+        now=130,
+    )
+    assert state.tool_activity_seen
+    assert state.similar_messages == 0
+    assert not state.triggered
+
+
 def test_claude_no_progress_state_disables_detection_after_tool_activity():
     state = _ClaudeNoProgressState()
     assert not state.observe(
@@ -311,7 +351,7 @@ async def test_no_progress_failure_queues_one_fresh_session_recovery(db_factory)
     manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
     manager._launch_params[instance_id] = {
         "prompt": "wrapped prompt",
-        "current_message": "finish the document",
+        "current_message": "stale launch parameter",
         "source_log_id": source_id,
         "model": "claude-opus-4-6[1m]",
         "enabled_skills": {"monitor": True},
@@ -324,9 +364,16 @@ async def test_no_progress_failure_queues_one_fresh_session_recovery(db_factory)
             task_id,
             record,
         )
+        duplicate = await manager._try_enqueue_no_progress_recovery(
+            instance_id,
+            task_id,
+            record,
+        )
 
     assert recovered is True
+    assert duplicate is False
     dispatcher.issue_context_retry_permit.assert_called_once()
+    dispatcher.enqueue_message.assert_awaited_once()
     retry = dispatcher.enqueue_message.await_args.kwargs
     assert retry["source"] == "no_progress_retry"
     assert retry["prompt"] == "finish the document"

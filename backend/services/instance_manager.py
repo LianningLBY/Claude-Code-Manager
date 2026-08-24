@@ -778,6 +778,13 @@ class _ClaudeNoProgressState:
     first_seen_monotonic: float | None = None
     tool_activity_seen: bool = False
     triggered: bool = False
+    recovery_claimed: bool = False
+
+    def mark_tool_activity(self) -> None:
+        self.tool_activity_seen = True
+        self.anchor_text = None
+        self.similar_messages = 0
+        self.first_seen_monotonic = None
 
     @staticmethod
     def _normalize(content: str) -> str:
@@ -817,12 +824,11 @@ class _ClaudeNoProgressState:
     def observe(self, event: dict, *, now: float) -> bool:
         """Return True once for a sustained, effect-free incomplete loop."""
 
+        if event.get("assistant_envelope_has_tool_use") is True:
+            self.mark_tool_activity()
         event_type = event.get("event_type")
         if event_type in {"tool_use", "tool_result"}:
-            self.tool_activity_seen = True
-            self.anchor_text = None
-            self.similar_messages = 0
-            self.first_seen_monotonic = None
+            self.mark_tool_activity()
             return False
         if self.triggered or self.tool_activity_seen:
             return False
@@ -14996,16 +15002,14 @@ class InstanceManager:
         state = record.claude_no_progress
         params = self._launch_params.get(instance_id) or {}
         attempt = params.get("no_progress_retry_attempt", 0)
-        prompt = params.get("current_message") or params.get("prompt")
         requested_source_id = params.get("source_log_id")
         if not (
             state.triggered
             and not state.tool_activity_seen
+            and not state.recovery_claimed
             and state.similar_messages >= state.MIN_SIMILAR_MESSAGES
             and type(attempt) is int
             and attempt == 0
-            and isinstance(prompt, str)
-            and bool(prompt)
             and type(requested_source_id) is int
             and requested_source_id > 0
             and record.provider == "claude"
@@ -15014,6 +15018,11 @@ class InstanceManager:
             and type(record.task_turn_generation) is int
         ):
             return False
+
+        # Both PTY terminal finalization and the proxy consumer may observe the
+        # same failed generation. Claim before the first await so only one can
+        # issue a permit or enqueue a replay for this exact consumer record.
+        state.recovery_claimed = True
 
         try:
             from backend.main import dispatcher
@@ -15060,6 +15069,17 @@ class InstanceManager:
                     not in {source.id, original_id}
                     or not source_shape_is_canonical(source, original)
                 ):
+                    return False
+                replay_source = (
+                    original if source.event_type == "turn_source" else source
+                )
+                prompt = (
+                    replay_source.content
+                    if replay_source is not None
+                    and isinstance(replay_source.content, str)
+                    else None
+                )
+                if not prompt:
                     return False
                 permit_values = {
                     "task_id": task.id,

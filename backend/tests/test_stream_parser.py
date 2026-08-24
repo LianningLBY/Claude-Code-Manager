@@ -90,6 +90,51 @@ def test_assistant_api_error_message_is_marked_error(parser):
     assert result["is_error"] is True
 
 
+def test_assistant_stop_reason_preserves_absent_vs_explicit_null(parser):
+    without_stop_reason = parser.parse_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "still working"}],
+        },
+    }))[0]
+    explicit_null = parser.parse_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "still working"}],
+            "stop_reason": None,
+        },
+    }))[0]
+
+    assert "stop_reason" not in without_stop_reason
+    assert "stop_reason" in explicit_null
+    assert explicit_null["stop_reason"] is None
+
+
+def test_assistant_mixed_envelope_marks_tool_before_text_processing(parser):
+    events = parser.parse_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "I will inspect the file now."},
+                {"type": "tool_use", "name": "Read", "input": {}},
+            ],
+            "stop_reason": None,
+        },
+    }))
+
+    assert [event["event_type"] for event in events] == [
+        "message",
+        "tool_use",
+    ]
+    assert all(
+        event["assistant_envelope_has_tool_use"] is True
+        for event in events
+    )
+
+
 def test_tool_use(parser):
     line = json.dumps({
         "type": "tool_use",

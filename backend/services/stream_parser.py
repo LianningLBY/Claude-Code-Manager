@@ -168,7 +168,8 @@ class StreamParser:
                 event = _base_event()
                 event["role"] = "assistant"
                 event["event_type"] = "message"
-                event["stop_reason"] = message_obj.get("stop_reason")
+                if "stop_reason" in message_obj:
+                    event["stop_reason"] = message_obj["stop_reason"]
                 anomaly = detect_assistant_protocol_anomaly(
                     event["event_type"],
                     event["role"],
@@ -182,11 +183,18 @@ class StreamParser:
                     event["context_usage"] = usage_data
                 return [event]
             events = []
+            envelope_has_tool_use = any(
+                isinstance(block, dict) and block.get("type") == "tool_use"
+                for block in content_blocks
+            )
             for block in content_blocks:
                 if not isinstance(block, dict):
                     continue
                 evt = _base_event()
                 evt["role"] = "assistant"
+                evt["assistant_envelope_has_tool_use"] = (
+                    envelope_has_tool_use
+                )
                 if block.get("type") == "tool_use":
                     evt["event_type"] = "tool_use"
                     evt["tool_name"] = block.get("name")
@@ -212,7 +220,8 @@ class StreamParser:
                 event = _base_event()
                 event["role"] = "assistant"
                 event["event_type"] = "message"
-                event["stop_reason"] = message_obj.get("stop_reason")
+                if "stop_reason" in message_obj:
+                    event["stop_reason"] = message_obj["stop_reason"]
                 if data.get("isApiErrorMessage"):
                     event["is_error"] = True
                 if usage_data:
@@ -221,9 +230,10 @@ class StreamParser:
             if data.get("isApiErrorMessage"):
                 for event in events:
                     event["is_error"] = True
-            stop_reason = message_obj.get("stop_reason")
-            for event in events:
-                event["stop_reason"] = stop_reason
+            if "stop_reason" in message_obj:
+                stop_reason = message_obj["stop_reason"]
+                for event in events:
+                    event["stop_reason"] = stop_reason
             # Attach usage data to the first event only
             if usage_data and events:
                 events[0]["context_usage"] = usage_data

@@ -1,5 +1,6 @@
 import asyncio
 import concurrent.futures
+import difflib
 import hashlib
 import inspect
 import json
@@ -759,6 +760,118 @@ class _OutputConsumerRecord:
     # ``assistant`` envelope and again in the terminal ``result`` envelope.
     # Keep terminal metadata but suppress only that exact repeated body.
     last_claude_assistant_text: str | None = None
+    claude_no_progress: "_ClaudeNoProgressState" = field(
+        default_factory=lambda: _ClaudeNoProgressState()
+    )
+
+
+@dataclass
+class _ClaudeNoProgressState:
+    """Detect one Claude turn repeatedly emitting similar incomplete text."""
+
+    MIN_SIMILAR_MESSAGES = 3
+    MIN_ELAPSED_SECONDS = 120.0
+    SIMILARITY_THRESHOLD = 0.45
+
+    anchor_text: str | None = None
+    similar_messages: int = 0
+    first_seen_monotonic: float | None = None
+    tool_activity_seen: bool = False
+    triggered: bool = False
+
+    @staticmethod
+    def _normalize(content: str) -> str:
+        return " ".join(content.casefold().split()).strip(" .,!?:;，。！？：；")
+
+    @staticmethod
+    def _stop_reason(event: dict) -> tuple[bool, object]:
+        if "stop_reason" in event:
+            return True, event.get("stop_reason")
+        raw = event.get("raw_json")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            return False, None
+        if not isinstance(parsed, dict):
+            return False, None
+        message = parsed.get("message")
+        if not isinstance(message, dict) or "stop_reason" not in message:
+            return False, None
+        return True, message.get("stop_reason")
+
+    @staticmethod
+    def session_id(event: dict) -> str | None:
+        value = event.get("session_id")
+        if isinstance(value, str) and value:
+            return value
+        raw = event.get("raw_json")
+        try:
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        value = parsed.get("sessionId") or parsed.get("session_id")
+        return value if isinstance(value, str) and value else None
+
+    def observe(self, event: dict, *, now: float) -> bool:
+        """Return True once for a sustained, effect-free incomplete loop."""
+
+        event_type = event.get("event_type")
+        if event_type in {"tool_use", "tool_result"}:
+            self.tool_activity_seen = True
+            self.anchor_text = None
+            self.similar_messages = 0
+            self.first_seen_monotonic = None
+            return False
+        if self.triggered or self.tool_activity_seen:
+            return False
+        if event_type != "message" or event.get("role") != "assistant":
+            return False
+        has_stop_reason, stop_reason = self._stop_reason(event)
+        if not has_stop_reason:
+            return False
+        if stop_reason is not None:
+            self.anchor_text = None
+            self.similar_messages = 0
+            self.first_seen_monotonic = None
+            return False
+
+        content = event.get("content")
+        if not isinstance(content, str):
+            return False
+        normalized = self._normalize(content)
+        if len(normalized) < 5:
+            return False
+
+        if self.anchor_text is None:
+            self.anchor_text = normalized
+            self.similar_messages = 1
+            self.first_seen_monotonic = now
+            return False
+
+        similarity = difflib.SequenceMatcher(
+            None,
+            self.anchor_text,
+            normalized,
+            autojunk=False,
+        ).ratio()
+        if similarity < self.SIMILARITY_THRESHOLD:
+            self.anchor_text = normalized
+            self.similar_messages = 1
+            self.first_seen_monotonic = now
+            return False
+
+        self.similar_messages += 1
+        first_seen = self.first_seen_monotonic
+        if (
+            self.similar_messages >= self.MIN_SIMILAR_MESSAGES
+            and first_seen is not None
+            and now - first_seen >= self.MIN_ELAPSED_SECONDS
+        ):
+            self.triggered = True
+            return True
+        return False
 
 
 @dataclass
@@ -3231,6 +3344,7 @@ class InstanceManager:
         ssh_agent_socket_snapshot: _SshAgentSocketSnapshot | None = None,
         context_retry_permit: object | None = None,
         context_retry_claimed_source_log_id: int | None = None,
+        no_progress_retry_attempt: int = 0,
     ) -> int:
         """Admit one turn and spend continuation authority on every attempt.
 
@@ -3278,6 +3392,7 @@ class InstanceManager:
                 context_retry_claimed_source_log_id=(
                     context_retry_claimed_source_log_id
                 ),
+                no_progress_retry_attempt=no_progress_retry_attempt,
             )
         finally:
             self.revoke_sequential_turn_continuation(
@@ -3317,6 +3432,7 @@ class InstanceManager:
         sequential_turn_token: object | None = None,
         context_retry_permit: object | None = None,
         context_retry_claimed_source_log_id: int | None = None,
+        no_progress_retry_attempt: int = 0,
     ) -> int:
         """Atomically admit one turn into a reusable instance slot."""
 
@@ -3431,6 +3547,9 @@ class InstanceManager:
                                 ),
                                 context_retry_claimed_source_log_id=(
                                     context_retry_claimed_source_log_id
+                                ),
+                                no_progress_retry_attempt=(
+                                    no_progress_retry_attempt
                                 ),
                             )
                     except BaseException:
@@ -4346,6 +4465,7 @@ class InstanceManager:
         ssh_agent_socket_snapshot: _SshAgentSocketSnapshot | None = None,
         context_retry_permit: object | None = None,
         context_retry_claimed_source_log_id: int | None = None,
+        no_progress_retry_attempt: int = 0,
     ) -> int:
         """Launch a Claude Code subprocess for the given instance.
 
@@ -6368,6 +6488,7 @@ class InstanceManager:
                 "execution_principal_kind": execution_principal_kind,
                 "attachment_paths": tuple(attachment_paths),
                 "ssh_agent_socket_snapshot": ssh_agent_socket_snapshot,
+                "no_progress_retry_attempt": no_progress_retry_attempt,
             }
 
         return await self._persist_and_track_launch(
@@ -11727,11 +11848,11 @@ class InstanceManager:
             )
 
         ec = exit_code if exit_code is not None else 0
+        provider_error = (record.fatal_provider_error or "").strip()
         interrupted = ec in (-2, 130)
-        successful_terminal = ec == 0 or interrupted
+        successful_terminal = (ec == 0 or interrupted) and not provider_error
         final_status = "completed" if successful_terminal else "failed"
         completed_at = datetime.utcnow()
-        provider_error = (record.fatal_provider_error or "").strip()
         failure_notice_data = None
 
         def background_handoff_pending() -> bool:
@@ -12155,14 +12276,17 @@ class InstanceManager:
                 if (
                     not preserve_background_failure
                     and not successful_terminal
-                    and provider_error.startswith("Response timed out")
+                    and (
+                        provider_error.startswith("Response timed out")
+                        or provider_error.startswith(
+                            "Claude response made no progress"
+                        )
+                    )
                 ):
-                    # A silent Claude PTY timeout means the persisted native
-                    # turn may contain an unmatched tool_use. Resuming that
-                    # session deterministically reproduced the same dead turn
-                    # in production (task 315). Fence it off so the next user
-                    # turn starts a fresh native session instead of replaying
-                    # corrupted executor state.
+                    # A silent timeout may leave an unmatched tool_use, while
+                    # a no-progress loop proves the native turn itself is not
+                    # converging. Fence either session off so the next user
+                    # message starts fresh instead of resuming bad state.
                     task.session_id = None
                     task.context_window_usage = None
                     await db.flush()
@@ -12262,6 +12386,18 @@ class InstanceManager:
                                 return "background_armed"
                             return None
                 await db.commit()
+
+            if (
+                not preserve_background_failure
+                and provider_error.startswith(
+                    "Claude response made no progress"
+                )
+            ):
+                await self._try_enqueue_no_progress_recovery(
+                    instance_id,
+                    task_id,
+                    record,
+                )
 
             if preserve_background_failure:
                 # The watchdog already committed and broadcast the precise
@@ -13250,6 +13386,28 @@ class InstanceManager:
                 await asyncio.gather(reader, return_exceptions=True)
             raise
 
+    async def _interrupt_no_progress_claude_turn(
+        self,
+        instance_id: int,
+        process: asyncio.subprocess.Process,
+    ) -> None:
+        """Interrupt only the exact Claude generation that emitted the loop."""
+
+        backend = self._pty_backend
+        session = getattr(process, "session", None)
+        if (
+            backend is not None
+            and session is not None
+            and getattr(backend, "_sessions", {}).get(instance_id) is session
+        ):
+            await session.send_interrupt()
+            return
+        await self._signal_managed_process_tree(
+            instance_id,
+            process,
+            signal.SIGINT,
+        )
+
     async def _consume_output_impl(self, instance_id: int, task_id: int | None, process: asyncio.subprocess.Process, loop_iteration: int | None = None, chat_initiated: bool = False, provider: str = "claude"):
         """Read NDJSON lines from stdout, parse, store, and broadcast.
 
@@ -13348,6 +13506,14 @@ class InstanceManager:
                                     record if tracked_generation else None
                                 ),
                             )
+                            if (
+                                record is not None
+                                and record.fatal_provider_error
+                                and _fatal_provider_error is None
+                            ):
+                                _fatal_provider_error = (
+                                    record.fatal_provider_error[:2000]
+                                )
                             if event.get("event_type") == "rate_limit_event":
                                 # Only a genuine near-limit/blocked event should
                                 # evaluate a switch. The CLI emits an
@@ -13424,7 +13590,7 @@ class InstanceManager:
             # DB ownership plus generation maps if proof still fails.
             reap_error = exc
         exit_code = process.returncode
-        if exit_code == 0 and _fatal_provider_error:
+        if exit_code in (0, -2, 130) and _fatal_provider_error:
             # The CLI can report a structurally failed provider turn while
             # exiting cleanly. Use the semantic result for retries and durable
             # task status; process health must not turn an API error into a
@@ -13925,6 +14091,15 @@ class InstanceManager:
                                 else f"Process exited with code {exit_code}"
                             )
                         await db.flush()
+                    if (
+                        not successful_terminal
+                        and failure_text.startswith(
+                            "Claude response made no progress"
+                        )
+                    ):
+                        current_task_generation.session_id = None
+                        current_task_generation.context_window_usage = None
+                        await db.flush()
                     final_status = current_task_generation.status
                     if not successful_terminal and not _fatal_provider_error:
                         process_label = self._provider_process_label(
@@ -14046,6 +14221,18 @@ class InstanceManager:
                 )
                 return
             await db.commit()
+
+        if (
+            task_id
+            and chat_initiated
+            and record is not None
+            and failure_text.startswith("Claude response made no progress")
+        ):
+            await self._try_enqueue_no_progress_recovery(
+                instance_id,
+                task_id,
+                record,
+            )
 
         await self._publish_agent_terminal_admission(admission)
 
@@ -14798,6 +14985,148 @@ class InstanceManager:
                 return True
             return source.actual_transport is not None
 
+    async def _try_enqueue_no_progress_recovery(
+        self,
+        instance_id: int,
+        task_id: int,
+        record: _OutputConsumerRecord,
+    ) -> bool:
+        """Queue one fresh-session replay after a proven effect-free loop."""
+
+        state = record.claude_no_progress
+        params = self._launch_params.get(instance_id) or {}
+        attempt = params.get("no_progress_retry_attempt", 0)
+        prompt = params.get("current_message") or params.get("prompt")
+        requested_source_id = params.get("source_log_id")
+        if not (
+            state.triggered
+            and not state.tool_activity_seen
+            and state.similar_messages >= state.MIN_SIMILAR_MESSAGES
+            and type(attempt) is int
+            and attempt == 0
+            and isinstance(prompt, str)
+            and bool(prompt)
+            and type(requested_source_id) is int
+            and requested_source_id > 0
+            and record.provider == "claude"
+            and record.task_id == task_id
+            and type(record.task_retry_count) is int
+            and type(record.task_turn_generation) is int
+        ):
+            return False
+
+        try:
+            from backend.main import dispatcher
+            from backend.services.dispatcher import PRIORITY_USER
+            from backend.services.terminal_arbitration import (
+                source_alias_original_log_id,
+                source_shape_is_canonical,
+            )
+
+            if dispatcher is None:
+                return False
+            async with self.db_factory() as db:
+                task = await db.get(Task, task_id)
+                if (
+                    task is None
+                    or (task.provider or "claude").lower() != "claude"
+                    or task.status != "failed"
+                    or task.instance_id != instance_id
+                    or task.retry_count != record.task_retry_count
+                    or task.turn_generation != record.task_turn_generation
+                    or task.session_id is not None
+                    or type(task.turn_source_log_id) is not int
+                    or task.turn_source_log_id <= 0
+                ):
+                    return False
+                source = await db.get(LogEntry, task.turn_source_log_id)
+                original_id = (
+                    source_alias_original_log_id(source)
+                    if source is not None
+                    else None
+                )
+                original = (
+                    await db.get(LogEntry, original_id)
+                    if original_id is not None
+                    else None
+                )
+                if (
+                    source is None
+                    or source.task_id != task.id
+                    or source.task_retry_count != task.retry_count
+                    or source.task_turn_generation != task.turn_generation
+                    or source.turn_scope != "source"
+                    or requested_source_id
+                    not in {source.id, original_id}
+                    or not source_shape_is_canonical(source, original)
+                ):
+                    return False
+                permit_values = {
+                    "task_id": task.id,
+                    "instance_id": instance_id,
+                    "retry_count": task.retry_count,
+                    "turn_generation": task.turn_generation,
+                    "turn_source_log_id": task.turn_source_log_id,
+                    "session_id": None,
+                    "started_at": task.started_at,
+                    "completed_at": task.completed_at,
+                }
+
+            permit = dispatcher.issue_context_retry_permit(**permit_values)
+            retry_kwargs = {
+                "task_id": task_id,
+                "prompt": prompt,
+                "priority": PRIORITY_USER,
+                "source": "no_progress_retry",
+                "source_log_id": requested_source_id,
+                "current_message": prompt,
+                "allow_new_session": True,
+                "context_retry_permit": permit,
+                "no_progress_retry_attempt": 1,
+                "initiating_user_id": params.get("initiating_user_id"),
+                "initiating_user_role": params.get(
+                    "initiating_user_role", "member"
+                ),
+                "execution_mode": params.get("execution_mode", "sandbox"),
+                "execution_principal_kind": params.get(
+                    "execution_principal_kind", "system"
+                ),
+                "attachment_paths": tuple(
+                    params.get("attachment_paths") or ()
+                ),
+                "ssh_agent_socket_snapshot": params.get(
+                    "ssh_agent_socket_snapshot"
+                ),
+            }
+            if isinstance(params.get("enabled_skills"), dict):
+                retry_kwargs["command_skills"] = dict(
+                    params["enabled_skills"]
+                )
+            if isinstance(params.get("model"), str):
+                retry_kwargs["model_override"] = params["model"]
+            if params.get("queue_timestamp") is not None:
+                retry_kwargs["queue_timestamp"] = params["queue_timestamp"]
+            try:
+                admitted = await dispatcher.enqueue_message(**retry_kwargs)
+            except BaseException:
+                dispatcher.revoke_context_retry_permit(permit)
+                raise
+            if admitted is False:
+                dispatcher.revoke_context_retry_permit(permit)
+                return False
+            logger.warning(
+                "Task %d no-progress loop stopped; queued one fresh-session "
+                "automatic retry",
+                task_id,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "Could not safely enqueue no-progress recovery for task %d",
+                task_id,
+            )
+            return False
+
     async def _try_chat_transient_retry(
         self, instance_id: int, task_id: int, exit_code: int, stderr_text: str,
     ) -> bool:
@@ -14919,6 +15248,9 @@ class InstanceManager:
                 ),
                 ssh_agent_socket_snapshot=params.get(
                     "ssh_agent_socket_snapshot"
+                ),
+                no_progress_retry_attempt=params.get(
+                    "no_progress_retry_attempt", 0
                 ),
             )
             return True
@@ -15170,6 +15502,9 @@ class InstanceManager:
                     ssh_agent_socket_snapshot=params.get(
                         "ssh_agent_socket_snapshot"
                     ),
+                    no_progress_retry_attempt=params.get(
+                        "no_progress_retry_attempt", 0
+                    ),
                 )
                 return True
 
@@ -15321,6 +15656,9 @@ class InstanceManager:
                 ),
                 ssh_agent_socket_snapshot=params.get(
                     "ssh_agent_socket_snapshot"
+                ),
+                no_progress_retry_attempt=params.get(
+                    "no_progress_retry_attempt", 0
                 ),
             )
             return True
@@ -16632,6 +16970,96 @@ class InstanceManager:
                 task_id,
             )
             return
+        if (
+            provider == "claude"
+            and event_record is not None
+            and event_record.chat_initiated
+            and not background_scoped
+            and not event.get("orphan")
+            and not event.get("autonomous")
+        ):
+            no_progress = event_record.claude_no_progress
+            process_session_id = getattr(
+                getattr(event_record.process, "session", None),
+                "session_id",
+                None,
+            )
+            exact_event_source = explicit_consumer_record or (
+                isinstance(process_session_id, str)
+                and process_session_id
+                and no_progress.session_id(event) == process_session_id
+            )
+            if not exact_event_source:
+                no_progress = None
+        else:
+            no_progress = None
+        if no_progress is not None:
+            triggered = no_progress.observe(event, now=time.monotonic())
+            has_stop_reason, stop_reason = no_progress._stop_reason(event)
+            if (
+                no_progress.triggered
+                and not triggered
+                and event.get("event_type") == "message"
+                and event.get("role") == "assistant"
+                and has_stop_reason
+                and stop_reason is None
+            ):
+                return
+            if triggered:
+                retry_attempt = (
+                    self._launch_params.get(instance_id, {}).get(
+                        "no_progress_retry_attempt", 0
+                    )
+                )
+                failure = (
+                    "Claude response made no progress: repeated similar "
+                    "incomplete assistant messages for at least two minutes"
+                )
+                object.__setattr__(
+                    event_record,
+                    "fatal_provider_error",
+                    failure,
+                )
+                logger.error(
+                    "Interrupting no-progress Claude turn for instance %s "
+                    "task %s after %s similar incomplete messages",
+                    instance_id,
+                    task_id,
+                    no_progress.similar_messages,
+                )
+                await self._interrupt_no_progress_claude_turn(
+                    instance_id,
+                    event_record.process,
+                )
+                event = dict(event)
+                event.update(
+                    event_type="system_event",
+                    role="system",
+                    content=(
+                        (
+                            "Claude 连续返回未完成且高度相似的回复，CCM 已"
+                            "中止异常回合，将尝试使用新会话自动恢复（仅重试一次）。"
+                        )
+                        if retry_attempt == 0
+                        else (
+                            "Claude 在自动恢复后仍连续返回未完成且高度相似的"
+                            "回复，CCM 已停止本轮。请重新发送消息后重试。"
+                        )
+                    ),
+                    is_error=True,
+                    protocol_anomaly="claude_no_progress_loop",
+                    raw_json=json.dumps(
+                        {
+                            "type": "ccm.turn.failed",
+                            "version": 1,
+                            "provider": "claude",
+                            "reason": "no_progress_loop",
+                            "recovery_attempt": retry_attempt,
+                        },
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                )
         fatal_provider_error = self._fatal_provider_error_for_event(event)
         if (
             fatal_provider_error

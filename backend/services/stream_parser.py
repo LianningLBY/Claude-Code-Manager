@@ -168,6 +168,7 @@ class StreamParser:
                 event = _base_event()
                 event["role"] = "assistant"
                 event["event_type"] = "message"
+                event["stop_reason"] = message_obj.get("stop_reason")
                 anomaly = detect_assistant_protocol_anomaly(
                     event["event_type"],
                     event["role"],
@@ -211,6 +212,7 @@ class StreamParser:
                 event = _base_event()
                 event["role"] = "assistant"
                 event["event_type"] = "message"
+                event["stop_reason"] = message_obj.get("stop_reason")
                 if data.get("isApiErrorMessage"):
                     event["is_error"] = True
                 if usage_data:
@@ -219,6 +221,9 @@ class StreamParser:
             if data.get("isApiErrorMessage"):
                 for event in events:
                     event["is_error"] = True
+            stop_reason = message_obj.get("stop_reason")
+            for event in events:
+                event["stop_reason"] = stop_reason
             # Attach usage data to the first event only
             if usage_data and events:
                 events[0]["context_usage"] = usage_data

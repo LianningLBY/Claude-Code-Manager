@@ -25,6 +25,7 @@ from backend.services.dispatcher import (
     WorkerTurnLaunchOutcomeUncertainError,
     _ModeTurnSequence,
     _ModeTurnTerminalProof,
+    _context_retry_permit_matches,
     _prepend_task_artifact_policy,
     _should_ensure_agent_docs,
 )
@@ -467,6 +468,137 @@ async def test_compact_retry_without_generation_permit_fails_closed(db_factory):
         assert current.retry_count == 1
         assert current.turn_generation == 3
         assert current.session_id is None
+
+
+def test_no_progress_retry_requires_and_matches_exact_generation_permit():
+    started_at = datetime(2026, 8, 24, 10, 0, 0)
+    task = Task(
+        id=41,
+        title="no-progress retry permit",
+        status="failed",
+        provider="claude",
+        retry_count=2,
+        turn_generation=8,
+        instance_id=17,
+        turn_source_log_id=91,
+        session_id=None,
+        started_at=started_at,
+        completed_at=None,
+    )
+    unproven = QueuedMessage(
+        priority=0,
+        timestamp=0,
+        prompt="retry",
+        source="no_progress_retry",
+        no_progress_retry_attempt=1,
+    )
+    proven = QueuedMessage(
+        priority=0,
+        timestamp=0,
+        prompt="retry",
+        source="no_progress_retry",
+        no_progress_retry_attempt=1,
+        context_retry_permit=ContextRetryPermit(
+            task_id=41,
+            instance_id=17,
+            retry_count=2,
+            turn_generation=8,
+            turn_source_log_id=91,
+            session_id=None,
+            started_at=started_at,
+            completed_at=None,
+        ),
+    )
+
+    assert _context_retry_permit_matches(task, unproven) is False
+    assert _context_retry_permit_matches(task, proven) is True
+
+
+@pytest.mark.asyncio
+async def test_no_progress_retry_claims_next_generation_with_fresh_session(
+    db_factory,
+):
+    started_at = datetime(2026, 8, 24, 10, 5, 0)
+    async with db_factory() as db:
+        previous = Instance(name="failed-no-progress", status="error")
+        idle = Instance(name="fresh-recovery-slot", status="idle")
+        db.add_all([previous, idle])
+        await db.flush()
+        task = Task(
+            title="no-progress automatic recovery",
+            description="retry once",
+            target_repo="/tmp",
+            status="failed",
+            provider="claude",
+            retry_count=0,
+            turn_generation=4,
+            instance_id=previous.id,
+            session_id=None,
+            started_at=started_at,
+            completed_at=None,
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            instance_id=previous.id,
+            task_id=task.id,
+            task_retry_count=task.retry_count,
+            task_turn_generation=task.turn_generation,
+            turn_scope="source",
+            event_type="user_message",
+            role="user",
+            content="finish the document",
+            raw_json=_system_source_metadata(
+                raw_content="finish the document",
+            ),
+            is_error=False,
+            actual_transport="claude_pty",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id = task.id
+        previous_id = previous.id
+        source_id = source.id
+
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._ensure_queue_worker = MagicMock()
+    dispatcher._resolve_resume_config_dir = AsyncMock(return_value=None)
+    permit = dispatcher.issue_context_retry_permit(
+        task_id=task_id,
+        instance_id=previous_id,
+        retry_count=0,
+        turn_generation=4,
+        turn_source_log_id=source_id,
+        session_id=None,
+        started_at=started_at,
+        completed_at=None,
+    )
+    await dispatcher.enqueue_message(
+        task_id=task_id,
+        prompt="finish the document",
+        source="no_progress_retry",
+        source_log_id=source_id,
+        current_message="finish the document",
+        allow_new_session=True,
+        context_retry_permit=permit,
+        no_progress_retry_attempt=1,
+    )
+    queued = dispatcher._get_task_queue(task_id).get_nowait()
+
+    await dispatcher._process_queued_message(task_id, queued)
+
+    dispatcher.instance_manager.launch.assert_awaited_once()
+    launch = dispatcher.instance_manager.launch.await_args.kwargs
+    assert launch["resume_session_id"] is None
+    assert launch["task_turn_generation"] == 5
+    assert launch["no_progress_retry_attempt"] == 1
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+    assert current.status == "executing"
+    assert current.turn_generation == 5
+    assert current.session_id is None
 
 
 async def _bind_hidden_lifecycle_source(db_factory, task_id: int) -> None:

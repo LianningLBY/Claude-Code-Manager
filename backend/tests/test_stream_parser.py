@@ -266,6 +266,28 @@ def test_assistant_legacy_tool_markup_remains_inert_text(parser, text):
     assert results[0]["protocol_anomaly"] == LEGACY_TOOL_MARKUP_ANOMALY
 
 
+def test_assistant_message_preserves_stop_reason(parser):
+    incomplete = parser.parse_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "I will rewrite it."}],
+            "stop_reason": None,
+        },
+    }))
+    complete = parser.parse_line(json.dumps({
+        "type": "assistant",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Done."}],
+            "stop_reason": "end_turn",
+        },
+    }))
+
+    assert incomplete[0]["stop_reason"] is None
+    assert complete[0]["stop_reason"] == "end_turn"
+
+
 @pytest.mark.parametrize(
     ("event_type", "role", "text"),
     [

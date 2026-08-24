@@ -770,7 +770,7 @@ class QueuedMessage:
     claimed_turn_generation: int | None = field(
         compare=False, default=None, repr=False
     )
-    # Once a compact retry has claimed G+1, bind later in-process launch
+    # Once an automatic retry has claimed G+1, bind later in-process launch
     # retries to the exact source row installed by that claim.  The original
     # permit still names rejected G; this field prevents it from floating to a
     # different G+1 source after a pre-launch rollback/requeue.
@@ -811,6 +811,12 @@ class QueuedMessage:
     context_retry_permit: "ContextRetryPermit | None" = field(
         compare=False,
         default=None,
+        repr=False,
+    )
+    # A no-progress recovery may replay the exact user input only once.
+    no_progress_retry_attempt: int = field(
+        compare=False,
+        default=0,
         repr=False,
     )
     # Internal producers snapshot this before committing the result which
@@ -857,17 +863,17 @@ def _context_retry_permit_matches(
     task: Task,
     msg: QueuedMessage,
 ) -> bool:
-    """Validate the exact rejected generation before compact-retry admission."""
+    """Validate the exact rejected generation before automatic retry."""
 
     permit = msg.context_retry_permit
     if permit is None:
-        # ``compact_retry`` is an internal replay authority, not merely a
-        # descriptive source label.  Legacy/forged queue items without the
-        # immutable rejected-generation proof must fail closed; ordinary
-        # queued messages do not need this specialized permit.
-        return msg.source != "compact_retry"
-    if msg.source != "compact_retry" or not isinstance(
-        permit, ContextRetryPermit
+        # Internal replay sources are authorities, not merely descriptive
+        # labels. Legacy/forged queue items without immutable generation proof
+        # must fail closed; ordinary messages do not need this permit.
+        return msg.source not in {"compact_retry", "no_progress_retry"}
+    if (
+        msg.source not in {"compact_retry", "no_progress_retry"}
+        or not isinstance(permit, ContextRetryPermit)
     ):
         return False
     baseline_matches = bool(
@@ -1291,7 +1297,7 @@ class GlobalDispatcher:
         started_at: datetime | None,
         completed_at: datetime | None,
     ) -> ContextRetryPermit:
-        """Issue one volatile authority for rejected G -> compact G+1."""
+        """Issue one volatile authority for a proven-safe rejected G -> G+1."""
 
         authority_id = secrets.token_hex(16)
         permit = ContextRetryPermit(
@@ -1305,7 +1311,7 @@ class GlobalDispatcher:
             started_at=started_at,
             completed_at=completed_at,
         )
-        # Only one compact authority for an exact rejected generation may be
+        # Only one retry authority for an exact rejected generation may be
         # live in this process.  Re-issuing revokes an older unconsumed copy.
         for existing_id, existing in tuple(
             self._context_retry_authorities.items()
@@ -1320,7 +1326,7 @@ class GlobalDispatcher:
         return permit
 
     def _context_retry_authority_is_live(self, msg: QueuedMessage) -> bool:
-        if msg.source != "compact_retry":
+        if msg.source not in {"compact_retry", "no_progress_retry"}:
             return msg.context_retry_permit is None
         permit = msg.context_retry_permit
         return bool(
@@ -1345,11 +1351,11 @@ class GlobalDispatcher:
             self._context_retry_authorities.pop(authority_id, None)
 
     def _consume_context_retry_authority(self, msg: QueuedMessage) -> None:
-        if msg.source != "compact_retry":
+        if msg.source not in {"compact_retry", "no_progress_retry"}:
             return
         if not self._context_retry_authority_is_live(msg):
             raise QueuedMessagePrelaunchError(
-                "Compact retry launch authority is no longer current"
+                "Automatic retry launch authority is no longer current"
             )
         self.revoke_context_retry_permit(msg.context_retry_permit)
 
@@ -18718,6 +18724,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         queue_timestamp: float | None = None,
         allow_new_session: bool | None = None,
         context_retry_permit: ContextRetryPermit | None = None,
+        no_progress_retry_attempt: int = 0,
         queue_admission_fence: QueueAdmissionFence | None = None,
         initiating_user_id: int | None = None,
         initiating_user_role: str = "member",
@@ -18745,6 +18752,19 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
         ):
             raise ValueError(
                 "Shared messages must use the sandboxed system principal"
+            )
+        if source == "no_progress_retry":
+            if (
+                no_progress_retry_attempt != 1
+                or context_retry_permit is None
+                or allow_new_session is not True
+            ):
+                raise ValueError(
+                    "No-progress retry requires one fresh-session authority"
+                )
+        elif no_progress_retry_attempt != 0:
+            raise ValueError(
+                "No-progress retry attempt is only valid for its internal source"
             )
         internal_session_report = source.startswith(("monitor:", "sub-agent:"))
         msg = QueuedMessage(
@@ -18775,6 +18795,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 allow_new_session is None and internal_session_report
             ),
             context_retry_permit=context_retry_permit,
+            no_progress_retry_attempt=no_progress_retry_attempt,
             queue_admission_fence=queue_admission_fence,
         )
         async with self._dispatch_claim_lock:
@@ -23726,6 +23747,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                 ssh_agent_socket_snapshot=msg.ssh_agent_socket_snapshot,
                 attachment_paths=msg.attachment_paths,
                 context_retry_permit=msg.context_retry_permit,
+                no_progress_retry_attempt=msg.no_progress_retry_attempt,
                 context_retry_claimed_source_log_id=(
                     msg.context_retry_claimed_source_log_id
                 ),

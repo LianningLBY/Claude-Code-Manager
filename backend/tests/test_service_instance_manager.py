@@ -7040,7 +7040,7 @@ async def test_local_user_demotion_between_precheck_and_transport_commit_blocks_
 
 
 @pytest.mark.asyncio
-async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
+async def test_claude_pty_large_prompt_receives_task_ssh_guard_env_and_policy(
     db_factory,
     monkeypatch,
     tmp_path,
@@ -7077,9 +7077,10 @@ async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
     im._pty_backend = MagicMock()
     im._launch_pty = AsyncMock(return_value=54_321)
 
+    prompt = "inspect remote files\n" + "x" * (64 * 1024)
     pid = await im.launch(
         instance_id=inst.id,
-        prompt="inspect remote files",
+        prompt=prompt,
         task_id=task.id,
         cwd=str(tmp_path),
         provider="claude",
@@ -7099,6 +7100,7 @@ async def test_claude_pty_receives_task_ssh_guard_env_and_policy(
 
     assert pid == 54_321
     kwargs = im._launch_pty.await_args.kwargs
+    assert kwargs["prompt"] == prompt
     assert kwargs["claude_binary_override"] == settings.claude_binary
     assert kwargs["git_env"]["CCM_TASK_SSH_GUARD"] == "1"
     assert kwargs["git_env"]["SSH_AUTH_SOCK"] == ""
@@ -22208,8 +22210,8 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
 
 
 @pytest.mark.asyncio
-async def test_claude_prompt_too_long_preflight_is_recoverable(db_factory):
-    """Claude's local blocking_limit can be compacted before any side effect."""
+async def test_claude_prompt_too_long_compacts_and_requeues(db_factory):
+    """A real Claude blocking_limit stream compacts and retries once."""
 
     started_at = datetime(2026, 8, 25, 10, 11, 12)
     async with db_factory() as db:
@@ -22250,57 +22252,233 @@ async def test_claude_prompt_too_long_preflight_is_recoverable(db_factory):
         await db.flush()
         task.turn_source_log_id = source.id
         instance.current_task_id = task.id
-        db.add_all([
-            LogEntry(
-                instance_id=instance.id,
-                task_id=task.id,
-                task_retry_count=0,
-                task_turn_generation=2,
-                turn_scope="foreground",
-                event_type="message",
-                role="assistant",
-                content="Prompt is too long",
-                raw_json=json.dumps({
-                    "type": "assistant",
-                    "error": "invalid_request",
-                }),
-            ),
-            LogEntry(
-                instance_id=instance.id,
-                task_id=task.id,
-                task_retry_count=0,
-                task_turn_generation=2,
-                turn_scope="foreground",
-                event_type="result",
-                is_error=True,
-                raw_json=json.dumps({
-                    "type": "result",
-                    "is_error": True,
-                    "result": "Prompt is too long",
-                    "terminal_reason": "blocking_limit",
-                    "duration_api_ms": 0,
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
-                }),
-            ),
-        ])
         await db.commit()
         task_id, instance_id, source_id = task.id, instance.id, source.id
 
+    process = _make_mock_process(pid=73_107, returncode=1)
+    output = iter((
+        json.dumps({
+            "type": "assistant",
+            "isApiErrorMessage": True,
+            "error": "invalid_request",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "Prompt is too long"}],
+            },
+        }).encode() + b"\n",
+        json.dumps({
+            "type": "result",
+            "is_error": True,
+            "result": "Prompt is too long",
+            "terminal_reason": "blocking_limit",
+            "duration_api_ms": 0,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }).encode() + b"\n",
+        b"",
+    ))
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
     manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
-    permit = await manager._chat_structured_context_preflight_rejection(
-        task_id,
+    manager.processes[instance_id] = process
+    manager._launch_params[instance_id] = {
+        "prompt": "[already wrapped history]\ncontinue the task",
+        "current_message": "continue the task",
+        "provider": "claude",
+        "task_turn_generation": 2,
+        "source_log_id": source_id,
+        "model": "claude-opus-5",
+    }
+    dispatcher = MagicMock()
+    dispatcher._compact_session = AsyncMock(return_value="durable summary")
+    dispatcher.enqueue_message = AsyncMock()
+
+    with patch("backend.main.dispatcher", dispatcher):
+        consumer = asyncio.create_task(manager._consume_output(
+            instance_id,
+            task_id,
+            process,
+            chat_initiated=True,
+            provider="claude",
+        ))
+        manager._track_output_consumer(
+            instance_id,
+            process,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=0,
+            task_turn_generation=2,
+            instance_started_at=started_at,
+        )
+        await consumer
+
+    dispatcher._compact_session.assert_awaited_once()
+    dispatcher.enqueue_message.assert_awaited_once()
+    retry = dispatcher.enqueue_message.await_args.kwargs
+    assert retry["source"] == "compact_retry"
+    assert retry["source_log_id"] == source_id
+    assert retry["current_message"] == "continue the task"
+    assert retry["model_override"] == "claude-opus-5"
+    assert "durable summary" in retry["prompt"]
+    assert "already wrapped history" not in retry["prompt"]
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.session_id is None
+        assert current.context_window_usage is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("activity", "synthetic_error"), [
+    (
+        {"type": "tool_use", "name": "Read", "input": {"path": "/tmp/a"}},
+        "invalid_request",
+    ),
+    (
         {
-            "provider": "claude",
-            "source_log_id": source_id,
-            "task_turn_generation": 2,
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "thinking", "thinking": "started"}],
+            },
         },
-        instance_id=instance_id,
-        expected_retry_count=0,
-        expected_turn_generation=2,
-        expected_started_at=started_at,
-    )
-    assert permit is not None
-    assert permit.session_id == "claude-old-session"
+        "invalid_request",
+    ),
+    (
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "I started working"}],
+            },
+        },
+        "invalid_request",
+    ),
+    (None, None),
+], ids=("tool", "thinking", "assistant", "missing-error-marker"))
+async def test_claude_prompt_too_long_unsafe_evidence_does_not_replay(
+    db_factory,
+    activity,
+    synthetic_error,
+):
+    """Prior activity or an inexact synthetic error fails closed."""
+
+    started_at = datetime(2026, 8, 25, 10, 12, 13)
+    async with db_factory() as db:
+        instance = Instance(
+            name="claude-context-activity",
+            status="running",
+            pid=73_108,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="claude context activity",
+            provider="claude",
+            status="executing",
+            retry_count=0,
+            turn_generation=3,
+            instance_id=instance.id,
+            session_id="claude-active-session",
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=3,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            raw_json=json.dumps({
+                "transport": "claude",
+                "original_source_log_id": None,
+            }),
+            actual_transport="claude_exec",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        instance.current_task_id = task.id
+        await db.commit()
+        task_id, instance_id, source_id = task.id, instance.id, source.id
+
+    process = _make_mock_process(pid=73_108, returncode=1)
+    synthetic = {
+        "type": "assistant",
+        "isApiErrorMessage": True,
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Prompt is too long"}],
+        },
+    }
+    if synthetic_error is not None:
+        synthetic["error"] = synthetic_error
+    output_lines = []
+    if activity is not None:
+        output_lines.append(json.dumps(activity).encode() + b"\n")
+    output_lines.extend((
+        json.dumps(synthetic).encode() + b"\n",
+        json.dumps({
+            "type": "result",
+            "is_error": True,
+            "result": "Prompt is too long",
+            "terminal_reason": "blocking_limit",
+            "duration_api_ms": 0,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }).encode() + b"\n",
+        b"",
+    ))
+    output = iter(output_lines)
+
+    async def readline():
+        return next(output)
+
+    process.stdout.readline = readline
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager.processes[instance_id] = process
+    manager._launch_params[instance_id] = {
+        "prompt": "continue the task",
+        "current_message": "continue the task",
+        "provider": "claude",
+        "task_turn_generation": 3,
+        "source_log_id": source_id,
+    }
+    dispatcher = MagicMock()
+    dispatcher._compact_session = AsyncMock(return_value="must not compact")
+    dispatcher.enqueue_message = AsyncMock()
+
+    with patch("backend.main.dispatcher", dispatcher):
+        consumer = asyncio.create_task(manager._consume_output(
+            instance_id,
+            task_id,
+            process,
+            chat_initiated=True,
+            provider="claude",
+        ))
+        manager._track_output_consumer(
+            instance_id,
+            process,
+            consumer,
+            chat_initiated=True,
+            provider="claude",
+            task_id=task_id,
+            task_retry_count=0,
+            task_turn_generation=3,
+            instance_started_at=started_at,
+        )
+        await consumer
+
+    dispatcher._compact_session.assert_not_awaited()
+    dispatcher.enqueue_message.assert_not_awaited()
+    async with db_factory() as db:
+        current = await db.get(Task, task_id)
+        assert current.session_id == "claude-active-session"
 
 
 @pytest.mark.asyncio

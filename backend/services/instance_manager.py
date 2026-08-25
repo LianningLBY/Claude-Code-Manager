@@ -6124,6 +6124,8 @@ class InstanceManager:
                 "Codex isolated workflow execution forbids exec fallback"
             )
 
+        # PTY launches return above with the complete prompt. Only the direct
+        # exec transport reaches this argv-size fallback and owns stdin.
         claude_prompt_via_stdin = bool(
             provider == "claude"
             and len(prompt.encode("utf-8"))
@@ -14708,10 +14710,11 @@ class InstanceManager:
                     if row.event_type == "message":
                         if not (
                             row.role == "assistant"
-                            and row.is_error is False
+                            and row.is_error is True
                             and isinstance(raw, dict)
-                            and str(raw.get("error") or "").strip().lower()
-                            in {"", "invalid_request"}
+                            and raw.get("type") == "assistant"
+                            and raw.get("isApiErrorMessage") is True
+                            and raw.get("error") == "invalid_request"
                             and str(row.content or "").strip().lower()
                             == "prompt is too long"
                         ):

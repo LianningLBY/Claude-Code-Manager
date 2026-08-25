@@ -23120,7 +23120,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     task_id,
                 )
                 return
-            if not (
+            if msg.source == "compact_retry" and not (
                 self._context_retry_authority_is_live(msg)
                 and _context_retry_permit_matches(task, msg)
             ):
@@ -23283,7 +23283,7 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                     task_id,
                 )
                 return
-            if not (
+            if msg.source == "compact_retry" and not (
                 self._context_retry_authority_is_live(msg)
                 and _context_retry_permit_matches(task, msg)
             ):
@@ -23338,11 +23338,24 @@ Codex 中工具会显示为上述 mcp__ccm_monitor_agent__* canonical 名称；
                         task_id,
                         task.session_id,
                     )
-                # A present Codex rollout remains resumable after a failed
-                # turn.  Unlike Claude's flat JSONL, it cannot be made into a
-                # new thread by merely copying/renaming the file because the
-                # thread id is embedded in its metadata.
-                keep_codex_session = provider == "codex" and not session_gone
+                # A present Codex rollout normally remains resumable after a
+                # failed turn.  A conflicting native-thread parent graph is
+                # different: retrying that rollout always fails before the
+                # model receives the queued message.  Fall back to a compacted
+                # fresh thread while retaining the durable chat history.
+                codex_lineage_conflict = (
+                    provider == "codex"
+                    and "native thread lineage has conflicting parents"
+                    in (task.error_message or "").lower()
+                )
+                # Unlike Claude's flat JSONL, a Codex rollout cannot be made
+                # into a new thread merely by copying/renaming the file
+                # because the thread id is embedded in its metadata.
+                keep_codex_session = (
+                    provider == "codex"
+                    and not session_gone
+                    and not codex_lineage_conflict
+                )
                 cloned = (
                     None if keep_codex_session else await _clone_session(task_id, db)
                 )

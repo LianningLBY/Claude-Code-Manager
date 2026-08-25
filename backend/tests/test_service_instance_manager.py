@@ -4158,6 +4158,22 @@ def test_build_command_claude_basic():
     assert "--verbose" in cmd
 
 
+def test_build_command_claude_large_prompt_uses_stdin_shape():
+    im = InstanceManager(MagicMock(), MagicMock())
+    prompt = "x" * (64 * 1024)
+    cmd = im._build_command(
+        provider="claude",
+        prompt=prompt,
+        model=None,
+        resume_session_id=None,
+        effort_level=None,
+        claude_prompt_via_stdin=True,
+    )
+    assert cmd[1] == "-p"
+    assert prompt not in cmd
+    assert "--output-format" in cmd
+
+
 def test_build_command_claude_with_resume_and_model():
     im = InstanceManager(MagicMock(), MagicMock())
     cmd = im._build_command(provider="claude", prompt="follow up", model="opus", resume_session_id="sess-1", effort_level="high")
@@ -5929,6 +5945,37 @@ async def test_launch_creates_subprocess(db_factory):
     if os.name == "posix":
         assert mock_exec.call_args.kwargs["start_new_session"] is True
     # Wait for consumer task to finish
+    await asyncio.sleep(0.1)
+
+
+@pytest.mark.asyncio
+async def test_launch_large_claude_prompt_streams_stdin(db_factory):
+    async with db_factory() as db:
+        inst = Instance(name="large-prompt-inst")
+        db.add(inst)
+        await db.commit()
+        await db.refresh(inst)
+        inst_id = inst.id
+
+    prompt = "large prompt " * 7000
+    mock_proc = _make_mock_process()
+    mock_proc.stdin = MagicMock()
+    mock_proc.stdin.drain = AsyncMock()
+    mock_proc.stdin.wait_closed = AsyncMock()
+    im = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+
+    with patch(
+        "backend.services.instance_manager.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        return_value=mock_proc,
+    ) as mock_exec:
+        await im.launch(instance_id=inst_id, prompt=prompt, cwd="/tmp")
+
+    assert prompt not in mock_exec.call_args.args
+    assert mock_exec.call_args.kwargs["stdin"] == asyncio.subprocess.PIPE
+    mock_proc.stdin.write.assert_called_once_with(prompt.encode("utf-8"))
+    mock_proc.stdin.drain.assert_awaited_once()
+    mock_proc.stdin.close.assert_called_once()
     await asyncio.sleep(0.1)
 
 
@@ -22158,6 +22205,102 @@ async def test_codex_context_window_failure_compacts_and_requeues(db_factory):
     assert "durable summary" in retry["prompt"]
     assert "continue the task" in retry["prompt"]
     assert "already wrapped history" not in retry["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_claude_prompt_too_long_preflight_is_recoverable(db_factory):
+    """Claude's local blocking_limit can be compacted before any side effect."""
+
+    started_at = datetime(2026, 8, 25, 10, 11, 12)
+    async with db_factory() as db:
+        instance = Instance(
+            name="claude-context-proof",
+            status="running",
+            pid=73_107,
+            started_at=started_at,
+        )
+        db.add(instance)
+        await db.flush()
+        task = Task(
+            title="claude context proof",
+            provider="claude",
+            status="executing",
+            retry_count=0,
+            turn_generation=2,
+            instance_id=instance.id,
+            session_id="claude-old-session",
+        )
+        db.add(task)
+        await db.flush()
+        source = LogEntry(
+            instance_id=instance.id,
+            task_id=task.id,
+            task_retry_count=0,
+            task_turn_generation=2,
+            turn_scope="source",
+            event_type="turn_source",
+            role="system",
+            raw_json=json.dumps({
+                "transport": "claude",
+                "original_source_log_id": None,
+            }),
+            actual_transport="claude_exec",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        instance.current_task_id = task.id
+        db.add_all([
+            LogEntry(
+                instance_id=instance.id,
+                task_id=task.id,
+                task_retry_count=0,
+                task_turn_generation=2,
+                turn_scope="foreground",
+                event_type="message",
+                role="assistant",
+                content="Prompt is too long",
+                raw_json=json.dumps({
+                    "type": "assistant",
+                    "error": "invalid_request",
+                }),
+            ),
+            LogEntry(
+                instance_id=instance.id,
+                task_id=task.id,
+                task_retry_count=0,
+                task_turn_generation=2,
+                turn_scope="foreground",
+                event_type="result",
+                is_error=True,
+                raw_json=json.dumps({
+                    "type": "result",
+                    "is_error": True,
+                    "result": "Prompt is too long",
+                    "terminal_reason": "blocking_limit",
+                    "duration_api_ms": 0,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                }),
+            ),
+        ])
+        await db.commit()
+        task_id, instance_id, source_id = task.id, instance.id, source.id
+
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    permit = await manager._chat_structured_context_preflight_rejection(
+        task_id,
+        {
+            "provider": "claude",
+            "source_log_id": source_id,
+            "task_turn_generation": 2,
+        },
+        instance_id=instance_id,
+        expected_retry_count=0,
+        expected_turn_generation=2,
+        expected_started_at=started_at,
+    )
+    assert permit is not None
+    assert permit.session_id == "claude-old-session"
 
 
 @pytest.mark.asyncio

@@ -88,6 +88,7 @@ from backend.schemas.pr_monitor import (
     PRFindingRebuttalResponse,
     PRMonitorBindRequest,
     PRMonitorRunResponse,
+    PRMonitorReviewAttemptResponse,
     PRRepairWakeResponse,
     PRMergeQueueActionResponse,
     required_checks_support_direct_auto_merge,
@@ -4396,6 +4397,42 @@ async def get_monitor_run(
     payload["merge_actions"] = [
         PRMergeQueueActionResponse.model_validate(item) for item in merge_actions
     ]
+    reviews = list((await db.execute(
+        select(PRReview)
+        .where(PRReview.monitor_run_id == run.id)
+        .order_by(PRReview.created_at, PRReview.id)
+    )).scalars())
+    reviewer_rows = list((await db.execute(
+        select(PRReviewerRun)
+        .where(PRReviewerRun.pr_review_id.in_([item.id for item in reviews]))
+        .options(load_only(
+            PRReviewerRun.pr_review_id,
+            PRReviewerRun.role,
+            PRReviewerRun.status,
+            PRReviewerRun.verdict,
+        ))
+    )).scalars()) if reviews else []
+    reviewer_runs_by_review: dict[int, list[PRReviewerRun]] = {}
+    for reviewer in reviewer_rows:
+        reviewer_runs_by_review.setdefault(reviewer.pr_review_id, []).append(reviewer)
+    review_history = []
+    for review in reviews:
+        reviewer_runs = reviewer_runs_by_review.get(review.id, [])
+        public_states = _public_review_states(review, reviewer_runs)
+        publication_evidence = _public_publication_evidence(review)
+        review_history.append(PRMonitorReviewAttemptResponse.model_validate({
+            "id": review.id,
+            "attempt": review.attempt,
+            "head_sha": review.head_sha,
+            "status": review.status,
+            "aggregate_verdict": public_states["aggregate_verdict"],
+            "publication_state": public_states["publication_state"],
+            "github_review_id": publication_evidence["github_review_id"],
+            "github_review_url": publication_evidence["github_review_url"],
+            "created_at": review.created_at,
+            "completed_at": review.completed_at,
+        }))
+    payload["review_history"] = review_history
     return payload
 
 
@@ -5190,6 +5227,8 @@ async def enqueue_monitor_merge(
         except FindingActionConflict as exc:
             raise HTTPException(404, "Repository not found") from exc
         await _reauthorize_pr_effect(request, db, repo)
+        if not repo.enabled:
+            raise HTTPException(409, "Enable the PR monitor before merging")
         run = (
             await db.execute(
                 select(PRMonitorRun)
@@ -5244,11 +5283,13 @@ async def enqueue_monitor_merge(
                 trigger_base_sha=run.current_base_sha,
                 trigger_head_sha=run.current_head_sha,
                 status="pending",
+                trigger_kind="manual",
                 action_nonce=secrets.token_hex(24),
             )
             db.add(action)
         elif action.status == "shadow":
             action.status = "pending"
+            action.trigger_kind = "manual"
         else:
             raise HTTPException(
                 409,

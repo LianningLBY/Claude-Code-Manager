@@ -678,6 +678,9 @@ class PRMergeQueueAction(Base):
     status: Mapped[str] = mapped_column(
         String(30), default="shadow", server_default="shadow", nullable=False
     )
+    trigger_kind: Mapped[str] = mapped_column(
+        String(20), default="policy", server_default="policy", nullable=False
+    )
     action_nonce: Mapped[str] = mapped_column(String(64), nullable=False)
     github_pr_node_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
     github_queue_entry_id: Mapped[str | None] = mapped_column(String(200), nullable=True)

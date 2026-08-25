@@ -1797,7 +1797,11 @@ async def test_publish_changes_review_uses_pinned_commit_nonce_and_json():
     assert api.await_args.kwargs == {
         "method": "POST",
         "payload": {
-            "body": f"Fix the race.\n\n{REVIEW_EVIDENCE_MARKER}",
+            "body": (
+                "Fix the race.\n\n"
+                f"Reviewed commit: `{PR_DATA['head_sha']}`.\n\n"
+                f"{REVIEW_EVIDENCE_MARKER}"
+            ),
             "commit_id": PR_DATA["head_sha"],
             "event": "COMMENT",
         },

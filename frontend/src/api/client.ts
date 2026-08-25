@@ -1711,6 +1711,7 @@ export interface PRMonitorRun {
   pr_number: number;
   status: string;
   current_head_sha: string;
+  current_review_id?: number | null;
   /** Stable ordinary Task used to display this PR's aggregate result. */
   display_task_id?: number | null;
   developer_task_id: number | null;
@@ -1719,6 +1720,21 @@ export interface PRMonitorRun {
   pause_reason: string | null;
   wakes: PRRepairWake[];
   merge_actions: PRMergeQueueAction[];
+  /** Immutable review attempts for this PR lifecycle, oldest first. */
+  review_history?: PRMonitorReviewAttempt[];
+}
+
+export interface PRMonitorReviewAttempt {
+  id: number;
+  attempt: number;
+  head_sha: string | null;
+  status: string;
+  aggregate_verdict: 'pass' | 'changes_required' | null;
+  publication_state: PRPublicationState;
+  github_review_id: number | null;
+  github_review_url: string | null;
+  created_at: string;
+  completed_at: string | null;
 }
 
 export interface PRMergeQueueAction {

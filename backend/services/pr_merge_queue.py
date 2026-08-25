@@ -804,6 +804,21 @@ async def _recover_terminal_queue_action(
     return True
 
 
+def _merge_queue_policy_allows_enqueue(
+    repo: MonitoredRepo,
+    action: PRMergeQueueAction,
+) -> bool:
+    """Match an unstarted enqueue to its durable authorization source."""
+
+    return bool(
+        (
+            action.trigger_kind == "policy"
+            and repo.merge_queue_mode == "auto"
+        )
+        or action.trigger_kind == "manual"
+    )
+
+
 async def reconcile_merge_queue(db_factory) -> int:
     from backend.services.pr_review_panel import fetch_exact_head_ci
     from backend.services.pr_review_service import _gh_pr_view, _validated_pr_snapshot
@@ -942,6 +957,17 @@ async def reconcile_merge_queue(db_factory) -> int:
                     run.status = "paused"
                     run.pause_reason = action.last_error
                     run.state_version += 1
+                await db.commit()
+                continue
+            if (
+                action.status == "pending"
+                and not _merge_queue_policy_allows_enqueue(repo, action)
+            ):
+                action.status = "paused"
+                action.last_error = "merge_queue_policy_changed"
+                run.status = "paused"
+                run.pause_reason = action.last_error
+                run.state_version += 1
                 await db.commit()
                 continue
             expected_generation = _queue_effect_generation(
@@ -1188,7 +1214,7 @@ async def reconcile_merge_queue(db_factory) -> int:
                     lifecycle_error = "lifecycle_missing"
                 elif not repo.enabled:
                     lifecycle_error = "repo_disabled"
-                elif repo.merge_queue_mode != "auto":
+                elif not _merge_queue_policy_allows_enqueue(repo, action):
                     lifecycle_error = "merge_queue_policy_changed"
                 elif action.status != "enqueuing":
                     lifecycle_error = f"action_{action.status}"

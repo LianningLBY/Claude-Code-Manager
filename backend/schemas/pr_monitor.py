@@ -639,6 +639,28 @@ class PRMergeQueueActionResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class PRMonitorReviewAttemptResponse(BaseModel):
+    """Safe history row for one immutable head reviewed by a Monitor Run."""
+
+    id: int
+    attempt: int = 1
+    head_sha: str | None
+    status: str
+    aggregate_verdict: Literal["pass", "changes_required"] | None = None
+    publication_state: Literal[
+        "not_started",
+        "publishing",
+        "reconciling",
+        "published",
+        "failed",
+        "not_applicable",
+    ] = "not_started"
+    github_review_id: int | None = None
+    github_review_url: str | None = None
+    created_at: datetime
+    completed_at: datetime | None
+
+
 class PRMonitorRunResponse(BaseModel):
     id: int
     repo_id: int
@@ -660,5 +682,6 @@ class PRMonitorRunResponse(BaseModel):
     completed_at: datetime | None
     wakes: list[PRRepairWakeResponse] = Field(default_factory=list)
     merge_actions: list[PRMergeQueueActionResponse] = Field(default_factory=list)
+    review_history: list[PRMonitorReviewAttemptResponse] = Field(default_factory=list)
 
     model_config = {"from_attributes": True}

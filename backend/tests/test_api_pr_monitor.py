@@ -5401,12 +5401,77 @@ async def test_webhook_synchronize_supersedes_old_review(client, session_factory
     async with session_factory() as db:
         old = await db.get(PRReview, first_review_id)
         new = await db.get(PRReview, second_review_id)
+        run_id = new.monitor_run_id
         assert old.status == "superseded"
         assert old.base_sha == BASE_SHA_1
         assert old.head_sha == HEAD_SHA_1
         assert new.status == "reviewing"
         assert new.base_sha == BASE_SHA_1
         assert new.head_sha == HEAD_SHA_2
+
+    detail = await client.get(f"/api/pr-monitor/runs/{run_id}")
+    assert detail.status_code == 200, detail.text
+    assert [item["id"] for item in detail.json()["review_history"]] == [
+        first_review_id,
+        second_review_id,
+    ]
+    assert [item["head_sha"] for item in detail.json()["review_history"]] == [
+        HEAD_SHA_1,
+        HEAD_SHA_2,
+    ]
+    assert [item["status"] for item in detail.json()["review_history"]] == [
+        "superseded",
+        "reviewing",
+    ]
+    assert set(detail.json()["review_history"][0]) == {
+        "id",
+        "attempt",
+        "head_sha",
+        "status",
+        "aggregate_verdict",
+        "publication_state",
+        "github_review_id",
+        "github_review_url",
+        "created_at",
+        "completed_at",
+    }
+
+
+@pytest.mark.asyncio
+async def test_ready_run_manual_merge_persists_user_trigger(
+    client,
+    session_factory,
+):
+    repo = await _create_repo(
+        client,
+        "owner/manual-merge-trigger",
+        review_mode="panel",
+        merge_queue_mode="manual",
+    )
+    review_id, run_id = await _seed_public_pr_result(
+        session_factory,
+        repo_id=repo["id"],
+        pr_number=139,
+        head_sha=HEAD_SHA_1,
+        review_status="approved",
+        run_status="ready_to_merge",
+        code_verdict="pass",
+        publication_state="published",
+    )
+
+    response = await client.post(
+        f"/api/pr-monitor/runs/{run_id}/enqueue-merge"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "merge_queue_pending"
+    async with session_factory() as db:
+        action = (await db.execute(select(PRMergeQueueAction).where(
+            PRMergeQueueAction.monitor_run_id == run_id,
+            PRMergeQueueAction.review_id == review_id,
+        ))).scalar_one()
+        assert action.status == "pending"
+        assert action.trigger_kind == "manual"
 
 
 @pytest.mark.asyncio

@@ -2102,6 +2102,16 @@ def _review_body_with_evidence(body: str, nonce: str) -> str:
     return f"{clean}\n\n{marker}" if clean else marker
 
 
+def _review_body_with_head(body: str, head_sha: str) -> str:
+    """Append the backend-owned, human-visible subject to a blocking Review."""
+
+    if _GITHUB_SHA_RE.fullmatch(head_sha) is None:
+        raise ValueError("invalid PR review head SHA")
+    clean = body.strip()
+    subject = f"Reviewed commit: `{head_sha}`."
+    return f"{clean}\n\n{subject}" if clean else subject
+
+
 def _approval_review_body(*, head_sha: str, auto_merge: bool) -> str:
     """Render the public, exact-head recommendation before any merge effect."""
 
@@ -3077,7 +3087,10 @@ async def _publish_review_action(
             # retarget cannot accidentally install a new branch-protection
             # approval or change-request state.
             event = "COMMENT"
-            body = _review_body_with_evidence(review_body, nonce)
+            body = _review_body_with_evidence(
+                _review_body_with_head(review_body, head_sha),
+                nonce,
+            )
             expected_states = {"COMMENTED"}
         elif result in {"lgtm_comment", "approved_merged"}:
             event = "COMMENT"
@@ -3158,7 +3171,7 @@ async def _publish_review_action(
                     head_sha=head_sha,
                 )
                 fallback_text = (
-                    review_body
+                    _review_body_with_head(review_body, head_sha)
                     if result == "review_comments"
                     else (
                         _approval_review_body(

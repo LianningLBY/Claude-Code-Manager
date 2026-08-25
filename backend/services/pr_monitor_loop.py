@@ -1153,6 +1153,7 @@ async def record_gate_pass(db: AsyncSession, review_id: int) -> None:
                 trigger_base_sha=review.base_sha,
                 trigger_head_sha=review.head_sha,
                 status="pending" if repo.merge_queue_mode == "auto" else "shadow",
+                trigger_kind="policy",
                 action_nonce=secrets.token_hex(24),
             ))
             if repo.merge_queue_mode == "auto":

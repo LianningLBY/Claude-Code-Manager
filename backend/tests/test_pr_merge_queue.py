@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from datetime import datetime
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy import select
@@ -210,6 +211,163 @@ async def test_fake_pr_enters_queue_checks_merge_group_and_confirms_merge(
     refreshed_run = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
     assert action.status == "merged"
     assert refreshed_run.status == "merged"
+
+
+@pytest.mark.asyncio
+async def test_manual_merge_action_enters_queue_without_enabling_auto_policy(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    repo = MonitoredRepo(
+        repo_full_name="fake/manual-queue",
+        webhook_secret="s" * 64,
+        review_mode="panel",
+        merge_queue_mode="manual",
+    )
+    db_session.add(repo)
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=139,
+        current_base_sha=BASE,
+        current_head_sha=HEAD,
+        status="merge_queue_pending",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review = PRReview(
+        monitor_run_id=run.id,
+        repo_id=repo.id,
+        pr_number=139,
+        base_ref="main",
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="manual queue",
+        pr_author="bot",
+        pr_url="https://example.invalid/fake/manual-queue/pull/139",
+        status="approved",
+        code_verdict="pass",
+    )
+    db_session.add(review)
+    await db_session.flush()
+    run.current_review_id = review.id
+    action = PRMergeQueueAction(
+        monitor_run_id=run.id,
+        review_id=review.id,
+        trigger_base_sha=BASE,
+        trigger_head_sha=HEAD,
+        status="pending",
+        trigger_kind="manual",
+        action_nonce="d" * 48,
+    )
+    db_session.add(action)
+    await db_session.commit()
+
+    async def fake_pr_view(_number, _repo):
+        return {
+            "state": "OPEN",
+            "mergedAt": None,
+            "baseRefName": "main",
+            "baseRefOid": BASE,
+            "headRefOid": HEAD,
+            "isDraft": False,
+            "mergeCommit": None,
+        }
+
+    async def fake_enqueue(_repo, _number, base_ref, base_sha, head_sha):
+        assert (base_ref, base_sha, head_sha) == ("main", BASE, HEAD)
+        return QueueEntry("MQ-manual", "QUEUED", "main", BASE, HEAD)
+
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_pr_view",
+        fake_pr_view,
+    )
+    monkeypatch.setattr("backend.services.pr_merge_queue._enqueue", fake_enqueue)
+
+    assert await reconcile_merge_queue(db_factory) == 1
+    action = await db_session.get(
+        PRMergeQueueAction,
+        action.id,
+        populate_existing=True,
+    )
+    run = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
+    assert repo.merge_queue_mode == "manual"
+    assert action.status == "queued"
+    assert action.github_queue_entry_id == "MQ-manual"
+    assert run.status == "merge_queued"
+
+
+@pytest.mark.asyncio
+async def test_disabled_auto_policy_does_not_borrow_manual_authority(
+    db_session,
+    db_factory,
+    monkeypatch,
+):
+    repo = MonitoredRepo(
+        repo_full_name="fake/disabled-auto-queue",
+        webhook_secret="s" * 64,
+        review_mode="panel",
+        merge_queue_mode="manual",
+    )
+    db_session.add(repo)
+    await db_session.flush()
+    run = PRMonitorRun(
+        repo_id=repo.id,
+        pr_number=140,
+        current_base_sha=BASE,
+        current_head_sha=HEAD,
+        status="merge_queue_pending",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    review = PRReview(
+        monitor_run_id=run.id,
+        repo_id=repo.id,
+        pr_number=140,
+        base_ref="main",
+        base_sha=BASE,
+        head_sha=HEAD,
+        pr_title="disabled auto queue",
+        pr_author="bot",
+        pr_url="https://example.invalid/fake/disabled-auto-queue/pull/140",
+        status="approved",
+        code_verdict="pass",
+    )
+    db_session.add(review)
+    await db_session.flush()
+    run.current_review_id = review.id
+    action = PRMergeQueueAction(
+        monitor_run_id=run.id,
+        review_id=review.id,
+        trigger_base_sha=BASE,
+        trigger_head_sha=HEAD,
+        status="pending",
+        trigger_kind="policy",
+        action_nonce="e" * 48,
+    )
+    db_session.add(action)
+    await db_session.commit()
+    pr_read = AsyncMock()
+    enqueue = AsyncMock()
+    monkeypatch.setattr(
+        "backend.services.pr_review_service._gh_pr_view",
+        pr_read,
+    )
+    monkeypatch.setattr("backend.services.pr_merge_queue._enqueue", enqueue)
+
+    assert await reconcile_merge_queue(db_factory) == 0
+    action = await db_session.get(
+        PRMergeQueueAction,
+        action.id,
+        populate_existing=True,
+    )
+    run = await db_session.get(PRMonitorRun, run.id, populate_existing=True)
+    assert action.status == "paused"
+    assert action.last_error == "merge_queue_policy_changed"
+    assert run.status == "paused"
+    pr_read.assert_not_awaited()
+    enqueue.assert_not_awaited()
 
 
 @pytest.mark.asyncio

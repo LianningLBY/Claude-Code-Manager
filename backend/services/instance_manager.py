@@ -772,6 +772,7 @@ class _ClaudeNoProgressState:
     MIN_SIMILAR_MESSAGES = 3
     MIN_ELAPSED_SECONDS = 120.0
     SIMILARITY_THRESHOLD = 0.45
+    COMPARISON_TEXT_LIMIT = 1024
 
     anchor_text: str | None = None
     similar_messages: int = 0
@@ -786,9 +787,25 @@ class _ClaudeNoProgressState:
         self.similar_messages = 0
         self.first_seen_monotonic = None
 
-    @staticmethod
-    def _normalize(content: str) -> str:
-        return " ".join(content.casefold().split()).strip(" .,!?:;，。！？：；")
+    @classmethod
+    def _representative_text(cls, content: str) -> str:
+        """Keep similarity work bounded while retaining both response ends."""
+
+        limit = cls.COMPARISON_TEXT_LIMIT
+        if len(content) <= limit:
+            return content
+        head = limit // 2
+        return content[:head] + content[-(limit - head):]
+
+    @classmethod
+    def _normalize(cls, content: str) -> str:
+        sampled = cls._representative_text(content)
+        normalized = " ".join(sampled.casefold().split()).strip(
+            " .,!?:;，。！？：；"
+        )
+        # Unicode case folding can expand a bounded source string. Apply the
+        # same representative cap again so SequenceMatcher has a hard limit.
+        return cls._representative_text(normalized)
 
     @staticmethod
     def _stop_reason(event: dict) -> tuple[bool, object]:

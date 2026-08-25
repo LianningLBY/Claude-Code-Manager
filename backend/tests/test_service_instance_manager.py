@@ -1,5 +1,6 @@
 """Tests for InstanceManager — subprocess lifecycle management."""
 import asyncio
+import difflib
 import json
 import os
 import signal
@@ -191,6 +192,46 @@ def test_claude_no_progress_state_reproduces_task_584_sequence():
         _incomplete_claude_message("让我重写一版。"),
         now=180,
     )
+
+
+def test_claude_no_progress_similarity_bounds_large_repetitive_text(
+    monkeypatch,
+):
+    state = _ClaudeNoProgressState()
+    huge = "I will rewrite this now. " + ("abcabc" * 200_000) + " ending"
+    compared_lengths = []
+    real_matcher = difflib.SequenceMatcher
+
+    def bounded_matcher(_isjunk, left, right, *, autojunk):
+        compared_lengths.append((len(left), len(right)))
+        return real_matcher(None, left, right, autojunk=autojunk)
+
+    monkeypatch.setattr(
+        "backend.services.instance_manager.difflib.SequenceMatcher",
+        bounded_matcher,
+    )
+
+    assert not state.observe(_incomplete_claude_message(huge), now=0)
+    assert len(state.anchor_text) <= state.COMPARISON_TEXT_LIMIT
+    assert not state.observe(_incomplete_claude_message(huge), now=60)
+    assert state.observe(_incomplete_claude_message(huge), now=121)
+    assert len(state.anchor_text) <= state.COMPARISON_TEXT_LIMIT
+    assert compared_lengths
+    assert all(
+        left <= state.COMPARISON_TEXT_LIMIT
+        and right <= state.COMPARISON_TEXT_LIMIT
+        for left, right in compared_lengths
+    )
+
+
+def test_claude_no_progress_sampling_retains_both_response_ends():
+    state = _ClaudeNoProgressState()
+    middle = "x" * (state.COMPARISON_TEXT_LIMIT * 2)
+    normalized = state._normalize("START " + middle + " END")
+
+    assert len(normalized) <= state.COMPARISON_TEXT_LIMIT
+    assert normalized.startswith("start")
+    assert normalized.endswith("end")
 
 
 def test_claude_no_progress_state_ignores_real_progress_and_terminal_answers():

@@ -399,31 +399,22 @@ async def test_no_progress_failure_queues_one_fresh_session_recovery(db_factory)
         "no_progress_retry_attempt": 0,
     }
 
-    with patch("backend.main.dispatcher", dispatcher):
-        recovered = await manager._try_enqueue_no_progress_recovery(
-            instance_id,
-            task_id,
-            record,
-        )
-        duplicate = await manager._try_enqueue_no_progress_recovery(
-            instance_id,
-            task_id,
-            record,
-        )
+    scheduler = AsyncMock(return_value=True)
+    manager.no_progress_recovery_scheduler = scheduler
+    recovered = await manager._try_enqueue_no_progress_recovery(
+        instance_id, task_id, record,
+    )
+    duplicate = await manager._try_enqueue_no_progress_recovery(
+        instance_id, task_id, record,
+    )
 
     assert recovered is True
     assert duplicate is False
-    dispatcher.issue_context_retry_permit.assert_called_once()
-    dispatcher.enqueue_message.assert_awaited_once()
-    retry = dispatcher.enqueue_message.await_args.kwargs
-    assert retry["source"] == "no_progress_retry"
-    assert retry["prompt"] == "finish the document"
-    assert retry["current_message"] == "finish the document"
-    assert retry["source_log_id"] == source_id
-    assert retry["allow_new_session"] is True
-    assert retry["context_retry_permit"] is permit
-    assert retry["no_progress_retry_attempt"] == 1
-    assert retry["command_skills"] == {"monitor": True}
+    scheduler.assert_awaited_once()
+    request = scheduler.await_args.kwargs
+    assert request["task_id"] == task_id
+    assert request["instance_id"] == instance_id
+    assert request["params"]["source_log_id"] == source_id
 
 
 @pytest.mark.asyncio
@@ -459,15 +450,73 @@ async def test_no_progress_recovery_does_not_replay_unsafe_or_second_attempt(
     dispatcher = MagicMock()
     dispatcher.enqueue_message = AsyncMock()
 
-    with patch("backend.main.dispatcher", dispatcher):
-        recovered = await manager._try_enqueue_no_progress_recovery(
-            9,
-            8,
-            record,
-        )
+    manager.no_progress_recovery_scheduler = dispatcher.enqueue_message
+    recovered = await manager._try_enqueue_no_progress_recovery(9, 8, record)
 
     assert recovered is False
     dispatcher.enqueue_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tool_result_from_process_event_blocks_no_progress_recovery(db_factory):
+    """A real parsed tool_result disables recovery before terminal handling."""
+    async with db_factory() as db:
+        instance = Instance(name="tool-result-recovery", status="running", pid=58403)
+        task = Task(
+            title="tool result safety", status="executing", provider="claude",
+            retry_count=0, turn_generation=1, session_id=None,
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        started_at = datetime.utcnow()
+        instance.started_at = started_at
+        task.started_at = started_at
+        source = LogEntry(
+            instance_id=instance.id, task_id=task.id,
+            task_retry_count=0, task_turn_generation=1, turn_scope="source",
+            event_type="user_message", role="user", content="do the work",
+            is_error=False, actual_transport="claude_pty",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        instance_id, task_id, source_id = instance.id, task.id, source.id
+
+    record = _OutputConsumerRecord(
+        process=_make_mock_process(pid=58_403, returncode=130),
+        task=asyncio.current_task(), chat_initiated=True, provider="claude",
+        task_id=task_id, task_retry_count=0, task_turn_generation=1,
+        instance_started_at=started_at,
+    )
+    record.process.session = MagicMock(session_id="tool-session")
+    scheduler = AsyncMock(return_value=True)
+    manager = InstanceManager(db_factory, MagicMock(broadcast=AsyncMock()))
+    manager.no_progress_recovery_scheduler = scheduler
+    manager._consumer_records[instance_id] = record
+    manager.processes[instance_id] = record.process
+    manager._tasks[instance_id] = record.task
+    manager._launch_params[instance_id] = {
+        "source_log_id": source_id, "no_progress_retry_attempt": 0,
+    }
+
+    await manager._process_event(instance_id, task_id, {
+        "event_type": "tool_result", "role": "tool",
+        "content": "changed the file", "raw_json": json.dumps({
+            "type": "user", "message": {
+                "content": [{"type": "tool_result", "content": "ok"}],
+            },
+            "session_id": "tool-session",
+        }), "is_error": False,
+    })
+    record.claude_no_progress.triggered = True
+    record.claude_no_progress.similar_messages = 3
+    assert record.claude_no_progress.tool_activity_seen
+    assert await manager._try_enqueue_no_progress_recovery(
+        instance_id, task_id, record,
+    ) is False
+    scheduler.assert_not_awaited()
 
 
 @pytest.mark.asyncio

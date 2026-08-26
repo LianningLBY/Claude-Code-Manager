@@ -1350,6 +1350,98 @@ class GlobalDispatcher:
         ):
             self._context_retry_authorities.pop(authority_id, None)
 
+    async def enqueue_no_progress_recovery(
+        self, *, task_id: int, instance_id: int, record, params: dict
+    ) -> bool:
+        """Authorize and enqueue one exact-generation Claude recovery.
+
+        InstanceManager supplies only the observed record and launch metadata;
+        all durable source validation and retry authority remain Dispatcher
+        policy, avoiding a dependency on the application singleton.
+        """
+        from backend.services.terminal_arbitration import (
+            source_alias_original_log_id,
+            source_shape_is_canonical,
+        )
+
+        requested_source_id = params.get("source_log_id")
+        async with self.db_factory() as db:
+            task = await db.get(Task, task_id)
+            if (
+                task is None
+                or (task.provider or "claude").lower() != "claude"
+                or task.status != "failed"
+                or task.instance_id != instance_id
+                or task.retry_count != record.task_retry_count
+                or task.turn_generation != record.task_turn_generation
+                or task.session_id is not None
+                or type(task.turn_source_log_id) is not int
+                or type(requested_source_id) is not int
+                or requested_source_id <= 0
+                or task.turn_source_log_id <= 0
+            ):
+                return False
+            source = await db.get(LogEntry, task.turn_source_log_id)
+            original_id = source_alias_original_log_id(source) if source else None
+            original = await db.get(LogEntry, original_id) if original_id else None
+            if (
+                source is None
+                or source.task_id != task.id
+                or source.task_retry_count != task.retry_count
+                or source.task_turn_generation != task.turn_generation
+                or source.turn_scope != "source"
+                or requested_source_id not in {source.id, original_id}
+                or not source_shape_is_canonical(source, original)
+            ):
+                return False
+            replay_source = original if source.event_type == "turn_source" else source
+            prompt = replay_source.content if replay_source else None
+            if not isinstance(prompt, str) or not prompt:
+                return False
+            permit = self.issue_context_retry_permit(
+                task_id=task.id,
+                instance_id=instance_id,
+                retry_count=task.retry_count,
+                turn_generation=task.turn_generation,
+                turn_source_log_id=task.turn_source_log_id,
+                session_id=None,
+                started_at=task.started_at,
+                completed_at=task.completed_at,
+            )
+        retry_kwargs = {
+            "task_id": task_id,
+            "prompt": prompt,
+            "priority": PRIORITY_USER,
+            "source": "no_progress_retry",
+            "source_log_id": requested_source_id,
+            "current_message": prompt,
+            "allow_new_session": True,
+            "context_retry_permit": permit,
+            "no_progress_retry_attempt": 1,
+            "initiating_user_id": params.get("initiating_user_id"),
+            "initiating_user_role": params.get("initiating_user_role", "member"),
+            "execution_mode": params.get("execution_mode", "sandbox"),
+            "execution_principal_kind": params.get("execution_principal_kind", "system"),
+            "attachment_paths": tuple(params.get("attachment_paths") or ()),
+            "ssh_agent_socket_snapshot": params.get("ssh_agent_socket_snapshot"),
+        }
+        if isinstance(params.get("enabled_skills"), dict):
+            retry_kwargs["command_skills"] = dict(params["enabled_skills"])
+        if isinstance(params.get("model"), str):
+            retry_kwargs["model_override"] = params["model"]
+        if params.get("queue_timestamp") is not None:
+            retry_kwargs["queue_timestamp"] = params["queue_timestamp"]
+        try:
+            admitted = await self.enqueue_message(**retry_kwargs)
+        except BaseException:
+            self.revoke_context_retry_permit(permit)
+            raise
+        if admitted is False:
+            self.revoke_context_retry_permit(permit)
+            return False
+        logger.warning("Task %d no-progress loop stopped; queued one fresh-session automatic retry", task_id)
+        return True
+
     def _consume_context_retry_authority(self, msg: QueuedMessage) -> None:
         if msg.source not in {"compact_retry", "no_progress_retry"}:
             return

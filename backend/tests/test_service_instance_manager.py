@@ -22272,7 +22272,12 @@ async def test_claude_prompt_too_long_compacts_and_requeues(db_factory):
             "result": "Prompt is too long",
             "terminal_reason": "blocking_limit",
             "duration_api_ms": 0,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            },
         }).encode() + b"\n",
         b"",
     ))
@@ -22332,10 +22337,14 @@ async def test_claude_prompt_too_long_compacts_and_requeues(db_factory):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("activity", "synthetic_error"), [
+@pytest.mark.parametrize(
+    ("activity", "synthetic_error", "usage", "duration_api_ms"),
+    [
     (
         {"type": "tool_use", "name": "Read", "input": {"path": "/tmp/a"}},
         "invalid_request",
+        {"input_tokens": 0, "output_tokens": 0},
+        0,
     ),
     (
         {
@@ -22346,6 +22355,8 @@ async def test_claude_prompt_too_long_compacts_and_requeues(db_factory):
             },
         },
         "invalid_request",
+        {"input_tokens": 0, "output_tokens": 0},
+        0,
     ),
     (
         {
@@ -22356,13 +22367,53 @@ async def test_claude_prompt_too_long_compacts_and_requeues(db_factory):
             },
         },
         "invalid_request",
+        {"input_tokens": 0, "output_tokens": 0},
+        0,
     ),
-    (None, None),
-], ids=("tool", "thinking", "assistant", "missing-error-marker"))
+    (None, None, {"input_tokens": 0, "output_tokens": 0}, 0),
+    (None, "invalid_request", {}, 0),
+    (None, "invalid_request", {"output_tokens": 0}, 0),
+    (None, "invalid_request", {"input_tokens": None, "output_tokens": 0}, 0),
+    (None, "invalid_request", {"input_tokens": True, "output_tokens": 0}, 0),
+    (None, "invalid_request", {"input_tokens": "0", "output_tokens": 0}, 0),
+    (None, "invalid_request", {"input_tokens": 0.5, "output_tokens": 0}, 0),
+    (None, "invalid_request", {"input_tokens": "unknown", "output_tokens": 0}, 0),
+    (None, "invalid_request", {"input_tokens": 1, "output_tokens": 0}, 0),
+    (
+        None,
+        "invalid_request",
+        {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": "0",
+        },
+        0,
+    ),
+    (None, "invalid_request", {"input_tokens": 0, "output_tokens": 0}, False),
+    (None, "invalid_request", {"input_tokens": 0, "output_tokens": 0}, "0"),
+], ids=(
+    "tool",
+    "thinking",
+    "assistant",
+    "missing-error-marker",
+    "empty-usage",
+    "missing-input",
+    "none-input",
+    "bool-input",
+    "string-input",
+    "fractional-input",
+    "unknown-input",
+    "nonzero-input",
+    "string-cache",
+    "bool-duration",
+    "string-duration",
+))
 async def test_claude_prompt_too_long_unsafe_evidence_does_not_replay(
     db_factory,
     activity,
     synthetic_error,
+    usage,
+    duration_api_ms,
 ):
     """Prior activity or an inexact synthetic error fails closed."""
 
@@ -22429,8 +22480,8 @@ async def test_claude_prompt_too_long_unsafe_evidence_does_not_replay(
             "is_error": True,
             "result": "Prompt is too long",
             "terminal_reason": "blocking_limit",
-            "duration_api_ms": 0,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "duration_api_ms": duration_api_ms,
+            "usage": usage,
         }).encode() + b"\n",
         b"",
     ))

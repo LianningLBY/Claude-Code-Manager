@@ -14686,6 +14686,28 @@ class InstanceManager:
                 )
                 terminal_message = str(terminal_result.get("result") or "")
                 usage = terminal_result.get("usage")
+                required_usage_keys = (
+                    "input_tokens",
+                    "output_tokens",
+                )
+                optional_usage_keys = (
+                    "cache_creation_input_tokens",
+                    "cache_read_input_tokens",
+                )
+                usage_is_canonical_zero = (
+                    isinstance(usage, dict)
+                    and all(
+                        key in usage
+                        and type(usage[key]) is int
+                        and usage[key] == 0
+                        for key in required_usage_keys
+                    )
+                    and all(
+                        type(usage[key]) is int and usage[key] == 0
+                        for key in optional_usage_keys
+                        if key in usage
+                    )
+                )
                 if not (
                     terminal.event_type == "result"
                     and terminal.is_error is True
@@ -14693,17 +14715,9 @@ class InstanceManager:
                     and terminal_result.get("is_error") is True
                     and terminal_result.get("terminal_reason") == "blocking_limit"
                     and "prompt is too long" in terminal_message.lower()
+                    and type(terminal_result.get("duration_api_ms")) is int
                     and terminal_result.get("duration_api_ms") == 0
-                    and isinstance(usage, dict)
-                    and not any(
-                        int(usage.get(key) or 0)
-                        for key in (
-                            "input_tokens",
-                            "output_tokens",
-                            "cache_creation_input_tokens",
-                            "cache_read_input_tokens",
-                        )
-                    )
+                    and usage_is_canonical_zero
                 ):
                     return None
                 for row, raw in zip(rows[:-1], parsed_rows[:-1], strict=True):

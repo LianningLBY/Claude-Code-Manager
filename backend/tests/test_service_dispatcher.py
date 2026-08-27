@@ -601,6 +601,130 @@ async def test_no_progress_retry_claims_next_generation_with_fresh_session(
     assert current.session_id is None
 
 
+@pytest.mark.asyncio
+async def test_no_progress_scheduler_validates_and_enqueues_recovery(db_factory):
+    started_at = datetime(2026, 8, 24, 10, 5, 0)
+    async with db_factory() as db:
+        instance = Instance(name="scheduler-source", status="error")
+        task = Task(
+            title="scheduler recovery", status="failed", provider="claude",
+            retry_count=0, turn_generation=3, instance_id=None,
+            session_id=None, started_at=started_at,
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        source = LogEntry(
+            instance_id=instance.id, task_id=task.id,
+            task_retry_count=0, task_turn_generation=3, turn_scope="source",
+            event_type="user_message", role="user", content="authoritative input",
+            raw_json=_system_source_metadata(raw_content="authoritative input"),
+            is_error=False, actual_transport="claude_pty",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id, instance_id, source_id = task.id, instance.id, source.id
+
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher._ensure_queue_worker = MagicMock()
+    record = SimpleNamespace(task_retry_count=0, task_turn_generation=3)
+    ok = await dispatcher.enqueue_no_progress_recovery(
+        task_id=task_id,
+        instance_id=instance_id,
+        record=record,
+        params={"source_log_id": source_id, "no_progress_retry_attempt": 0},
+    )
+    assert ok is True
+    queued = dispatcher._get_task_queue(task_id).get_nowait()
+    assert queued.source == "no_progress_retry"
+    assert queued.prompt == "authoritative input"
+    assert queued.allow_new_session is True
+    assert queued.no_progress_retry_attempt == 1
+    assert queued.context_retry_permit is not None
+    assert dispatcher._context_retry_authority_is_live(queued)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"turn_generation": 4},
+        {"session_id": "already-live"},
+    ],
+)
+async def test_no_progress_scheduler_rejects_stale_generation_or_session(
+    db_factory, changes,
+):
+    async with db_factory() as db:
+        instance = Instance(name="scheduler-reject", status="error")
+        task = Task(
+            title="scheduler reject", status="failed", provider="claude",
+            retry_count=0, turn_generation=3, instance_id=None, session_id=None,
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        source = LogEntry(
+            instance_id=instance.id, task_id=task.id,
+            task_retry_count=0, task_turn_generation=3, turn_scope="source",
+            event_type="user_message", role="user", content="input",
+            raw_json=_system_source_metadata(raw_content="input"),
+            is_error=False, actual_transport="claude_pty",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        for key, value in changes.items():
+            setattr(task, key, value)
+        await db.commit()
+        task_id, instance_id, source_id = task.id, instance.id, source.id
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher.enqueue_message = AsyncMock()
+    result = await dispatcher.enqueue_no_progress_recovery(
+        task_id=task_id, instance_id=instance_id,
+        record=SimpleNamespace(task_retry_count=0, task_turn_generation=3),
+        params={"source_log_id": source_id, "no_progress_retry_attempt": 0},
+    )
+    assert result is False
+    dispatcher.enqueue_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_no_progress_scheduler_revokes_permit_on_enqueue_failure(db_factory):
+    async with db_factory() as db:
+        instance = Instance(name="scheduler-failure", status="error")
+        task = Task(
+            title="scheduler failure", status="failed", provider="claude",
+            retry_count=0, turn_generation=3, instance_id=None, session_id=None,
+        )
+        db.add_all([instance, task])
+        await db.flush()
+        task.instance_id = instance.id
+        source = LogEntry(
+            instance_id=instance.id, task_id=task.id,
+            task_retry_count=0, task_turn_generation=3, turn_scope="source",
+            event_type="user_message", role="user", content="input",
+            raw_json=_system_source_metadata(raw_content="input"),
+            is_error=False, actual_transport="claude_pty",
+        )
+        db.add(source)
+        await db.flush()
+        task.turn_source_log_id = source.id
+        await db.commit()
+        task_id, instance_id, source_id = task.id, instance.id, source.id
+    dispatcher = _make_dispatcher(db_factory)
+    dispatcher.enqueue_message = AsyncMock(side_effect=RuntimeError("queue down"))
+    with pytest.raises(RuntimeError):
+        await dispatcher.enqueue_no_progress_recovery(
+            task_id=task_id, instance_id=instance_id,
+            record=SimpleNamespace(task_retry_count=0, task_turn_generation=3),
+            params={"source_log_id": source_id, "no_progress_retry_attempt": 0},
+        )
+    assert dispatcher._context_retry_authorities == {}
+
+
 async def _bind_hidden_lifecycle_source(db_factory, task_id: int) -> None:
     from backend.services.terminal_arbitration import bind_turn_source
 

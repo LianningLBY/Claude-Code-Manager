@@ -14684,7 +14684,7 @@ class InstanceManager:
                 terminal_result = (
                     terminal_raw if isinstance(terminal_raw, dict) else {}
                 )
-                terminal_message = str(terminal_result.get("result") or "")
+                terminal_message = terminal_result.get("result")
                 usage = terminal_result.get("usage")
                 required_usage_keys = (
                     "input_tokens",
@@ -14696,6 +14696,9 @@ class InstanceManager:
                 )
                 usage_is_canonical_zero = (
                     isinstance(usage, dict)
+                    and set(usage).issubset(
+                        {*required_usage_keys, *optional_usage_keys}
+                    )
                     and all(
                         key in usage
                         and type(usage[key]) is int
@@ -14714,6 +14717,7 @@ class InstanceManager:
                     and terminal_result.get("type") == "result"
                     and terminal_result.get("is_error") is True
                     and terminal_result.get("terminal_reason") == "blocking_limit"
+                    and isinstance(terminal_message, str)
                     and "prompt is too long" in terminal_message.lower()
                     and type(terminal_result.get("duration_api_ms")) is int
                     and terminal_result.get("duration_api_ms") == 0

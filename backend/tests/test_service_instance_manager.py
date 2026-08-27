@@ -22391,6 +22391,22 @@ async def test_claude_prompt_too_long_compacts_and_requeues(db_factory):
     ),
     (None, "invalid_request", {"input_tokens": 0, "output_tokens": 0}, False),
     (None, "invalid_request", {"input_tokens": 0, "output_tokens": 0}, "0"),
+    (
+        {"_terminal_result": {"detail": "Prompt is too long"}},
+        "invalid_request",
+        {"input_tokens": 0, "output_tokens": 0},
+        0,
+    ),
+    (
+        None,
+        "invalid_request",
+        {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "future_input_tokens": 1,
+        },
+        0,
+    ),
 ], ids=(
     "tool",
     "thinking",
@@ -22407,6 +22423,8 @@ async def test_claude_prompt_too_long_compacts_and_requeues(db_factory):
     "string-cache",
     "bool-duration",
     "string-duration",
+    "non-string-result",
+    "unknown-usage-field",
 ))
 async def test_claude_prompt_too_long_unsafe_evidence_does_not_replay(
     db_factory,
@@ -22470,6 +22488,10 @@ async def test_claude_prompt_too_long_unsafe_evidence_does_not_replay(
     }
     if synthetic_error is not None:
         synthetic["error"] = synthetic_error
+    terminal_result_value = "Prompt is too long"
+    if isinstance(activity, dict) and "_terminal_result" in activity:
+        terminal_result_value = activity["_terminal_result"]
+        activity = None
     output_lines = []
     if activity is not None:
         output_lines.append(json.dumps(activity).encode() + b"\n")
@@ -22478,7 +22500,7 @@ async def test_claude_prompt_too_long_unsafe_evidence_does_not_replay(
         json.dumps({
             "type": "result",
             "is_error": True,
-            "result": "Prompt is too long",
+            "result": terminal_result_value,
             "terminal_reason": "blocking_limit",
             "duration_api_ms": duration_api_ms,
             "usage": usage,
